@@ -1,0 +1,53 @@
+node_modules
+dist/
+.artifacts/
+*.log
+.DS_Store
+*.tsbuildinfo
+# packages/*/node_modules/
+packages/*/dist/
+packages/*/dist-chrome/
+packages/*/dist-firefox/
+packages/ai/src/providers/data/
+packages/ai/src/providers/.model-generation-*/
+*.cpuprofile
+
+# Environment
+.env
+
+# Editor files
+.vscode/
+.zed/
+.idea/
+.claude/
+*.swp
+*.swo
+*~
+
+# Package specific
+.npm/
+coverage/
+.nyc_output/
+.mehh_config/
+tui-debug.log
+compaction-results/
+.opencode/
+syntax.jsonl
+out.jsonl
+mehh-*.html
+out.html
+packages/coding-agent/binaries/
+packages/env/bin/
+packages/env/daemon/target/
+todo.md
+/plans/
+.mehh/hf-sessions/
+.mehh/hf-sessions-backup/
+.mehh/settings.json
+collect.sh
+packages/agent/docs/extensions/mehh-server-artifact/index.md
+
+# Rust
+/target
+Cargo.lock
+
