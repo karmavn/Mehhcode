@@ -1,0 +1,36 @@
+{
+	"extends": "./tsconfig.base.json",
+	"compilerOptions": {
+		"noEmit": true,
+		"module": "NodeNext",
+		"moduleResolution": "NodeNext",
+		"paths": {
+			"@mehh-code/telemetry": ["./packages/telemetry/src/index.ts"],
+			"@mehh-code/telemetry/testing": ["./packages/telemetry/src/testing/index.ts"],
+			"@mehh-code/telemetry/render": ["./packages/telemetry/src/render.ts"],
+			"@mehh-code/codemode": ["./packages/codemode/src/index.ts"],
+			"@mehh-code/codemode/cloudflare": ["./packages/codemode/src/cloudflare.ts"],
+			"@mehh-code/codemode/declarations": ["./packages/codemode/src/declarations.ts"],
+			"@mehh-code/codemode/portable": ["./packages/codemode/src/portable.ts"],
+			"@mehh-code/codemode/source": ["./packages/codemode/src/source.ts"],
+			"@mehh-code/codemode/worker": ["./packages/codemode/src/runtime/worker.ts"],
+			"@mehh-code/schema": ["./packages/schema/src/index.ts"],
+			"@mehh-code/schema/formats": ["./packages/schema/src/formats/index.ts"],
+			"@mehh-code/mcp": ["./packages/mcp/src/index.ts"],
+			"@mehh-code/mcp/oauth": ["./packages/mcp/src/oauth/index.ts"],
+			"@mehh-code/mcp/testing": ["./packages/mcp/src/testing/index.ts"],
+			"@mehh-code/ai": ["./packages/ai/src/index.ts"],
+			"@mehh-code/ai/oauth": ["./packages/ai/src/oauth.ts"],
+			"@mehh-code/ai/*": ["./packages/ai/src/*.ts", "./packages/ai/src/providers/*.ts"],
+			"@mehh-code/ai/dist/*": ["./packages/ai/src/*"],
+			"@mehh-code/agent-core": ["./packages/agent/src/index.ts"],
+			"@mehh-code/coding-agent": ["./packages/coding-agent/src/index.ts"],
+			"@mehh-code/coding-agent/hooks": ["./packages/coding-agent/src/core/hooks/index.ts"],
+			"@mehh-code/coding-agent/*": ["./packages/coding-agent/src/*"],
+			"@mehh-code/tui": ["./packages/tui/src/index.ts"],
+			"@mehh-code/tui/*": ["./packages/tui/src/*"]
+		}
+	},
+	"include": ["packages/*/src/**/*", "packages/*/test/**/*", "packages/ai/catalog/**/*"],
+	"exclude": ["**/dist/**"]
+}
