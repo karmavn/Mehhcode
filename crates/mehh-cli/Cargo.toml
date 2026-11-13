@@ -1,0 +1,19 @@
+[package]
+name = "mehh-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "mehh"
+path = "src/main.rs"
+
+[dependencies]
+mehh-ai.workspace = true
+mehh-agent.workspace = true
+mehh-tools.workspace = true
+mehh-coding-agent.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true

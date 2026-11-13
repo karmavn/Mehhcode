@@ -1,0 +1,25 @@
+[package]
+name = "mehh-coding-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mehh-ai = { workspace = true }
+mehh-agent = { workspace = true }
+mehh-tools = { workspace = true }
+mehh-tui = { workspace = true }
+mehh-mcp = { workspace = true }
+mehh-codemode = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }

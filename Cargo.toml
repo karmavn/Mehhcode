@@ -1,0 +1,48 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mehh-ai",
+    "crates/mehh-agent",
+    "crates/mehh-tools",
+    "crates/mehh-coding-agent",
+    "crates/mehh-tui",
+    "crates/mehh-mcp",
+    "crates/mehh-codemode",
+    "crates/mehh-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+async-trait = "0.1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+base64 = "0.22"
+sha2 = "0.10"
+regex = "1"
+globset = "0.4"
+ignore = "0.4"
+similar = "2"
+clap = { version = "4", features = ["derive", "env"] }
+crossterm = "0.28"
+unicode-width = "0.2"
+unicode-segmentation = "1"
+tracing = "0.1"
+
+mehh-ai = { path = "crates/mehh-ai" }
+mehh-agent = { path = "crates/mehh-agent" }
+mehh-tools = { path = "crates/mehh-tools" }
+mehh-coding-agent = { path = "crates/mehh-coding-agent" }
+mehh-tui = { path = "crates/mehh-tui" }
+mehh-mcp = { path = "crates/mehh-mcp" }
+mehh-codemode = { path = "crates/mehh-codemode" }
