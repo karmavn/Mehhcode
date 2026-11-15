@@ -263,6 +263,7 @@ pub fn faux_model() -> Model {
         context_window: 128_000,
         max_tokens: 4096,
         headers: None,
+        ..Default::default()
     }
 }
 

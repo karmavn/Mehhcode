@@ -39,6 +39,9 @@ impl Default for Theme {
 /// Parse a 3- or 6-digit hex string into (r, g, b) bytes.
 fn parse_hex_color(hex: &str) -> Option<(u8, u8, u8)> {
     let clean = hex.trim().strip_prefix('#').unwrap_or(hex.trim());
+    if !clean.is_ascii() {
+        return None;
+    }
     if clean.len() == 6 {
         let r = u8::from_str_radix(&clean[0..2], 16).ok()?;
         let g = u8::from_str_radix(&clean[2..4], 16).ok()?;

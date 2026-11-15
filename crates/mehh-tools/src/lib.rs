@@ -31,6 +31,35 @@ pub fn create_coding_tools(cwd: PathBuf) -> Vec<Arc<dyn AgentTool>> {
 }
 
 #[cfg(test)]
+pub(crate) struct TempTestDir(PathBuf);
+
+#[cfg(test)]
+impl TempTestDir {
+    pub(crate) fn new(prefix: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mehh_tools_test_{prefix}_{}_{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempTestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use base64::prelude::*;
@@ -38,24 +67,11 @@ mod tests {
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
-    fn create_test_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mehh_tools_test_{}_{}",
-            name,
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[tokio::test]
     async fn test_write_and_read_tool() {
-        let temp_dir = create_test_dir("write_read");
-        let write_tool = WriteTool::new(temp_dir.clone());
-        let read_tool = ReadTool::new(temp_dir.clone());
+        let temp_dir = TempTestDir::new("write_read");
+        let write_tool = WriteTool::new(temp_dir.path().to_path_buf());
+        let read_tool = ReadTool::new(temp_dir.path().to_path_buf());
         let cancel = CancellationToken::new();
 
         // 1. Write file with parent directories
@@ -118,7 +134,7 @@ mod tests {
 
         // 4. Test image reading
         let dummy_png_bytes = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
-        let image_path = temp_dir.join("photo.png");
+        let image_path = temp_dir.path().join("photo.png");
         std::fs::write(&image_path, &dummy_png_bytes).unwrap();
 
         let img_params = json!({
@@ -139,18 +155,16 @@ mod tests {
             }
             _ => panic!("Expected image content block"),
         }
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
     async fn test_edit_tool_and_crlf_preservation() {
-        let temp_dir = create_test_dir("edit");
-        let edit_tool = EditTool::new(temp_dir.clone());
+        let temp_dir = TempTestDir::new("edit");
+        let edit_tool = EditTool::new(temp_dir.path().to_path_buf());
         let cancel = CancellationToken::new();
 
         // 1. Test CRLF preservation with single edit
-        let file_path = temp_dir.join("crlf_test.txt");
+        let file_path = temp_dir.path().join("crlf_test.txt");
         let crlf_content = "first line\r\nsecond line\r\nthird line\r\n";
         std::fs::write(&file_path, crlf_content).unwrap();
 
@@ -199,7 +213,7 @@ mod tests {
         assert!(err_missing.unwrap_err().contains("Could not find edits[0]"));
 
         // 3. Error on ambiguous (multiple) occurrences
-        let dup_file = temp_dir.join("dup_test.txt");
+        let dup_file = temp_dir.path().join("dup_test.txt");
         std::fs::write(&dup_file, "same\nsame\n").unwrap();
 
         let dup_params = json!({
@@ -218,7 +232,7 @@ mod tests {
         assert!(err_dup.unwrap_err().contains("Found 2 occurrences"));
 
         // 4. Multiple edits
-        let multi_file = temp_dir.join("multi_test.txt");
+        let multi_file = temp_dir.path().join("multi_test.txt");
         std::fs::write(&multi_file, "alpha\nbeta\ngamma\n").unwrap();
 
         let multi_params = json!({
@@ -243,19 +257,17 @@ mod tests {
 
         let multi_str = std::fs::read_to_string(&multi_file).unwrap();
         assert_eq!(multi_str, "AAA\nbeta\nCCC\n");
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
     async fn test_grep_tool() {
-        let temp_dir = create_test_dir("grep");
-        let grep_tool = GrepTool::new(temp_dir.clone());
+        let temp_dir = TempTestDir::new("grep");
+        let grep_tool = GrepTool::new(temp_dir.path().to_path_buf());
         let cancel = CancellationToken::new();
 
-        std::fs::write(temp_dir.join("a.txt"), "hello world\nsecond line").unwrap();
-        std::fs::write(temp_dir.join("b.txt"), "HELLO WORLD\nthird line").unwrap();
-        std::fs::write(temp_dir.join("c.rs"), "fn hello() {}").unwrap();
+        std::fs::write(temp_dir.path().join("a.txt"), "hello world\nsecond line").unwrap();
+        std::fs::write(temp_dir.path().join("b.txt"), "HELLO WORLD\nthird line").unwrap();
+        std::fs::write(temp_dir.path().join("c.rs"), "fn hello() {}").unwrap();
 
         // 1. Literal and case-sensitive
         let params1 = json!({
@@ -299,20 +311,18 @@ mod tests {
         };
         assert!(text2.contains("c.rs:1:fn hello() {}"));
         assert!(!text2.contains("a.txt"));
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
     async fn test_find_tool() {
-        let temp_dir = create_test_dir("find");
-        let find_tool = FindTool::new(temp_dir.clone());
+        let temp_dir = TempTestDir::new("find");
+        let find_tool = FindTool::new(temp_dir.path().to_path_buf());
         let cancel = CancellationToken::new();
 
-        std::fs::create_dir_all(temp_dir.join("src")).unwrap();
-        std::fs::write(temp_dir.join("src/lib.rs"), "// lib").unwrap();
-        std::fs::write(temp_dir.join("src/main.rs"), "// main").unwrap();
-        std::fs::write(temp_dir.join("README.md"), "# Readme").unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("src")).unwrap();
+        std::fs::write(temp_dir.path().join("src/lib.rs"), "// lib").unwrap();
+        std::fs::write(temp_dir.path().join("src/main.rs"), "// main").unwrap();
+        std::fs::write(temp_dir.path().join("README.md"), "# Readme").unwrap();
 
         // 1. Glob match
         let params1 = json!({
@@ -351,20 +361,18 @@ mod tests {
             _ => panic!("Expected text"),
         };
         assert!(text2.contains("README.md"));
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
     async fn test_ls_tool() {
-        let temp_dir = create_test_dir("ls");
-        let ls_tool = LsTool::new(temp_dir.clone());
+        let temp_dir = TempTestDir::new("ls");
+        let ls_tool = LsTool::new(temp_dir.path().to_path_buf());
         let cancel = CancellationToken::new();
 
-        std::fs::create_dir_all(temp_dir.join("dir_b")).unwrap();
-        std::fs::create_dir_all(temp_dir.join("dir_a")).unwrap();
-        std::fs::write(temp_dir.join("file_z.txt"), "z").unwrap();
-        std::fs::write(temp_dir.join("file_a.txt"), "a").unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("dir_b")).unwrap();
+        std::fs::create_dir_all(temp_dir.path().join("dir_a")).unwrap();
+        std::fs::write(temp_dir.path().join("file_z.txt"), "z").unwrap();
+        std::fs::write(temp_dir.path().join("file_a.txt"), "a").unwrap();
 
         let params = json!({}).as_object().unwrap().clone();
         let res = ls_tool
@@ -378,14 +386,12 @@ mod tests {
 
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines, vec!["dir_a/", "dir_b/", "file_a.txt", "file_z.txt"]);
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[tokio::test]
     async fn test_bash_tool() {
-        let temp_dir = create_test_dir("bash");
-        let bash_tool = BashTool::new(temp_dir.clone());
+        let temp_dir = TempTestDir::new("bash");
+        let bash_tool = BashTool::new(temp_dir.path().to_path_buf());
         let cancel = CancellationToken::new();
 
         // 1. Success command
@@ -419,8 +425,6 @@ mod tests {
             .await;
         assert!(err2.is_err());
         assert!(err2.unwrap_err().contains("42"));
-
-        let _ = std::fs::remove_dir_all(&temp_dir);
     }
 
     #[test]

@@ -2,21 +2,35 @@ use crate::types::{
     AssistantMessage, AssistantMessageEvent, Context, Model, StreamOptions,
 };
 use anyhow::{anyhow, Result};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
+
+const EVENT_CHANNEL_CAPACITY: usize = 1024;
 
 #[derive(Clone, Debug)]
 pub struct AssistantEventSender {
-    sender: UnboundedSender<AssistantMessageEvent>,
+    sender: Sender<AssistantMessageEvent>,
 }
 
 impl AssistantEventSender {
     pub fn push(&self, event: AssistantMessageEvent) {
-        let _ = self.sender.send(event);
+        let _ = self.sender.try_send(event);
+    }
+
+    pub async fn send(&self, event: AssistantMessageEvent) {
+        let _ = self.sender.send(event).await;
+    }
+
+    pub async fn send_batch(&self, events: Vec<AssistantMessageEvent>) {
+        for event in events {
+            if self.sender.send(event).await.is_err() {
+                break;
+            }
+        }
     }
 }
 
 pub struct AssistantEventStream {
-    receiver: UnboundedReceiver<AssistantMessageEvent>,
+    receiver: Receiver<AssistantMessageEvent>,
 }
 
 impl AssistantEventStream {
@@ -36,15 +50,19 @@ impl AssistantEventStream {
                 }
                 AssistantMessageEvent::Start { partial }
                 | AssistantMessageEvent::TextStart { partial, .. }
-                | AssistantMessageEvent::TextDelta { partial, .. }
                 | AssistantMessageEvent::TextEnd { partial, .. }
                 | AssistantMessageEvent::ThinkingStart { partial, .. }
-                | AssistantMessageEvent::ThinkingDelta { partial, .. }
                 | AssistantMessageEvent::ThinkingEnd { partial, .. }
                 | AssistantMessageEvent::ToolCallStart { partial, .. }
-                | AssistantMessageEvent::ToolCallDelta { partial, .. }
                 | AssistantMessageEvent::ToolCallEnd { partial, .. } => {
                     last_partial = Some(partial);
+                }
+                AssistantMessageEvent::TextDelta { partial, .. }
+                | AssistantMessageEvent::ThinkingDelta { partial, .. }
+                | AssistantMessageEvent::ToolCallDelta { partial, .. } => {
+                    if last_partial.is_none() || !partial.content.is_empty() {
+                        last_partial = Some(partial);
+                    }
                 }
             }
         }
@@ -53,7 +71,7 @@ impl AssistantEventStream {
 }
 
 pub fn create_event_stream() -> (AssistantEventSender, AssistantEventStream) {
-    let (sender, receiver) = unbounded_channel();
+    let (sender, receiver) = channel(EVENT_CHANNEL_CAPACITY);
     (
         AssistantEventSender { sender },
         AssistantEventStream { receiver },

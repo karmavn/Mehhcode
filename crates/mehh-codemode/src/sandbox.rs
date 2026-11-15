@@ -20,7 +20,7 @@ pub struct CodemodeConfig {
 impl Default for CodemodeConfig {
     fn default() -> Self {
         Self {
-            memory_limit_bytes: 256 * 1024 * 1024,
+            memory_limit_bytes: 64 * 1024 * 1024,
             timeout: Duration::from_secs(30),
             max_output_chars: 16 * 1024 * 1024,
             max_output_items: 100_000,
@@ -100,6 +100,37 @@ pub fn to_identifier(name: &str) -> String {
 }
 
 const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
+    const hostCallTool = globalThis.__host_call_tool;
+    const hostLog = globalThis.__host_log;
+    const hostText = globalThis.__host_text;
+    const hostImage = globalThis.__host_image;
+    const hostStore = globalThis.__host_store;
+    const hostLoad = globalThis.__host_load;
+    const hostExit = globalThis.__host_exit;
+    const hostSearchTools = globalThis.__host_search_tools;
+    const hostDescribeTool = globalThis.__host_describe_tool;
+    const hostDescribeNamespace = globalThis.__host_describe_namespace;
+    const hostModelsList = globalThis.__host_models_list;
+    const hostModelsResolve = globalThis.__host_models_resolve;
+    const hostModelsGetAvailable = globalThis.__host_models_get_available;
+    for (const k of [
+        "__host_call_tool",
+        "__host_log",
+        "__host_text",
+        "__host_image",
+        "__host_store",
+        "__host_load",
+        "__host_exit",
+        "__host_search_tools",
+        "__host_describe_tool",
+        "__host_describe_namespace",
+        "__host_models_list",
+        "__host_models_resolve",
+        "__host_models_get_available",
+    ]) {
+        delete globalThis[k];
+    }
+
     const toolMap = new Map();
     const allTools = [];
     for (const t of __TOOLS_META__) {
@@ -116,7 +147,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
                 const toolName = toolMap.get(prop);
                 return async function(args) {
                     const argsJson = JSON.stringify(args !== undefined ? args : {});
-                    const resJson = __host_call_tool(toolName, argsJson);
+                    const resJson = hostCallTool(toolName, argsJson);
                     let res;
                     try {
                         res = JSON.parse(resJson);
@@ -167,7 +198,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
     for (const level of ["log", "info", "warn", "error", "debug"]) {
         consoleObj[level] = (...args) => {
             const formatted = args.map(outputText).join(" ");
-            const err = __host_log(level, formatted);
+            const err = hostLog(level, formatted);
             if (err) throw new RangeError(err);
         };
     }
@@ -175,7 +206,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
 
     function text(v) {
         const s = outputText(v);
-        const err = __host_text(s);
+        const err = hostText(s);
         if (err) throw new RangeError(err);
     }
 
@@ -233,7 +264,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
         if (!detectedMime) {
             throw new TypeError("invalid image output. The image data is not a PNG, JPEG, GIF, or WebP image");
         }
-        const err = __host_image(data, detectedMime);
+        const err = hostImage(data, detectedMime);
         if (err) throw new RangeError(err);
     }
 
@@ -243,7 +274,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
             throw new TypeError("store() key must be a string");
         }
         if (value === undefined) {
-            const err = __host_store(key, "__UNDEFINED__");
+            const err = hostStore(key, "__UNDEFINED__");
             if (err) throw new RangeError(err);
             return;
         }
@@ -259,7 +290,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
         if (json.length > MAX_STORE_VAL) {
             throw new RangeError("store('" + key + "') value exceeds 256KB limit");
         }
-        const err = __host_store(key, json);
+        const err = hostStore(key, json);
         if (err) throw new RangeError(err);
     }
 
@@ -267,7 +298,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
         if (typeof key !== "string") {
             throw new TypeError("load() key must be a string");
         }
-        const raw = __host_load(key);
+        const raw = hostLoad(key);
         if (raw === "" || raw === "__UNDEFINED__") {
             return undefined;
         }
@@ -279,7 +310,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
     }
 
     function exit() {
-        __host_exit();
+        hostExit();
         throw new Error("__EXIT__");
     }
 
@@ -288,7 +319,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
             throw new TypeError("searchTools(query) requires query to be a string");
         }
         const optJson = JSON.stringify(options !== undefined ? options : {});
-        const resJson = __host_search_tools(query, optJson);
+        const resJson = hostSearchTools(query, optJson);
         return JSON.parse(resJson);
     }
 
@@ -296,7 +327,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
         if (typeof name !== "string") {
             throw new TypeError("describeTool(name) requires name to be a string");
         }
-        const raw = __host_describe_tool(name);
+        const raw = hostDescribeTool(name);
         if (!raw) {
             return undefined;
         }
@@ -307,7 +338,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
         if (typeof name !== "string") {
             throw new TypeError("describeNamespace(name) requires name to be a string");
         }
-        const raw = __host_describe_namespace(name);
+        const raw = hostDescribeNamespace(name);
         if (!raw) {
             return undefined;
         }
@@ -316,11 +347,11 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
 
     const modelsObj = {
         list() {
-            return JSON.parse(__host_models_list());
+            return JSON.parse(hostModelsList());
         },
         resolve(providerOrId, modelId) {
             const mIdJson = JSON.stringify(modelId !== undefined ? modelId : null);
-            const res = __host_models_resolve(String(providerOrId), mIdJson);
+            const res = hostModelsResolve(String(providerOrId), mIdJson);
             if (!res) {
                 return undefined;
             }
@@ -328,7 +359,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
         },
         getAvailableOfType(provider) {
             const pJson = JSON.stringify(provider !== undefined ? provider : null);
-            return JSON.parse(__host_models_get_available(pJson));
+            return JSON.parse(hostModelsGetAvailable(pJson));
         }
     };
     Object.freeze(modelsObj);
@@ -471,12 +502,27 @@ fn run_codemode_blocking(
         // 1. __host_call_tool
         let handle_tool = handle.clone();
         let executor_tool = executor.clone();
+        let cancel_tool = cancel.clone();
         let host_call_tool = match rquickjs::Function::new(
             ctx.clone(),
             move |name: String, args_json: String| -> String {
+                if cancel_tool.is_cancelled() {
+                    return serde_json::json!({ "ok": false, "error": "Execution was cancelled" }).to_string();
+                }
+                let now = Instant::now();
+                if now >= deadline {
+                    return serde_json::json!({ "ok": false, "error": "Execution timed out" }).to_string();
+                }
+                let remaining = deadline.saturating_duration_since(now);
                 let args_val = serde_json::from_str(&args_json)
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                let res = handle_tool.block_on((executor_tool)(&name, args_val));
+                let res = handle_tool.block_on(async {
+                    tokio::select! {
+                        _ = cancel_tool.cancelled() => Err("Execution was cancelled".to_string()),
+                        _ = tokio::time::sleep(remaining) => Err("Execution timed out".to_string()),
+                        out = (executor_tool)(&name, args_val) => out,
+                    }
+                });
                 match res {
                     Ok(v) => serde_json::json!({ "ok": true, "value": v }).to_string(),
                     Err(e) => serde_json::json!({ "ok": false, "error": e }).to_string(),
@@ -738,8 +784,10 @@ fn run_codemode_blocking(
             };
         }
 
+        let shared_tool_defs: Arc<[ToolDefinition]> = Arc::from(tool_defs);
+
         // 8. __host_search_tools
-        let tool_defs_search = Arc::new(tool_defs.to_vec());
+        let tool_defs_search = Arc::clone(&shared_tool_defs);
         let host_search_tools = match rquickjs::Function::new(
             ctx.clone(),
             move |query: String, options_json: String| -> String {
@@ -756,26 +804,32 @@ fn run_codemode_blocking(
                     .filter(|s| !s.is_empty())
                     .collect();
 
+                let ns_filter = opts.namespace.as_deref().map(|ns| {
+                    if ns == "builtin" {
+                        (ns, None)
+                    } else {
+                        let ns_prefix = format!("mcp__{ns}__");
+                        let ns_sanitized = ns.replace('-', "_");
+                        let ns_prefix_sanitized = format!("mcp__{ns_sanitized}__");
+                        (ns, Some((ns_prefix, ns_prefix_sanitized)))
+                    }
+                });
+
                 let mut scored: Vec<(f64, &ToolDefinition)> = Vec::new();
 
-                for tool in tool_defs_search.as_slice() {
-                    if let Some(ref ns) = opts.namespace {
-                        if ns == "builtin" {
-                            if tool.name.starts_with("mcp__") {
-                                continue;
-                            }
-                        } else {
-                            let ns_prefix = format!("mcp__{ns}__");
-                            let ns_sanitized = ns.replace('-', "_");
-                            let ns_prefix_sanitized = format!("mcp__{ns_sanitized}__");
-                            let exact = tool.name == *ns;
+                for tool in tool_defs_search.iter() {
+                    if let Some((ns, ref prefixes)) = ns_filter {
+                        if let Some((ns_prefix, ns_prefix_sanitized)) = prefixes {
+                            let exact = tool.name == ns;
                             if !exact
-                                && !tool.name.starts_with(&ns_prefix)
-                                && !tool.name.starts_with(&ns_prefix_sanitized)
+                                && !tool.name.starts_with(ns_prefix)
+                                && !tool.name.starts_with(ns_prefix_sanitized)
                                 && !tool.name.starts_with(ns)
                             {
                                 continue;
                             }
+                        } else if tool.name.starts_with("mcp__") {
+                            continue;
                         }
                     }
 
@@ -848,7 +902,7 @@ fn run_codemode_blocking(
         }
 
         // 9. __host_describe_tool
-        let tool_defs_desc = Arc::new(tool_defs.to_vec());
+        let tool_defs_desc = Arc::clone(&shared_tool_defs);
         let host_describe_tool = match rquickjs::Function::new(
             ctx.clone(),
             move |name: String| -> String {
@@ -888,7 +942,7 @@ fn run_codemode_blocking(
         }
 
         // 10. __host_describe_namespace
-        let tool_defs_ns = Arc::new(tool_defs.to_vec());
+        let tool_defs_ns = Arc::clone(&shared_tool_defs);
         let host_describe_namespace = match rquickjs::Function::new(
             ctx.clone(),
             move |name: String| -> String {

@@ -3,6 +3,10 @@
 use futures::StreamExt;
 
 use crate::openai_responses::{build_openai_responses_request, OpenAiResponsesStreamState};
+use crate::retry::{
+    default_http_client, retry_failure_event, send_with_retry, RetryPolicy,
+    DEFAULT_STREAM_CHUNK_TIMEOUT,
+};
 use crate::sse::SseParser;
 use crate::stream::{create_event_stream, AssistantEventStream, LlmProvider};
 use crate::types::*;
@@ -27,7 +31,7 @@ impl AzureOpenAiResponsesProvider {
 impl Default for AzureOpenAiResponsesProvider {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: default_http_client(),
         }
     }
 }
@@ -104,68 +108,41 @@ impl LlmProvider for AzureOpenAiResponsesProvider {
             let body = build_openai_responses_request(&model, &context, &options);
             let url = build_azure_openai_url(&model, None, None);
 
-            let mut req = client.post(&url);
-            req = req.header("content-type", "application/json");
+            let resp = match send_with_retry(
+                || {
+                    let mut req = client.post(&url);
+                    req = req.header("content-type", "application/json");
 
-            // Azure OpenAI uses the `api-key` header rather than Authorization Bearer
-            if let Some(api_key) = &options.api_key {
-                req = req.header("api-key", api_key);
-            } else if let Ok(env_key) = std::env::var("AZURE_OPENAI_API_KEY") {
-                req = req.header("api-key", env_key);
-            }
+                    // Azure OpenAI uses the `api-key` header rather than Authorization Bearer
+                    if let Some(api_key) = &options.api_key {
+                        req = req.header("api-key", api_key);
+                    } else if let Ok(env_key) = std::env::var("AZURE_OPENAI_API_KEY") {
+                        req = req.header("api-key", env_key);
+                    }
 
-            if let Some(headers) = &model.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            if let Some(headers) = &options.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            req = req.json(&body);
-
-            let resp = tokio::select! {
-                _ = cancel.cancelled() => {
-                    let mut err_msg = AssistantMessage::empty_for_model(&model);
-                    err_msg.stop_reason = StopReason::Aborted;
-                    err_msg.error_message = Some("Request was cancelled".to_string());
-                    sender.push(AssistantMessageEvent::Error {
-                        reason: StopReason::Aborted,
-                        error: err_msg,
-                    });
-                    return;
-                }
-                res = req.send() => {
-                    match res {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let mut err_msg = AssistantMessage::empty_for_model(&model);
-                            err_msg.stop_reason = StopReason::Error;
-                            err_msg.error_message = Some(e.to_string());
-                            sender.push(AssistantMessageEvent::Error {
-                                reason: StopReason::Error,
-                                error: err_msg,
-                            });
-                            return;
+                    if let Some(headers) = &model.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
                         }
                     }
+                    if let Some(headers) = &options.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
+                        }
+                    }
+                    req.json(&body)
+                },
+                &RetryPolicy::default(),
+                &cancel,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(failure) => {
+                    sender.send(retry_failure_event(failure, &model)).await;
+                    return;
                 }
             };
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                let mut err_msg = AssistantMessage::empty_for_model(&model);
-                err_msg.stop_reason = StopReason::Error;
-                err_msg.error_message = Some(format!("HTTP {status}: {text}"));
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
-                    error: err_msg,
-                });
-                return;
-            }
 
             let mut byte_stream = resp.bytes_stream();
             let mut sse_parser = SseParser::new();
@@ -174,45 +151,64 @@ impl LlmProvider for AzureOpenAiResponsesProvider {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        let mut err_msg = state.finish(&sender);
-                        err_msg.stop_reason = StopReason::Aborted;
-                        err_msg.error_message = Some("Request was cancelled".to_string());
-                        sender.push(AssistantMessageEvent::Error {
-                            reason: StopReason::Aborted,
-                            error: err_msg,
-                        });
+                        state.mark_aborted("Request was cancelled");
+                        let mut batch = Vec::new();
+                        state.finish_into(&mut batch);
+                        sender.send_batch(batch).await;
                         return;
                     }
-                    chunk_opt = byte_stream.next() => {
+                    chunk_opt = tokio::time::timeout(DEFAULT_STREAM_CHUNK_TIMEOUT, byte_stream.next()) => {
                         match chunk_opt {
-                            Some(Ok(bytes)) => {
-                                let chunk_str = String::from_utf8_lossy(&bytes);
-                                let events = sse_parser.feed(&chunk_str);
-                                for ev in events {
-                                    state.process_chunk(&ev.data, &sender);
+                            Ok(Some(Ok(bytes))) => {
+                                let events = sse_parser.feed_bytes(&bytes);
+                                if sse_parser.has_overflowed() {
+                                    state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+                                    let mut batch = Vec::new();
+                                    state.finish_into(&mut batch);
+                                    sender.send_batch(batch).await;
+                                    return;
                                 }
+                                let mut batch = Vec::new();
+                                for ev in events {
+                                    state.process_chunk_into(&ev.data, &mut batch);
+                                }
+                                sender.send_batch(batch).await;
                             }
-                            Some(Err(e)) => {
-                                let mut err_msg = state.finish(&sender);
-                                err_msg.stop_reason = StopReason::Error;
-                                err_msg.error_message = Some(e.to_string());
-                                sender.push(AssistantMessageEvent::Error {
-                                    reason: StopReason::Error,
-                                    error: err_msg,
-                                });
+                            Ok(Some(Err(e))) => {
+                                state.mark_error(e.to_string());
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
                                 return;
                             }
-                            None => break,
+                            Err(_) => {
+                                state.mark_error(format!(
+                                    "Stream read timed out after {} seconds",
+                                    DEFAULT_STREAM_CHUNK_TIMEOUT.as_secs()
+                                ));
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
+                                return;
+                            }
+                            Ok(None) => break,
                         }
                     }
                 }
             }
 
             let remaining = sse_parser.finish();
+            let mut batch = Vec::new();
             for ev in remaining {
-                state.process_chunk(&ev.data, &sender);
+                state.process_chunk_into(&ev.data, &mut batch);
             }
-            state.finish(&sender);
+            if sse_parser.has_overflowed() {
+                state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+            } else if sse_parser.has_pending_bytes() || !state.received_terminal {
+                state.mark_error("Stream ended prematurely before Azure OpenAI Responses completion");
+            }
+            state.finish_into(&mut batch);
+            sender.send_batch(batch).await;
         });
 
         stream
@@ -237,6 +233,7 @@ mod tests {
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
+            ..Default::default()
         };
 
         // Explicit resource and api_version override
@@ -272,6 +269,7 @@ mod tests {
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
+            ..Default::default()
         };
 
         let context = Context {
@@ -290,6 +288,7 @@ mod tests {
             reasoning: None,
             session_id: None,
             headers: None,
+            ..Default::default()
         };
 
         let body = build_openai_responses_request(&model, &context, &options);

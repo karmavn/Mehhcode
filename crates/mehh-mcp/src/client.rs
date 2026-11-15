@@ -108,6 +108,7 @@ pub struct McpClient {
     server_info: Arc<RwLock<Option<serde_json::Value>>>,
     server_capabilities: Arc<RwLock<Option<serde_json::Value>>>,
     roots: Arc<Vec<McpRoot>>,
+    reader_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl McpClient {
@@ -137,6 +138,7 @@ impl McpClient {
             server_info: server_info.clone(),
             server_capabilities: server_capabilities.clone(),
             roots: roots_arc.clone(),
+            reader_task: Mutex::new(None),
         };
 
         // Start background reader task
@@ -145,7 +147,8 @@ impl McpClient {
         let closed_reader = closed.clone();
         let roots_reader = roots_arc.clone();
 
-        tokio::spawn(async move {
+        let reader_handle = tokio::spawn(async move {
+            let mut close_reason: Option<String> = None;
             while let Some(msg_res) = transport_reader.recv().await {
                 match msg_res {
                     Ok(JsonRpcMessage::Response(resp)) => {
@@ -176,69 +179,92 @@ impl McpClient {
                         // Notifications (e.g. progress, log messages) are acknowledged silently
                     }
                     Err(e) => {
-                        tracing::warn!("MCP transport read error: {e}");
+                        let err_msg = format!("MCP transport error: {e}");
+                        tracing::warn!("{err_msg}");
+                        let mut map = pending_reader.lock().await;
+                        for (_, tx) in map.drain() {
+                            let _ = tx.send(Err(err_msg.clone()));
+                        }
+                        close_reason = Some(err_msg);
                     }
                 }
             }
             closed_reader.store(true, Ordering::SeqCst);
+            let final_reason = close_reason.unwrap_or_else(|| "MCP connection closed".to_string());
             let mut map = pending_reader.lock().await;
             for (_, tx) in map.drain() {
-                let _ = tx.send(Err("MCP connection closed".to_string()));
+                let _ = tx.send(Err(final_reason.clone()));
             }
         });
+        *client.reader_task.lock().await = Some(reader_handle);
 
-        // Send initialize request
-        let capabilities = if roots_arc.is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::json!({
-                "roots": {
-                    "listChanged": false
+        let handshake_res: anyhow::Result<()> = async {
+            // Send initialize request
+            let capabilities = if roots_arc.is_empty() {
+                serde_json::json!({})
+            } else {
+                serde_json::json!({
+                    "roots": {
+                        "listChanged": false
+                    }
+                })
+            };
+
+            let init_params = serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": capabilities,
+                "clientInfo": {
+                    "name": "mehh",
+                    "version": "0.1.0"
                 }
-            })
-        };
+            });
 
-        let init_params = serde_json::json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": capabilities,
-            "clientInfo": {
-                "name": "mehh",
-                "version": "0.1.0"
+            let init_res = client
+                .request("initialize", Some(init_params), Some(Duration::from_secs(15)))
+                .await?;
+
+            let negotiated_version = init_res
+                .get("protocolVersion")
+                .and_then(|v| v.as_str())
+                .unwrap_or("2024-11-05")
+                .to_string();
+
+            if !SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated_version.as_str()) {
+                anyhow::bail!(
+                    "MCP server selected unsupported protocol version: {negotiated_version}"
+                );
             }
-        });
 
-        let init_res = client
-            .request("initialize", Some(init_params), Some(Duration::from_secs(15)))
-            .await?;
+            {
+                let mut pv_guard = server_protocol_version.write().await;
+                *pv_guard = Some(negotiated_version);
+            }
+            if let Some(s_info) = init_res.get("serverInfo") {
+                let mut info_guard = server_info.write().await;
+                *info_guard = Some(s_info.clone());
+            }
+            if let Some(s_caps) = init_res.get("capabilities") {
+                let mut caps_guard = server_capabilities.write().await;
+                *caps_guard = Some(s_caps.clone());
+            }
 
-        let negotiated_version = init_res
-            .get("protocolVersion")
-            .and_then(|v| v.as_str())
-            .unwrap_or("2024-11-05")
-            .to_string();
+            // Send notifications/initialized
+            let notif = JsonRpcNotification::new("notifications/initialized", None);
+            tokio::time::timeout(
+                Duration::from_secs(15),
+                transport.send(JsonRpcMessage::Notification(notif)),
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out sending notifications/initialized"))??;
 
-        if !SUPPORTED_PROTOCOL_VERSIONS.contains(&negotiated_version.as_str()) {
-            anyhow::bail!(
-                "MCP server selected unsupported protocol version: {negotiated_version}"
-            );
+            Ok(())
         }
+        .await;
 
-        {
-            let mut pv_guard = server_protocol_version.write().await;
-            *pv_guard = Some(negotiated_version);
+        if let Err(e) = handshake_res {
+            let _ = client.close().await;
+            return Err(e);
         }
-        if let Some(s_info) = init_res.get("serverInfo") {
-            let mut info_guard = server_info.write().await;
-            *info_guard = Some(s_info.clone());
-        }
-        if let Some(s_caps) = init_res.get("capabilities") {
-            let mut caps_guard = server_capabilities.write().await;
-            *caps_guard = Some(s_caps.clone());
-        }
-
-        // Send notifications/initialized
-        let notif = JsonRpcNotification::new("notifications/initialized", None);
-        transport.send(JsonRpcMessage::Notification(notif)).await?;
 
         Ok(client)
     }
@@ -262,18 +288,25 @@ impl McpClient {
             map.insert(key.clone(), tx);
         }
 
-        let req = JsonRpcRequest::new(id, method, params);
-        if let Err(e) = self.transport.send(JsonRpcMessage::Request(req)).await {
-            let mut map = self.pending_requests.lock().await;
-            map.remove(&key);
-            return Err(e);
-        }
-
         let timeout_dur = timeout.unwrap_or(Duration::from_secs(30));
-        match tokio::time::timeout(timeout_dur, rx).await {
-            Ok(Ok(Ok(val))) => Ok(val),
-            Ok(Ok(Err(err_msg))) => anyhow::bail!("{err_msg}"),
-            Ok(Err(_)) => anyhow::bail!("MCP request sender dropped / connection closed"),
+        let req = JsonRpcRequest::new(id, method, params);
+        let outcome = tokio::time::timeout(timeout_dur, async {
+            self.transport.send(JsonRpcMessage::Request(req)).await?;
+            match rx.await {
+                Ok(Ok(val)) => Ok(val),
+                Ok(Err(err_msg)) => anyhow::bail!("{err_msg}"),
+                Err(_) => anyhow::bail!("MCP request sender dropped / connection closed"),
+            }
+        })
+        .await;
+
+        match outcome {
+            Ok(Ok(val)) => Ok(val),
+            Ok(Err(e)) => {
+                let mut map = self.pending_requests.lock().await;
+                map.remove(&key);
+                Err(e)
+            }
             Err(_) => {
                 let mut map = self.pending_requests.lock().await;
                 map.remove(&key);
@@ -437,6 +470,15 @@ impl McpClient {
     /// Closes the client and tears down the underlying transport.
     pub async fn close(&self) -> anyhow::Result<()> {
         self.is_closed.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.reader_task.lock().await.take() {
+            handle.abort();
+        }
+        {
+            let mut map = self.pending_requests.lock().await;
+            for (_, tx) in map.drain() {
+                let _ = tx.send(Err("MCP connection closed".to_string()));
+            }
+        }
         self.transport.close().await
     }
 
@@ -458,5 +500,91 @@ impl McpClient {
     /// Returns the server capabilities negotiated during initialization, if available.
     pub async fn server_capabilities(&self) -> Option<serde_json::Value> {
         self.server_capabilities.read().await.clone()
+    }
+}
+
+#[cfg(test)]
+mod client_tests {
+    use super::*;
+    use async_trait::async_trait;
+
+    struct SlowSendTransport {
+        closed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl McpTransport for SlowSendTransport {
+        async fn send(&self, _msg: JsonRpcMessage) -> anyhow::Result<()> {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        }
+
+        async fn recv(&self) -> Option<anyhow::Result<JsonRpcMessage>> {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            None
+        }
+
+        async fn close(&self) -> anyhow::Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_request_timeout_covers_send_phase() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let client = McpClient {
+            transport: Arc::new(SlowSendTransport {
+                closed: closed.clone(),
+            }),
+            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            is_closed: Arc::new(AtomicBool::new(false)),
+            server_protocol_version: Arc::new(RwLock::new(None)),
+            server_info: Arc::new(RwLock::new(None)),
+            server_capabilities: Arc::new(RwLock::new(None)),
+            roots: Arc::new(Vec::new()),
+            reader_task: Mutex::new(None),
+        };
+
+        let start = std::time::Instant::now();
+        let err = client
+            .request("tools/list", None, Some(Duration::from_millis(50)))
+            .await
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(err.to_string().contains("timed out"));
+        assert!(client.pending_requests.lock().await.is_empty());
+    }
+
+    struct FailingInitTransport {
+        closed: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl McpTransport for FailingInitTransport {
+        async fn send(&self, _msg: JsonRpcMessage) -> anyhow::Result<()> {
+            anyhow::bail!("mock send failure")
+        }
+
+        async fn recv(&self) -> Option<anyhow::Result<JsonRpcMessage>> {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            None
+        }
+
+        async fn close(&self) -> anyhow::Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn test_connect_failure_closes_transport() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let transport = Arc::new(FailingInitTransport {
+            closed: closed.clone(),
+        });
+        let res = McpClient::connect(transport).await;
+        assert!(res.is_err());
+        assert!(closed.load(Ordering::SeqCst));
     }
 }

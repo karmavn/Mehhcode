@@ -3,13 +3,23 @@
 use std::collections::HashMap;
 use futures::StreamExt;
 
+use crate::retry::{
+    default_http_client, send_with_retry, RetryFailure, RetryPolicy, DEFAULT_STREAM_CHUNK_TIMEOUT,
+};
 use crate::sse::{SseEvent, SseParser};
 use crate::stream::{create_event_stream, AssistantEventSender, AssistantEventStream, LlmProvider};
+use crate::streaming_json::ToolCallArgumentsStream;
 use crate::types::*;
 
 /// Provider for OpenAI Chat Completions API and compatible endpoints.
 pub struct OpenAiCompletionsProvider {
     client: reqwest::Client,
+}
+
+impl Default for OpenAiCompletionsProvider {
+    fn default() -> Self {
+        Self::new(default_http_client())
+    }
 }
 
 impl OpenAiCompletionsProvider {
@@ -42,64 +52,69 @@ impl LlmProvider for OpenAiCompletionsProvider {
                 format!("{}/chat/completions", model.base_url.trim_end_matches('/'))
             };
 
-            let mut req = client.post(&url);
-            req = req.header("content-type", "application/json");
+            let resp = match send_with_retry(
+                || {
+                    let mut req = client.post(&url);
+                    req = req.header("content-type", "application/json");
 
-            if let Some(api_key) = &options.api_key {
-                req = req.header("authorization", format!("Bearer {api_key}"));
-            }
-            if let Some(headers) = &model.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            if let Some(headers) = &options.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            req = req.json(&body);
-
-            let resp = tokio::select! {
-                _ = cancel.cancelled() => {
+                    if let Some(api_key) = &options.api_key {
+                        req = req.header("authorization", format!("Bearer {api_key}"));
+                    }
+                    if let Some(headers) = &model.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
+                        }
+                    }
+                    if let Some(headers) = &options.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
+                        }
+                    }
+                    req.json(&body)
+                },
+                &RetryPolicy::default(),
+                &cancel,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(RetryFailure::Cancelled) => {
                     let mut err_msg = AssistantMessage::empty_for_model(&model);
                     err_msg.stop_reason = StopReason::Aborted;
                     err_msg.error_message = Some("Request was cancelled".to_string());
-                    sender.push(AssistantMessageEvent::Error {
-                        reason: StopReason::Aborted,
-                        error: err_msg,
-                    });
+                    sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Aborted,
+                            error: err_msg,
+                        })
+                        .await;
                     return;
                 }
-                res = req.send() => {
-                    match res {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let mut err_msg = AssistantMessage::empty_for_model(&model);
-                            err_msg.stop_reason = StopReason::Error;
-                            err_msg.error_message = Some(e.to_string());
-                            sender.push(AssistantMessageEvent::Error {
-                                reason: StopReason::Error,
-                                error: err_msg,
-                            });
-                            return;
-                        }
-                    }
+                Err(RetryFailure::HttpStatus { status, body }) => {
+                    let mut err_msg = AssistantMessage::empty_for_model(&model);
+                    err_msg.stop_reason = StopReason::Error;
+                    err_msg.error_message = Some(format!("HTTP {status}: {body}"));
+                    sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: err_msg,
+                        })
+                        .await;
+                    return;
+                }
+                Err(RetryFailure::Transport(e)) => {
+                    let mut err_msg = AssistantMessage::empty_for_model(&model);
+                    err_msg.stop_reason = StopReason::Error;
+                    err_msg.error_message = Some(e);
+                    sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: err_msg,
+                        })
+                        .await;
+                    return;
                 }
             };
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                let mut err_msg = AssistantMessage::empty_for_model(&model);
-                err_msg.stop_reason = StopReason::Error;
-                err_msg.error_message = Some(format!("HTTP {status}: {text}"));
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
-                    error: err_msg,
-                });
-                return;
-            }
 
             let mut byte_stream = resp.bytes_stream();
             let mut sse_parser = SseParser::new();
@@ -108,45 +123,64 @@ impl LlmProvider for OpenAiCompletionsProvider {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        let mut err_msg = state.finish(&sender);
-                        err_msg.stop_reason = StopReason::Aborted;
-                        err_msg.error_message = Some("Request was cancelled".to_string());
-                        sender.push(AssistantMessageEvent::Error {
-                            reason: StopReason::Aborted,
-                            error: err_msg,
-                        });
+                        state.mark_aborted("Request was cancelled");
+                        let mut batch = Vec::new();
+                        state.finish_into(&mut batch);
+                        sender.send_batch(batch).await;
                         return;
                     }
-                    chunk_opt = byte_stream.next() => {
+                    chunk_opt = tokio::time::timeout(DEFAULT_STREAM_CHUNK_TIMEOUT, byte_stream.next()) => {
                         match chunk_opt {
-                            Some(Ok(bytes)) => {
-                                let chunk_str = String::from_utf8_lossy(&bytes);
-                                let events = sse_parser.feed(&chunk_str);
-                                for ev in events {
-                                    state.process_chunk(&ev.data, &sender);
+                            Ok(Some(Ok(bytes))) => {
+                                let events = sse_parser.feed_bytes(&bytes);
+                                if sse_parser.has_overflowed() {
+                                    state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+                                    let mut batch = Vec::new();
+                                    state.finish_into(&mut batch);
+                                    sender.send_batch(batch).await;
+                                    return;
                                 }
+                                let mut batch = Vec::new();
+                                for ev in &events {
+                                    state.process_chunk_into(&ev.data, &mut batch);
+                                }
+                                sender.send_batch(batch).await;
                             }
-                            Some(Err(e)) => {
-                                let mut err_msg = state.finish(&sender);
-                                err_msg.stop_reason = StopReason::Error;
-                                err_msg.error_message = Some(e.to_string());
-                                sender.push(AssistantMessageEvent::Error {
-                                    reason: StopReason::Error,
-                                    error: err_msg,
-                                });
+                            Ok(Some(Err(e))) => {
+                                state.mark_error(e.to_string());
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
                                 return;
                             }
-                            None => break,
+                            Err(_) => {
+                                state.mark_error(format!(
+                                    "Stream read timed out after {} seconds",
+                                    DEFAULT_STREAM_CHUNK_TIMEOUT.as_secs()
+                                ));
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
+                                return;
+                            }
+                            Ok(None) => break,
                         }
                     }
                 }
             }
 
             let remaining = sse_parser.finish();
-            for ev in remaining {
-                state.process_chunk(&ev.data, &sender);
+            let mut batch = Vec::new();
+            for ev in &remaining {
+                state.process_chunk_into(&ev.data, &mut batch);
             }
-            state.finish(&sender);
+            if sse_parser.has_overflowed() {
+                state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+            } else if sse_parser.has_pending_bytes() || !state.received_terminal {
+                state.mark_error("Stream ended prematurely without completion marker");
+            }
+            state.finish_into(&mut batch);
+            sender.send_batch(batch).await;
         });
 
         stream
@@ -154,35 +188,85 @@ impl LlmProvider for OpenAiCompletionsProvider {
 }
 
 /// Builds the JSON request payload for OpenAI Chat Completions API.
+fn normalize_openai_tool_call_id(id: &str, model: &Model) -> String {
+    if id.contains('|') {
+        let separator_index = id.find('|').unwrap();
+        let call_id: String = id[..separator_index]
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let item_id: String = id[separator_index + 1..]
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+            .collect();
+        let combined_id = if !item_id.is_empty() {
+            format!("{call_id}_{item_id}")
+        } else {
+            call_id.clone()
+        };
+        if combined_id.len() <= 40 {
+            return combined_id;
+        }
+        let hash = crate::transform_messages::short_hash(id);
+        let hash_prefix = if hash.len() >= 8 { &hash[..8] } else { &hash };
+        let max_prefix_len = (40usize.saturating_sub(hash_prefix.len() + 1)).max(1);
+        let prefix = if call_id.len() > max_prefix_len {
+            &call_id[..max_prefix_len]
+        } else {
+            &call_id
+        };
+        return format!("{prefix}_{hash_prefix}");
+    }
+
+    if model.provider == "openai" {
+        if id.chars().count() > 40 {
+            id.chars().take(40).collect()
+        } else {
+            id.to_string()
+        }
+    } else {
+        id.to_string()
+    }
+}
+
 pub fn build_openai_request(
     model: &Model,
     context: &Context,
     options: &StreamOptions,
 ) -> serde_json::Value {
+    use crate::transform_messages::transform_messages;
+    use crate::unicode::sanitize_surrogates;
+
+    let transformed_messages = transform_messages(
+        &context.messages,
+        model,
+        Some(|id: &str, m: &Model, _a: &AssistantMessage| normalize_openai_tool_call_id(id, m)),
+    );
+
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
     if let Some(sys_prompt) = &context.system_prompt {
         if !sys_prompt.is_empty() {
             messages.push(serde_json::json!({
                 "role": "system",
-                "content": sys_prompt,
+                "content": sanitize_surrogates(sys_prompt),
             }));
         }
     }
 
-    for msg in &context.messages {
+    for msg in &transformed_messages {
         match msg {
             Message::System(sys) => {
                 messages.push(serde_json::json!({
                     "role": "system",
-                    "content": sys.content,
+                    "content": sanitize_surrogates(&sys.content),
                 }));
             }
             Message::User(u) => match &u.content {
                 UserContent::Text(text) => {
                     messages.push(serde_json::json!({
                         "role": "user",
-                        "content": text,
+                        "content": sanitize_surrogates(text),
                     }));
                 }
                 UserContent::Blocks(blocks) => {
@@ -192,7 +276,7 @@ pub fn build_openai_request(
                             UserContentBlock::Text(tc) => {
                                 serde_json::json!({
                                     "type": "text",
-                                    "text": tc.text,
+                                    "text": sanitize_surrogates(&tc.text),
                                 })
                             }
                             UserContentBlock::Image(img) => {
@@ -218,7 +302,7 @@ pub fn build_openai_request(
                 for block in &a.content {
                     match block {
                         AssistantContentBlock::Text(tc) => {
-                            text_parts.push(tc.text.clone());
+                            text_parts.push(sanitize_surrogates(&tc.text));
                         }
                         AssistantContentBlock::Thinking(_) => {}
                         AssistantContentBlock::ToolCall(tc) => {
@@ -265,7 +349,7 @@ pub fn build_openai_request(
                             if !text_content.is_empty() {
                                 text_content.push('\n');
                             }
-                            text_content.push_str(&tc.text);
+                            text_content.push_str(&sanitize_surrogates(&tc.text));
                         }
                         ToolResultContentBlock::Image(_) => {}
                     }
@@ -351,7 +435,7 @@ struct ActiveToolCall {
     content_index: usize,
     id: String,
     name: String,
-    arguments_buf: String,
+    stream: ToolCallArgumentsStream,
 }
 
 /// Streaming state machine processing OpenAI SSE chunks.
@@ -360,6 +444,7 @@ pub struct OpenAiStreamState {
     output: AssistantMessage,
     started: bool,
     done: bool,
+    received_terminal: bool,
     active_thinking_index: Option<usize>,
     active_text_index: Option<usize>,
     tool_calls_by_index: HashMap<usize, ActiveToolCall>,
@@ -373,17 +458,40 @@ impl OpenAiStreamState {
             output: AssistantMessage::empty_for_model(model),
             started: false,
             done: false,
+            received_terminal: false,
             active_thinking_index: None,
             active_text_index: None,
             tool_calls_by_index: HashMap::new(),
         }
     }
 
+    /// Marks the stream state as failed with an error message before finalizing.
+    pub fn mark_error(&mut self, msg: impl Into<String>) {
+        self.output.stop_reason = StopReason::Error;
+        self.output.error_message = Some(msg.into());
+    }
+
+    /// Marks the stream state as aborted before finalizing.
+    pub fn mark_aborted(&mut self, msg: impl Into<String>) {
+        self.output.stop_reason = StopReason::Aborted;
+        self.output.error_message = Some(msg.into());
+    }
+
     /// Processes a raw SSE data payload string (e.g. JSON chunk or `[DONE]`).
     pub fn process_chunk(&mut self, data: &str, sender: &AssistantEventSender) {
+        let mut out = Vec::new();
+        self.process_chunk_into(data, &mut out);
+        for ev in out {
+            sender.push(ev);
+        }
+    }
+
+    /// Processes a raw SSE data payload string and appends emitted events into `out`.
+    pub fn process_chunk_into(&mut self, data: &str, out: &mut Vec<AssistantMessageEvent>) {
         let trimmed = data.trim();
         if trimmed == "[DONE]" {
-            self.finish(sender);
+            self.received_terminal = true;
+            self.finish_into(out);
             return;
         }
 
@@ -399,7 +507,7 @@ impl OpenAiStreamState {
 
         if !self.started {
             self.started = true;
-            sender.push(AssistantMessageEvent::Start {
+            out.push(AssistantMessageEvent::Start {
                 partial: self.output.clone(),
             });
         }
@@ -429,6 +537,7 @@ impl OpenAiStreamState {
 
         if let Some(choice) = json.get("choices").and_then(|c| c.get(0)) {
             if let Some(finish_reason_str) = choice.get("finish_reason").and_then(|r| r.as_str()) {
+                self.received_terminal = true;
                 self.output.stop_reason = match finish_reason_str {
                     "stop" | "end" => StopReason::Stop,
                     "length" => StopReason::Length,
@@ -464,7 +573,7 @@ impl OpenAiStreamState {
                                     }));
                                 let idx = self.output.content.len() - 1;
                                 self.active_thinking_index = Some(idx);
-                                sender.push(AssistantMessageEvent::ThinkingStart {
+                                out.push(AssistantMessageEvent::ThinkingStart {
                                     content_index: idx,
                                     partial: self.output.clone(),
                                 });
@@ -476,10 +585,10 @@ impl OpenAiStreamState {
                         {
                             tc.thinking.push_str(reasoning);
                         }
-                        sender.push(AssistantMessageEvent::ThinkingDelta {
+                        out.push(AssistantMessageEvent::ThinkingDelta {
                             content_index,
                             delta: reasoning.to_string(),
-                            partial: self.output.clone(),
+                            partial: self.output.metadata_clone(),
                         });
                     }
                 }
@@ -496,7 +605,7 @@ impl OpenAiStreamState {
                             } else {
                                 String::new()
                             };
-                            sender.push(AssistantMessageEvent::ThinkingEnd {
+                            out.push(AssistantMessageEvent::ThinkingEnd {
                                 content_index: thinking_idx,
                                 content: thinking_content,
                                 partial: self.output.clone(),
@@ -514,7 +623,7 @@ impl OpenAiStreamState {
                                     }));
                                 let idx = self.output.content.len() - 1;
                                 self.active_text_index = Some(idx);
-                                sender.push(AssistantMessageEvent::TextStart {
+                                out.push(AssistantMessageEvent::TextStart {
                                     content_index: idx,
                                     partial: self.output.clone(),
                                 });
@@ -526,10 +635,10 @@ impl OpenAiStreamState {
                         {
                             tc.text.push_str(content);
                         }
-                        sender.push(AssistantMessageEvent::TextDelta {
+                        out.push(AssistantMessageEvent::TextDelta {
                             content_index,
                             delta: content.to_string(),
-                            partial: self.output.clone(),
+                            partial: self.output.metadata_clone(),
                         });
                     }
                 }
@@ -545,7 +654,7 @@ impl OpenAiStreamState {
                         } else {
                             String::new()
                         };
-                        sender.push(AssistantMessageEvent::ThinkingEnd {
+                        out.push(AssistantMessageEvent::ThinkingEnd {
                             content_index: thinking_idx,
                             content: thinking_content,
                             partial: self.output.clone(),
@@ -559,7 +668,7 @@ impl OpenAiStreamState {
                         } else {
                             String::new()
                         };
-                        sender.push(AssistantMessageEvent::TextEnd {
+                        out.push(AssistantMessageEvent::TextEnd {
                             content_index: text_idx,
                             content: text_content,
                             partial: self.output.clone(),
@@ -601,7 +710,12 @@ impl OpenAiStreamState {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            active.arguments_buf.push_str(&delta);
+                            let args = active.stream.append(&delta);
+                            if let Some(AssistantContentBlock::ToolCall(tc)) =
+                                self.output.content.get_mut(active.content_index)
+                            {
+                                tc.arguments = args;
+                            }
                             (active.content_index, delta)
                         } else {
                             let id = tc_chunk
@@ -622,12 +736,19 @@ impl OpenAiStreamState {
                                 .unwrap_or("")
                                 .to_string();
 
+                            let mut stream = ToolCallArgumentsStream::new();
+                            let args = if !delta.is_empty() {
+                                stream.append(&delta)
+                            } else {
+                                serde_json::Map::new()
+                            };
+
                             self.output
                                 .content
                                 .push(AssistantContentBlock::ToolCall(ToolCall {
                                     id: id.clone(),
                                     name: name.clone(),
-                                    arguments: serde_json::Map::new(),
+                                    arguments: args,
                                     arguments_error: None,
                                     thought_signature: None,
                                 }));
@@ -638,10 +759,10 @@ impl OpenAiStreamState {
                                     content_index,
                                     id,
                                     name,
-                                    arguments_buf: delta.clone(),
+                                    stream,
                                 },
                             );
-                            sender.push(AssistantMessageEvent::ToolCallStart {
+                            out.push(AssistantMessageEvent::ToolCallStart {
                                 content_index,
                                 partial: self.output.clone(),
                             });
@@ -649,7 +770,7 @@ impl OpenAiStreamState {
                         };
 
                         if !args_delta.is_empty() {
-                            sender.push(AssistantMessageEvent::ToolCallDelta {
+                            out.push(AssistantMessageEvent::ToolCallDelta {
                                 content_index,
                                 delta: args_delta,
                                 partial: self.output.clone(),
@@ -661,8 +782,8 @@ impl OpenAiStreamState {
         }
     }
 
-    /// Closes any remaining active blocks and emits the terminal completion event if needed.
-    pub fn finish(&mut self, sender: &AssistantEventSender) -> AssistantMessage {
+    /// Closes any remaining active blocks and appends the terminal completion event into `out`.
+    pub fn finish_into(&mut self, out: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
         if let Some(thinking_idx) = self.active_thinking_index.take() {
             let content = if let Some(AssistantContentBlock::Thinking(tc)) =
                 self.output.content.get(thinking_idx)
@@ -671,7 +792,7 @@ impl OpenAiStreamState {
             } else {
                 String::new()
             };
-            sender.push(AssistantMessageEvent::ThinkingEnd {
+            out.push(AssistantMessageEvent::ThinkingEnd {
                 content_index: thinking_idx,
                 content,
                 partial: self.output.clone(),
@@ -686,7 +807,7 @@ impl OpenAiStreamState {
             } else {
                 String::new()
             };
-            sender.push(AssistantMessageEvent::TextEnd {
+            out.push(AssistantMessageEvent::TextEnd {
                 content_index: text_idx,
                 content,
                 partial: self.output.clone(),
@@ -711,23 +832,9 @@ impl OpenAiStreamState {
                     }
                 };
 
-                if active.arguments_buf.is_empty() {
-                    tool_call.arguments = serde_json::Map::new();
-                } else {
-                    match serde_json::from_str::<serde_json::Value>(&active.arguments_buf) {
-                        Ok(serde_json::Value::Object(map)) => {
-                            tool_call.arguments = map;
-                        }
-                        Ok(val) => {
-                            let mut map = serde_json::Map::new();
-                            map.insert("input".to_string(), val);
-                            tool_call.arguments = map;
-                        }
-                        Err(e) => {
-                            tool_call.arguments_error = Some(e.to_string());
-                        }
-                    }
-                }
+                let (args, err) = active.stream.finish();
+                tool_call.arguments = args;
+                tool_call.arguments_error = err;
 
                 if let Some(AssistantContentBlock::ToolCall(tc)) =
                     self.output.content.get_mut(active.content_index)
@@ -735,7 +842,7 @@ impl OpenAiStreamState {
                     *tc = tool_call.clone();
                 }
 
-                sender.push(AssistantMessageEvent::ToolCallEnd {
+                out.push(AssistantMessageEvent::ToolCallEnd {
                     content_index: active.content_index,
                     tool_call,
                     partial: self.output.clone(),
@@ -755,13 +862,13 @@ impl OpenAiStreamState {
 
         if !self.done {
             self.done = true;
-            if self.output.stop_reason == StopReason::Error {
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
+            if matches!(self.output.stop_reason, StopReason::Error | StopReason::Aborted) {
+                out.push(AssistantMessageEvent::Error {
+                    reason: self.output.stop_reason,
                     error: self.output.clone(),
                 });
             } else {
-                sender.push(AssistantMessageEvent::Done {
+                out.push(AssistantMessageEvent::Done {
                     reason: self.output.stop_reason,
                     message: self.output.clone(),
                 });
@@ -769,6 +876,16 @@ impl OpenAiStreamState {
         }
 
         self.output.clone()
+    }
+
+    /// Closes any remaining active blocks and emits the terminal completion event if needed.
+    pub fn finish(&mut self, sender: &AssistantEventSender) -> AssistantMessage {
+        let mut out = Vec::new();
+        let res = self.finish_into(&mut out);
+        for ev in out {
+            sender.push(ev);
+        }
+        res
     }
 }
 
@@ -807,6 +924,7 @@ mod tests {
             context_window: 128_000,
             max_tokens: 4096,
             headers: None,
+            ..Default::default()
         }
     }
 
@@ -883,6 +1001,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::High),
             session_id: None,
             headers: None,
+            ..Default::default()
         };
 
         let req = build_openai_request(&model, &context, &options);
@@ -1084,6 +1203,192 @@ mod tests {
                 assert_eq!(tc.arguments["city"], "Boston");
             }
             _ => panic!("Expected ToolCall block at index 1"),
+        }
+    }
+
+    #[test]
+    fn build_request_normalizes_pipe_ids_to_40_chars() {
+        let model = Model {
+            id: "gpt-4o".to_string(),
+            name: "GPT-4o".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "openai".to_string(),
+            base_url: "".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 4096,
+            headers: None,
+            ..Default::default()
+        };
+
+        let pipe_id = "call_pAYbIr76hXIjncD9UE4eGfnS|t5nnb2qYMFWGSsr13fhCd1CaCu3t3qONEPuOudu4HSVEtA8YJSL6FAZUxvoOoD792VIJWl91g87EdqsCWp9krVsdBysQoDaf9lMCLb8BS4EYi4gQd5kBQBYLlgD71PYwvf+TbMD9J9/5OMD42oxSRj8H+vRf78/l2Xla33LWz4nOgsddBlbvabICRs8GHt5C9PK5keFtzyi3lsyVKNlfduK3iphsZqs4MLv4zyGJnvZo/+QzShyk5xnMSQX/f98+aEoNflEApCdEOXipipgeiNWnpFSHbcwmMkZoJhURNu+JEz3xCh1mrXeYoN5o+trLL3IXJacSsLYXDrYTipZZbJFRPAucgbnjYBC+/ZzJOfkwCs+Gkw7EoZR7ZQgJ8ma+9586n4tT4cI8DEhBSZsWMjrCt8dxKg==";
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Run echo".to_string()),
+                    timestamp: 100,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContentBlock::ToolCall(ToolCall {
+                        id: pipe_id.to_string(),
+                        name: "echo".to_string(),
+                        arguments: serde_json::Map::new(),
+                        arguments_error: None,
+                        thought_signature: None,
+                    })],
+                    api: "openai-responses".to_string(),
+                    provider: "github-copilot".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 200,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: pipe_id.to_string(),
+                    tool_name: "echo".to_string(),
+                    content: vec![ToolResultContentBlock::Text(TextContent {
+                        text: "hello".to_string(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 300,
+                }),
+            ],
+            tools: None,
+        };
+
+        let req = build_openai_request(&model, &context, &StreamOptions::default());
+        let messages = req["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+
+        let assistant_tc = &messages[1]["tool_calls"][0];
+        let normalized_id = assistant_tc["id"].as_str().unwrap();
+        assert!(normalized_id.len() <= 40, "Normalized ID must be <= 40 chars, got {}", normalized_id.len());
+        assert!(normalized_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+
+        // Matching tool result in message 2 must use the same normalized ID
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], normalized_id);
+    }
+
+    #[test]
+    fn test_normalize_openai_tool_call_id_non_ascii_utf8_truncation() {
+        let model = test_model();
+        // 39 ASCII characters + 4-byte UTF-8 character '🦀' (bytes 39..43) + additional characters
+        let mut foreign_id = "a".repeat(39);
+        foreign_id.push('🦀');
+        foreign_id.push_str("extra_tail_after_40_chars");
+
+        // Prior to fix, &id[..40] panicked with: byte index 40 is not a char boundary; it is inside '🦀'
+        let normalized = normalize_openai_tool_call_id(&foreign_id, &model);
+        assert_eq!(normalized.chars().count(), 40);
+        let mut expected = "a".repeat(39);
+        expected.push('🦀');
+        assert_eq!(normalized, expected);
+    }
+
+    #[test]
+    fn openai_sse_updates_partial_tool_arguments_incrementally() {
+        let model = test_model();
+        let mut state = OpenAiStreamState::new(&model);
+        let mut events = Vec::new();
+
+        // Chunk 1: Tool call start with initial partial argument chunk
+        let chunk1 = serde_json::json!({
+            "id": "chatcmpl-test",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": "call_123",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": r#"{"query":"hel"#
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+
+        state.process_chunk_into(&chunk1, &mut events);
+
+        // Find the ToolCallDelta event
+        let delta1 = events.iter().find(|ev| matches!(ev, AssistantMessageEvent::ToolCallDelta { .. }));
+        assert!(delta1.is_some(), "Expected ToolCallDelta event from initial chunk");
+        match delta1.unwrap() {
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+                partial,
+            } => {
+                assert_eq!(*content_index, 0);
+                assert_eq!(delta, r#"{"query":"hel"#);
+                match &partial.content[0] {
+                    AssistantContentBlock::ToolCall(tc) => {
+                        assert_eq!(
+                            tc.arguments.get("query").and_then(|v| v.as_str()),
+                            Some("hel"),
+                            "ToolCallDelta partial AssistantMessage must reflect parsed partial arguments incrementally"
+                        );
+                    }
+                    _ => panic!("Expected ToolCall at index 0"),
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        events.clear();
+
+        // Chunk 2: Second delta completing the JSON argument
+        let chunk2 = serde_json::json!({
+            "id": "chatcmpl-test",
+            "choices": [{
+                "index": 0,
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "function": {
+                            "arguments": r#"lo"}"#
+                        }
+                    }]
+                }
+            }]
+        })
+        .to_string();
+
+        state.process_chunk_into(&chunk2, &mut events);
+        let delta2 = events.iter().find(|ev| matches!(ev, AssistantMessageEvent::ToolCallDelta { .. }));
+        assert!(delta2.is_some(), "Expected ToolCallDelta event from second chunk");
+        match delta2.unwrap() {
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+                partial,
+            } => {
+                assert_eq!(*content_index, 0);
+                assert_eq!(delta, r#"lo"}"#);
+                match &partial.content[0] {
+                    AssistantContentBlock::ToolCall(tc) => {
+                        assert_eq!(
+                            tc.arguments.get("query").and_then(|v| v.as_str()),
+                            Some("hello"),
+                            "ToolCallDelta partial AssistantMessage must reflect updated arguments before finish"
+                        );
+                    }
+                    _ => panic!("Expected ToolCall at index 0"),
+                }
+            }
+            _ => unreachable!(),
         }
     }
 }

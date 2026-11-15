@@ -34,6 +34,33 @@ pub enum StoredCredential {
     },
 }
 
+impl StoredCredential {
+    /// Returns "api_key" or "oauth" based on credential variant.
+    pub fn credential_type(&self) -> &'static str {
+        match self {
+            StoredCredential::ApiKey { .. } => "api_key",
+            StoredCredential::OAuth { .. } => "oauth",
+        }
+    }
+}
+
+/// Non-secret credential metadata for account/status enumeration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CredentialInfo {
+    pub provider_id: String,
+    #[serde(rename = "type")]
+    pub credential_type: String,
+}
+
+impl CredentialInfo {
+    pub fn new(provider_id: impl Into<String>, credential_type: impl Into<String>) -> Self {
+        Self {
+            provider_id: provider_id.into(),
+            credential_type: credential_type.into(),
+        }
+    }
+}
+
 /// A PKCE code verifier and code challenge pair.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PkcePair {
@@ -131,6 +158,15 @@ pub fn build_authorize_url(
     }
 }
 
+const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn send_oauth_request(req: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
+    let resp = tokio::time::timeout(OAUTH_HTTP_TIMEOUT, req.send())
+        .await
+        .map_err(|_| anyhow::anyhow!("OAuth HTTP request timed out after 30s"))??;
+    Ok(resp.error_for_status()?)
+}
+
 /// Exchanges an authorization code and PKCE verifier for OAuth access and refresh tokens.
 pub async fn exchange_code_for_tokens(
     client: &reqwest::Client,
@@ -149,12 +185,7 @@ pub async fn exchange_code_for_tokens(
             params.insert("code_verifier", verifier);
             params.insert("redirect_uri", redirect_uri);
 
-            let res = client
-                .post(token_url)
-                .form(&params)
-                .send()
-                .await?
-                .error_for_status()?;
+            let res = send_oauth_request(client.post(token_url).form(&params)).await?;
 
             let json: serde_json::Value = res.json().await?;
             let access = json["access_token"]
@@ -185,12 +216,7 @@ pub async fn exchange_code_for_tokens(
             params.insert("code_verifier", verifier);
             params.insert("redirect_uri", redirect_uri);
 
-            let res = client
-                .post(token_url)
-                .form(&params)
-                .send()
-                .await?
-                .error_for_status()?;
+            let res = send_oauth_request(client.post(token_url).form(&params)).await?;
 
             let json: serde_json::Value = res.json().await?;
             let access = json["access_token"]
@@ -241,18 +267,14 @@ pub async fn refresh_oauth_credential(
 
     match kind {
         OAuthProviderKind::Anthropic => {
-            let token_url = "https://platform.claude.com/v1/oauth/token";
+            let token_url = std::env::var("ANTHROPIC_TOKEN_URL")
+                .unwrap_or_else(|_| "https://platform.claude.com/v1/oauth/token".to_string());
             let mut params = HashMap::new();
             params.insert("grant_type", "refresh_token");
             params.insert("client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e");
             params.insert("refresh_token", &refresh_token);
 
-            let res = client
-                .post(token_url)
-                .form(&params)
-                .send()
-                .await?
-                .error_for_status()?;
+            let res = send_oauth_request(client.post(&token_url).form(&params)).await?;
 
             let json: serde_json::Value = res.json().await?;
             let access = json["access_token"]
@@ -275,7 +297,8 @@ pub async fn refresh_oauth_credential(
             })
         }
         OAuthProviderKind::OpenAiChatGpt => {
-            let token_url = "https://auth.openai.com/api/accounts/oauth/token";
+            let token_url = std::env::var("OPENAI_TOKEN_URL")
+                .unwrap_or_else(|_| "https://auth.openai.com/api/accounts/oauth/token".to_string());
             let c_id = client_id_opt
                 .as_deref()
                 .unwrap_or("dynamic_agent_client");
@@ -284,12 +307,7 @@ pub async fn refresh_oauth_credential(
             params.insert("client_id", c_id);
             params.insert("refresh_token", &refresh_token);
 
-            let res = client
-                .post(token_url)
-                .form(&params)
-                .send()
-                .await?
-                .error_for_status()?;
+            let res = send_oauth_request(client.post(&token_url).form(&params)).await?;
 
             let json: serde_json::Value = res.json().await?;
             let access = json["access_token"]
@@ -312,17 +330,17 @@ pub async fn refresh_oauth_credential(
             })
         }
         OAuthProviderKind::GitHubCopilot => {
-            let res = client
-                .get("https://api.github.com/copilot_internal/v2/token")
-                .header("Authorization", format!("Bearer {refresh_token}"))
-                .header("User-Agent", "GitHubCopilotChat/0.35.0")
-                .header("Editor-Version", "vscode/1.107.0")
-                .header("Editor-Plugin-Version", "copilot-chat/0.35.0")
-                .header("Copilot-Integration-Id", "vscode-chat")
-                .header("Accept", "application/json")
-                .send()
-                .await?
-                .error_for_status()?;
+            let res = send_oauth_request(
+                client
+                    .get("https://api.github.com/copilot_internal/v2/token")
+                    .header("Authorization", format!("Bearer {refresh_token}"))
+                    .header("User-Agent", "GitHubCopilotChat/0.35.0")
+                    .header("Editor-Version", "vscode/1.107.0")
+                    .header("Editor-Plugin-Version", "copilot-chat/0.35.0")
+                    .header("Copilot-Integration-Id", "vscode-chat")
+                    .header("Accept", "application/json"),
+            )
+            .await?;
 
             let json: serde_json::Value = res.json().await?;
             let token = json["token"]
@@ -351,14 +369,14 @@ pub async fn start_copilot_device_flow(client: &reqwest::Client) -> anyhow::Resu
     params.insert("client_id", "Iv1.b507a08c87ecfe98");
     params.insert("scope", "read:user");
 
-    let res = client
-        .post("https://github.com/login/device/code")
-        .header("Accept", "application/json")
-        .header("User-Agent", "GitHubCopilotChat/0.35.0")
-        .form(&params)
-        .send()
-        .await?
-        .error_for_status()?;
+    let res = send_oauth_request(
+        client
+            .post("https://github.com/login/device/code")
+            .header("Accept", "application/json")
+            .header("User-Agent", "GitHubCopilotChat/0.35.0")
+            .form(&params),
+    )
+    .await?;
 
     let json: serde_json::Value = res.json().await?;
     let device_code = json["device_code"]
@@ -396,14 +414,14 @@ pub async fn poll_copilot_device_token(
     params.insert("device_code", device_code);
     params.insert("grant_type", "urn:ietf:params:oauth:grant-type:device_code");
 
-    let res = client
-        .post("https://github.com/login/oauth/access_token")
-        .header("Accept", "application/json")
-        .header("User-Agent", "GitHubCopilotChat/0.35.0")
-        .form(&params)
-        .send()
-        .await?
-        .error_for_status()?;
+    let res = send_oauth_request(
+        client
+            .post("https://github.com/login/oauth/access_token")
+            .header("Accept", "application/json")
+            .header("User-Agent", "GitHubCopilotChat/0.35.0")
+            .form(&params),
+    )
+    .await?;
 
     let json: serde_json::Value = res.json().await?;
 
@@ -426,17 +444,17 @@ pub async fn poll_copilot_device_token(
         .to_string();
 
     // Exchange GitHub token for Copilot internal session token
-    let copilot_res = client
-        .get("https://api.github.com/copilot_internal/v2/token")
-        .header("Authorization", format!("Bearer {github_token}"))
-        .header("User-Agent", "GitHubCopilotChat/0.35.0")
-        .header("Editor-Version", "vscode/1.107.0")
-        .header("Editor-Plugin-Version", "copilot-chat/0.35.0")
-        .header("Copilot-Integration-Id", "vscode-chat")
-        .header("Accept", "application/json")
-        .send()
-        .await?
-        .error_for_status()?;
+    let copilot_res = send_oauth_request(
+        client
+            .get("https://api.github.com/copilot_internal/v2/token")
+            .header("Authorization", format!("Bearer {github_token}"))
+            .header("User-Agent", "GitHubCopilotChat/0.35.0")
+            .header("Editor-Version", "vscode/1.107.0")
+            .header("Editor-Plugin-Version", "copilot-chat/0.35.0")
+            .header("Copilot-Integration-Id", "vscode-chat")
+            .header("Accept", "application/json"),
+    )
+    .await?;
 
     let copilot_json: serde_json::Value = copilot_res.json().await?;
     let token = copilot_json["token"]
@@ -519,6 +537,230 @@ pub async fn wait_for_loopback_callback(
     })
     .await
     .map_err(|_| anyhow::anyhow!("Timed out waiting for loopback callback on port {port}"))?
+}
+
+pub type CredentialModifyFuture<'a> =
+    futures::future::BoxFuture<'a, anyhow::Result<Option<StoredCredential>>>;
+
+pub type CredentialModifyFn =
+    Box<dyn FnOnce(Option<StoredCredential>) -> CredentialModifyFuture<'static> + Send>;
+
+/// App-owned credential storage, keyed by provider id, one credential per provider.
+#[async_trait::async_trait]
+pub trait CredentialStore: Send + Sync {
+    /// Read the stored credential, returning None if missing.
+    async fn read(&self, provider_id: &str) -> anyhow::Result<Option<StoredCredential>>;
+
+    /// List stored credential metadata without resolving or exposing secrets.
+    async fn list(&self) -> anyhow::Result<Vec<CredentialInfo>>;
+
+    /// Serialized write — the only write path. `modify_fn` receives the current
+    /// credential and returns the new credential (or None to leave unchanged).
+    async fn modify(
+        &self,
+        provider_id: &str,
+        modify_fn: CredentialModifyFn,
+    ) -> anyhow::Result<Option<StoredCredential>>;
+
+    /// Removes a credential (logout).
+    async fn delete(&self, provider_id: &str) -> anyhow::Result<()>;
+}
+
+/// In-process lock registry keyed by canonical normalized lock path to prevent
+/// blocking Tokio runtime worker threads on OS file locks.
+static FILE_LOCK_REGISTRY: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Returns or creates an in-process mutex for the given lock file path.
+pub fn get_path_lock_mutex(path: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    let normalized = normalize_lock_path(path);
+    let mut reg = FILE_LOCK_REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
+    reg.entry(normalized)
+        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Normalizes a path for lock registry keying.
+pub fn normalize_lock_path(path: &std::path::Path) -> std::path::PathBuf {
+    let p = if let Ok(c) = std::fs::canonicalize(path) {
+        c
+    } else if let Some(parent) = path.parent() {
+        if let Ok(c_parent) = std::fs::canonicalize(parent) {
+            if let Some(file_name) = path.file_name() {
+                c_parent.join(file_name)
+            } else {
+                path.to_path_buf()
+            }
+        } else {
+            path.to_path_buf()
+        }
+    } else {
+        path.to_path_buf()
+    };
+    #[cfg(windows)]
+    {
+        std::path::PathBuf::from(p.to_string_lossy().to_ascii_lowercase())
+    }
+    #[cfg(not(windows))]
+    {
+        p
+    }
+}
+
+/// RAII file lock guard holding an open file OS lock and an in-process Tokio mutex guard.
+pub struct FileLockGuard {
+    file: Option<std::fs::File>,
+    _in_process: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for FileLockGuard {
+    fn drop(&mut self) {
+        if let Some(file) = self.file.take() {
+            let _ = file.unlock();
+            drop(file);
+        }
+    }
+}
+
+/// Acquires an advisory file lock on `<path>.lock`, first serializing in-process tasks
+/// via `tokio::sync::Mutex` without blocking Tokio runtime worker threads, then locking
+/// the file inside `tokio::task::spawn_blocking`.
+pub async fn acquire_file_lock(
+    lock_path: &std::path::Path,
+    in_process_mutex: std::sync::Arc<tokio::sync::Mutex<()>>,
+) -> anyhow::Result<FileLockGuard> {
+    use anyhow::Context;
+    let in_process_guard = in_process_mutex.lock_owned().await;
+
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create parent directory for lock file '{}'", parent.display()))?;
+    }
+
+    let path_clone = lock_path.to_path_buf();
+    let file = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).read(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts
+            .open(&path_clone)
+            .with_context(|| format!("Failed to open lock file '{}'", path_clone.display()))?;
+        file.lock()
+            .with_context(|| format!("Failed to acquire OS file lock on '{}'", path_clone.display()))?;
+        Ok(file)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("File lock blocking task failed to join: {e}"))??;
+
+    Ok(FileLockGuard {
+        file: Some(file),
+        _in_process: Some(in_process_guard),
+    })
+}
+
+/// In-memory credential store. Writes are serialized per provider id.
+#[derive(Debug, Default, Clone)]
+pub struct InMemoryCredentialStore {
+    credentials: std::sync::Arc<tokio::sync::RwLock<HashMap<String, StoredCredential>>>,
+    provider_locks: std::sync::Arc<tokio::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl InMemoryCredentialStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_credentials(initial: HashMap<String, StoredCredential>) -> Self {
+        Self {
+            credentials: std::sync::Arc::new(tokio::sync::RwLock::new(initial)),
+            provider_locks: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialStore for InMemoryCredentialStore {
+    async fn read(&self, provider_id: &str) -> anyhow::Result<Option<StoredCredential>> {
+        let map = self.credentials.read().await;
+        let cred = map.get(provider_id).or_else(|| {
+            map.iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(provider_id))
+                .map(|(_, v)| v)
+        });
+        Ok(cred.cloned())
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<CredentialInfo>> {
+        let map = self.credentials.read().await;
+        let mut list: Vec<CredentialInfo> = map
+            .iter()
+            .map(|(k, v)| CredentialInfo::new(k, v.credential_type()))
+            .collect();
+        list.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+        Ok(list)
+    }
+
+    async fn modify(
+        &self,
+        provider_id: &str,
+        modify_fn: CredentialModifyFn,
+    ) -> anyhow::Result<Option<StoredCredential>> {
+        let lock_key = provider_id.to_ascii_lowercase();
+        let provider_lock = {
+            let mut locks = self.provider_locks.lock().await;
+            locks
+                .entry(lock_key)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = provider_lock.lock().await;
+
+        let current = self.read(provider_id).await?;
+        let next = modify_fn(current.clone()).await?;
+
+        if let Some(ref new_cred) = next {
+            let mut map = self.credentials.write().await;
+            let existing_key = map
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(provider_id))
+                .cloned();
+            let key = existing_key.unwrap_or_else(|| provider_id.to_string());
+            map.insert(key, new_cred.clone());
+            Ok(Some(new_cred.clone()))
+        } else {
+            Ok(current)
+        }
+    }
+
+    async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
+        let lock_key = provider_id.to_ascii_lowercase();
+        let provider_lock = {
+            let mut locks = self.provider_locks.lock().await;
+            locks
+                .entry(lock_key)
+                .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+
+        let _guard = provider_lock.lock().await;
+        let mut map = self.credentials.write().await;
+        let existing_key = map
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(provider_id))
+            .cloned();
+        if let Some(key) = existing_key {
+            map.remove(&key);
+        } else {
+            map.remove(provider_id);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -631,6 +873,51 @@ mod tests {
                 assert_eq!(available_model_ids, Some(vec!["m1".to_string()]));
             }
             _ => panic!("Expected OAuth variant"),
+        }
+    }
+
+    #[tokio::test]
+    async fn in_memory_credential_store_serializes_modify_per_provider() {
+        use std::sync::Arc;
+        let store = Arc::new(InMemoryCredentialStore::new());
+        let mut handles = Vec::new();
+
+        for _ in 0..10 {
+            let s = store.clone();
+            handles.push(tokio::spawn(async move {
+                s.modify(
+                    "openai",
+                    Box::new(|current| {
+                        Box::pin(async move {
+                            let cur_num = match current {
+                                Some(StoredCredential::ApiKey { key: Some(k), .. }) => {
+                                    k.parse::<u32>().unwrap()
+                                }
+                                _ => 0,
+                            };
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                            Ok(Some(StoredCredential::ApiKey {
+                                key: Some((cur_num + 1).to_string()),
+                                env: None,
+                            }))
+                        })
+                    }),
+                )
+                .await
+                .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let final_cred = store.read("openai").await.unwrap();
+        match final_cred {
+            Some(StoredCredential::ApiKey { key: Some(k), .. }) => {
+                assert_eq!(k, "10");
+            }
+            other => panic!("Unexpected final credential: {other:?}"),
         }
     }
 }

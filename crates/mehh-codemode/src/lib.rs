@@ -514,4 +514,72 @@ mod tests {
         let google_count = val.get("googleCount").and_then(|v| v.as_u64()).unwrap();
         assert!(google_count > 0);
     }
+
+    #[test]
+    fn test_default_memory_limit_is_64mib() {
+        let config = CodemodeConfig::default();
+        assert_eq!(config.memory_limit_bytes, 64 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_sandbox_removes_host_globals_and_cancels_nested_tool() {
+        let echo_tool = Arc::new(MockEchoTool);
+        let tool_def = tool_to_definition(echo_tool.as_ref());
+
+        // 1. Verify raw __host_* globals are hidden from user scripts.
+        let kv = Arc::new(Mutex::new(HashMap::new()));
+        let config = CodemodeConfig::default();
+        let probe_res = run_codemode(
+            r#"
+                return {
+                    hasHostCall: typeof globalThis.__host_call_tool !== "undefined",
+                    hasHostKvGet: typeof globalThis.__host_kv_get !== "undefined",
+                    hasHostLog: typeof globalThis.__host_log !== "undefined",
+                };
+            "#,
+            &[tool_def.clone()],
+            dummy_executor(),
+            kv.clone(),
+            &config,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(probe_res.ok, "Probe script failed: {:?}", probe_res.error);
+        let probe_val = probe_res.value.unwrap();
+        assert_eq!(probe_val.get("hasHostCall").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(probe_val.get("hasHostKvGet").and_then(|v| v.as_bool()), Some(false));
+        assert_eq!(probe_val.get("hasHostLog").and_then(|v| v.as_bool()), Some(false));
+
+        // 2. Verify cancellation interrupts a slow nested host tool call promptly.
+        let slow_executor: SandboxToolExecutor = Arc::new(move |_name, _args| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                Ok(serde_json::Value::String("done".to_string()))
+            })
+        });
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let start = std::time::Instant::now();
+        let cancel_res = run_codemode(
+            r#"return await tools.echo({ msg: "slow" });"#,
+            &[tool_def],
+            slow_executor,
+            kv,
+            &config,
+            cancel,
+        )
+        .await;
+        let elapsed = start.elapsed();
+
+        assert!(!cancel_res.ok, "Cancelled nested tool call must not succeed");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "Cancelled nested tool took too long: {elapsed:?}"
+        );
+    }
 }

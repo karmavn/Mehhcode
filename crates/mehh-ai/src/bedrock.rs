@@ -6,7 +6,12 @@ use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+use crate::retry::{
+    default_http_client, retry_failure_event, send_with_retry, RetryPolicy,
+    DEFAULT_STREAM_CHUNK_TIMEOUT,
+};
 use crate::stream::{create_event_stream, AssistantEventSender, AssistantEventStream, LlmProvider};
+use crate::streaming_json::ToolCallArgumentsStream;
 use crate::types::*;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -270,6 +275,9 @@ pub fn encode_eventstream_frame(headers: &[(&str, &str)], payload: &[u8]) -> Vec
     buf
 }
 
+/// Maximum buffered bytes allowed in EventStream parser before failing closed.
+pub const MAX_EVENTSTREAM_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
 /// Binary frame parser for AWS `application/vnd.amazon.eventstream` protocol.
 pub struct EventStreamParser {
     buffer: Vec<u8>,
@@ -281,53 +289,77 @@ impl EventStreamParser {
         Self { buffer: Vec::new() }
     }
 
+    /// Returns true when trailing incomplete bytes remain in the frame buffer.
+    pub fn has_pending_bytes(&self) -> bool {
+        !self.buffer.is_empty()
+    }
+
     /// Feeds raw bytes into the parser and extracts all complete valid frames.
     pub fn feed(&mut self, chunk: &[u8]) -> Result<Vec<EventStreamMessage>, anyhow::Error> {
+        if self.buffer.len().saturating_add(chunk.len()) > MAX_EVENTSTREAM_BUFFER_BYTES {
+            anyhow::bail!(
+                "EventStream frame buffer exceeded {} bytes",
+                MAX_EVENTSTREAM_BUFFER_BYTES
+            );
+        }
         self.buffer.extend_from_slice(chunk);
         let mut messages = Vec::new();
+        let mut offset = 0usize;
 
-        while self.buffer.len() >= 12 {
-            let total_len = u32::from_be_bytes(self.buffer[0..4].try_into().unwrap()) as usize;
-            let headers_len = u32::from_be_bytes(self.buffer[4..8].try_into().unwrap()) as usize;
-            let prelude_crc = u32::from_be_bytes(self.buffer[8..12].try_into().unwrap());
+        let result = (|| {
+            while self.buffer.len() - offset >= 12 {
+                let frame = &self.buffer[offset..];
+                let total_len = u32::from_be_bytes(frame[0..4].try_into().unwrap()) as usize;
+                let headers_len = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
+                let prelude_crc = u32::from_be_bytes(frame[8..12].try_into().unwrap());
 
-            if total_len < 16 || headers_len > total_len - 16 {
-                anyhow::bail!("Invalid EventStream frame: total_len={total_len}, headers_len={headers_len}");
+                if !(16..=MAX_EVENTSTREAM_BUFFER_BYTES).contains(&total_len)
+                    || headers_len > total_len - 16
+                {
+                    anyhow::bail!(
+                        "Invalid EventStream frame: total_len={total_len}, headers_len={headers_len}"
+                    );
+                }
+
+                let calculated_prelude_crc = crc32fast::hash(&frame[0..8]);
+                if calculated_prelude_crc != prelude_crc {
+                    anyhow::bail!(
+                        "EventStream prelude CRC mismatch: expected {prelude_crc}, got {calculated_prelude_crc}"
+                    );
+                }
+
+                if frame.len() < total_len {
+                    break;
+                }
+
+                let message_crc =
+                    u32::from_be_bytes(frame[total_len - 4..total_len].try_into().unwrap());
+                let calculated_message_crc = crc32fast::hash(&frame[0..total_len - 4]);
+                if calculated_message_crc != message_crc {
+                    anyhow::bail!(
+                        "EventStream message CRC mismatch: expected {message_crc}, got {calculated_message_crc}"
+                    );
+                }
+
+                let headers_bytes = &frame[12..12 + headers_len];
+                let headers = decode_eventstream_headers(headers_bytes)?;
+                let payload_bytes = frame[12 + headers_len..total_len - 4].to_vec();
+
+                messages.push(EventStreamMessage {
+                    headers,
+                    payload: payload_bytes,
+                });
+
+                offset += total_len;
             }
+            Ok(messages)
+        })();
 
-            let calculated_prelude_crc = crc32fast::hash(&self.buffer[0..8]);
-            if calculated_prelude_crc != prelude_crc {
-                anyhow::bail!(
-                    "EventStream prelude CRC mismatch: expected {prelude_crc}, got {calculated_prelude_crc}"
-                );
-            }
-
-            if self.buffer.len() < total_len {
-                break;
-            }
-
-            let message_crc =
-                u32::from_be_bytes(self.buffer[total_len - 4..total_len].try_into().unwrap());
-            let calculated_message_crc = crc32fast::hash(&self.buffer[0..total_len - 4]);
-            if calculated_message_crc != message_crc {
-                anyhow::bail!(
-                    "EventStream message CRC mismatch: expected {message_crc}, got {calculated_message_crc}"
-                );
-            }
-
-            let headers_bytes = &self.buffer[12..12 + headers_len];
-            let headers = decode_eventstream_headers(headers_bytes)?;
-            let payload_bytes = self.buffer[12 + headers_len..total_len - 4].to_vec();
-
-            messages.push(EventStreamMessage {
-                headers,
-                payload: payload_bytes,
-            });
-
-            self.buffer.drain(0..total_len);
+        if offset > 0 {
+            self.buffer.drain(0..offset);
         }
 
-        Ok(messages)
+        result
     }
 }
 
@@ -337,38 +369,105 @@ impl Default for EventStreamParser {
     }
 }
 
+fn is_anthropic_claude_model(model: &Model) -> bool {
+    let id = model.id.to_lowercase();
+    let name = model.name.to_lowercase();
+    id.contains("anthropic.claude")
+        || id.contains("anthropic/claude")
+        || name.contains("anthropic.claude")
+        || name.contains("anthropic/claude")
+        || name.contains("claude")
+}
+
+fn supports_prompt_caching(model: &Model) -> bool {
+    let id = model.id.to_lowercase();
+    let name = model.name.to_lowercase();
+    let candidates = [id.as_str(), name.as_str()];
+
+    let has_claude_ref = candidates.iter().any(|s| s.contains("claude"));
+    if !has_claude_ref {
+        if std::env::var("AWS_BEDROCK_FORCE_CACHE").as_deref() == Ok("1") {
+            return true;
+        }
+        return false;
+    }
+
+    if candidates.iter().any(|s| {
+        s.contains("fable-5") || s.contains("opus-5") || s.contains("sonnet-5") || s.contains("haiku-5")
+    }) {
+        return true;
+    }
+    if candidates.iter().any(|s| s.contains("-4-")) {
+        return true;
+    }
+    if candidates.iter().any(|s| s.contains("claude-3-7-sonnet")) {
+        return true;
+    }
+    if candidates.iter().any(|s| s.contains("claude-3-5-haiku")) {
+        return true;
+    }
+
+    false
+}
+
+fn normalize_bedrock_tool_call_id(id: &str) -> String {
+    let sanitized: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if sanitized.len() > 64 {
+        sanitized[..64].to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Builds the JSON request payload for Amazon Bedrock ConverseStream API.
 pub fn build_bedrock_request(
     model: &Model,
     context: &Context,
     options: &StreamOptions,
 ) -> serde_json::Value {
+    use crate::transform_messages::{split_error_tool_result_images, transform_messages};
+    use crate::unicode::sanitize_surrogates;
+
     let mut system_texts = Vec::new();
     if let Some(sys) = &context.system_prompt {
         if !sys.is_empty() {
-            system_texts.push(sys.clone());
+            system_texts.push(sanitize_surrogates(sys));
         }
     }
     for msg in &context.messages {
         if let Message::System(sys) = msg {
             if !sys.content.is_empty() {
-                system_texts.push(sys.content.clone());
+                system_texts.push(sanitize_surrogates(&sys.content));
             }
         }
     }
 
-    let mut messages: Vec<serde_json::Value> = Vec::new();
+    let transformed_messages = transform_messages(
+        &context.messages,
+        model,
+        Some(|id: &str, _m: &Model, _a: &AssistantMessage| normalize_bedrock_tool_call_id(id)),
+    );
 
-    for msg in &context.messages {
+    let mut messages: Vec<serde_json::Value> = Vec::new();
+    let is_claude = is_anthropic_claude_model(model);
+
+    let mut i = 0;
+    while i < transformed_messages.len() {
+        let msg = &transformed_messages[i];
         match msg {
-            Message::System(_) => {}
+            Message::System(_) => {
+                i += 1;
+            }
             Message::User(u) => {
                 let content_parts: Vec<serde_json::Value> = match &u.content {
-                    UserContent::Text(text) => vec![serde_json::json!({ "text": text })],
+                    UserContent::Text(text) => vec![serde_json::json!({ "text": sanitize_surrogates(text) })],
                     UserContent::Blocks(blocks) => blocks
                         .iter()
                         .map(|b| match b {
-                            UserContentBlock::Text(tc) => serde_json::json!({ "text": tc.text }),
+                            UserContentBlock::Text(tc) => serde_json::json!({ "text": sanitize_surrogates(&tc.text) }),
                             UserContentBlock::Image(img) => {
                                 let format = match img.mime_type.as_str() {
                                     "image/png" => "png",
@@ -391,6 +490,7 @@ pub fn build_bedrock_request(
                     "role": "user",
                     "content": content_parts,
                 }));
+                i += 1;
             }
             Message::Assistant(a) => {
                 let mut content_parts: Vec<serde_json::Value> = Vec::new();
@@ -398,12 +498,12 @@ pub fn build_bedrock_request(
                     match block {
                         AssistantContentBlock::Text(tc) => {
                             if !tc.text.is_empty() {
-                                content_parts.push(serde_json::json!({ "text": tc.text }));
+                                content_parts.push(serde_json::json!({ "text": sanitize_surrogates(&tc.text) }));
                             }
                         }
                         AssistantContentBlock::Thinking(th) => {
                             let mut reasoning_obj = serde_json::Map::new();
-                            reasoning_obj.insert("text".to_string(), serde_json::json!(th.thinking));
+                            reasoning_obj.insert("text".to_string(), serde_json::json!(sanitize_surrogates(&th.thinking)));
                             if let Some(sig) = &th.thinking_signature {
                                 reasoning_obj.insert("signature".to_string(), serde_json::json!(sig));
                             }
@@ -426,30 +526,107 @@ pub fn build_bedrock_request(
                     "role": "assistant",
                     "content": content_parts,
                 }));
+                i += 1;
             }
-            Message::ToolResult(tr) => {
-                let text = tr
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ToolResultContentBlock::Text(tc) => Some(tc.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-
-                let tool_result = serde_json::json!({
-                    "toolResult": {
-                        "toolUseId": tr.tool_call_id,
-                        "content": [{ "text": text }],
-                        "status": if tr.is_error { "error" } else { "success" }
+            Message::ToolResult(_) => {
+                let mut tool_results: Vec<serde_json::Value> = Vec::new();
+                let mut error_images: Vec<serde_json::Value> = Vec::new();
+                let mut j = i;
+                while j < transformed_messages.len() {
+                    if let Message::ToolResult(tr) = &transformed_messages[j] {
+                        let split = if is_claude {
+                            split_error_tool_result_images(tr)
+                        } else {
+                            None
+                        };
+                        let content_blocks = if let Some(ref s) = split {
+                            &s.content
+                        } else {
+                            &tr.content
+                        };
+                        let mut contents = Vec::new();
+                        for b in content_blocks {
+                            match b {
+                                ToolResultContentBlock::Text(tc) => {
+                                    contents.push(serde_json::json!({ "text": sanitize_surrogates(&tc.text) }));
+                                }
+                                ToolResultContentBlock::Image(img) => {
+                                    let format = match img.mime_type.as_str() {
+                                        "image/png" => "png",
+                                        "image/jpeg" => "jpeg",
+                                        "image/gif" => "gif",
+                                        "image/webp" => "webp",
+                                        _ => "png",
+                                    };
+                                    contents.push(serde_json::json!({
+                                        "image": {
+                                            "format": format,
+                                            "source": { "bytes": img.data }
+                                        }
+                                    }));
+                                }
+                            }
+                        }
+                        if contents.is_empty() {
+                            contents.push(serde_json::json!({ "text": "<empty>" }));
+                        }
+                        tool_results.push(serde_json::json!({
+                            "toolResult": {
+                                "toolUseId": tr.tool_call_id,
+                                "content": contents,
+                                "status": if tr.is_error { "error" } else { "success" }
+                            }
+                        }));
+                        if let Some(s) = split {
+                            error_images.push(serde_json::json!({ "text": sanitize_surrogates(&s.caption) }));
+                            for img in s.images {
+                                let format = match img.mime_type.as_str() {
+                                    "image/png" => "png",
+                                    "image/jpeg" => "jpeg",
+                                    "image/gif" => "gif",
+                                    "image/webp" => "webp",
+                                    _ => "png",
+                                };
+                                error_images.push(serde_json::json!({
+                                    "image": {
+                                        "format": format,
+                                        "source": { "bytes": img.data }
+                                    }
+                                }));
+                            }
+                        }
+                        j += 1;
+                    } else {
+                        break;
                     }
-                });
+                }
+                i = j;
 
+                let mut combined_content = tool_results;
+                combined_content.extend(error_images);
                 messages.push(serde_json::json!({
                     "role": "user",
-                    "content": [tool_result]
+                    "content": combined_content,
                 }));
+            }
+        }
+    }
+
+    let resolved_cache_retention = resolve_cache_retention(options.cache_retention);
+    let caching_enabled = resolved_cache_retention != CacheRetention::None
+        && supports_prompt_caching(model);
+    let cache_point = if resolved_cache_retention == CacheRetention::Long {
+        serde_json::json!({ "type": "default", "ttl": "ONE_HOUR" })
+    } else {
+        serde_json::json!({ "type": "default" })
+    };
+
+    if caching_enabled {
+        if let Some(last_msg) = messages.last_mut() {
+            if last_msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                if let Some(content_arr) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    content_arr.push(serde_json::json!({ "cachePoint": cache_point }));
+                }
             }
         }
     }
@@ -458,9 +635,13 @@ pub fn build_bedrock_request(
     req_map.insert("messages".to_string(), serde_json::Value::Array(messages));
 
     if !system_texts.is_empty() {
+        let mut sys_blocks = vec![serde_json::json!({ "text": system_texts.join("\n\n") })];
+        if caching_enabled {
+            sys_blocks.push(serde_json::json!({ "cachePoint": cache_point }));
+        }
         req_map.insert(
             "system".to_string(),
-            serde_json::json!([{ "text": system_texts.join("\n\n") }]),
+            serde_json::Value::Array(sys_blocks),
         );
     }
 
@@ -528,7 +709,10 @@ pub fn build_bedrock_request(
 enum BedrockOpenBlock {
     Text { content_index: usize },
     Thinking { content_index: usize },
-    ToolCall { content_index: usize, raw_args: String },
+    ToolCall {
+        content_index: usize,
+        stream: Box<ToolCallArgumentsStream>,
+    },
 }
 
 /// Streaming state machine processing Bedrock EventStream frames into AssistantMessageEvents.
@@ -537,6 +721,7 @@ pub struct BedrockStreamState {
     output: AssistantMessage,
     started: bool,
     done: bool,
+    pub received_terminal: bool,
     open_blocks: HashMap<usize, BedrockOpenBlock>,
 }
 
@@ -548,15 +733,41 @@ impl BedrockStreamState {
             output: AssistantMessage::empty_for_model(model),
             started: false,
             done: false,
+            received_terminal: false,
             open_blocks: HashMap::new(),
         }
     }
 
-    /// Processes a single decoded JSON payload from an EventStream frame.
+    /// Marks the stream as aborted so `finish_into` emits an aborted terminal event.
+    pub fn mark_aborted(&mut self, msg: &str) {
+        self.output.stop_reason = StopReason::Aborted;
+        self.output.error_message = Some(msg.to_string());
+    }
+
+    /// Marks the stream as failed so `finish_into` emits an error terminal event.
+    pub fn mark_error(&mut self, msg: impl Into<String>) {
+        self.output.stop_reason = StopReason::Error;
+        self.output.error_message = Some(msg.into());
+    }
+
+    /// Processes a single decoded JSON payload from an EventStream frame and sends events.
     pub fn process_event(&mut self, json: &serde_json::Value, sender: &AssistantEventSender) {
+        let mut batch = Vec::new();
+        self.process_event_into(json, &mut batch);
+        for ev in batch {
+            sender.push(ev);
+        }
+    }
+
+    /// Processes a single decoded JSON payload from an EventStream frame, appending to `events`.
+    pub fn process_event_into(
+        &mut self,
+        json: &serde_json::Value,
+        events: &mut Vec<AssistantMessageEvent>,
+    ) {
         if !self.started {
             self.started = true;
-            sender.push(AssistantMessageEvent::Start {
+            events.push(AssistantMessageEvent::Start {
                 partial: self.output.clone(),
             });
         }
@@ -583,11 +794,11 @@ impl BedrockStreamState {
                         block_idx,
                         BedrockOpenBlock::ToolCall {
                             content_index,
-                            raw_args: String::new(),
+                            stream: Box::new(ToolCallArgumentsStream::new()),
                         },
                     );
 
-                    sender.push(AssistantMessageEvent::ToolCallStart {
+                    events.push(AssistantMessageEvent::ToolCallStart {
                         content_index,
                         partial: self.output.clone(),
                     });
@@ -609,7 +820,7 @@ impl BedrockStreamState {
                             }));
                             let idx = self.output.content.len() - 1;
                             self.open_blocks.insert(block_idx, BedrockOpenBlock::Text { content_index: idx });
-                            sender.push(AssistantMessageEvent::TextStart {
+                            events.push(AssistantMessageEvent::TextStart {
                                 content_index: idx,
                                 partial: self.output.clone(),
                             });
@@ -620,10 +831,10 @@ impl BedrockStreamState {
                     if let Some(AssistantContentBlock::Text(tc)) = self.output.content.get_mut(content_index) {
                         tc.text.push_str(text);
                     }
-                    sender.push(AssistantMessageEvent::TextDelta {
+                    events.push(AssistantMessageEvent::TextDelta {
                         content_index,
                         delta: text.to_string(),
-                        partial: self.output.clone(),
+                        partial: self.output.metadata_clone(),
                     });
                 } else if let Some(rc) = delta.get("reasoningContent") {
                     let content_index = match self.open_blocks.get(&block_idx) {
@@ -636,7 +847,7 @@ impl BedrockStreamState {
                             }));
                             let idx = self.output.content.len() - 1;
                             self.open_blocks.insert(block_idx, BedrockOpenBlock::Thinking { content_index: idx });
-                            sender.push(AssistantMessageEvent::ThinkingStart {
+                            events.push(AssistantMessageEvent::ThinkingStart {
                                 content_index: idx,
                                 partial: self.output.clone(),
                             });
@@ -648,10 +859,10 @@ impl BedrockStreamState {
                         if let Some(AssistantContentBlock::Thinking(th)) = self.output.content.get_mut(content_index) {
                             th.thinking.push_str(th_text);
                         }
-                        sender.push(AssistantMessageEvent::ThinkingDelta {
+                        events.push(AssistantMessageEvent::ThinkingDelta {
                             content_index,
                             delta: th_text.to_string(),
-                            partial: self.output.clone(),
+                            partial: self.output.metadata_clone(),
                         });
                     }
                     if let Some(sig) = rc.get("signature").and_then(|v| v.as_str()) {
@@ -661,10 +872,13 @@ impl BedrockStreamState {
                     }
                 } else if let Some(tu) = delta.get("toolUse") {
                     if let Some(input_delta) = tu.get("input").and_then(|v| v.as_str()) {
-                        if let Some(BedrockOpenBlock::ToolCall { content_index, raw_args }) = self.open_blocks.get_mut(&block_idx) {
+                        if let Some(BedrockOpenBlock::ToolCall { content_index, stream }) = self.open_blocks.get_mut(&block_idx) {
                             let c_idx = *content_index;
-                            raw_args.push_str(input_delta);
-                            sender.push(AssistantMessageEvent::ToolCallDelta {
+                            let args = stream.append(input_delta);
+                            if let Some(AssistantContentBlock::ToolCall(tc)) = self.output.content.get_mut(c_idx) {
+                                tc.arguments = args;
+                            }
+                            events.push(AssistantMessageEvent::ToolCallDelta {
                                 content_index: c_idx,
                                 delta: input_delta.to_string(),
                                 partial: self.output.clone(),
@@ -686,7 +900,7 @@ impl BedrockStreamState {
                         } else {
                             String::new()
                         };
-                        sender.push(AssistantMessageEvent::TextEnd {
+                        events.push(AssistantMessageEvent::TextEnd {
                             content_index,
                             content,
                             partial: self.output.clone(),
@@ -698,22 +912,22 @@ impl BedrockStreamState {
                         } else {
                             String::new()
                         };
-                        sender.push(AssistantMessageEvent::ThinkingEnd {
+                        events.push(AssistantMessageEvent::ThinkingEnd {
                             content_index,
                             content,
                             partial: self.output.clone(),
                         });
                     }
-                    BedrockOpenBlock::ToolCall { content_index, raw_args } => {
-                        let parsed = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw_args)
-                            .unwrap_or_default();
+                    BedrockOpenBlock::ToolCall { content_index, stream } => {
+                        let (args, err) = stream.finish();
                         let tool_call = if let Some(AssistantContentBlock::ToolCall(tc)) = self.output.content.get_mut(content_index) {
-                            tc.arguments = parsed;
+                            tc.arguments = args;
+                            tc.arguments_error = err;
                             tc.clone()
                         } else {
                             return;
                         };
-                        sender.push(AssistantMessageEvent::ToolCallEnd {
+                        events.push(AssistantMessageEvent::ToolCallEnd {
                             content_index,
                             tool_call,
                             partial: self.output.clone(),
@@ -725,6 +939,7 @@ impl BedrockStreamState {
 
         // 4. messageStop
         if let Some(ms) = json.get("messageStop") {
+            self.received_terminal = true;
             if let Some(reason) = ms.get("stopReason").and_then(|v| v.as_str()) {
                 self.output.stop_reason = match reason {
                     "end_turn" | "stop_sequence" => StopReason::Stop,
@@ -757,6 +972,16 @@ impl BedrockStreamState {
 
     /// Closes all active blocks and emits the terminal completion event.
     pub fn finish(&mut self, sender: &AssistantEventSender) -> AssistantMessage {
+        let mut batch = Vec::new();
+        let out = self.finish_into(&mut batch);
+        for ev in batch {
+            sender.push(ev);
+        }
+        out
+    }
+
+    /// Closes all active blocks and appends the terminal completion event to `events`.
+    pub fn finish_into(&mut self, events: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
         let mut keys: Vec<usize> = self.open_blocks.keys().copied().collect();
         keys.sort();
         for k in keys {
@@ -768,7 +993,7 @@ impl BedrockStreamState {
                         } else {
                             String::new()
                         };
-                        sender.push(AssistantMessageEvent::TextEnd {
+                        events.push(AssistantMessageEvent::TextEnd {
                             content_index,
                             content,
                             partial: self.output.clone(),
@@ -780,22 +1005,22 @@ impl BedrockStreamState {
                         } else {
                             String::new()
                         };
-                        sender.push(AssistantMessageEvent::ThinkingEnd {
+                        events.push(AssistantMessageEvent::ThinkingEnd {
                             content_index,
                             content,
                             partial: self.output.clone(),
                         });
                     }
-                    BedrockOpenBlock::ToolCall { content_index, raw_args } => {
-                        let parsed = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw_args)
-                            .unwrap_or_default();
+                    BedrockOpenBlock::ToolCall { content_index, stream } => {
+                        let (args, err) = stream.finish();
                         let tool_call = if let Some(AssistantContentBlock::ToolCall(tc)) = self.output.content.get_mut(content_index) {
-                            tc.arguments = parsed;
+                            tc.arguments = args;
+                            tc.arguments_error = err;
                             tc.clone()
                         } else {
                             continue;
                         };
-                        sender.push(AssistantMessageEvent::ToolCallEnd {
+                        events.push(AssistantMessageEvent::ToolCallEnd {
                             content_index,
                             tool_call,
                             partial: self.output.clone(),
@@ -813,13 +1038,16 @@ impl BedrockStreamState {
 
         if !self.done {
             self.done = true;
-            if self.output.stop_reason == StopReason::Error {
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
+            if matches!(
+                self.output.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            ) {
+                events.push(AssistantMessageEvent::Error {
+                    reason: self.output.stop_reason,
                     error: self.output.clone(),
                 });
             } else {
-                sender.push(AssistantMessageEvent::Done {
+                events.push(AssistantMessageEvent::Done {
                     reason: self.output.stop_reason,
                     message: self.output.clone(),
                 });
@@ -850,7 +1078,7 @@ impl BedrockProvider {
 impl Default for BedrockProvider {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: default_http_client(),
         }
     }
 }
@@ -886,97 +1114,72 @@ impl LlmProvider for BedrockProvider {
 
             let url = format!("{base_url}/model/{}/converse-stream", model.id);
 
-            let mut req = client.post(&url);
-            req = req.header("content-type", "application/json");
-            req = req.header("accept", "application/vnd.amazon.eventstream");
+            let resp = match send_with_retry(
+                || {
+                    let mut req = client.post(&url);
+                    req = req.header("content-type", "application/json");
+                    req = req.header("accept", "application/vnd.amazon.eventstream");
 
-            // Check if bearer token is provided
-            if let Ok(bearer) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
-                req = req.header("authorization", format!("Bearer {bearer}"));
-            } else {
-                // Perform AWS SigV4 signing
-                let access_key = std::env::var("AWS_ACCESS_KEY_ID")
-                    .or_else(|_| options.api_key.clone().ok_or(std::env::VarError::NotPresent))
-                    .unwrap_or_default();
-                let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
-                let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+                    // Check if bearer token is provided
+                    if let Ok(bearer) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
+                        req = req.header("authorization", format!("Bearer {bearer}"));
+                    } else {
+                        // Perform AWS SigV4 signing fresh on each retry attempt
+                        let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+                            .or_else(|_| {
+                                options.api_key.clone().ok_or(std::env::VarError::NotPresent)
+                            })
+                            .unwrap_or_default();
+                        let secret_key =
+                            std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
+                        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
 
-                let now = SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
-                // Simple UTC timestamp format YYYYMMDDTHHMMSSZ
-                let amz_date = format_iso8601_basic(now);
+                        let now = SystemTime::now()
+                            .duration_since(SystemTime::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        let amz_date = format_iso8601_basic(now);
 
-                let sig_headers = sign_aws_sigv4(
-                    "POST",
-                    &url,
-                    &region,
-                    "bedrock",
-                    &access_key,
-                    &secret_key,
-                    session_token.as_deref(),
-                    &body_bytes,
-                    &amz_date,
-                );
+                        let sig_headers = sign_aws_sigv4(
+                            "POST",
+                            &url,
+                            &region,
+                            "bedrock",
+                            &access_key,
+                            &secret_key,
+                            session_token.as_deref(),
+                            &body_bytes,
+                            &amz_date,
+                        );
 
-                for (name, val) in sig_headers {
-                    req = req.header(name, val);
-                }
-            }
-
-            if let Some(headers) = &model.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            if let Some(headers) = &options.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            req = req.body(body_bytes);
-
-            let resp = tokio::select! {
-                _ = cancel.cancelled() => {
-                    let mut err_msg = AssistantMessage::empty_for_model(&model);
-                    err_msg.stop_reason = StopReason::Aborted;
-                    err_msg.error_message = Some("Request was cancelled".to_string());
-                    sender.push(AssistantMessageEvent::Error {
-                        reason: StopReason::Aborted,
-                        error: err_msg,
-                    });
-                    return;
-                }
-                res = req.send() => {
-                    match res {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let mut err_msg = AssistantMessage::empty_for_model(&model);
-                            err_msg.stop_reason = StopReason::Error;
-                            err_msg.error_message = Some(e.to_string());
-                            sender.push(AssistantMessageEvent::Error {
-                                reason: StopReason::Error,
-                                error: err_msg,
-                            });
-                            return;
+                        for (name, val) in sig_headers {
+                            req = req.header(name, val);
                         }
                     }
+
+                    if let Some(headers) = &model.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
+                        }
+                    }
+                    if let Some(headers) = &options.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
+                        }
+                    }
+                    req.body(body_bytes.clone())
+                },
+                &RetryPolicy::default(),
+                &cancel,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(failure) => {
+                    sender.send(retry_failure_event(failure, &model)).await;
+                    return;
                 }
             };
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                let mut err_msg = AssistantMessage::empty_for_model(&model);
-                err_msg.stop_reason = StopReason::Error;
-                err_msg.error_message = Some(format!("HTTP {status}: {text}"));
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
-                    error: err_msg,
-                });
-                return;
-            }
 
             let mut byte_stream = resp.bytes_stream();
             let mut parser = EventStreamParser::new();
@@ -985,55 +1188,77 @@ impl LlmProvider for BedrockProvider {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        let mut err_msg = state.finish(&sender);
-                        err_msg.stop_reason = StopReason::Aborted;
-                        err_msg.error_message = Some("Request was cancelled".to_string());
-                        sender.push(AssistantMessageEvent::Error {
-                            reason: StopReason::Aborted,
-                            error: err_msg,
-                        });
+                        state.mark_aborted("Request was cancelled");
+                        let mut batch = Vec::new();
+                        state.finish_into(&mut batch);
+                        sender.send_batch(batch).await;
                         return;
                     }
-                    chunk_opt = byte_stream.next() => {
+                    chunk_opt = tokio::time::timeout(DEFAULT_STREAM_CHUNK_TIMEOUT, byte_stream.next()) => {
                         match chunk_opt {
-                            Some(Ok(bytes)) => {
+                            Ok(Some(Ok(bytes))) => {
                                 match parser.feed(&bytes) {
                                     Ok(events) => {
+                                        let mut batch = Vec::new();
                                         for ev in events {
+                                            if ev.headers.get(":message-type").map(|s| s.as_str())
+                                                == Some("exception")
+                                            {
+                                                let exc = ev
+                                                    .headers
+                                                    .get(":exception-type")
+                                                    .cloned()
+                                                    .unwrap_or_else(|| "Bedrock exception".to_string());
+                                                let detail = String::from_utf8_lossy(&ev.payload);
+                                                state.mark_error(format!("{exc}: {detail}"));
+                                                state.finish_into(&mut batch);
+                                                sender.send_batch(batch).await;
+                                                return;
+                                            }
                                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&ev.payload) {
-                                                state.process_event(&json, &sender);
+                                                state.process_event_into(&json, &mut batch);
                                             }
                                         }
+                                        sender.send_batch(batch).await;
                                     }
                                     Err(e) => {
-                                        let mut err_msg = state.finish(&sender);
-                                        err_msg.stop_reason = StopReason::Error;
-                                        err_msg.error_message = Some(e.to_string());
-                                        sender.push(AssistantMessageEvent::Error {
-                                            reason: StopReason::Error,
-                                            error: err_msg,
-                                        });
+                                        state.mark_error(e.to_string());
+                                        let mut batch = Vec::new();
+                                        state.finish_into(&mut batch);
+                                        sender.send_batch(batch).await;
                                         return;
                                     }
                                 }
                             }
-                            Some(Err(e)) => {
-                                let mut err_msg = state.finish(&sender);
-                                err_msg.stop_reason = StopReason::Error;
-                                err_msg.error_message = Some(e.to_string());
-                                sender.push(AssistantMessageEvent::Error {
-                                    reason: StopReason::Error,
-                                    error: err_msg,
-                                });
+                            Ok(Some(Err(e))) => {
+                                state.mark_error(e.to_string());
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
                                 return;
                             }
-                            None => break,
+                            Err(_) => {
+                                state.mark_error(format!(
+                                    "Stream read timed out after {} seconds",
+                                    DEFAULT_STREAM_CHUNK_TIMEOUT.as_secs()
+                                ));
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
+                                return;
+                            }
+                            Ok(None) => break,
                         }
                     }
                 }
             }
 
-            state.finish(&sender);
+            let mut batch = Vec::new();
+            if parser.has_pending_bytes() || !state.received_terminal {
+                state.mark_error("Stream ended prematurely before Bedrock messageStop");
+            }
+            state.finish_into(&mut batch);
+            sender.send_batch(batch).await;
         });
 
         stream
@@ -1140,6 +1365,7 @@ mod tests {
             context_window: 200_000,
             max_tokens: 64_000,
             headers: None,
+            ..Default::default()
         };
         let (sender, _stream) = create_event_stream();
         let mut state = BedrockStreamState::new(&model);
@@ -1219,6 +1445,336 @@ mod tests {
                 assert_eq!(tc.text, "Final response text");
             }
             _ => panic!("Expected text block at index 1"),
+        }
+    }
+
+    #[test]
+    fn build_request_splits_error_images_for_claude_and_normalizes_ids() {
+        let model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            name: "Claude 3.7 Sonnet (Bedrock)".to_string(),
+            api: "bedrock-converse-stream".to_string(),
+            provider: "amazon-bedrock".to_string(),
+            base_url: "".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string(), "image".to_string()],
+            cost: ModelCost::default(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            headers: None,
+            ..Default::default()
+        };
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Run two tools".to_string()),
+                    timestamp: 100,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![
+                        AssistantContentBlock::ToolCall(ToolCall {
+                            id: "call_tool1|item1".to_string(),
+                            name: "failing_tool".to_string(),
+                            arguments: serde_json::Map::new(),
+                            arguments_error: None,
+                            thought_signature: None,
+                        }),
+                        AssistantContentBlock::ToolCall(ToolCall {
+                            id: "call_tool2|item2".to_string(),
+                            name: "orphaned_tool".to_string(),
+                            arguments: serde_json::Map::new(),
+                            arguments_error: None,
+                            thought_signature: None,
+                        }),
+                    ],
+                    api: "openai-responses".to_string(),
+                    provider: "openai".to_string(),
+                    model: "gpt-5".to_string(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 200,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "call_tool1|item1".to_string(),
+                    tool_name: "failing_tool".to_string(),
+                    content: vec![
+                        ToolResultContentBlock::Text(TextContent {
+                            text: "Failure with screenshot".to_string(),
+                            text_signature: None,
+                        }),
+                        ToolResultContentBlock::Image(ImageContent {
+                            mime_type: "image/png".to_string(),
+                            data: "bedrock_base64".to_string(),
+                        }),
+                    ],
+                    details: None,
+                    is_error: true,
+                    timestamp: 300,
+                }),
+            ],
+            tools: None,
+        };
+
+        let uncached_opts = StreamOptions {
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+        let req = build_bedrock_request(&model, &context, &uncached_opts);
+        let messages = req["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+
+        let assistant_blocks = messages[1]["content"].as_array().unwrap();
+        assert_eq!(assistant_blocks.len(), 2);
+        assert_eq!(assistant_blocks[0]["toolUse"]["toolUseId"], "call_tool1_item1");
+        assert_eq!(assistant_blocks[1]["toolUse"]["toolUseId"], "call_tool2_item2");
+
+        let turn_content = messages[2]["content"].as_array().unwrap();
+        assert_eq!(turn_content.len(), 4, "Expected 2 toolResult blocks + 1 caption + 1 image");
+        assert_eq!(turn_content[0]["toolResult"]["toolUseId"], "call_tool1_item1");
+        assert_eq!(turn_content[0]["toolResult"]["status"], "error");
+        let tool1_content = turn_content[0]["toolResult"]["content"].as_array().unwrap();
+        assert_eq!(tool1_content[0]["text"], "Failure with screenshot");
+        assert_eq!(tool1_content[1]["text"], "(image attached after the tool results)");
+
+        assert_eq!(turn_content[1]["toolResult"]["toolUseId"], "call_tool2_item2");
+        assert_eq!(turn_content[1]["toolResult"]["content"][0]["text"], "No result provided");
+
+        assert!(turn_content[2]["text"].as_str().unwrap().contains("Images from the error result"));
+        assert_eq!(turn_content[3]["image"]["source"]["bytes"], "bedrock_base64");
+    }
+
+    #[test]
+    fn test_bedrock_prompt_cache_point_added_for_supported_models() {
+        let mut model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            name: "Anthropic Claude 3.7 Sonnet".to_string(),
+            api: "bedrock-converse-stream".to_string(),
+            provider: "amazon-bedrock".to_string(),
+            base_url: "".to_string(),
+            reasoning: true,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 200000,
+            max_tokens: 8192,
+            ..Default::default()
+        };
+
+        let context = Context {
+            system_prompt: Some("System instructions".to_string()),
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("User query".to_string()),
+                    timestamp: 1,
+                }),
+            ],
+            tools: None,
+        };
+
+        // 0. Default StreamOptions (options.cache_retention == None) defaults to Short retention
+        let default_opts = StreamOptions::default();
+        let req_default = build_bedrock_request(&model, &context, &default_opts);
+        let sys_default = req_default["system"].as_array().expect("system array");
+        assert_eq!(sys_default.len(), 2);
+        assert_eq!(
+            sys_default[1]["cachePoint"],
+            serde_json::json!({ "type": "default" })
+        );
+        let msgs_default = req_default["messages"].as_array().expect("messages array");
+        let user_content_default = msgs_default[0]["content"].as_array().expect("content array");
+        assert_eq!(user_content_default.len(), 2);
+        assert_eq!(
+            user_content_default[1]["cachePoint"],
+            serde_json::json!({ "type": "default" })
+        );
+
+        // 1. When cache_retention is Short on supported model:
+        let short_opts = StreamOptions {
+            cache_retention: Some(CacheRetention::Short),
+            ..Default::default()
+        };
+        let req_short = build_bedrock_request(&model, &context, &short_opts);
+
+        // system contains cachePoint
+        let sys_short = req_short["system"].as_array().expect("system array");
+        assert_eq!(sys_short.len(), 2);
+        assert_eq!(sys_short[0]["text"], "System instructions");
+        assert_eq!(
+            sys_short[1]["cachePoint"],
+            serde_json::json!({ "type": "default" })
+        );
+
+        // final user message content contains cachePoint
+        let msgs_short = req_short["messages"].as_array().expect("messages array");
+        let user_msg_short = &msgs_short[0];
+        let user_content_short = user_msg_short["content"].as_array().expect("content array");
+        assert_eq!(user_content_short.len(), 2);
+        assert_eq!(user_content_short[0]["text"], "User query");
+        assert_eq!(
+            user_content_short[1]["cachePoint"],
+            serde_json::json!({ "type": "default" })
+        );
+
+        // 2. Long cache retention adds ttl: ONE_HOUR
+        let long_opts = StreamOptions {
+            cache_retention: Some(CacheRetention::Long),
+            ..Default::default()
+        };
+        let req_long = build_bedrock_request(&model, &context, &long_opts);
+        let sys_long = req_long["system"].as_array().expect("system array");
+        assert_eq!(
+            sys_long[1]["cachePoint"],
+            serde_json::json!({ "type": "default", "ttl": "ONE_HOUR" })
+        );
+        let msgs_long = req_long["messages"].as_array().expect("messages array");
+        let user_content_long = msgs_long[0]["content"].as_array().expect("content array");
+        assert_eq!(
+            user_content_long[1]["cachePoint"],
+            serde_json::json!({ "type": "default", "ttl": "ONE_HOUR" })
+        );
+
+        // 3. When cache_retention == Some(CacheRetention::None): cachePoint is omitted
+        let none_opts = StreamOptions {
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+        let req_none = build_bedrock_request(&model, &context, &none_opts);
+        let sys_none = req_none["system"].as_array().expect("system array");
+        assert_eq!(sys_none.len(), 1);
+        assert!(sys_none[0].get("cachePoint").is_none());
+
+        let msgs_none = req_none["messages"].as_array().expect("messages array");
+        let user_content_none = msgs_none[0]["content"].as_array().expect("content array");
+        assert_eq!(user_content_none.len(), 1);
+        assert!(user_content_none[0].get("cachePoint").is_none());
+
+        // 4. Unsupported model (e.g. amazon nova / titan) does not get cachePoint
+        model.id = "amazon.titan-text-express-v1".to_string();
+        model.name = "Titan Text Express".to_string();
+        let req_unsupported = build_bedrock_request(&model, &context, &short_opts);
+        let sys_unsup = req_unsupported["system"].as_array().expect("system array");
+        assert_eq!(sys_unsup.len(), 1);
+        let msgs_unsup = req_unsupported["messages"].as_array().expect("messages array");
+        let user_content_unsup = msgs_unsup[0]["content"].as_array().expect("content array");
+        assert_eq!(user_content_unsup.len(), 1);
+    }
+
+    #[test]
+    fn bedrock_sse_updates_partial_tool_arguments_incrementally() {
+        let model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            name: "Anthropic Claude 3.7 Sonnet".to_string(),
+            api: "bedrock-converse-stream".to_string(),
+            provider: "amazon-bedrock".to_string(),
+            base_url: "".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 200000,
+            max_tokens: 8192,
+            ..Default::default()
+        };
+
+        let mut state = BedrockStreamState::new(&model);
+        let mut events = Vec::new();
+
+        // 1. Tool call start
+        state.process_event_into(
+            &serde_json::json!({
+                "contentBlockStart": {
+                    "contentBlockIndex": 0,
+                    "start": {
+                        "toolUse": {
+                            "toolUseId": "toolu_01",
+                            "name": "search"
+                        }
+                    }
+                }
+            }),
+            &mut events,
+        );
+
+        events.clear();
+
+        // 2. Partial input delta
+        state.process_event_into(
+            &serde_json::json!({
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {
+                        "toolUse": {
+                            "input": r#"{"query":"hel"#
+                        }
+                    }
+                }
+            }),
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+                partial,
+            } => {
+                assert_eq!(*content_index, 0);
+                assert_eq!(delta, r#"{"query":"hel"#);
+                match &partial.content[0] {
+                    AssistantContentBlock::ToolCall(tc) => {
+                        assert_eq!(
+                            tc.arguments.get("query").and_then(|v| v.as_str()),
+                            Some("hel"),
+                            "ToolCallDelta partial AssistantMessage must reflect parsed partial arguments incrementally"
+                        );
+                    }
+                    _ => panic!("Expected ToolCall at index 0"),
+                }
+            }
+            _ => panic!("Expected ToolCallDelta event"),
+        }
+
+        events.clear();
+
+        // 3. Second input delta
+        state.process_event_into(
+            &serde_json::json!({
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": {
+                        "toolUse": {
+                            "input": r#"lo"}"#
+                        }
+                    }
+                }
+            }),
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+                partial,
+            } => {
+                assert_eq!(*content_index, 0);
+                assert_eq!(delta, r#"lo"}"#);
+                match &partial.content[0] {
+                    AssistantContentBlock::ToolCall(tc) => {
+                        assert_eq!(
+                            tc.arguments.get("query").and_then(|v| v.as_str()),
+                            Some("hello"),
+                            "ToolCallDelta partial AssistantMessage must reflect parsed arguments incrementally"
+                        );
+                    }
+                    _ => panic!("Expected ToolCall at index 0"),
+                }
+            }
+            _ => panic!("Expected ToolCallDelta event"),
         }
     }
 }

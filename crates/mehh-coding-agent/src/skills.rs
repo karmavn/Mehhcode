@@ -18,7 +18,8 @@ pub struct Skill {
 /// Returns a map of key-value pairs and the remaining body text.
 pub fn parse_frontmatter(content: &str) -> (HashMap<String, String>, &str) {
     let mut map = HashMap::new();
-    let trimmed = content.trim_start();
+    let clean = content.strip_prefix('\u{feff}').unwrap_or(content);
+    let trimmed = clean.trim_start();
 
     if !trimmed.starts_with("---") {
         return (map, content);
@@ -120,12 +121,14 @@ fn scan_dir_for_skills(dir: &Path, out: &mut Vec<Skill>) {
 
 /// Loads skills from global directory `~/.mehh/agent/skills` and project directory `<cwd>/.mehh/skills`.
 /// Project skills override global skills with the same name.
-pub fn load_skills(cwd: &Path) -> Vec<Skill> {
+/// Loads global skills and, when `trusted` is true, project-local skills under `.agents/skills` and `.mehh/skills`.
+pub fn load_skills_with_trust(cwd: &Path, trusted: bool) -> Vec<Skill> {
     let mut skill_map: HashMap<String, Skill> = HashMap::new();
 
     // 1. Global skills
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from);
 
     if let Some(home_path) = home {
@@ -137,17 +140,28 @@ pub fn load_skills(cwd: &Path) -> Vec<Skill> {
         }
     }
 
-    // 2. Project local skills (take precedence)
-    let local_dir = cwd.join(".mehh").join("skills");
-    let mut local_skills = Vec::new();
-    scan_dir_for_skills(&local_dir, &mut local_skills);
-    for skill in local_skills {
-        skill_map.insert(skill.name.clone(), skill);
+    // 2. Project local skills (only when project directory is trusted)
+    if trusted {
+        for local_dir in [
+            cwd.join(".agents").join("skills"),
+            cwd.join(".mehh").join("skills"),
+        ] {
+            let mut local_skills = Vec::new();
+            scan_dir_for_skills(&local_dir, &mut local_skills);
+            for skill in local_skills {
+                skill_map.insert(skill.name.clone(), skill);
+            }
+        }
     }
 
     let mut result: Vec<Skill> = skill_map.into_values().collect();
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result
+}
+
+/// Loads global skills only (untrusted default). Call `load_skills_with_trust` for trusted projects.
+pub fn load_skills(cwd: &Path) -> Vec<Skill> {
+    load_skills_with_trust(cwd, false)
 }
 
 fn escape_xml(s: &str) -> String {
@@ -306,5 +320,28 @@ Use Clippy and avoid unnecessary allocations.
         assert!(non_skill_input.is_none());
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_load_skills_respects_trust_and_strips_bom() {
+        let dir = std::env::temp_dir().join(format!("mehh_skill_trust_{}", Uuid::now_v7()));
+        let skill_dir = dir.join(".agents").join("skills").join("proj-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "\u{feff}---\nname: proj-skill\ndescription: Project skill\n---\nBody text",
+        )
+        .unwrap();
+
+        // Untrusted project must NOT load repo-local skills
+        let untrusted = load_skills_with_trust(&dir, false);
+        assert!(!untrusted.iter().any(|s| s.name == "proj-skill"));
+
+        // Trusted project loads .agents/skills and strips UTF-8 BOM cleanly
+        let trusted = load_skills_with_trust(&dir, true);
+        let found = trusted.iter().find(|s| s.name == "proj-skill").unwrap();
+        assert_eq!(found.description, "Project skill");
+
+        let _ = fs::remove_dir_all(dir);
     }
 }

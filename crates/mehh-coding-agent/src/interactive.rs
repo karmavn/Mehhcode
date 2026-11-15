@@ -2,22 +2,25 @@
 //! Provides conversational transcript, live markdown streaming, slash commands,
 //! editor with history and autocomplete, and async agent loop turns.
 
+use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
-use crossterm::event::Event;
+use crossterm::event::{Event, MouseEventKind};
 use futures::FutureExt;
 use mehh_agent::{run_agent_loop, AgentEvent, AgentTool, QueueMode};
 use mehh_ai::oauth::{self, OAuthProviderKind, StoredCredential};
-use mehh_ai::{AssistantContentBlock, AssistantMessageEvent, Message, ThinkingLevel};
+use mehh_ai::{AssistantContentBlock, AssistantMessageEvent, Message, StopReason, ThinkingLevel};
 use mehh_tui::{
     normalize_crossterm_key, truncate_to_width, wrap_text_with_ansi, BorderStyle, BorderedBox,
     Component, CrosstermTerminal, Editor, EditorOutput, Keybindings, Loader, MarkdownView,
     SelectItem, SelectList, Terminal, Theme, TuiAction, TuiRenderer,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::agent_session::AgentSession;
 use crate::mcp_manager::{McpConnectionSummary, McpManager};
@@ -50,6 +53,8 @@ pub struct Selector {
     pub list: SelectList,
 }
 
+type MarkdownCache = HashMap<(usize, usize), (String, String, Vec<String>)>;
+
 /// State managed by the interactive mode session.
 pub struct InteractiveState {
     pub items: Vec<TranscriptItem>,
@@ -62,10 +67,17 @@ pub struct InteractiveState {
     pub selector: Option<Selector>,
     pub mcp_summaries: Vec<McpConnectionSummary>,
     pub theme: Theme,
+    pub scroll_offset: usize,
+    pub last_max_scroll: AtomicUsize,
+    pub last_prompt_text: Option<String>,
+    pub overflow_retried: bool,
+    pub turn_start_idx: Option<usize>,
+    pub last_turn_error: Option<String>,
     /// File that settings changes are written to. `None` uses the global settings file.
     pub settings_file: Option<PathBuf>,
     /// File that credentials are written to. `None` uses the default auth file.
     pub auth_file: Option<PathBuf>,
+    markdown_cache: Mutex<MarkdownCache>,
 }
 
 impl InteractiveState {
@@ -81,8 +93,15 @@ impl InteractiveState {
             selector: None,
             mcp_summaries,
             theme: Theme::load(settings.theme.as_deref()),
+            scroll_offset: 0,
+            last_max_scroll: AtomicUsize::new(0),
+            last_prompt_text: None,
+            overflow_retried: false,
+            turn_start_idx: None,
+            last_turn_error: None,
             settings_file: None,
             auth_file: None,
+            markdown_cache: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -174,7 +193,7 @@ pub fn persist_settings(
 ) -> anyhow::Result<()> {
     let file_path = match path {
         Some(p) => p.to_path_buf(),
-        None => SettingsManager::global_path(),
+        None => SettingsManager::global_path()?,
     };
     let mut target = SettingsManager::load_file(&file_path)?;
     copy_toggle(&mut target, settings, key);
@@ -236,7 +255,7 @@ pub async fn perform_login(
         )
     })?;
 
-    let client = reqwest::Client::new();
+    let client = mehh_ai::default_http_client();
     let cred = match kind {
         OAuthProviderKind::Anthropic | OAuthProviderKind::OpenAiChatGpt => {
             login_via_pkce(&client, kind).await?
@@ -452,7 +471,7 @@ fn settings_selector_items(settings: &Settings) -> Vec<SelectItem> {
         ),
         SelectItem::new(
             "auto_compact",
-            format!("auto compact: {}", settings.auto_compact.unwrap_or(false)),
+            format!("auto compact: {}", settings.auto_compact.unwrap_or(true)),
         ),
     ]
 }
@@ -516,7 +535,7 @@ fn apply_setting_cycle(
             Ok(format!("hide_thinking_block = {next}"))
         }
         "auto_compact" => {
-            let next = !session.settings.auto_compact.unwrap_or(false);
+            let next = !session.settings.auto_compact.unwrap_or(true);
             session.settings.auto_compact = Some(next);
             Ok(format!("auto_compact = {next}"))
         }
@@ -529,7 +548,11 @@ fn is_derived_tool(name: &str) -> bool {
     name.starts_with("mcp__")
         || matches!(
             name,
-            "list_mcp_resources" | "list_mcp_resource_templates" | "read_mcp_resource" | "codemode"
+            "list_mcp_resources"
+                | "list_mcp_resource_templates"
+                | "read_mcp_resource"
+                | "codemode"
+                | "tool_search"
         )
 }
 
@@ -558,26 +581,87 @@ fn split_system_prompt(prompt: &str) -> (Option<String>, Option<String>) {
 
 /// Replaces the MCP-derived tools on the session with a freshly synchronized set.
 ///
-/// `enable_mcp_and_codemode` rebuilds the system prompt from scratch, so the
-/// custom prompt and the addendum are carried over to the rebuilt prompt.
+/// Preserves multi-paragraph custom/append system prompts when stored on `AgentSession`,
+/// falling back to `split_system_prompt` only when no explicit overrides were recorded.
 fn sync_mcp_tools(
     session: &mut AgentSession,
     mcp_tools: Vec<Arc<dyn AgentTool>>,
     codemode_enabled: bool,
 ) {
-    let (preamble, addendum) = split_system_prompt(&session.system_prompt);
+    let has_explicit_overrides =
+        session.custom_system_prompt.is_some() || session.append_system_prompt.is_some();
+    let (preamble, addendum) = if has_explicit_overrides {
+        (None, None)
+    } else {
+        split_system_prompt(&session.system_prompt)
+    };
 
     session.tools.retain(|t| !is_derived_tool(t.name()));
+    session.clear_deferred_mcp_tools();
     session.enable_mcp_and_codemode(mcp_tools, codemode_enabled);
 
-    let tool_names: Vec<&str> = session.tools().iter().map(|t| t.name()).collect();
-    session.set_system_prompt(crate::system_prompt::build_system_prompt_with_skills(
-        &session.cwd,
-        preamble.as_deref(),
-        addendum.as_deref(),
-        &tool_names,
-        session.skills(),
-    ));
+    if !has_explicit_overrides {
+        let tool_names: Vec<&str> = session.tools().iter().map(|t| t.name()).collect();
+        session.set_system_prompt(crate::system_prompt::build_system_prompt_with_skills(
+            &session.cwd,
+            preamble.as_deref(),
+            addendum.as_deref(),
+            &tool_names,
+            session.skills(),
+        ));
+    }
+}
+
+/// Switches the session's model via [`ModelRegistry`] and asynchronously refreshes credentials.
+async fn apply_interactive_model_switch(
+    target: &str,
+    session: &mut AgentSession,
+    state: &mut InteractiveState,
+) {
+    let reg = match crate::models_config::ModelRegistry::load_default() {
+        Ok(r) => r,
+        Err(e) => {
+            state.items.push(TranscriptItem::System(format!(
+                "Failed to load models registry: {e}"
+            )));
+            return;
+        }
+    };
+    let Some(m) = reg.resolve(target, None) else {
+        state.items.push(TranscriptItem::System(format!(
+            "Unknown model: '{target}'"
+        )));
+        return;
+    };
+
+    let resolved_key = if m.provider != "faux" && m.api != "faux" {
+        match crate::auth::resolve_api_key_async(&m.provider, None, state.auth_file.as_deref()).await
+        {
+            Ok(key) => key.or_else(|| reg.provider_api_key(&m.provider).map(str::to_string)),
+            Err(e) => {
+                state.items.push(TranscriptItem::System(format!(
+                    "Failed to resolve credentials for '{}': {e}",
+                    m.provider
+                )));
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
+    let provider_changed = !session.model.provider.eq_ignore_ascii_case(&m.provider);
+    let prov = AgentSession::default_provider_for_model(&m);
+    session.set_model(m.clone(), prov);
+    if let Some(key) = resolved_key {
+        if provider_changed || !session.has_explicit_api_key() {
+            session.set_api_key(Some(key));
+        }
+    }
+    state.items.push(TranscriptItem::System(format!(
+        "Switched model to {} ({})",
+        m.name, m.provider
+    )));
 }
 
 /// Dispatches interactive slash commands.
@@ -602,6 +686,7 @@ pub async fn handle_slash_command(
         "/exit" | "/quit" => SlashCommandOutcome::Quit,
         "/clear" => {
             state.items.clear();
+            state.scroll_offset = 0;
             state.status = None;
             SlashCommandOutcome::Handled
         }
@@ -643,6 +728,7 @@ Keybindings:
             match session.session_mut().new_session() {
                 Ok(()) => {
                     state.items.clear();
+                    state.scroll_offset = 0;
                     state.items.push(TranscriptItem::System(format!(
                         "Started new session: {}",
                         session.session().session_id()
@@ -670,30 +756,32 @@ Keybindings:
         }
         "/model" => {
             if let Some(target) = arg {
-                if let Some(m) = mehh_ai::resolve_model(target, None) {
-                    let prov = AgentSession::default_provider_for_model(&m);
-                    session.set_model(m.clone(), prov);
-                    state.items.push(TranscriptItem::System(format!(
-                        "Switched model to {} ({})",
-                        m.name, m.provider
-                    )));
-                } else {
-                    state.items.push(TranscriptItem::System(format!(
-                        "Unknown model: '{target}'"
-                    )));
-                }
+                apply_interactive_model_switch(target, session, state).await;
             } else {
-                let items: Vec<SelectItem> = mehh_ai::builtin_models()
-                    .into_iter()
-                    .map(|m| {
-                        SelectItem::new(m.id.clone(), format!("{} ({})", m.name, m.provider))
-                            .with_description(m.id)
-                    })
-                    .collect();
-                state.selector = Some(Selector {
-                    kind: SelectorKind::Model,
-                    list: SelectList::new(items, 8),
-                });
+                match crate::models_config::ModelRegistry::load_default() {
+                    Ok(reg) => {
+                        let items: Vec<SelectItem> = reg
+                            .models()
+                            .iter()
+                            .map(|m| {
+                                SelectItem::new(
+                                    format!("{}/{}", m.provider, m.id),
+                                    format!("{} ({})", m.name, m.provider),
+                                )
+                                .with_description(m.id.clone())
+                            })
+                            .collect();
+                        state.selector = Some(Selector {
+                            kind: SelectorKind::Model,
+                            list: SelectList::new(items, 8),
+                        });
+                    }
+                    Err(e) => {
+                        state.items.push(TranscriptItem::System(format!(
+                            "Failed to load models registry: {e}"
+                        )));
+                    }
+                }
             }
             SlashCommandOutcome::Handled
         }
@@ -923,6 +1011,7 @@ Keybindings:
                     match session.session_mut().branch_from(entry_id) {
                         Ok(()) => {
                             state.items = rebuild_transcript_items(session);
+                            state.scroll_offset = 0;
                             state.items.push(TranscriptItem::System(format!(
                                 "Switched to branch at {entry_id}"
                             )));
@@ -983,6 +1072,7 @@ Keybindings:
                         let new_id = new_session.session_id().to_string();
                         session.session = new_session;
                         state.items = rebuild_transcript_items(session);
+                        state.scroll_offset = 0;
                         state.items.push(TranscriptItem::System(format!(
                             "Forked session into {new_id}"
                         )));
@@ -999,6 +1089,7 @@ Keybindings:
                     let new_id = new_session.session_id().to_string();
                     session.session = new_session;
                     state.items = rebuild_transcript_items(session);
+                    state.scroll_offset = 0;
                     state.items.push(TranscriptItem::System(format!(
                         "Cloned session into {new_id}"
                     )));
@@ -1133,6 +1224,34 @@ fn resume_selector_items(sessions: &[SessionSummary]) -> Vec<SelectItem> {
         .collect()
 }
 
+fn format_assistant_stop_notice(msg: &mehh_ai::AssistantMessage) -> String {
+    let err_text = msg
+        .error_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if msg.stop_reason == StopReason::Aborted {
+                "Aborted"
+            } else {
+                "Provider stream error"
+            }
+        });
+    if msg.stop_reason == StopReason::Aborted {
+        format!("Turn aborted: {err_text}")
+    } else {
+        format!("Provider error: {err_text}")
+    }
+}
+
+fn push_turn_error_once(state: &mut InteractiveState, notice: String) {
+    if state.last_turn_error.as_deref() == Some(notice.as_str()) {
+        return;
+    }
+    state.last_turn_error = Some(notice.clone());
+    state.items.push(TranscriptItem::System(notice));
+}
+
 /// Applies agent lifecycle and stream events to update interactive state and transcript.
 pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
     match event {
@@ -1183,6 +1302,10 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                         });
                     }
                 }
+                AssistantMessageEvent::Error { error, .. } => {
+                    let notice = format_assistant_stop_notice(error);
+                    push_turn_error_once(state, notice);
+                }
                 _ => {}
             }
         }
@@ -1195,6 +1318,10 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                     if text.is_empty() && thinking.is_empty() {
                         *text = a.text_content();
                     }
+                }
+                if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) {
+                    let notice = format_assistant_stop_notice(a);
+                    push_turn_error_once(state, notice);
                 }
             }
         }
@@ -1342,7 +1469,11 @@ pub fn render_interactive_frame(
     // 4. Transcript
     let hide_thinking = session.settings.hide_thinking_block.unwrap_or(false);
     let mut transcript_lines = Vec::new();
-    for item in &state.items {
+    let mut md_cache = state.markdown_cache.lock().unwrap_or_else(|e| e.into_inner());
+    if md_cache.len() > state.items.len().saturating_mul(2).saturating_add(16) {
+        md_cache.clear();
+    }
+    for (item_idx, item) in state.items.iter().enumerate() {
         match item {
             TranscriptItem::User(text) => {
                 let formatted = format!(
@@ -1358,8 +1489,16 @@ pub fn render_interactive_frame(
                     transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
                 }
                 if !text.is_empty() {
-                    let view = MarkdownView::new(text).with_theme(theme.clone());
-                    transcript_lines.extend(view.render(width));
+                    let key = (item_idx, width);
+                    if let Some((cached_theme, cached_src, cached_lines)) = md_cache.get(&key) {
+                        if cached_theme == &theme.name && cached_src == text {
+                            transcript_lines.extend(cached_lines.iter().cloned());
+                            continue;
+                        }
+                    }
+                    let rendered = MarkdownView::new(text).with_theme(theme.clone()).render(width);
+                    transcript_lines.extend(rendered.iter().cloned());
+                    md_cache.insert(key, (theme.name.clone(), text.clone(), rendered));
                 }
             }
             TranscriptItem::ToolCall { id, name, status, is_error } => {
@@ -1391,9 +1530,18 @@ pub fn render_interactive_frame(
     let used_lines = header_lines.len() + footer_lines.len() + bottom_lines.len();
     let available_height = height.saturating_sub(used_lines);
 
-    let visible_transcript = if transcript_lines.len() > available_height {
-        transcript_lines[transcript_lines.len() - available_height..].to_vec()
+    let visible_transcript = if available_height == 0 {
+        state.last_max_scroll.store(0, Ordering::Relaxed);
+        Vec::new()
+    } else if transcript_lines.len() > available_height {
+        let max_scroll = transcript_lines.len() - available_height;
+        state.last_max_scroll.store(max_scroll, Ordering::Relaxed);
+        let offset = state.scroll_offset.min(max_scroll);
+        let end = transcript_lines.len() - offset;
+        let start = end.saturating_sub(available_height);
+        transcript_lines[start..end].to_vec()
     } else {
+        state.last_max_scroll.store(0, Ordering::Relaxed);
         transcript_lines
     };
 
@@ -1406,8 +1554,23 @@ pub fn render_interactive_frame(
     frame
 }
 
-/// Signal delivered from a running agent turn to the interactive UI loop.
+/// Signal delivered from a running agent turn or background prep/compaction task to the UI loop.
 enum AgentSignal {
+    ReadyForTurn {
+        prompt_text: String,
+        new_api_key: Option<String>,
+        compaction: Option<(String, String, u64)>,
+        warning: Option<String>,
+        cancel: CancellationToken,
+    },
+    PrepFailed(String),
+    PrepAborted,
+    OverflowCompacted {
+        original_messages: Vec<Message>,
+        prep: Option<(String, u64)>,
+        result: Result<String, String>,
+        cancelled: bool,
+    },
     Event(Box<AgentEvent>),
     Finished(Vec<Message>),
     Failed(String),
@@ -1436,8 +1599,17 @@ fn apply_agent_signal(
             state.is_busy = false;
             state.status = None;
             *session.active_cancel_slot().lock().unwrap() = None;
+            if let Some(Message::Assistant(a)) =
+                messages.iter().rev().find(|m| matches!(m, Message::Assistant(_)))
+            {
+                if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) {
+                    let notice = format_assistant_stop_notice(a);
+                    push_turn_error_once(state, notice);
+                }
+            }
             if let Err(e) = session.finish_prompt(&messages) {
-                state.items
+                state
+                    .items
                     .push(TranscriptItem::System(format!("Failed to persist turn: {e}")));
             }
             true
@@ -1451,10 +1623,159 @@ fn apply_agent_signal(
                 .push(TranscriptItem::System(format!("Agent turn failed: {message}")));
             true
         }
+        AgentSignal::PrepFailed(message) => {
+            state.is_busy = false;
+            state.status = None;
+            *session.active_cancel_slot().lock().unwrap() = None;
+            state.items.push(TranscriptItem::System(message));
+            true
+        }
+        AgentSignal::PrepAborted => {
+            state.is_busy = false;
+            state.status = None;
+            *session.active_cancel_slot().lock().unwrap() = None;
+            state
+                .items
+                .push(TranscriptItem::System("Turn aborted.".to_string()));
+            true
+        }
+        AgentSignal::ReadyForTurn { .. } | AgentSignal::OverflowCompacted { .. } => false,
     }
 }
 
-/// Applies every signal that is already queued. Returns true when a turn ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignalOutcome {
+    Continuing,
+    RetryStarted,
+    TurnEnded,
+}
+
+async fn handle_agent_signal_async(
+    signal: AgentSignal,
+    session: &mut AgentSession,
+    state: &mut InteractiveState,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
+) -> SignalOutcome {
+    match signal {
+        AgentSignal::ReadyForTurn {
+            prompt_text,
+            new_api_key,
+            compaction,
+            warning,
+            cancel,
+        } => {
+            if cancel.is_cancelled() {
+                *session.active_cancel_slot().lock().unwrap() = None;
+                state.is_busy = false;
+                state.status = None;
+                state
+                    .items
+                    .push(TranscriptItem::System("Turn aborted.".to_string()));
+                return SignalOutcome::TurnEnded;
+            }
+            if let Some(key) = new_api_key {
+                if !session.has_explicit_api_key()
+                    && session.api_key.as_deref() != Some(key.as_str())
+                {
+                    session.set_api_key(Some(key));
+                }
+            }
+            if let Some((summary, first_kept_id, tokens_before)) = compaction {
+                if let Err(e) =
+                    session.apply_prepared_compaction(summary, first_kept_id, tokens_before)
+                {
+                    state.items.push(TranscriptItem::System(format!(
+                        "Warning: failed to persist proactive auto-compaction: {e}"
+                    )));
+                }
+            }
+            if let Some(w) = warning {
+                state.items.push(TranscriptItem::System(format!(
+                    "Warning: proactive auto-compaction failed: {w}"
+                )));
+            }
+            start_turn(session, state, &prompt_text, agent_tx);
+            SignalOutcome::RetryStarted
+        }
+        AgentSignal::Finished(messages) => {
+            *session.active_cancel_slot().lock().unwrap() = None;
+            if !state.overflow_retried && session.is_overflow_turn(&messages) {
+                state.overflow_retried = true;
+                if let Some(prep) = session.prepare_overflow_compaction() {
+                    state.is_busy = true;
+                    state.status = Some("Context overflow — compacting history...".to_string());
+                    start_overflow_compaction(session, prep, messages, agent_tx);
+                    return SignalOutcome::RetryStarted;
+                }
+            }
+            if apply_agent_signal(AgentSignal::Finished(messages), session, state) {
+                SignalOutcome::TurnEnded
+            } else {
+                SignalOutcome::Continuing
+            }
+        }
+        AgentSignal::OverflowCompacted {
+            original_messages,
+            prep,
+            result,
+            cancelled,
+        } => {
+            *session.active_cancel_slot().lock().unwrap() = None;
+            if !cancelled {
+                if let (Ok(summary), Some((first_kept_id, tokens_before)), Some(retry_text)) =
+                    (result.as_ref(), prep, state.last_prompt_text.clone())
+                {
+                    match session.apply_prepared_compaction(
+                        summary.clone(),
+                        first_kept_id,
+                        tokens_before,
+                    ) {
+                        Ok(()) => {
+                            if let Some(start_idx) = state.turn_start_idx {
+                                state.items.truncate(start_idx);
+                            }
+                            state.last_turn_error = None;
+                            state.items.push(TranscriptItem::System(
+                                "Context overflow detected; auto-compacted history and retrying turn..."
+                                    .to_string(),
+                            ));
+                            start_turn(session, state, &retry_text, agent_tx);
+                            return SignalOutcome::RetryStarted;
+                        }
+                        Err(e) => {
+                            state.items.push(TranscriptItem::System(format!(
+                                "Failed to persist overflow auto-compaction: {e}"
+                            )));
+                        }
+                    }
+                } else if let Err(err) = result {
+                    state.items.push(TranscriptItem::System(format!(
+                        "Overflow auto-compaction failed: {err}"
+                    )));
+                }
+            } else {
+                state.items.push(TranscriptItem::System(
+                    "Overflow auto-compaction aborted.".to_string(),
+                ));
+            }
+            if apply_agent_signal(AgentSignal::Finished(original_messages), session, state) {
+                SignalOutcome::TurnEnded
+            } else {
+                SignalOutcome::Continuing
+            }
+        }
+        other => {
+            if apply_agent_signal(other, session, state) {
+                SignalOutcome::TurnEnded
+            } else {
+                SignalOutcome::Continuing
+            }
+        }
+    }
+}
+
+/// Applies every signal that is already queued. Returns true when a turn ended without retry.
+#[cfg(test)]
 fn drain_agent_signals(
     agent_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentSignal>,
     session: &mut AgentSession,
@@ -1469,6 +1790,172 @@ fn drain_agent_signals(
     turn_ended
 }
 
+/// Applies every queued signal in interactive mode, handling automatic overflow retries.
+/// Returns `Some(is_still_running)` when turn state changed.
+async fn drain_agent_signals_async(
+    agent_rx: &mut tokio::sync::mpsc::UnboundedReceiver<AgentSignal>,
+    session: &mut AgentSession,
+    state: &mut InteractiveState,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
+) -> Option<bool> {
+    let mut next_running = None;
+    while let Ok(signal) = agent_rx.try_recv() {
+        match handle_agent_signal_async(signal, session, state, agent_tx).await {
+            SignalOutcome::TurnEnded => next_running = Some(false),
+            SignalOutcome::RetryStarted => next_running = Some(true),
+            SignalOutcome::Continuing => {}
+        }
+    }
+    next_running
+}
+
+/// Refreshes credentials and runs optional proactive compaction off the UI thread so the TUI and Ctrl+C remain responsive.
+fn start_turn_preparation(
+    session: &AgentSession,
+    text: &str,
+    auth_file: Option<&Path>,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
+) {
+    let cancel = CancellationToken::new();
+    *session.active_cancel_slot().lock().unwrap() = Some(cancel.clone());
+
+    let prompt_text = text.to_string();
+    let provider_name = session.model.provider.clone();
+    let model_api = session.model.api.clone();
+    let has_explicit_key = session.has_explicit_api_key();
+    let auth_file = auth_file.map(Path::to_path_buf);
+    let existing_key = session.api_key.clone();
+    let model = session.model.clone();
+    let provider = session.provider.clone();
+    let proactive_prep = session.prepare_proactive_compaction();
+    let tx = agent_tx.clone();
+    let tx_panic = agent_tx.clone();
+
+    tokio::spawn(async move {
+        let outcome = AssertUnwindSafe(async {
+            let key_res = tokio::select! {
+                _ = cancel.cancelled() => {
+                    let _ = tx.send(AgentSignal::PrepAborted);
+                    return;
+                }
+                res = AgentSession::refresh_resolved_api_key(
+                    &provider_name,
+                    &model_api,
+                    has_explicit_key,
+                    auth_file.as_deref(),
+                ) => res,
+            };
+            if cancel.is_cancelled() {
+                let _ = tx.send(AgentSignal::PrepAborted);
+                return;
+            }
+            let new_api_key = match key_res {
+                Ok(k) => k,
+                Err(e) => {
+                    let _ = tx.send(AgentSignal::PrepFailed(format!(
+                        "Failed to resolve provider credentials: {e}"
+                    )));
+                    return;
+                }
+            };
+
+            let mut compaction = None;
+            let mut warning = None;
+            if let Some(prep) = proactive_prep {
+                let effective_key = new_api_key.as_deref().or(existing_key.as_deref());
+                match crate::compaction::compact_with_provider(
+                    &prep,
+                    &model,
+                    provider.as_ref(),
+                    effective_key,
+                    None,
+                    cancel.clone(),
+                )
+                .await
+                {
+                    Ok(summary) => {
+                        compaction = Some((summary, prep.first_kept_entry_id, prep.tokens_before));
+                    }
+                    Err(e) => {
+                        if cancel.is_cancelled() {
+                            let _ = tx.send(AgentSignal::PrepAborted);
+                            return;
+                        }
+                        warning = Some(e.to_string());
+                    }
+                }
+            }
+
+            if cancel.is_cancelled() {
+                let _ = tx.send(AgentSignal::PrepAborted);
+            } else {
+                let _ = tx.send(AgentSignal::ReadyForTurn {
+                    prompt_text,
+                    new_api_key,
+                    compaction,
+                    warning,
+                    cancel,
+                });
+            }
+        })
+        .catch_unwind()
+        .await;
+
+        if outcome.is_err() {
+            let _ = tx_panic.send(AgentSignal::PrepFailed(
+                "turn preparation panicked".to_string(),
+            ));
+        }
+    });
+}
+
+fn start_overflow_compaction(
+    session: &AgentSession,
+    prep: crate::compaction::CompactionPreparation,
+    original_messages: Vec<Message>,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
+) {
+    let cancel = CancellationToken::new();
+    *session.active_cancel_slot().lock().unwrap() = Some(cancel.clone());
+
+    let model = session.model.clone();
+    let provider = session.provider.clone();
+    let api_key = session.api_key.clone();
+    let tx = agent_tx.clone();
+    let tx_panic = agent_tx.clone();
+    let prep_meta = (prep.first_kept_entry_id.clone(), prep.tokens_before);
+
+    tokio::spawn(async move {
+        let res = AssertUnwindSafe(crate::compaction::compact_with_provider(
+            &prep,
+            &model,
+            provider.as_ref(),
+            api_key.as_deref(),
+            None,
+            cancel.clone(),
+        ))
+        .catch_unwind()
+        .await;
+
+        match res {
+            Ok(compact_res) => {
+                let cancelled = cancel.is_cancelled();
+                let _ = tx.send(AgentSignal::OverflowCompacted {
+                    original_messages,
+                    prep: Some(prep_meta),
+                    result: compact_res.map_err(|e| e.to_string()),
+                    cancelled,
+                });
+            }
+            Err(_) => {
+                let _ = tx_panic.send(AgentSignal::Failed(
+                    "overflow compaction panicked".to_string(),
+                ));
+            }
+        }
+    });
+}
+
 /// Starts an agent turn in a background task and streams its events to the UI loop.
 fn start_turn(
     session: &AgentSession,
@@ -1476,8 +1963,9 @@ fn start_turn(
     text: &str,
     agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
 ) {
-    let expanded = session.expand_input(text);
-    let (user_msg, history, config) = session.prepare_prompt(&expanded);
+    state.turn_start_idx = Some(state.items.len());
+    state.last_turn_error = None;
+    let (user_msg, history, config) = session.prepare_prompt(text);
 
     let tx_events = agent_tx.clone();
     let tx_done = agent_tx.clone();
@@ -1519,35 +2007,53 @@ fn start_turn(
 /// suffix that completes the typed prefix. A prefix that already spells a command
 /// exactly leaves the popup closed, so `Enter` submits the command instead of
 /// completing it a second time.
-fn update_autocomplete(editor: &mut Editor, current_text: &str) {
-    if !current_text.starts_with('/') || current_text.contains(' ') {
-        editor.clear_autocomplete();
+fn update_autocomplete_with_cwd(editor: &mut Editor, current_text: &str, cwd: &Path) {
+    if current_text.starts_with('/') && !current_text.contains(' ') {
+        let commands = builtin_slash_commands();
+        if commands.iter().any(|cmd| cmd.id == current_text) {
+            editor.clear_autocomplete();
+            return;
+        }
+
+        let matches: Vec<SelectItem> = commands
+            .into_iter()
+            .filter(|cmd| cmd.id.starts_with(current_text))
+            .map(|cmd| {
+                let suffix = cmd.id[current_text.len()..].to_string();
+                let description = match &cmd.description {
+                    Some(d) => format!("{} — {d}", cmd.id),
+                    None => cmd.id.clone(),
+                };
+                SelectItem::new(cmd.id, suffix).with_description(description)
+            })
+            .collect();
+
+        if matches.is_empty() {
+            editor.clear_autocomplete();
+        } else {
+            editor.set_autocomplete(matches);
+        }
         return;
     }
 
-    let commands = builtin_slash_commands();
-    if commands.iter().any(|cmd| cmd.id == current_text) {
-        editor.clear_autocomplete();
-        return;
-    }
-
-    let matches: Vec<SelectItem> = commands
-        .into_iter()
-        .filter(|cmd| cmd.id.starts_with(current_text))
-        .map(|cmd| {
-            let suffix = cmd.id[current_text.len()..].to_string();
-            let description = match &cmd.description {
-                Some(d) => format!("{} — {d}", cmd.id),
-                None => cmd.id.clone(),
-            };
-            SelectItem::new(cmd.id, suffix).with_description(description)
-        })
-        .collect();
-
-    if matches.is_empty() {
-        editor.clear_autocomplete();
+    let active_line = editor
+        .lines
+        .get(editor.cursor_row)
+        .map(String::as_str)
+        .unwrap_or("");
+    if let Some(at_q) = crate::file_complete::extract_at_query(active_line, editor.cursor_col) {
+        let matches = crate::file_complete::complete_file_paths(cwd, &at_q.query, 15);
+        let items: Vec<SelectItem> = matches
+            .into_iter()
+            .map(|rel| SelectItem::new(format!("@{rel}"), rel))
+            .collect();
+        if items.is_empty() {
+            editor.clear_autocomplete();
+        } else {
+            editor.set_autocomplete_replacing(items, at_q.replace_start);
+        }
     } else {
-        editor.set_autocomplete(matches);
+        editor.clear_autocomplete();
     }
 }
 
@@ -1627,15 +2133,39 @@ pub async fn run_interactive_mode(
                     Event::Resize(_new_cols, _new_rows) => {
                         render_now(&state, &editor, session, &mut terminal, &mut renderer);
                     }
+                    Event::Mouse(mouse) => match mouse.kind {
+                        MouseEventKind::ScrollUp => {
+                            let max_scroll = state.last_max_scroll.load(Ordering::Relaxed);
+                            state.scroll_offset =
+                                state.scroll_offset.saturating_add(3).min(max_scroll);
+                            render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                        }
+                        MouseEventKind::ScrollDown => {
+                            let max_scroll = state.last_max_scroll.load(Ordering::Relaxed);
+                            state.scroll_offset =
+                                state.scroll_offset.min(max_scroll).saturating_sub(3);
+                            render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                        }
+                        _ => {}
+                    },
                     Event::Paste(pasted) => {
                         editor.insert_text(&pasted);
+                        let text = editor.text();
+                        update_autocomplete_with_cwd(&mut editor, &text, &session.cwd);
                         render_now(&state, &editor, session, &mut terminal, &mut renderer);
                     }
                     Event::Key(key_event) => {
                         // Apply agent signals that are already queued so a key press
                         // cannot start a new turn before the previous one was persisted.
-                        if drain_agent_signals(&mut agent_rx, session, &mut state) {
-                            turn_running = false;
+                        if let Some(running) = drain_agent_signals_async(
+                            &mut agent_rx,
+                            session,
+                            &mut state,
+                            &agent_tx,
+                        )
+                        .await
+                        {
+                            turn_running = running;
                         }
                         if let Some(key_str) = normalize_crossterm_key(key_event) {
                             // 1. Selector overlay handling
@@ -1655,23 +2185,18 @@ pub async fn run_interactive_mode(
                                         }
                                         match (kind, selected) {
                                             (Some(SelectorKind::Model), Some(item)) => {
-                                                if let Some(m) = mehh_ai::resolve_model(&item.id, None) {
-                                                    let prov = AgentSession::default_provider_for_model(&m);
-                                                    session.set_model(m.clone(), prov);
-                                                    state.items.push(TranscriptItem::System(format!(
-                                                        "Switched model to {} ({})",
-                                                        m.name, m.provider
-                                                    )));
-                                                } else {
-                                                    state.items.push(TranscriptItem::System(format!(
-                                                        "Unknown model: '{}'", item.id
-                                                    )));
-                                                }
+                                                apply_interactive_model_switch(
+                                                    &item.id,
+                                                    session,
+                                                    &mut state,
+                                                )
+                                                .await;
                                             }
                                             (Some(SelectorKind::Tree), Some(item)) => {
                                                 match session.session_mut().branch_from(&item.id) {
                                                     Ok(()) => {
                                                         state.items = rebuild_transcript_items(session);
+                                                        state.scroll_offset = 0;
                                                         state.items.push(TranscriptItem::System(format!(
                                                             "Switched to branch at {}", item.id
                                                         )));
@@ -1689,6 +2214,7 @@ pub async fn run_interactive_mode(
                                                     Ok(mgr) => {
                                                         session.session = mgr;
                                                         state.items = rebuild_transcript_items(session);
+                                                        state.scroll_offset = 0;
                                                         state.items.push(TranscriptItem::System(format!(
                                                             "Resumed session {}",
                                                             session.session.session_id()
@@ -1801,6 +2327,27 @@ pub async fn run_interactive_mode(
                                 break 'outer;
                             }
 
+                            // Scroll keybindings operate regardless of turn state when selector is closed
+                            if keybindings.matches(&key_str, TuiAction::ScrollUp) {
+                                let max_scroll = state.last_max_scroll.load(Ordering::Relaxed);
+                                state.scroll_offset =
+                                    state.scroll_offset.saturating_add(5).min(max_scroll);
+                                render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                                continue 'outer;
+                            }
+                            if keybindings.matches(&key_str, TuiAction::ScrollDown) {
+                                let max_scroll = state.last_max_scroll.load(Ordering::Relaxed);
+                                state.scroll_offset =
+                                    state.scroll_offset.min(max_scroll).saturating_sub(5);
+                                render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                                continue 'outer;
+                            }
+                            if keybindings.matches(&key_str, TuiAction::ScrollBottom) {
+                                state.scroll_offset = 0;
+                                render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                                continue 'outer;
+                            }
+
                             // 3. Normal editor input handling
                             let output = editor.handle_editor_key(&key_str, &keybindings);
                             match output {
@@ -1873,15 +2420,25 @@ pub async fn run_interactive_mode(
                                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
                                         }
                                         SlashCommandOutcome::NotACommand => {
+                                            state.scroll_offset = 0;
                                             state.items.push(TranscriptItem::User(trimmed.to_string()));
-                                            start_turn(session, &mut state, trimmed, &agent_tx);
-                                            turn_running = true;
+                                            state.last_prompt_text = Some(trimmed.to_string());
+                                            state.overflow_retried = false;
+                                            state.is_busy = true;
+                                            state.status = Some("Preparing turn...".to_string());
                                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                                            start_turn_preparation(
+                                                session,
+                                                trimmed,
+                                                state.auth_file.as_deref(),
+                                                &agent_tx,
+                                            );
+                                            turn_running = true;
                                         }
                                     }
                                 }
                                 EditorOutput::Changed(current_text) => {
-                                    update_autocomplete(&mut editor, &current_text);
+                                    update_autocomplete_with_cwd(&mut editor, &current_text, &session.cwd);
                                     render_now(&state, &editor, session, &mut terminal, &mut renderer);
                                 }
                                 EditorOutput::None => {
@@ -1894,10 +2451,16 @@ pub async fn run_interactive_mode(
                 }
             }
             Some(sig) = agent_rx.recv() => {
-                let turn_ended = apply_agent_signal(sig, session, &mut state);
-                if turn_ended {
-                    turn_running = false;
-                    render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                match handle_agent_signal_async(sig, session, &mut state, &agent_tx).await {
+                    SignalOutcome::TurnEnded => {
+                        turn_running = false;
+                        render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                    }
+                    SignalOutcome::RetryStarted => {
+                        turn_running = true;
+                        render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                    }
+                    SignalOutcome::Continuing => {}
                 }
                 // Streaming updates are painted by the 80 ms tick, so a burst of
                 // token deltas does not rebuild the frame for every delta.
@@ -1938,6 +2501,7 @@ mod tests {
             context_window: 100_000,
             max_tokens: 4096,
             headers: None,
+            ..Default::default()
         };
         AgentSession::new(
             temp_dir,
@@ -2567,7 +3131,7 @@ mod tests {
     fn test_update_autocomplete_offers_only_the_missing_suffix() {
         let mut editor = Editor::new();
         editor.set_text("/t");
-        update_autocomplete(&mut editor, "/t");
+        update_autocomplete_with_cwd(&mut editor, "/t", Path::new("."));
 
         let items = editor.autocomplete.as_ref().expect("popup").items.clone();
         let theme = items.iter().find(|i| i.id == "/theme").expect("/theme offered");
@@ -2585,7 +3149,7 @@ mod tests {
         let mut editor = Editor::new();
         editor.set_text("/theme");
         let typed = editor.text();
-        update_autocomplete(&mut editor, &typed);
+        update_autocomplete_with_cwd(&mut editor, &typed, Path::new("."));
         assert!(
             editor.autocomplete.is_none(),
             "an exact command must not keep the popup open"
@@ -3024,6 +3588,7 @@ mod tests {
                 AgentSignal::Failed(message) => {
                     panic!("the agent turn failed unexpectedly: {message}");
                 }
+                _ => {}
             }
         }
 
@@ -3063,5 +3628,135 @@ mod tests {
                 text: "hi there".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn test_sync_mcp_tools_preserves_multi_paragraph_custom_prompt() {
+        let mut session = make_test_session();
+        session.set_custom_system_prompt(
+            Some("First paragraph.\n\nSecond paragraph.".to_string()),
+            Some("Append line.".to_string()),
+        );
+        sync_mcp_tools(&mut session, Vec::new(), true);
+        assert!(session
+            .system_prompt
+            .contains("First paragraph.\n\nSecond paragraph."));
+        assert!(session.system_prompt.contains("Append line."));
+        assert!(session.system_prompt.contains("codemode"));
+    }
+
+    #[test]
+    fn test_update_autocomplete_with_cwd_completes_and_replaces_at_file() {
+        let dir = std::env::temp_dir().join(format!("mehh_ic_at_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src").join("alpha.rs"), "fn a() {}").unwrap();
+
+        let mut editor = Editor::new();
+        let kb = Keybindings::default_bindings();
+        for ch in "inspect @src/al".chars() {
+            let _ = editor.handle_editor_key(&ch.to_string(), &kb);
+        }
+        let text = editor.text();
+        update_autocomplete_with_cwd(&mut editor, &text, &dir);
+
+        let popup = editor.autocomplete.as_ref().expect("@file popup");
+        assert!(popup.items.iter().any(|it| it.id == "@src/alpha.rs"));
+
+        let _ = editor.handle_editor_key("tab", &kb);
+        assert_eq!(editor.text(), "inspect @src/alpha.rs");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_interactive_surfaces_errors_and_retries_context_overflow() {
+        let dir = crate::TempTestDir::new("ic_overflow");
+        let mut sm = SessionManager::in_memory(dir.path());
+        for i in 0..4 {
+            sm.append_message(Message::User(mehh_ai::UserMessage {
+                content: mehh_ai::UserContent::Text(format!("prior prompt {i}: {}", "data ".repeat(800))),
+                timestamp: mehh_ai::now_ms(),
+            }))
+            .unwrap();
+            sm.append_message(Message::Assistant(mehh_ai::faux_assistant_message(&format!(
+                "prior reply {i}: {}",
+                "reply ".repeat(800)
+            ))))
+            .unwrap();
+        }
+
+        let faux = Arc::new(mehh_ai::FauxProvider::with_responses(vec![
+            mehh_ai::AssistantMessage {
+                content: Vec::new(),
+                api: "faux".to_string(),
+                provider: "faux".to_string(),
+                model: "faux-model".to_string(),
+                response_id: None,
+                usage: Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some("prompt is too long: exceeded context length".to_string()),
+                timestamp: mehh_ai::now_ms(),
+            },
+            mehh_ai::faux_assistant_message("## Goal\nCompacted summary."),
+            mehh_ai::faux_assistant_message("Recovered in interactive!"),
+        ]));
+
+        let mut model = mehh_ai::faux_model();
+        model.context_window = 200_000;
+        let mut session = AgentSession::new_with_trust(
+            dir.path().to_path_buf(),
+            model,
+            faux,
+            sm,
+            Settings::default(),
+            false,
+        );
+        let mut state = make_test_state();
+
+        // Direct MessageEnd error event surfaces as TranscriptItem::System
+        let err_ast = mehh_ai::AssistantMessage {
+            content: Vec::new(),
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            model: "faux-model".to_string(),
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("invalid api key".to_string()),
+            timestamp: mehh_ai::now_ms(),
+        };
+        apply_agent_event(
+            &mut state,
+            &AgentEvent::MessageEnd {
+                message: Message::Assistant(err_ast),
+            },
+        );
+        assert!(matches!(
+            state.items.last(),
+            Some(TranscriptItem::System(s)) if s.contains("invalid api key")
+        ));
+
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+        let _keepalive = agent_tx.clone();
+        state.last_prompt_text = Some("continue".to_string());
+        state.overflow_retried = false;
+        start_turn(&session, &mut state, "continue", &agent_tx);
+
+        while let Some(sig) = agent_rx.recv().await {
+            if matches!(
+                handle_agent_signal_async(sig, &mut session, &mut state, &agent_tx).await,
+                SignalOutcome::TurnEnded
+            ) {
+                break;
+            }
+        }
+
+        assert!(session.session().entries().iter().any(|e| {
+            matches!(e.kind, SessionEntryKind::Compaction { .. })
+        }));
+        assert!(state.items.iter().any(|it| matches!(
+            it,
+            TranscriptItem::Assistant { text, .. } if text.contains("Recovered in interactive!")
+        )));
     }
 }

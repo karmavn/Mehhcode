@@ -21,6 +21,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 64_000,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "claude-opus-4-5".to_string(),
@@ -39,6 +40,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 32_000,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "claude-3-7-sonnet-latest".to_string(),
@@ -57,6 +59,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 64_000,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "claude-3-5-haiku-latest".to_string(),
@@ -75,6 +78,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
 
         // 2. OpenAI models (openai-completions + gpt-5 / codex)
@@ -95,6 +99,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "gpt-4.1".to_string(),
@@ -113,6 +118,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "gpt-4.1-mini".to_string(),
@@ -131,6 +137,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "o3".to_string(),
@@ -149,6 +156,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 100_000,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "o4-mini".to_string(),
@@ -167,6 +175,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 65_536,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "gpt-5".to_string(),
@@ -185,6 +194,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 256_000,
             max_tokens: 32_768,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "codex".to_string(),
@@ -203,6 +213,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
+            ..Default::default()
         },
 
         // 3. OpenAI Responses models (openai-responses)
@@ -223,6 +234,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "o3".to_string(),
@@ -241,6 +253,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 100_000,
             headers: None,
+            ..Default::default()
         },
 
         // 4. Google models (google-generative-ai)
@@ -261,6 +274,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 1_000_000,
             max_tokens: 65_536,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "gemini-2.5-flash".to_string(),
@@ -279,6 +293,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 1_000_000,
             max_tokens: 65_536,
             headers: None,
+            ..Default::default()
         },
 
         // 5. Google Vertex models (google-vertex)
@@ -299,6 +314,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 1_000_000,
             max_tokens: 65_536,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "gemini-2.5-flash".to_string(),
@@ -317,6 +333,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 1_000_000,
             max_tokens: 65_536,
             headers: None,
+            ..Default::default()
         },
 
         // 6. Amazon Bedrock models (bedrock-converse-stream)
@@ -337,6 +354,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 64_000,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "us.anthropic.claude-sonnet-4-20250514-v1:0".to_string(),
@@ -355,6 +373,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 64_000,
             headers: None,
+            ..Default::default()
         },
 
         // 7. Mistral models (mistral-conversations)
@@ -375,6 +394,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 32_768,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "codestral-latest".to_string(),
@@ -393,6 +413,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 256_000,
             max_tokens: 32_768,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "magistral-medium-latest".to_string(),
@@ -411,6 +432,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 32_768,
             headers: None,
+            ..Default::default()
         },
 
         // 8. Azure OpenAI Responses models (azure-openai-responses)
@@ -431,6 +453,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "o3".to_string(),
@@ -449,6 +472,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 100_000,
             headers: None,
+            ..Default::default()
         },
 
         // 9. OpenRouter models (openai-completions)
@@ -469,6 +493,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 64_000,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "openai/gpt-4o".to_string(),
@@ -487,6 +512,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 16_384,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "deepseek/deepseek-r1".to_string(),
@@ -505,6 +531,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 64_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
 
         // 10. Groq models (openai-completions)
@@ -525,6 +552,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "deepseek-r1-distill-llama-70b".to_string(),
@@ -543,6 +571,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
 
         // 11. DeepSeek models (openai-completions)
@@ -563,6 +592,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 64_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "deepseek-reasoner".to_string(),
@@ -581,6 +611,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 64_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
 
         // 12. xAI models (openai-completions)
@@ -601,6 +632,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 131_072,
             max_tokens: 32_768,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "grok-3-mini".to_string(),
@@ -619,6 +651,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 131_072,
             max_tokens: 32_768,
             headers: None,
+            ..Default::default()
         },
 
         // 13. Cerebras models (openai-completions)
@@ -639,6 +672,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "qwen-3-32b".to_string(),
@@ -657,6 +691,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
 
         // 14. Together models (openai-completions)
@@ -677,6 +712,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 131_072,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "deepseek-ai/DeepSeek-R1".to_string(),
@@ -695,6 +731,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 131_072,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
 
         // 15. Fireworks models (openai-completions)
@@ -715,6 +752,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 131_072,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         },
 
         // 16. GitHub Copilot models (openai-completions)
@@ -730,6 +768,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 128_000,
             max_tokens: 4096,
             headers: None,
+            ..Default::default()
         },
         Model {
             id: "claude-sonnet-4.5".to_string(),
@@ -743,6 +782,7 @@ pub fn builtin_models() -> Vec<Model> {
             context_window: 200_000,
             max_tokens: 4096,
             headers: None,
+            ..Default::default()
         },
     ]
 }

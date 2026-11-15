@@ -1,5 +1,6 @@
 //! MCP tool adapter exposing MCP tools as `mehh_agent::AgentTool` implementations.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
@@ -10,7 +11,60 @@ use tokio::sync::RwLock;
 use crate::client::{McpCallToolResult, McpClient, McpContentBlock, McpToolInfo};
 
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
+pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 4096;
+pub const MAX_TOOL_SCHEMA_BYTES: usize = 64 * 1024;
 pub const MCP_OUTPUT_MAX_BYTES: usize = 20 * 1024; // 20KB model-facing limit
+pub const MCP_RESOURCE_MAX_BYTES: usize = 100 * 1024; // 100KB cap for resources/images
+
+/// Sanitizes untrusted control characters and caps length on a UTF-8 char boundary.
+pub fn sanitize_mcp_text(raw: &str, max_bytes: usize) -> String {
+    let cleaned: String = raw
+        .chars()
+        .filter(|&c| {
+            let code = c as u32;
+            c == '\n' || c == '\t' || (code >= 0x20 && code != 0x7f && !(0x80..=0x9f).contains(&code))
+        })
+        .collect();
+    if cleaned.len() <= max_bytes {
+        return cleaned;
+    }
+    let mut end = max_bytes.saturating_sub(3);
+    while end > 0 && !cleaned.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &cleaned[..end])
+}
+
+fn sanitize_schema_value(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::String(s) => {
+            *s = sanitize_mcp_text(s, MAX_TOOL_DESCRIPTION_BYTES);
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                sanitize_schema_value(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for v in map.values_mut() {
+                sanitize_schema_value(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_input_schema(mut schema: serde_json::Value) -> serde_json::Value {
+    sanitize_schema_value(&mut schema);
+    if serde_json::to_vec(&schema)
+        .map(|b| b.len() > MAX_TOOL_SCHEMA_BYTES)
+        .unwrap_or(true)
+    {
+        serde_json::json!({ "type": "object" })
+    } else {
+        schema
+    }
+}
 
 /// Sanitizes and formats an MCP tool into `mcp__<server>__<tool>`.
 /// When length exceeds 64 characters, shortens to 55 characters + `_` + 8-char SHA-256 suffix.
@@ -31,6 +85,54 @@ pub fn create_mcp_tool_name(server: &str, tool: &str) -> String {
         let prefix = &sanitized[..55];
         format!("{prefix}_{hash_prefix}")
     }
+}
+
+/// Generates a sanitized `mcp__<server>__<tool>` name guaranteed unique against `used_names`.
+pub fn resolve_unique_mcp_tool_name(
+    server: &str,
+    tool: &str,
+    used_names: &mut HashSet<String>,
+) -> String {
+    let base = create_mcp_tool_name(server, tool);
+    if used_names.insert(base.clone()) {
+        return base;
+    }
+
+    let mut suffix_num = 2usize;
+    loop {
+        let suffix = format!("_{suffix_num}");
+        let max_prefix_len = MAX_TOOL_NAME_LENGTH.saturating_sub(suffix.len());
+        let mut prefix_len = max_prefix_len.min(base.len());
+        while prefix_len > 0 && !base.is_char_boundary(prefix_len) {
+            prefix_len -= 1;
+        }
+        let candidate = format!("{}{}", &base[..prefix_len], suffix);
+        if used_names.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix_num += 1;
+    }
+}
+
+/// Builds collision-free `McpAgentTool` adapters for a list of tools from one server.
+pub fn create_mcp_agent_tools(
+    server_name: &str,
+    tools: Vec<McpToolInfo>,
+    client: Arc<McpClient>,
+) -> Vec<Arc<dyn AgentTool>> {
+    let mut used = HashSet::new();
+    tools
+        .into_iter()
+        .map(|info| {
+            let unique_name = resolve_unique_mcp_tool_name(server_name, &info.name, &mut used);
+            Arc::new(McpAgentTool::with_resolved_name(
+                server_name,
+                info,
+                client.clone(),
+                unique_name,
+            )) as Arc<dyn AgentTool>
+        })
+        .collect()
 }
 
 /// Computes the server namespace `mcp__<server>` with hyphens replaced by underscores.
@@ -67,10 +169,34 @@ pub fn truncate_middle(text: &str, max_bytes: usize) -> Option<String> {
     ))
 }
 
+fn push_capped_image(
+    data: String,
+    mime_type: String,
+    images: &mut Vec<ToolResultContentBlock>,
+    text_parts: &mut Vec<String>,
+    total_image_bytes: &mut usize,
+) {
+    let new_total = total_image_bytes.saturating_add(data.len());
+    if new_total > MCP_RESOURCE_MAX_BYTES {
+        text_parts.push(format!(
+            "[image {mime_type} omitted: {} bytes exceeds {} byte cap]",
+            data.len(),
+            MCP_RESOURCE_MAX_BYTES
+        ));
+    } else {
+        *total_image_bytes = new_total;
+        images.push(ToolResultContentBlock::Image(ImageContent {
+            data,
+            mime_type,
+        }));
+    }
+}
+
 /// Converts an MCP tool call result into an `AgentToolResult` conforming to `mehh_agent`.
 pub fn convert_mcp_result(call_res: McpCallToolResult) -> AgentToolResult {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
+    let mut total_image_bytes = 0usize;
 
     for block in call_res.content {
         match block {
@@ -78,10 +204,7 @@ pub fn convert_mcp_result(call_res: McpCallToolResult) -> AgentToolResult {
                 text_parts.push(text);
             }
             McpContentBlock::Image { data, mime_type } => {
-                images.push(ToolResultContentBlock::Image(ImageContent {
-                    data,
-                    mime_type,
-                }));
+                push_capped_image(data, mime_type, &mut images, &mut text_parts, &mut total_image_bytes);
             }
             McpContentBlock::Audio { mime_type, .. } => {
                 text_parts.push(format!("[audio {mime_type} omitted]"));
@@ -91,16 +214,21 @@ pub fn convert_mcp_result(call_res: McpCallToolResult) -> AgentToolResult {
             }
             McpContentBlock::Resource { resource } => {
                 if let Some(text) = resource.get("text").and_then(|t| t.as_str()) {
-                    text_parts.push(text.to_string());
+                    let display = truncate_middle(text, MCP_RESOURCE_MAX_BYTES)
+                        .unwrap_or_else(|| text.to_string());
+                    text_parts.push(display);
                 } else if let (Some(blob), Some(mime)) = (
                     resource.get("blob").and_then(|b| b.as_str()),
                     resource.get("mimeType").and_then(|m| m.as_str()),
                 ) {
                     if mime.starts_with("image/") {
-                        images.push(ToolResultContentBlock::Image(ImageContent {
-                            data: blob.to_string(),
-                            mime_type: mime.to_string(),
-                        }));
+                        push_capped_image(
+                            blob.to_string(),
+                            mime.to_string(),
+                            &mut images,
+                            &mut text_parts,
+                            &mut total_image_bytes,
+                        );
                     } else {
                         text_parts.push("[binary resource omitted]".to_string());
                     }
@@ -146,6 +274,8 @@ pub struct McpAgentTool {
     server_name: String,
     tool_name: String,
     adapter_name: String,
+    sanitized_description: String,
+    sanitized_schema: serde_json::Value,
     tool_info: McpToolInfo,
     client: Arc<McpClient>,
 }
@@ -155,11 +285,27 @@ impl McpAgentTool {
     pub fn new(server_name: impl Into<String>, tool_info: McpToolInfo, client: Arc<McpClient>) -> Self {
         let server = server_name.into();
         let adapter_name = create_mcp_tool_name(&server, &tool_info.name);
+        Self::with_resolved_name(server, tool_info, client, adapter_name)
+    }
+
+    /// Creates a new MCP agent tool adapter with an explicit pre-deduplicated adapter name.
+    pub fn with_resolved_name(
+        server_name: impl Into<String>,
+        tool_info: McpToolInfo,
+        client: Arc<McpClient>,
+        adapter_name: impl Into<String>,
+    ) -> Self {
+        let server = server_name.into();
         let tool_name = tool_info.name.clone();
+        let sanitized_description =
+            sanitize_mcp_text(tool_info.description.as_deref().unwrap_or(""), MAX_TOOL_DESCRIPTION_BYTES);
+        let sanitized_schema = sanitize_input_schema(tool_info.input_schema.clone());
         Self {
             server_name: server,
             tool_name,
-            adapter_name,
+            adapter_name: adapter_name.into(),
+            sanitized_description,
+            sanitized_schema,
             tool_info,
             client,
         }
@@ -189,11 +335,11 @@ impl AgentTool for McpAgentTool {
     }
 
     fn description(&self) -> &str {
-        self.tool_info.description.as_deref().unwrap_or("")
+        &self.sanitized_description
     }
 
     fn parameters(&self) -> serde_json::Value {
-        self.tool_info.input_schema.clone()
+        self.sanitized_schema.clone()
     }
 
     fn execution_mode(&self) -> ToolExecutionMode {
@@ -380,9 +526,10 @@ impl AgentTool for ListMcpResourcesTool {
         };
 
         let formatted = serde_json::to_string_pretty(&result_json).unwrap_or_default();
+        let output = truncate_middle(&formatted, MCP_OUTPUT_MAX_BYTES).unwrap_or(formatted);
         Ok(AgentToolResult {
             content: vec![ToolResultContentBlock::Text(TextContent {
-                text: formatted,
+                text: output,
                 text_signature: None,
             })],
             details: Some(result_json),
@@ -503,9 +650,10 @@ impl AgentTool for ListMcpResourceTemplatesTool {
         };
 
         let formatted = serde_json::to_string_pretty(&result_json).unwrap_or_default();
+        let output = truncate_middle(&formatted, MCP_OUTPUT_MAX_BYTES).unwrap_or(formatted);
         Ok(AgentToolResult {
             content: vec![ToolResultContentBlock::Text(TextContent {
-                text: formatted,
+                text: output,
                 text_signature: None,
             })],
             details: Some(result_json),
@@ -591,6 +739,7 @@ impl AgentTool for ReadMcpResourceTool {
 
         let mut blocks = Vec::new();
         let mut text_parts = Vec::new();
+        let mut total_image_bytes = 0usize;
 
         if let Some(contents_arr) = res.get("contents").and_then(|v| v.as_array()) {
             for item in contents_arr {
@@ -601,10 +750,13 @@ impl AgentTool for ReadMcpResourceTool {
                     item.get("mimeType").and_then(|m| m.as_str()),
                 ) {
                     if mime.starts_with("image/") {
-                        blocks.push(ToolResultContentBlock::Image(ImageContent {
-                            data: blob.to_string(),
-                            mime_type: mime.to_string(),
-                        }));
+                        push_capped_image(
+                            blob.to_string(),
+                            mime.to_string(),
+                            &mut blocks,
+                            &mut text_parts,
+                            &mut total_image_bytes,
+                        );
                     } else {
                         text_parts.push(format!("[binary resource {mime} omitted]"));
                     }
@@ -618,10 +770,11 @@ impl AgentTool for ReadMcpResourceTool {
 
         let combined = text_parts.join("\n");
         if !combined.is_empty() {
+            let final_text = truncate_middle(&combined, MCP_RESOURCE_MAX_BYTES).unwrap_or(combined);
             blocks.insert(
                 0,
                 ToolResultContentBlock::Text(TextContent {
-                    text: combined,
+                    text: final_text,
                     text_signature: None,
                 }),
             );
@@ -658,6 +811,52 @@ mod tests {
         assert_eq!(name.len(), 64);
         assert!(name.starts_with("mcp__aaaaaaaaaa"));
         assert_eq!(name.chars().nth(55), Some('_'));
+    }
+
+    #[test]
+    fn test_resolve_unique_mcp_tool_name_deduplicates_collisions() {
+        let mut used = HashSet::new();
+        let n1 = resolve_unique_mcp_tool_name("srv", "foo-bar", &mut used);
+        let n2 = resolve_unique_mcp_tool_name("srv", "foo.bar", &mut used);
+        assert_eq!(n1, "mcp__srv__foo_bar");
+        assert_eq!(n2, "mcp__srv__foo_bar_2");
+
+        let long_a = format!("{}a", "x".repeat(60));
+        let long_b = format!("{}b", "x".repeat(60));
+        let l1 = resolve_unique_mcp_tool_name("srv", &long_a, &mut used);
+        let l2 = resolve_unique_mcp_tool_name("srv", &long_b, &mut used);
+        assert!(l1.len() <= MAX_TOOL_NAME_LENGTH);
+        assert!(l2.len() <= MAX_TOOL_NAME_LENGTH);
+        assert_ne!(l1, l2);
+    }
+
+    #[test]
+    fn test_sanitize_mcp_text_strips_control_and_truncates_utf8_safely() {
+        let dirty = format!("hello\x1b[31m world\t\n{}", "界".repeat(2000));
+        let clean = sanitize_mcp_text(&dirty, MAX_TOOL_DESCRIPTION_BYTES);
+        assert!(!clean.contains('\x1b'));
+        assert!(clean.contains('\t'));
+        assert!(clean.contains('\n'));
+        assert!(clean.len() <= MAX_TOOL_DESCRIPTION_BYTES);
+    }
+
+    #[test]
+    fn test_convert_mcp_result_caps_oversized_images() {
+        let big_img = "A".repeat(MCP_RESOURCE_MAX_BYTES + 10);
+        let res = McpCallToolResult {
+            content: vec![McpContentBlock::Image {
+                data: big_img,
+                mime_type: "image/png".to_string(),
+            }],
+            is_error: false,
+            structured_content: None,
+        };
+        let converted = convert_mcp_result(res);
+        assert_eq!(converted.content.len(), 1);
+        match &converted.content[0] {
+            ToolResultContentBlock::Text(t) => assert!(t.text.contains("exceeds")),
+            _ => panic!("expected text omission warning"),
+        }
     }
 
     #[test]

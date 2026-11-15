@@ -798,13 +798,11 @@ checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
 name = "mehh-agent"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "async-trait",
  "futures",
  "mehh-ai",
  "serde",
  "serde_json",
- "thiserror",
  "tokio",
  "tokio-util",
 ]
@@ -819,14 +817,13 @@ dependencies = [
  "crc32fast",
  "futures",
  "hmac",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
  "sha2",
- "thiserror",
  "tokio",
  "tokio-util",
- "tracing",
  "uuid",
 ]
 
@@ -840,7 +837,6 @@ dependencies = [
  "mehh-ai",
  "mehh-coding-agent",
  "mehh-tools",
- "serde_json",
  "tokio",
 ]
 
@@ -868,6 +864,7 @@ dependencies = [
  "async-trait",
  "crossterm",
  "futures",
+ "ignore",
  "mehh-agent",
  "mehh-ai",
  "mehh-codemode",
@@ -898,7 +895,6 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
- "thiserror",
  "tokio",
  "tokio-util",
  "tracing",
@@ -921,19 +917,16 @@ dependencies = [
  "similar",
  "tokio",
  "tokio-util",
- "tracing",
 ]
 
 [[package]]
 name = "mehh-tui"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "crossterm",
  "pulldown-cmark",
  "serde",
  "serde_json",
- "tokio",
  "unicode-segmentation",
  "unicode-width",
 ]

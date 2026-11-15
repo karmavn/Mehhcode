@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 
 use mehh_agent::AgentEvent;
-use mehh_ai::{AssistantMessageEvent, Message};
+use mehh_ai::{AssistantMessageEvent, Message, StopReason};
 
 use crate::agent_session::AgentSession;
 
@@ -51,13 +51,24 @@ pub async fn run_print_mode(
 
     let new_messages = session.prompt(prompt, Some(on_event)).await?;
 
-    let final_text = new_messages
-        .iter()
-        .rev()
-        .find_map(|m| match m {
-            Message::Assistant(a) => Some(a.text_content()),
-            _ => None,
-        })
+    let final_assistant = new_messages.iter().rev().find_map(|m| match m {
+        Message::Assistant(a) => Some(a),
+        _ => None,
+    });
+
+    if let Some(ast) = final_assistant {
+        if matches!(ast.stop_reason, StopReason::Error | StopReason::Aborted) {
+            anyhow::bail!(
+                "{}",
+                ast.error_message
+                    .clone()
+                    .unwrap_or_else(|| format!("Agent stopped with {:?}", ast.stop_reason))
+            );
+        }
+    }
+
+    let final_text = final_assistant
+        .map(|a| a.text_content())
         .unwrap_or_default();
 
     if mode == OutputMode::Text {
@@ -69,4 +80,46 @@ pub async fn run_print_mode(
     }
 
     Ok(final_text)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mehh_ai::{
+        faux_model, now_ms, AssistantMessage, FauxProvider, TextContent, Usage,
+    };
+    use crate::session::SessionManager;
+    use crate::settings::Settings;
+
+    #[tokio::test]
+    async fn test_run_print_mode_propagates_provider_error() {
+        let dir = std::env::temp_dir().join(format!("mehh_print_err_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let faux = Arc::new(FauxProvider::with_responses(vec![AssistantMessage {
+            content: vec![mehh_ai::AssistantContentBlock::Text(TextContent {
+                text: String::new(),
+                text_signature: None,
+            })],
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            model: "faux-model".to_string(),
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("upstream 500 failure".to_string()),
+            timestamp: now_ms(),
+        }]));
+        let mut session = AgentSession::new(
+            dir.clone(),
+            faux_model(),
+            faux,
+            SessionManager::in_memory(&dir),
+            Settings::default(),
+        );
+        let err = run_print_mode(&mut session, "hello", OutputMode::Json)
+            .await
+            .expect_err("print mode must fail when assistant stops with Error");
+        assert!(format!("{err:#}").contains("upstream 500 failure"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

@@ -1,12 +1,13 @@
 //! Headless RPC protocol for embedding the coding agent over asynchronous stdin/stdout or duplex streams.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 use anyhow::Result;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 
 use mehh_agent::AgentEvent;
-use mehh_ai::{Model, ThinkingLevel};
+use mehh_ai::{Message, StopReason, ThinkingLevel};
 
 use crate::agent_session::AgentSession;
 
@@ -134,15 +135,21 @@ where
 {
     let output = RpcOutput::new(writer);
     let mut line = String::new();
+    let mut pending_lines: VecDeque<String> = VecDeque::new();
 
     loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).await?;
-        if bytes_read == 0 {
-            break;
-        }
+        let raw_line = if let Some(queued) = pending_lines.pop_front() {
+            queued
+        } else {
+            line.clear();
+            let bytes_read = reader.read_line(&mut line).await?;
+            if bytes_read == 0 {
+                break;
+            }
+            line.clone()
+        };
 
-        let trimmed = line.trim();
+        let trimmed = raw_line.trim();
         if trimmed.is_empty() {
             continue;
         }
@@ -185,13 +192,70 @@ where
                     let _ = event_tx.send(ev);
                 });
 
-                let prompt_res = session.prompt(message, Some(on_event)).await;
+                let cancel_slot = session.active_cancel_slot();
+                let prompt_res = {
+                    let prompt_fut = session.prompt(message, Some(on_event));
+                    tokio::pin!(prompt_fut);
+                    let mut concurrent_line = String::new();
+                    let mut stdin_eof = false;
+
+                    loop {
+                        tokio::select! {
+                            res = &mut prompt_fut => break res,
+                            read_res = reader.read_line(&mut concurrent_line), if !stdin_eof => {
+                                match read_res {
+                                    Ok(0) => {
+                                        stdin_eof = true;
+                                    }
+                                    Ok(_) => {
+                                        let conc_trimmed = concurrent_line.trim().to_string();
+                                        concurrent_line.clear();
+                                        if conc_trimmed.is_empty() {
+                                            continue;
+                                        }
+                                        if let Ok(cval) = serde_json::from_str::<serde_json::Value>(&conc_trimmed) {
+                                            if cval.get("type").and_then(|v| v.as_str()) == Some("abort") {
+                                                let cid = cval.get("id").and_then(|v| v.as_str());
+                                                if let Some(tok) = cancel_slot.lock().unwrap().take() {
+                                                    tok.cancel();
+                                                }
+                                                output.send_success(cid, "abort", None).await?;
+                                                continue;
+                                            }
+                                        }
+                                        pending_lines.push_back(conc_trimmed);
+                                    }
+                                    Err(e) => return Err(e.into()),
+                                }
+                            }
+                        }
+                    }
+                };
+
                 // Allow event drain task to finish processing buffered events
                 let _ = drain_handle.await;
 
                 match prompt_res {
-                    Ok(_) => {
-                        output.send_success(id, "prompt", None).await?;
+                    Ok(new_messages) => {
+                        let stop_err = new_messages.iter().rev().find_map(|m| match m {
+                            Message::Assistant(a)
+                                if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) =>
+                            {
+                                Some(
+                                    a.error_message
+                                        .clone()
+                                        .unwrap_or_else(|| {
+                                            format!("Agent stopped with {:?}", a.stop_reason)
+                                        }),
+                                )
+                            }
+                            _ => None,
+                        });
+                        if let Some(err_msg) = stop_err {
+                            output.send_error(id, "prompt", &err_msg).await?;
+                        } else {
+                            output.send_success(id, "prompt", None).await?;
+                        }
                     }
                     Err(e) => {
                         output.send_error(id, "prompt", &e.to_string()).await?;
@@ -216,36 +280,62 @@ where
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
 
-                let all_models = mehh_ai::builtin_models();
-                let found = all_models.into_iter().find(|m| {
-                    m.provider.eq_ignore_ascii_case(provider)
-                        && m.id.eq_ignore_ascii_case(model_id)
-                });
-
-                let model = match found {
-                    Some(m) => m,
-                    None => Model {
-                        id: model_id.to_string(),
-                        name: model_id.to_string(),
-                        api: match provider {
-                            "anthropic" => "anthropic-messages".to_string(),
-                            "google" | "gemini" => "google-generative-ai".to_string(),
-                            "openai-responses" => "openai-responses".to_string(),
-                            _ => "openai-completions".to_string(),
-                        },
-                        provider: provider.to_string(),
-                        base_url: String::new(),
-                        reasoning: false,
-                        input: vec!["text".to_string()],
-                        cost: Default::default(),
-                        context_window: 128_000,
-                        max_tokens: 4096,
-                        headers: None,
-                    },
+                let reg = match crate::models_config::ModelRegistry::load_default() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        output
+                            .send_error(
+                                id,
+                                "set_model",
+                                &format!("Failed to load models registry: {e}"),
+                            )
+                            .await?;
+                        continue;
+                    }
                 };
 
+                let model = match reg.resolve_exact(provider, model_id) {
+                    Some(m) => m,
+                    None => {
+                        output
+                            .send_error(
+                                id,
+                                "set_model",
+                                &format!("Unknown model '{provider}/{model_id}'"),
+                            )
+                            .await?;
+                        continue;
+                    }
+                };
+
+                let resolved_key = if model.provider != "faux" && model.api != "faux" {
+                    match crate::auth::resolve_api_key_async(&model.provider, None, None).await {
+                        Ok(key) => key.or_else(|| {
+                            reg.provider_api_key(&model.provider).map(str::to_string)
+                        }),
+                        Err(e) => {
+                            output
+                                .send_error(
+                                    id,
+                                    "set_model",
+                                    &format!("Failed to resolve provider credentials: {e}"),
+                                )
+                                .await?;
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                let provider_changed = !session.model.provider.eq_ignore_ascii_case(&model.provider);
                 let prov = AgentSession::default_provider_for_model(&model);
                 session.set_model(model.clone(), prov);
+                if let Some(key) = resolved_key {
+                    if provider_changed || !session.has_explicit_api_key() {
+                        session.set_api_key(Some(key));
+                    }
+                }
                 output
                     .send_success(id, "set_model", Some(serde_json::to_value(&model)?))
                     .await?;
@@ -269,16 +359,26 @@ where
                     output.send_success(id, "set_thinking_level", None).await?;
                 }
             }
-            "get_available_models" => {
-                let models = mehh_ai::builtin_models();
-                output
-                    .send_success(
-                        id,
-                        "get_available_models",
-                        Some(serde_json::json!({ "models": models })),
-                    )
-                    .await?;
-            }
+            "get_available_models" => match crate::models_config::ModelRegistry::load_default() {
+                Ok(reg) => {
+                    output
+                        .send_success(
+                            id,
+                            "get_available_models",
+                            Some(serde_json::json!({ "models": reg.models() })),
+                        )
+                        .await?;
+                }
+                Err(e) => {
+                    output
+                        .send_error(
+                            id,
+                            "get_available_models",
+                            &format!("Failed to load models registry: {e}"),
+                        )
+                        .await?;
+                }
+            },
             "get_messages" => {
                 let messages = session.session().build_context_messages();
                 output
@@ -354,6 +454,7 @@ where
                 }
             },
             "abort" => {
+                session.abort();
                 output.send_success(id, "abort", None).await?;
             }
             _ => {
@@ -375,8 +476,8 @@ mod tests {
     use uuid::Uuid;
 
     use mehh_ai::{
-        now_ms, AssistantContentBlock, AssistantMessage, FauxProvider, ModelCost, StopReason,
-        TextContent, Usage,
+        now_ms, AssistantContentBlock, AssistantMessage, FauxProvider, Model, ModelCost,
+        StopReason, TextContent, Usage,
     };
 
     use crate::session::SessionManager;
@@ -395,6 +496,7 @@ mod tests {
             context_window: 100_000,
             max_tokens: 4096,
             headers: None,
+            ..Default::default()
         }
     }
 
@@ -549,6 +651,101 @@ mod tests {
         let res = rpc_handle.await.unwrap();
         assert!(res.is_ok());
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_rpc_rejects_unknown_model_and_reports_provider_error() {
+        let temp_dir = std::env::temp_dir().join(format!("mehh_rpc_err_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let faux = Arc::new(FauxProvider::with_responses(vec![mehh_ai::AssistantMessage {
+            content: vec![mehh_ai::AssistantContentBlock::Text(mehh_ai::TextContent {
+                text: String::new(),
+                text_signature: None,
+            })],
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            model: "faux-model".to_string(),
+            response_id: None,
+            usage: mehh_ai::Usage::default(),
+            stop_reason: StopReason::Error,
+            error_message: Some("upstream rpc error".to_string()),
+            timestamp: mehh_ai::now_ms(),
+        }]));
+
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            make_test_model(),
+            faux,
+            crate::session::SessionManager::in_memory(&temp_dir),
+            crate::settings::Settings::default(),
+        );
+
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let (server_read, server_write) = tokio::io::split(server_stream);
+        let (client_read, mut client_write) = tokio::io::split(client_stream);
+
+        let rpc_handle = tokio::spawn(async move {
+            run_rpc_mode(&mut session, tokio::io::BufReader::new(server_read), server_write).await
+        });
+
+        let mut reader = tokio::io::BufReader::new(client_read);
+        let mut line = String::new();
+
+        // 1. Unknown model fails with success: false
+        let bad_model = serde_json::json!({
+            "id": "m1",
+            "type": "set_model",
+            "provider": "openai",
+            "modelId": "nonexistent-model-xyz"
+        });
+        client_write
+            .write_all(format!("{bad_model}\n").as_bytes())
+            .await
+            .unwrap();
+        client_write.flush().await.unwrap();
+
+        line.clear();
+        reader.read_line(&mut line).await.unwrap();
+        let m_resp: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(m_resp["id"], "m1");
+        assert_eq!(m_resp["success"], false);
+
+        // 2. Prompt returning StopReason::Error fails with success: false
+        let bad_prompt = serde_json::json!({
+            "id": "p1",
+            "type": "prompt",
+            "message": "trigger failure"
+        });
+        client_write
+            .write_all(format!("{bad_prompt}\n").as_bytes())
+            .await
+            .unwrap();
+        client_write.flush().await.unwrap();
+
+        let mut prompt_err_seen = false;
+        loop {
+            line.clear();
+            let n = reader.read_line(&mut line).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            let ev: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if ev.get("type").and_then(|v| v.as_str()) == Some("response")
+                && ev.get("command").and_then(|v| v.as_str()) == Some("prompt")
+            {
+                assert_eq!(ev["id"], "p1");
+                assert_eq!(ev["success"], false);
+                assert!(ev["error"].as_str().unwrap_or("").contains("upstream rpc error"));
+                prompt_err_seen = true;
+                break;
+            }
+        }
+        assert!(prompt_err_seen);
+
+        drop(client_write);
+        assert!(rpc_handle.await.unwrap().is_ok());
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

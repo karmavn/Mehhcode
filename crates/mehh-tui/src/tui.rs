@@ -26,6 +26,11 @@ pub struct CrosstermTerminal {
 impl CrosstermTerminal {
     pub fn new() -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableMouseCapture
+        );
         Ok(Self {
             raw_mode_enabled: true,
         })
@@ -35,6 +40,11 @@ impl CrosstermTerminal {
 impl Drop for CrosstermTerminal {
     fn drop(&mut self) {
         if self.raw_mode_enabled {
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::DisableMouseCapture,
+                crossterm::event::DisableBracketedPaste
+            );
             let _ = crossterm::terminal::disable_raw_mode();
         }
     }

@@ -78,9 +78,12 @@ pub fn parse_iso8601_or_now(s: &str) -> i64 {
         Err(_) => return now_ms(),
     };
     let ms: i64 = if sec_sub.len() > 1 {
-        let frac = sec_sub[1];
-        let frac_str = if frac.len() >= 3 { &frac[..3] } else { frac };
-        frac_str.parse().unwrap_or(0)
+        let digits: String = sec_sub[1]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .take(3)
+            .collect();
+        digits.parse().unwrap_or(0)
     } else {
         0
     };
@@ -246,21 +249,27 @@ pub fn list_sessions(cwd: &Path) -> Result<Vec<SessionSummary>> {
                 Ok(l) => l,
                 Err(_) => break,
             };
-            let trimmed = line.trim();
+            let clean = if line_idx == 0 {
+                line.strip_prefix('\u{feff}').unwrap_or(&line)
+            } else {
+                &line
+            };
+            let trimmed = clean.trim();
             if trimmed.is_empty() {
                 continue;
             }
 
-            if line_idx == 0 {
+            if header.is_none() {
                 if let Ok(h) = serde_json::from_str::<SessionHeader>(trimmed) {
                     header = Some(h);
                 } else {
                     break;
                 }
-            } else {
+            } else if PersistedBranchSelection::parse(trimmed).is_some() {
+                continue;
+            } else if let Ok(entry) = serde_json::from_str::<SessionEntry>(trimmed) {
                 entry_count += 1;
-                if let Ok(entry) = serde_json::from_str::<SessionEntry>(trimmed) {
-                    match &entry.kind {
+                match &entry.kind {
                         SessionEntryKind::SessionInfo { name: Some(n) }
                             if session_name.is_none() =>
                         {
@@ -279,8 +288,9 @@ pub fn list_sessions(cwd: &Path) -> Result<Vec<SessionSummary>> {
                             first_prompt = Some(snippet);
                         }
                         _ => {}
-                    }
                 }
+            } else {
+                continue;
             }
         }
 
@@ -324,6 +334,28 @@ pub struct SessionManager {
     file_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedBranchSelection {
+    #[serde(rename = "type")]
+    kind: String,
+    #[serde(rename = "leafId")]
+    leaf_id: String,
+}
+
+impl PersistedBranchSelection {
+    fn new(leaf_id: &str) -> Self {
+        Self {
+            kind: "branch_selection".to_string(),
+            leaf_id: leaf_id.to_string(),
+        }
+    }
+
+    fn parse(line: &str) -> Option<String> {
+        let parsed: Self = serde_json::from_str(line).ok()?;
+        (parsed.kind == "branch_selection" && !parsed.leaf_id.is_empty()).then_some(parsed.leaf_id)
+    }
+}
+
 impl SessionManager {
     /// Creates an in-memory session manager without disk persistence.
     pub fn in_memory(cwd: impl Into<PathBuf>) -> Self {
@@ -360,36 +392,61 @@ impl SessionManager {
             let mut header: Option<SessionHeader> = None;
             let mut entries = Vec::new();
             let mut by_id = HashMap::new();
+            let mut persisted_leaf_id: Option<String> = None;
 
             for (line_idx, line_res) in reader.lines().enumerate() {
-                let line = line_res?;
-                let trimmed = line.trim();
+                let line = match line_res {
+                    Ok(l) => l,
+                    Err(e) => {
+                        eprintln!(
+                            "Warning: failed to read session line {} in '{}': {e}",
+                            line_idx + 1,
+                            file_path.display()
+                        );
+                        continue;
+                    }
+                };
+                let clean = if line_idx == 0 {
+                    line.strip_prefix('\u{feff}').unwrap_or(&line)
+                } else {
+                    &line
+                };
+                let trimmed = clean.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
 
-                if line_idx == 0 {
+                if header.is_none() {
                     let h: SessionHeader = serde_json::from_str(trimmed).with_context(|| {
                         format!("Failed to parse session header: {}", file_path.display())
                     })?;
                     header = Some(h);
+                } else if let Some(sel_leaf) = PersistedBranchSelection::parse(trimmed) {
+                    persisted_leaf_id = Some(sel_leaf);
                 } else {
-                    let entry: SessionEntry = serde_json::from_str(trimmed).with_context(|| {
-                        format!(
-                            "Failed to parse session entry at line {}: {}",
-                            line_idx + 1,
-                            file_path.display()
-                        )
-                    })?;
-                    by_id.insert(entry.id.clone(), entries.len());
-                    entries.push(entry);
+                    match serde_json::from_str::<SessionEntry>(trimmed) {
+                        Ok(entry) => {
+                            persisted_leaf_id = None;
+                            by_id.insert(entry.id.clone(), entries.len());
+                            entries.push(entry);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: skipping malformed session entry at line {} in '{}': {e}",
+                                line_idx + 1,
+                                file_path.display()
+                            );
+                        }
+                    }
                 }
             }
 
             let header = header.ok_or_else(|| {
                 anyhow!("Session file is empty or missing header: {}", file_path.display())
             })?;
-            let leaf_id = entries.last().map(|e| e.id.clone());
+            let leaf_id = persisted_leaf_id
+                .filter(|id| by_id.contains_key(id))
+                .or_else(|| entries.last().map(|e| e.id.clone()));
 
             Ok(Self {
                 header,
@@ -469,10 +526,22 @@ impl SessionManager {
         self.append_entry(SessionEntryKind::Message { message })
     }
 
-    /// Branches conversation from the specified entry ID.
+    /// Branches conversation from the specified entry ID and persists active branch selection.
     pub fn branch_from(&mut self, entry_id: &str) -> Result<()> {
         if self.by_id.contains_key(entry_id) {
             self.leaf_id = Some(entry_id.to_string());
+            if let Some(path) = &self.file_path {
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                    .with_context(|| {
+                        format!("Failed to persist branch selection to session file: {}", path.display())
+                    })?;
+                let line = serde_json::to_string(&PersistedBranchSelection::new(entry_id))?;
+                writeln!(file, "{line}")?;
+                file.flush()?;
+            }
             Ok(())
         } else {
             Err(anyhow!("Entry ID not found in session: {entry_id}"))
@@ -1090,5 +1159,55 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(temp_dir);
         let _ = std::fs::remove_dir_all(sdir);
+    }
+
+    #[test]
+    fn test_session_persists_branch_selection_and_recovers_from_corrupt_line() {
+        let dir = std::env::temp_dir().join(format!("mehh_session_recover_{}", Uuid::now_v7()));
+        create_dir_all(&dir).unwrap();
+        let file = dir.join("branch_recover.jsonl");
+
+        let (m1, m3) = {
+            let mut s = SessionManager::open_file(&file, &dir).unwrap();
+            let m1 = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("root".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            let _m2 = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("branch A".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            s.branch_from(&m1).unwrap();
+            let m3 = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("branch B".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            // Switch active branch back to m1 WITHOUT appending another message
+            s.branch_from(&m1).unwrap();
+            (m1, m3)
+        };
+
+        // Append a trailing corrupted JSONL line
+        {
+            let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+            writeln!(f, "{{corrupt-trailing-line").unwrap();
+        }
+
+        let reopened = SessionManager::open_file(&file, &dir).unwrap();
+        assert_eq!(reopened.leaf_id(), Some(m1.as_str()));
+        assert_eq!(reopened.build_context_messages().len(), 1);
+        assert!(reopened.entries().iter().any(|e| e.id == m3));
+
+        // Non-ASCII bytes inside timestamp fractional field must not panic
+        let ts = parse_iso8601_or_now("2026-11-12T10:00:00.äöüZ");
+        assert!(ts > 0);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

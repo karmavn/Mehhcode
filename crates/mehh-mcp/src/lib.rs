@@ -17,6 +17,35 @@ pub use tool_adapter::*;
 pub use transport::*;
 
 #[cfg(test)]
+pub(crate) struct TempTestDir(std::path::PathBuf);
+
+#[cfg(test)]
+impl TempTestDir {
+    pub(crate) fn new(prefix: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mehh_mcp_test_{prefix}_{}_{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempTestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
@@ -260,8 +289,8 @@ mod tests {
 
     #[test]
     fn test_config_loading() {
-        let temp_dir = std::env::temp_dir().join(format!("mehh_mcp_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
-        let mehh_dir = temp_dir.join(".mehh");
+        let temp_dir = crate::TempTestDir::new("config_loading");
+        let mehh_dir = temp_dir.path().join(".mehh");
         std::fs::create_dir_all(&mehh_dir).unwrap();
 
         let config_json = json!({
@@ -276,14 +305,15 @@ mod tests {
         });
         std::fs::write(mehh_dir.join("mcp.json"), serde_json::to_string_pretty(&config_json).unwrap()).unwrap();
 
-        let configs = load_mcp_configs(&temp_dir).unwrap();
+        let untrusted = config::load_mcp_configs_from_paths(None, temp_dir.path(), false).unwrap();
+        assert!(untrusted.is_empty(), "project mcp.json must be ignored when untrusted");
+
+        let configs = config::load_mcp_configs_from_paths(None, temp_dir.path(), true).unwrap();
         assert!(configs.contains_key("local_server"));
         let srv = &configs["local_server"];
         assert_eq!(srv.command.as_deref(), Some("python"));
         assert_eq!(srv.args, vec!["server.py"]);
         assert!(srv.is_enabled());
-
-        let _ = std::fs::remove_dir_all(temp_dir);
     }
 
     #[tokio::test]

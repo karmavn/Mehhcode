@@ -2,8 +2,11 @@
 
 use std::collections::HashMap;
 use futures::StreamExt;
-use sha2::{Digest, Sha256};
 
+use crate::retry::{
+    default_http_client, retry_failure_event, send_with_retry, RetryPolicy,
+    DEFAULT_STREAM_CHUNK_TIMEOUT,
+};
 use crate::sse::{SseEvent, SseParser};
 use crate::stream::{create_event_stream, AssistantEventSender, AssistantEventStream, LlmProvider};
 use crate::types::*;
@@ -28,27 +31,79 @@ impl MistralProvider {
 impl Default for MistralProvider {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: default_http_client(),
+        }
+    }
+}
+
+const MISTRAL_TOOL_CALL_ID_LENGTH: usize = 9;
+
+fn derive_mistral_tool_call_id(id: &str, attempt: usize) -> String {
+    let normalized: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if attempt == 0 && normalized.len() == MISTRAL_TOOL_CALL_ID_LENGTH {
+        return normalized;
+    }
+    let seed_base = if !normalized.is_empty() {
+        normalized.as_str()
+    } else {
+        id
+    };
+    let seed = if attempt == 0 {
+        seed_base.to_string()
+    } else {
+        format!("{seed_base}:{attempt}")
+    };
+    let hash = crate::transform_messages::short_hash(&seed);
+    let filtered: String = hash.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    if filtered.len() >= MISTRAL_TOOL_CALL_ID_LENGTH {
+        filtered[..MISTRAL_TOOL_CALL_ID_LENGTH].to_string()
+    } else {
+        format!("{:0<9}", filtered)
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct MistralToolCallIdNormalizer {
+    id_map: HashMap<String, String>,
+    reverse_map: HashMap<String, String>,
+}
+
+impl MistralToolCallIdNormalizer {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn normalize(&mut self, id: &str) -> String {
+        if let Some(existing) = self.id_map.get(id) {
+            return existing.clone();
+        }
+
+        let mut attempt = 0;
+        loop {
+            let candidate = derive_mistral_tool_call_id(id, attempt);
+            let owner = self.reverse_map.get(&candidate);
+            match owner {
+                None => {
+                    self.id_map.insert(id.to_string(), candidate.clone());
+                    self.reverse_map.insert(candidate.clone(), id.to_string());
+                    return candidate;
+                }
+                Some(owner_id) if owner_id == id => {
+                    self.id_map.insert(id.to_string(), candidate.clone());
+                    return candidate;
+                }
+                _ => {
+                    attempt += 1;
+                }
+            }
         }
     }
 }
 
 /// Normalizes a tool call ID to Mistral's requirement of exactly 9 ASCII alphanumeric characters.
-/// If `id` already has length 9 and is all ASCII alphanumeric, returns it as-is.
-/// Otherwise, computes a deterministic 9-character alphanumeric hex digest from SHA-256.
 pub fn normalize_mistral_tool_call_id(id: &str) -> String {
-    let filtered: String = id.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
-    if filtered.len() == 9 {
-        return filtered;
-    }
-
-    let hash = Sha256::digest(id.as_bytes());
-    let mut hex = String::with_capacity(64);
-    for b in hash {
-        use std::fmt::Write;
-        let _ = write!(&mut hex, "{:02x}", b);
-    }
-    hex[..9].to_string()
+    let mut normalizer = MistralToolCallIdNormalizer::new();
+    normalizer.normalize(id)
 }
 
 /// Builds the JSON request payload for Mistral Chat Completions API.
@@ -57,19 +112,29 @@ pub fn build_mistral_request(
     context: &Context,
     options: &StreamOptions,
 ) -> serde_json::Value {
+    use crate::transform_messages::transform_messages;
+    use crate::unicode::sanitize_surrogates;
+
+    let mut normalizer = MistralToolCallIdNormalizer::new();
+    let transformed_messages = transform_messages(
+        &context.messages,
+        model,
+        Some(|id: &str, _m: &Model, _a: &AssistantMessage| normalizer.normalize(id)),
+    );
+
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
     // System prompt
     let mut system_texts = Vec::new();
     if let Some(sys) = &context.system_prompt {
         if !sys.is_empty() {
-            system_texts.push(sys.clone());
+            system_texts.push(sanitize_surrogates(sys));
         }
     }
-    for msg in &context.messages {
+    for msg in &transformed_messages {
         if let Message::System(sys) = msg {
             if !sys.content.is_empty() {
-                system_texts.push(sys.content.clone());
+                system_texts.push(sanitize_surrogates(&sys.content));
             }
         }
     }
@@ -80,12 +145,12 @@ pub fn build_mistral_request(
         }));
     }
 
-    for msg in &context.messages {
+    for msg in &transformed_messages {
         match msg {
             Message::System(_) => {}
             Message::User(u) => {
                 let content_val = match &u.content {
-                    UserContent::Text(text) => serde_json::json!(text),
+                    UserContent::Text(text) => serde_json::json!(sanitize_surrogates(text)),
                     UserContent::Blocks(blocks) => {
                         let chunks: Vec<serde_json::Value> = blocks
                             .iter()
@@ -93,7 +158,7 @@ pub fn build_mistral_request(
                                 UserContentBlock::Text(t) => {
                                     serde_json::json!({
                                         "type": "text",
-                                        "text": t.text,
+                                        "text": sanitize_surrogates(&t.text),
                                     })
                                 }
                                 UserContentBlock::Image(img) => {
@@ -118,7 +183,7 @@ pub fn build_mistral_request(
 
                 let text_content = a.text_content();
                 if !text_content.is_empty() {
-                    asst_map.insert("content".to_string(), serde_json::json!(text_content));
+                    asst_map.insert("content".to_string(), serde_json::json!(sanitize_surrogates(&text_content)));
                 }
 
                 let tool_calls = a.tool_calls();
@@ -126,11 +191,10 @@ pub fn build_mistral_request(
                     let tc_json: Vec<serde_json::Value> = tool_calls
                         .iter()
                         .map(|tc| {
-                            let normalized_id = normalize_mistral_tool_call_id(&tc.id);
                             let args_str = serde_json::to_string(&tc.arguments)
                                 .unwrap_or_else(|_| "{}".to_string());
                             serde_json::json!({
-                                "id": normalized_id,
+                                "id": tc.id,
                                 "type": "function",
                                 "function": {
                                     "name": tc.name,
@@ -145,12 +209,11 @@ pub fn build_mistral_request(
                 messages.push(serde_json::Value::Object(asst_map));
             }
             Message::ToolResult(tr) => {
-                let normalized_id = normalize_mistral_tool_call_id(&tr.tool_call_id);
                 let text = tr
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ToolResultContentBlock::Text(tc) => Some(tc.text.as_str()),
+                        ToolResultContentBlock::Text(tc) => Some(sanitize_surrogates(&tc.text)),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -158,7 +221,7 @@ pub fn build_mistral_request(
 
                 messages.push(serde_json::json!({
                     "role": "tool",
-                    "tool_call_id": normalized_id,
+                    "tool_call_id": tr.tool_call_id,
                     "name": tr.tool_name,
                     "content": text,
                 }));
@@ -232,65 +295,38 @@ impl LlmProvider for MistralProvider {
                 format!("{base_url}/chat/completions")
             };
 
-            let mut req = client.post(&url);
-            req = req.header("content-type", "application/json");
-            req = req.header("accept", "text/event-stream");
+            let resp = match send_with_retry(
+                || {
+                    let mut req = client.post(&url);
+                    req = req.header("content-type", "application/json");
+                    req = req.header("accept", "text/event-stream");
 
-            if let Some(api_key) = &options.api_key {
-                req = req.header("authorization", format!("Bearer {api_key}"));
-            }
-            if let Some(headers) = &model.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            if let Some(headers) = &options.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            req = req.json(&body);
-
-            let resp = tokio::select! {
-                _ = cancel.cancelled() => {
-                    let mut err_msg = AssistantMessage::empty_for_model(&model);
-                    err_msg.stop_reason = StopReason::Aborted;
-                    err_msg.error_message = Some("Request was cancelled".to_string());
-                    sender.push(AssistantMessageEvent::Error {
-                        reason: StopReason::Aborted,
-                        error: err_msg,
-                    });
-                    return;
-                }
-                res = req.send() => {
-                    match res {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let mut err_msg = AssistantMessage::empty_for_model(&model);
-                            err_msg.stop_reason = StopReason::Error;
-                            err_msg.error_message = Some(e.to_string());
-                            sender.push(AssistantMessageEvent::Error {
-                                reason: StopReason::Error,
-                                error: err_msg,
-                            });
-                            return;
+                    if let Some(api_key) = &options.api_key {
+                        req = req.header("authorization", format!("Bearer {api_key}"));
+                    }
+                    if let Some(headers) = &model.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
                         }
                     }
+                    if let Some(headers) = &options.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
+                        }
+                    }
+                    req.json(&body)
+                },
+                &RetryPolicy::default(),
+                &cancel,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(failure) => {
+                    sender.send(retry_failure_event(failure, &model)).await;
+                    return;
                 }
             };
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                let mut err_msg = AssistantMessage::empty_for_model(&model);
-                err_msg.stop_reason = StopReason::Error;
-                err_msg.error_message = Some(format!("HTTP {status}: {text}"));
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
-                    error: err_msg,
-                });
-                return;
-            }
 
             let mut byte_stream = resp.bytes_stream();
             let mut sse_parser = SseParser::new();
@@ -299,45 +335,64 @@ impl LlmProvider for MistralProvider {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        let mut err_msg = state.finish(&sender);
-                        err_msg.stop_reason = StopReason::Aborted;
-                        err_msg.error_message = Some("Request was cancelled".to_string());
-                        sender.push(AssistantMessageEvent::Error {
-                            reason: StopReason::Aborted,
-                            error: err_msg,
-                        });
+                        state.mark_aborted("Request was cancelled");
+                        let mut batch = Vec::new();
+                        state.finish_into(&mut batch);
+                        sender.send_batch(batch).await;
                         return;
                     }
-                    chunk_opt = byte_stream.next() => {
+                    chunk_opt = tokio::time::timeout(DEFAULT_STREAM_CHUNK_TIMEOUT, byte_stream.next()) => {
                         match chunk_opt {
-                            Some(Ok(bytes)) => {
-                                let chunk_str = String::from_utf8_lossy(&bytes);
-                                let events = sse_parser.feed(&chunk_str);
-                                for ev in events {
-                                    state.process_chunk(&ev.data, &sender);
+                            Ok(Some(Ok(bytes))) => {
+                                let events = sse_parser.feed_bytes(&bytes);
+                                if sse_parser.has_overflowed() {
+                                    state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+                                    let mut batch = Vec::new();
+                                    state.finish_into(&mut batch);
+                                    sender.send_batch(batch).await;
+                                    return;
                                 }
+                                let mut batch = Vec::new();
+                                for ev in events {
+                                    state.process_chunk_into(&ev.data, &mut batch);
+                                }
+                                sender.send_batch(batch).await;
                             }
-                            Some(Err(e)) => {
-                                let mut err_msg = state.finish(&sender);
-                                err_msg.stop_reason = StopReason::Error;
-                                err_msg.error_message = Some(e.to_string());
-                                sender.push(AssistantMessageEvent::Error {
-                                    reason: StopReason::Error,
-                                    error: err_msg,
-                                });
+                            Ok(Some(Err(e))) => {
+                                state.mark_error(e.to_string());
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
                                 return;
                             }
-                            None => break,
+                            Err(_) => {
+                                state.mark_error(format!(
+                                    "Stream read timed out after {} seconds",
+                                    DEFAULT_STREAM_CHUNK_TIMEOUT.as_secs()
+                                ));
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
+                                return;
+                            }
+                            Ok(None) => break,
                         }
                     }
                 }
             }
 
             let remaining = sse_parser.finish();
+            let mut batch = Vec::new();
             for ev in remaining {
-                state.process_chunk(&ev.data, &sender);
+                state.process_chunk_into(&ev.data, &mut batch);
             }
-            state.finish(&sender);
+            if sse_parser.has_overflowed() {
+                state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+            } else if sse_parser.has_pending_bytes() || !state.received_terminal {
+                state.mark_error("Stream ended prematurely before Mistral completion");
+            }
+            state.finish_into(&mut batch);
+            sender.send_batch(batch).await;
         });
 
         stream
@@ -355,6 +410,7 @@ pub struct MistralStreamState {
     output: AssistantMessage,
     started: bool,
     done: bool,
+    pub received_terminal: bool,
     active_thinking_index: Option<usize>,
     active_text_index: Option<usize>,
     active_tool_calls: HashMap<usize, ToolCallInProgress>,
@@ -368,16 +424,42 @@ impl MistralStreamState {
             output: AssistantMessage::empty_for_model(model),
             started: false,
             done: false,
+            received_terminal: false,
             active_thinking_index: None,
             active_text_index: None,
             active_tool_calls: HashMap::new(),
         }
     }
 
-    /// Processes a raw SSE data payload string.
+    /// Marks the stream as aborted so `finish_into` emits an aborted terminal event.
+    pub fn mark_aborted(&mut self, msg: &str) {
+        self.output.stop_reason = StopReason::Aborted;
+        self.output.error_message = Some(msg.to_string());
+    }
+
+    /// Marks the stream as failed so `finish_into` emits an error terminal event.
+    pub fn mark_error(&mut self, msg: impl Into<String>) {
+        self.output.stop_reason = StopReason::Error;
+        self.output.error_message = Some(msg.into());
+    }
+
+    /// Processes a raw SSE data payload string and sends produced events.
     pub fn process_chunk(&mut self, data: &str, sender: &AssistantEventSender) {
+        let mut batch = Vec::new();
+        self.process_chunk_into(data, &mut batch);
+        for ev in batch {
+            sender.push(ev);
+        }
+    }
+
+    /// Processes a raw SSE data payload string, appending produced events to `events`.
+    pub fn process_chunk_into(&mut self, data: &str, events: &mut Vec<AssistantMessageEvent>) {
         let trimmed = data.trim();
-        if trimmed.is_empty() || trimmed == "[DONE]" {
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed == "[DONE]" {
+            self.received_terminal = true;
             return;
         }
 
@@ -393,7 +475,7 @@ impl MistralStreamState {
 
         if !self.started {
             self.started = true;
-            sender.push(AssistantMessageEvent::Start {
+            events.push(AssistantMessageEvent::Start {
                 partial: self.output.clone(),
             });
         }
@@ -427,13 +509,16 @@ impl MistralStreamState {
         };
 
         if let Some(finish_reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
-            self.output.stop_reason = match finish_reason {
-                "stop" => StopReason::Stop,
-                "tool_calls" => StopReason::ToolUse,
-                "length" => StopReason::Length,
-                "error" => StopReason::Error,
-                _ => StopReason::Stop,
-            };
+            if !finish_reason.is_empty() {
+                self.received_terminal = true;
+                self.output.stop_reason = match finish_reason {
+                    "stop" => StopReason::Stop,
+                    "tool_calls" => StopReason::ToolUse,
+                    "length" => StopReason::Length,
+                    "error" => StopReason::Error,
+                    _ => StopReason::Stop,
+                };
+            }
         }
 
         let Some(delta) = choice.get("delta") else {
@@ -443,7 +528,7 @@ impl MistralStreamState {
         // 1. Content: string or structured array
         if let Some(content_val) = delta.get("content") {
             if let Some(text_str) = content_val.as_str() {
-                self.handle_text_delta(text_str, sender);
+                self.handle_text_delta(text_str, events);
             } else if let Some(chunks) = content_val.as_array() {
                 for chunk in chunks {
                     let chunk_type = chunk.get("type").and_then(|v| v.as_str()).unwrap_or("");
@@ -459,11 +544,11 @@ impl MistralStreamState {
                             thinking_text.push_str(t);
                         }
                         if !thinking_text.is_empty() {
-                            self.handle_thinking_delta(&thinking_text, sender);
+                            self.handle_thinking_delta(&thinking_text, events);
                         }
                     } else if chunk_type == "text" {
                         if let Some(t) = chunk.get("text").and_then(|v| v.as_str()) {
-                            self.handle_text_delta(t, sender);
+                            self.handle_text_delta(t, events);
                         }
                     }
                 }
@@ -473,8 +558,8 @@ impl MistralStreamState {
         // 2. Tool calls
         if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
             // Close active text or thinking before tool calls
-            self.flush_text_block(sender);
-            self.flush_thinking_block(sender);
+            self.flush_text_block(events);
+            self.flush_thinking_block(events);
 
             for tc_val in tool_calls {
                 let idx = tc_val.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -511,7 +596,7 @@ impl MistralStreamState {
                         },
                     );
 
-                    sender.push(AssistantMessageEvent::ToolCallStart {
+                    events.push(AssistantMessageEvent::ToolCallStart {
                         content_index,
                         partial: self.output.clone(),
                     });
@@ -521,10 +606,10 @@ impl MistralStreamState {
                     if let Some(args_delta) = args_opt {
                         if !args_delta.is_empty() {
                             in_progress.raw_args.push_str(args_delta);
-                            sender.push(AssistantMessageEvent::ToolCallDelta {
+                            events.push(AssistantMessageEvent::ToolCallDelta {
                                 content_index: in_progress.content_index,
                                 delta: args_delta.to_string(),
-                                partial: self.output.clone(),
+                                partial: self.output.metadata_clone(),
                             });
                         }
                     }
@@ -533,11 +618,11 @@ impl MistralStreamState {
         }
     }
 
-    fn handle_text_delta(&mut self, text: &str, sender: &AssistantEventSender) {
+    fn handle_text_delta(&mut self, text: &str, events: &mut Vec<AssistantMessageEvent>) {
         if text.is_empty() {
             return;
         }
-        self.flush_thinking_block(sender);
+        self.flush_thinking_block(events);
 
         let content_index = match self.active_text_index {
             Some(idx) => idx,
@@ -550,7 +635,7 @@ impl MistralStreamState {
                     }));
                 let idx = self.output.content.len() - 1;
                 self.active_text_index = Some(idx);
-                sender.push(AssistantMessageEvent::TextStart {
+                events.push(AssistantMessageEvent::TextStart {
                     content_index: idx,
                     partial: self.output.clone(),
                 });
@@ -562,18 +647,18 @@ impl MistralStreamState {
             tc.text.push_str(text);
         }
 
-        sender.push(AssistantMessageEvent::TextDelta {
+        events.push(AssistantMessageEvent::TextDelta {
             content_index,
             delta: text.to_string(),
-            partial: self.output.clone(),
+            partial: self.output.metadata_clone(),
         });
     }
 
-    fn handle_thinking_delta(&mut self, text: &str, sender: &AssistantEventSender) {
+    fn handle_thinking_delta(&mut self, text: &str, events: &mut Vec<AssistantMessageEvent>) {
         if text.is_empty() {
             return;
         }
-        self.flush_text_block(sender);
+        self.flush_text_block(events);
 
         let content_index = match self.active_thinking_index {
             Some(idx) => idx,
@@ -587,7 +672,7 @@ impl MistralStreamState {
                     }));
                 let idx = self.output.content.len() - 1;
                 self.active_thinking_index = Some(idx);
-                sender.push(AssistantMessageEvent::ThinkingStart {
+                events.push(AssistantMessageEvent::ThinkingStart {
                     content_index: idx,
                     partial: self.output.clone(),
                 });
@@ -599,21 +684,21 @@ impl MistralStreamState {
             tc.thinking.push_str(text);
         }
 
-        sender.push(AssistantMessageEvent::ThinkingDelta {
+        events.push(AssistantMessageEvent::ThinkingDelta {
             content_index,
             delta: text.to_string(),
-            partial: self.output.clone(),
+            partial: self.output.metadata_clone(),
         });
     }
 
-    fn flush_text_block(&mut self, sender: &AssistantEventSender) {
+    fn flush_text_block(&mut self, events: &mut Vec<AssistantMessageEvent>) {
         if let Some(text_idx) = self.active_text_index.take() {
             let content = if let Some(AssistantContentBlock::Text(tc)) = self.output.content.get(text_idx) {
                 tc.text.clone()
             } else {
                 String::new()
             };
-            sender.push(AssistantMessageEvent::TextEnd {
+            events.push(AssistantMessageEvent::TextEnd {
                 content_index: text_idx,
                 content,
                 partial: self.output.clone(),
@@ -621,14 +706,14 @@ impl MistralStreamState {
         }
     }
 
-    fn flush_thinking_block(&mut self, sender: &AssistantEventSender) {
+    fn flush_thinking_block(&mut self, events: &mut Vec<AssistantMessageEvent>) {
         if let Some(th_idx) = self.active_thinking_index.take() {
             let content = if let Some(AssistantContentBlock::Thinking(th)) = self.output.content.get(th_idx) {
                 th.thinking.clone()
             } else {
                 String::new()
             };
-            sender.push(AssistantMessageEvent::ThinkingEnd {
+            events.push(AssistantMessageEvent::ThinkingEnd {
                 content_index: th_idx,
                 content,
                 partial: self.output.clone(),
@@ -638,8 +723,18 @@ impl MistralStreamState {
 
     /// Closes all active blocks, completes tool calls parsing, and emits Done/Error events.
     pub fn finish(&mut self, sender: &AssistantEventSender) -> AssistantMessage {
-        self.flush_thinking_block(sender);
-        self.flush_text_block(sender);
+        let mut batch = Vec::new();
+        let out = self.finish_into(&mut batch);
+        for ev in batch {
+            sender.push(ev);
+        }
+        out
+    }
+
+    /// Closes all active blocks, completes tool calls parsing, and appends terminal events to `events`.
+    pub fn finish_into(&mut self, events: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
+        self.flush_thinking_block(events);
+        self.flush_text_block(events);
 
         // Finalize tool calls
         let mut tool_call_indices: Vec<(usize, usize, String)> = self
@@ -667,7 +762,7 @@ impl MistralStreamState {
                 continue;
             };
 
-            sender.push(AssistantMessageEvent::ToolCallEnd {
+            events.push(AssistantMessageEvent::ToolCallEnd {
                 content_index,
                 tool_call,
                 partial: self.output.clone(),
@@ -682,13 +777,16 @@ impl MistralStreamState {
 
         if !self.done {
             self.done = true;
-            if self.output.stop_reason == StopReason::Error {
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
+            if matches!(
+                self.output.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            ) {
+                events.push(AssistantMessageEvent::Error {
+                    reason: self.output.stop_reason,
                     error: self.output.clone(),
                 });
             } else {
-                sender.push(AssistantMessageEvent::Done {
+                events.push(AssistantMessageEvent::Done {
                     reason: self.output.stop_reason,
                     message: self.output.clone(),
                 });
@@ -751,6 +849,7 @@ mod tests {
             context_window: 128_000,
             max_tokens: 32_768,
             headers: None,
+            ..Default::default()
         };
 
         let context = Context {
@@ -774,7 +873,7 @@ mod tests {
                     })],
                     api: "mistral-conversations".to_string(),
                     provider: "mistral".to_string(),
-                    model: "magistral-medium-latest".to_string(),
+                    model: "mistral-small".to_string(),
                     response_id: None,
                     usage: Usage::default(),
                     stop_reason: StopReason::ToolUse,
@@ -803,6 +902,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::High),
             session_id: None,
             headers: None,
+            ..Default::default()
         };
 
         let req = build_mistral_request(&model, &context, &options);
@@ -840,6 +940,7 @@ mod tests {
             context_window: 128_000,
             max_tokens: 32_768,
             headers: None,
+            ..Default::default()
         };
         let (sender, _stream) = create_event_stream();
 
@@ -909,5 +1010,111 @@ mod tests {
             AssistantContentBlock::Text(tc) => assert_eq!(tc.text, "The answer is 42."),
             _ => panic!("Expected Text block at index 1"),
         }
+    }
+
+    #[test]
+    fn mistral_normalizer_resolves_hash_collisions_deterministically() {
+        let mut normalizer = MistralToolCallIdNormalizer::new();
+
+        // Two distinct IDs that would collide on same 9-char alphanumeric string if simply stripped
+        let id_a = "abcdef123";
+        let id_b = "abcdef_123";
+
+        let norm_a = normalizer.normalize(id_a);
+        let norm_b = normalizer.normalize(id_b);
+
+        assert_eq!(norm_a.len(), 9);
+        assert_eq!(norm_b.len(), 9);
+        assert!(norm_a.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert!(norm_b.chars().all(|c| c.is_ascii_alphanumeric()));
+        assert_ne!(norm_a, norm_b, "Colliding IDs must resolve to distinct candidates");
+
+        // Deterministic repeat
+        assert_eq!(normalizer.normalize(id_a), norm_a);
+        assert_eq!(normalizer.normalize(id_b), norm_b);
+
+        let model = Model {
+            id: "mistral-large-latest".to_string(),
+            name: "Mistral Large".to_string(),
+            api: "mistral-conversations".to_string(),
+            provider: "mistral".to_string(),
+            base_url: "".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 4096,
+            headers: None,
+            ..Default::default()
+        };
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Call tools".to_string()),
+                    timestamp: 100,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![
+                        AssistantContentBlock::ToolCall(ToolCall {
+                            id: id_a.to_string(),
+                            name: "tool_a".to_string(),
+                            arguments: serde_json::Map::new(),
+                            arguments_error: None,
+                            thought_signature: None,
+                        }),
+                        AssistantContentBlock::ToolCall(ToolCall {
+                            id: id_b.to_string(),
+                            name: "tool_b".to_string(),
+                            arguments: serde_json::Map::new(),
+                            arguments_error: None,
+                            thought_signature: None,
+                        }),
+                    ],
+                    api: "other".to_string(),
+                    provider: "other".to_string(),
+                    model: "other".to_string(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 200,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: id_a.to_string(),
+                    tool_name: "tool_a".to_string(),
+                    content: vec![ToolResultContentBlock::Text(TextContent {
+                        text: "res_a".to_string(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 300,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: id_b.to_string(),
+                    tool_name: "tool_b".to_string(),
+                    content: vec![ToolResultContentBlock::Text(TextContent {
+                        text: "res_b".to_string(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 301,
+                }),
+            ],
+            tools: None,
+        };
+
+        let req = build_mistral_request(&model, &context, &StreamOptions::default());
+        let messages = req["messages"].as_array().expect("messages array");
+        let assistant_tc = messages[1]["tool_calls"].as_array().unwrap();
+        assert_eq!(assistant_tc[0]["id"], norm_a);
+        assert_eq!(assistant_tc[1]["id"], norm_b);
+
+        // Tool results adopt the same mapped IDs
+        assert_eq!(messages[2]["tool_call_id"], norm_a);
+        assert_eq!(messages[3]["tool_call_id"], norm_b);
     }
 }

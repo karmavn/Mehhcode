@@ -15,20 +15,6 @@ pub fn normalize_crossterm_key(event: KeyEvent) -> Option<String> {
     let has_shift = event.modifiers.contains(KeyModifiers::SHIFT);
     let has_super = event.modifiers.contains(KeyModifiers::SUPER);
 
-    let mut mods = Vec::new();
-    if has_ctrl {
-        mods.push("ctrl");
-    }
-    if has_alt {
-        mods.push("alt");
-    }
-    if has_shift {
-        mods.push("shift");
-    }
-    if has_super {
-        mods.push("super");
-    }
-
     let make_mod_str = |base: &str, include_shift: bool| -> String {
         let mut parts = Vec::new();
         if has_ctrl {
@@ -167,6 +153,9 @@ pub enum TuiAction {
     TabComplete,
     Interrupt,
     ClearOrExit,
+    ScrollUp,
+    ScrollDown,
+    ScrollBottom,
 }
 
 #[derive(Debug, Clone)]
@@ -246,6 +235,18 @@ impl Keybindings {
         map.insert(
             TuiAction::ClearOrExit,
             vec!["ctrl+c".into(), "ctrl+d".into()],
+        );
+        map.insert(
+            TuiAction::ScrollUp,
+            vec!["pageup".into(), "shift+up".into()],
+        );
+        map.insert(
+            TuiAction::ScrollDown,
+            vec!["pagedown".into(), "shift+down".into()],
+        );
+        map.insert(
+            TuiAction::ScrollBottom,
+            vec!["ctrl+end".into(), "shift+end".into()],
         );
 
         Self { bindings: map }

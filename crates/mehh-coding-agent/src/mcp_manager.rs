@@ -8,10 +8,10 @@ use std::time::Duration;
 use anyhow::Context;
 use mehh_agent::AgentTool;
 use mehh_mcp::{
-    load_mcp_configs, ListMcpResourceTemplatesTool, ListMcpResourcesTool, McpAgentTool, McpAuthEntry,
-    McpAuthStore, McpClient, McpRoot, McpServerConfig, McpServerRegistry, McpToolInfo,
-    McpTransport, OAuthTokens, ReadMcpResourceTool, StdioTransport, StoredMcpBearerProvider,
-    StreamableHttpTransport,
+    create_mcp_agent_tools, load_mcp_configs_with_trust, ListMcpResourceTemplatesTool,
+    ListMcpResourcesTool, McpAuthEntry, McpAuthStore, McpClient, McpRoot, McpServerConfig,
+    McpServerRegistry, McpToolInfo, McpTransport, OAuthTokens, ReadMcpResourceTool,
+    StdioTransport, StoredMcpBearerProvider, StreamableHttpTransport,
 };
 
 /// Connection status summary for an MCP server.
@@ -39,6 +39,7 @@ pub struct McpManager {
     cwd: PathBuf,
     configs: HashMap<String, McpServerConfig>,
     clients: Vec<(String, Arc<McpClient>)>,
+    server_tools: HashMap<String, Vec<Arc<dyn AgentTool>>>,
     tools: Vec<Arc<dyn AgentTool>>,
     resource_tools: Vec<Arc<dyn AgentTool>>,
     summaries: Vec<McpConnectionSummary>,
@@ -49,7 +50,12 @@ pub struct McpManager {
 impl Default for McpManager {
     fn default() -> Self {
         let registry: McpServerRegistry = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-        let auth_store = Arc::new(McpAuthStore::new());
+        let auth_store = Arc::new(McpAuthStore::try_new().unwrap_or_else(|_| {
+            let fallback = std::env::temp_dir()
+                .join(format!("mehh-mcp-auth-fallback-{}.json", std::process::id()));
+            McpAuthStore::try_with_path(fallback)
+                .expect("temp-dir MCP auth store fallback must initialize")
+        }));
         let resource_tools: Vec<Arc<dyn AgentTool>> = vec![
             Arc::new(ListMcpResourcesTool::new(registry.clone())),
             Arc::new(ListMcpResourceTemplatesTool::new(registry.clone())),
@@ -59,6 +65,7 @@ impl Default for McpManager {
             cwd: PathBuf::new(),
             configs: HashMap::new(),
             clients: Vec::new(),
+            server_tools: HashMap::new(),
             tools: Vec::new(),
             resource_tools,
             summaries: Vec::new(),
@@ -69,15 +76,25 @@ impl Default for McpManager {
 }
 
 impl McpManager {
-    /// Loads MCP configs from disk (global and project) and attempts connection to each enabled server.
-    pub async fn connect_from_configs(cwd: &Path) -> Self {
-        let configs = match load_mcp_configs(cwd) {
-            Ok(c) => c,
-            Err(_) => return Self::default(),
-        };
+    /// Loads MCP configs from disk (`~/.mehh/mcp.json` and, only when `trusted` is true,
+    /// `<cwd>/.mehh/mcp.json`) and attempts connection to each enabled server.
+    /// Fails closed on malformed config JSON or credential store errors.
+    pub async fn connect_from_configs_with_trust(
+        cwd: &Path,
+        trusted: bool,
+    ) -> anyhow::Result<Self> {
+        let configs = load_mcp_configs_with_trust(cwd, trusted)?;
+        let auth_store = Arc::new(McpAuthStore::try_new()?);
+        Ok(Self::connect_with_configs(cwd, configs, auth_store).await)
+    }
 
+    /// Connects to an already-loaded map of MCP server configs using the given auth store.
+    pub async fn connect_with_configs(
+        cwd: &Path,
+        configs: HashMap<String, McpServerConfig>,
+        auth_store: Arc<McpAuthStore>,
+    ) -> Self {
         let registry: McpServerRegistry = Arc::new(tokio::sync::RwLock::new(Vec::new()));
-        let auth_store = Arc::new(McpAuthStore::new());
         let resource_tools: Vec<Arc<dyn AgentTool>> = vec![
             Arc::new(ListMcpResourcesTool::new(registry.clone())),
             Arc::new(ListMcpResourceTemplatesTool::new(registry.clone())),
@@ -88,6 +105,7 @@ impl McpManager {
             cwd: cwd.to_path_buf(),
             configs: configs.clone(),
             clients: Vec::new(),
+            server_tools: HashMap::new(),
             tools: Vec::new(),
             resource_tools,
             summaries: Vec::new(),
@@ -98,38 +116,43 @@ impl McpManager {
         let mut sorted_names: Vec<String> = configs.keys().cloned().collect();
         sorted_names.sort();
 
-        let mut server_tools: Vec<Arc<dyn AgentTool>> = Vec::new();
+        let enabled: Vec<(&String, &McpServerConfig)> = sorted_names
+            .iter()
+            .filter_map(|name| {
+                let cfg = configs.get(name)?;
+                if cfg.enabled == Some(false) {
+                    None
+                } else {
+                    Some((name, cfg))
+                }
+            })
+            .collect();
 
-        for name in &sorted_names {
-            let cfg = match configs.get(name) {
-                Some(c) => c,
-                None => continue,
-            };
-
-            if cfg.enabled == Some(false) {
-                continue;
+        let connect_futs = enabled.iter().map(|(name, cfg)| {
+            let auth_store = &mgr.auth_store;
+            async move {
+                let res = Self::connect_server_internal(name, cfg, cwd, auth_store).await;
+                ((*name).clone(), res)
             }
+        });
+        let results = futures::future::join_all(connect_futs).await;
 
-            match Self::connect_server_internal(name, cfg, cwd, &mgr.auth_store).await {
+        for (name, res) in results {
+            match res {
                 Ok((client, tool_infos)) => {
-                    let tool_count = tool_infos.len();
-                    for tool_info in tool_infos {
-                        server_tools.push(Arc::new(McpAgentTool::new(
-                            name.clone(),
-                            tool_info,
-                            client.clone(),
-                        )));
-                    }
+                    let adapted = create_mcp_agent_tools(&name, tool_infos, client.clone());
+                    let tool_count = adapted.len();
+                    mgr.server_tools.insert(name.clone(), adapted);
                     mgr.clients.push((name.clone(), client));
                     mgr.summaries.push(McpConnectionSummary {
-                        server: name.clone(),
+                        server: name,
                         tool_count,
                         error: None,
                     });
                 }
                 Err(e) => {
                     mgr.summaries.push(McpConnectionSummary {
-                        server: name.clone(),
+                        server: name,
                         tool_count: 0,
                         error: Some(e.to_string()),
                     });
@@ -139,14 +162,24 @@ impl McpManager {
 
         // Sync registry with all connected clients
         *mgr.registry.write().await = mgr.clients.clone();
-
-        // Include resource tools if at least one server is configured or connected
-        if !mgr.configs.is_empty() || !mgr.clients.is_empty() {
-            server_tools.extend(mgr.resource_tools.clone());
-        }
-        mgr.tools = server_tools;
+        mgr.rebuild_tools();
 
         mgr
+    }
+
+    fn rebuild_tools(&mut self) {
+        let mut rebuilt = Vec::new();
+        let mut names: Vec<&String> = self.server_tools.keys().collect();
+        names.sort();
+        for name in names {
+            if let Some(tools) = self.server_tools.get(name) {
+                rebuilt.extend(tools.iter().cloned());
+            }
+        }
+        if !self.configs.is_empty() || !self.clients.is_empty() {
+            rebuilt.extend(self.resource_tools.iter().cloned());
+        }
+        self.tools = rebuilt;
     }
 
     async fn create_transport_for_server(
@@ -266,9 +299,8 @@ impl McpManager {
             let _ = client.close().await;
         }
 
-        // Remove old server tools (tools starting with mcp__{name}__)
-        let prefix = format!("mcp__{}__", name);
-        self.tools.retain(|t| !t.name().starts_with(&prefix));
+        // Remove all prior tools belonging to this configured server (handles truncated >=64-byte names)
+        self.server_tools.remove(name);
 
         // Remove old summary
         self.summaries.retain(|s| s.server != name);
@@ -282,14 +314,9 @@ impl McpManager {
         } else {
             match Self::connect_server_internal(name, &cfg, &self.cwd, &self.auth_store).await {
                 Ok((client, tool_infos)) => {
-                    let tool_count = tool_infos.len();
-                    for tool_info in tool_infos {
-                        self.tools.push(Arc::new(McpAgentTool::new(
-                            name.to_string(),
-                            tool_info,
-                            client.clone(),
-                        )));
-                    }
+                    let adapted = create_mcp_agent_tools(name, tool_infos, client.clone());
+                    let tool_count = adapted.len();
+                    self.server_tools.insert(name.to_string(), adapted);
                     self.clients.push((name.to_string(), client));
                     McpConnectionSummary {
                         server: name.to_string(),
@@ -307,15 +334,7 @@ impl McpManager {
 
         self.summaries.push(summary.clone());
         *self.registry.write().await = self.clients.clone();
-
-        // Ensure resource tools are present if servers exist
-        if !self.configs.is_empty() || !self.clients.is_empty() {
-            for res_tool in &self.resource_tools {
-                if !self.tools.iter().any(|t| t.name() == res_tool.name()) {
-                    self.tools.push(res_tool.clone());
-                }
-            }
-        }
+        self.rebuild_tools();
 
         Ok(summary)
     }
@@ -350,7 +369,7 @@ impl McpManager {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Server '{name}' is not an HTTP server"))?;
 
-        let http_client = reqwest::Client::new();
+        let http_client = mehh_mcp::oauth::oauth_http_client();
         let meta = mehh_mcp::oauth::discover_oauth_metadata(&http_client, url).await?;
 
         // Bind an ephemeral loopback port for the OAuth callback
@@ -423,6 +442,7 @@ impl McpManager {
             form_params.insert("client_secret", secret);
         }
 
+        mehh_mcp::oauth::validate_oauth_request_url(&meta.token_endpoint).await?;
         let token_resp = http_client
             .post(&meta.token_endpoint)
             .form(&form_params)
@@ -469,9 +489,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_mcp_manager_empty_configs() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("mehh_mcp_mgr_test_{}", uuid::Uuid::now_v7()));
-        let mgr = McpManager::connect_from_configs(&temp_dir).await;
+        let temp_dir = crate::TempTestDir::new("mcp_mgr");
+        let store = Arc::new(
+            McpAuthStore::try_with_path(temp_dir.path().join("mcp-auth.json")).unwrap(),
+        );
+        let configs = HashMap::new();
+        let mgr = McpManager::connect_with_configs(temp_dir.path(), configs, store).await;
         assert!(mgr.tools().is_empty());
         assert!(mgr.summaries().is_empty());
         assert!(mgr.configured_server_names().is_empty());
@@ -502,5 +525,20 @@ mod tests {
 
         let reg = mgr.registry();
         assert!(reg.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_connect_from_configs_with_trust_fails_closed_on_corrupt_trusted_project_config() {
+        let dir = crate::TempTestDir::new("mcp_mgr_corrupt");
+        let mehh_dir = dir.path().join(".mehh");
+        std::fs::create_dir_all(&mehh_dir).unwrap();
+        std::fs::write(mehh_dir.join("mcp.json"), b"{invalid-json").unwrap();
+
+        let err = McpManager::connect_from_configs_with_trust(dir.path(), true)
+            .await
+            .err()
+            .expect("trusted corrupt project mcp.json must fail closed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mcp.json"), "unexpected error: {msg}");
     }
 }

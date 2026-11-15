@@ -13,11 +13,10 @@ pub enum EditorOutput {
 }
 
 fn split_char_at(s: &str, char_idx: usize) -> (String, String) {
-    let chars: Vec<char> = s.chars().collect();
-    let split = char_idx.min(chars.len());
-    let before: String = chars[..split].iter().collect();
-    let after: String = chars[split..].iter().collect();
-    (before, after)
+    match s.char_indices().nth(char_idx) {
+        Some((byte_idx, _)) => (s[..byte_idx].to_string(), s[byte_idx..].to_string()),
+        None => (s.to_string(), String::new()),
+    }
 }
 
 /// Multiline interactive text editor supporting undo, kill ring, history,
@@ -32,6 +31,7 @@ pub struct Editor {
     pub undo_stack: Vec<(Vec<String>, usize, usize)>,
     pub kill_ring: String,
     pub autocomplete: Option<SelectList>,
+    pub autocomplete_replace_start: Option<usize>,
     pub prompt_prefix: String,
     pub placeholder: String,
     pastes: HashMap<usize, String>,
@@ -55,6 +55,7 @@ impl Editor {
             undo_stack: Vec::new(),
             kill_ring: String::new(),
             autocomplete: None,
+            autocomplete_replace_start: None,
             prompt_prefix: "> ".to_string(),
             placeholder: String::new(),
             pastes: HashMap::new(),
@@ -203,10 +204,34 @@ impl Editor {
 
     pub fn set_autocomplete(&mut self, items: Vec<SelectItem>) {
         self.autocomplete = Some(SelectList::new(items, 5));
+        self.autocomplete_replace_start = None;
+    }
+
+    /// Sets autocomplete items that replace `[replace_start..cursor_col]` on the active line.
+    pub fn set_autocomplete_replacing(
+        &mut self,
+        items: Vec<SelectItem>,
+        replace_start: usize,
+    ) {
+        self.autocomplete = Some(SelectList::new(items, 5));
+        self.autocomplete_replace_start = Some(replace_start);
     }
 
     pub fn clear_autocomplete(&mut self) {
         self.autocomplete = None;
+        self.autocomplete_replace_start = None;
+    }
+
+    fn replace_current_line_range(&mut self, start_col: usize, replacement: &str) {
+        self.push_undo();
+        let line = &self.lines[self.cursor_row];
+        let char_len = line.chars().count();
+        let start = start_col.min(self.cursor_col).min(char_len);
+        let end = self.cursor_col.min(char_len);
+        let (before, _) = split_char_at(line, start);
+        let (_, after) = split_char_at(line, end);
+        self.lines[self.cursor_row] = format!("{before}{replacement}{after}");
+        self.cursor_col = start + replacement.chars().count();
     }
 
     fn move_word_left(&mut self) {
@@ -341,8 +366,13 @@ impl Editor {
                         .as_ref()
                         .and_then(|ac| ac.selected_item().cloned())
                     {
+                        let replace_start = self.autocomplete_replace_start;
                         self.clear_autocomplete();
-                        self.insert_text(&item.label);
+                        if let Some(start) = replace_start {
+                            self.replace_current_line_range(start, &item.id);
+                        } else {
+                            self.insert_text(&item.label);
+                        }
                         return EditorOutput::Changed(self.text());
                     } else {
                         self.clear_autocomplete();
@@ -588,5 +618,41 @@ impl Component for Editor {
             self.handle_editor_key(key, &default_bindings),
             EditorOutput::Changed(_) | EditorOutput::Submit(_)
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_set_autocomplete_replacing_replaces_range_on_accept() {
+        let mut editor = Editor::new();
+        editor.set_text("check @src/ma");
+        assert_eq!(editor.cursor_col, 13);
+
+        editor.set_autocomplete_replacing(
+            vec![SelectItem::new("@src/main.rs ", "src/main.rs")],
+            6,
+        );
+        let kb = Keybindings::default_bindings();
+        let out = editor.handle_editor_key("tab", &kb);
+        assert!(matches!(out, EditorOutput::Changed(_)));
+        assert_eq!(editor.text(), "check @src/main.rs ");
+        assert_eq!(editor.cursor_col, 19);
+        assert!(editor.autocomplete.is_none());
+        assert!(editor.autocomplete_replace_start.is_none());
+    }
+
+    #[test]
+    fn test_set_autocomplete_replacing_handles_multibyte_chars() {
+        let mut editor = Editor::new();
+        editor.set_text("xem @tệp");
+        // Chars: 'x','e','m',' ','@','t','ệ','p' -> '@' at char index 4, cursor at 8
+        assert_eq!(editor.cursor_col, 8);
+        editor.set_autocomplete_replacing(vec![SelectItem::new("@test.rs", "test.rs")], 4);
+        let kb = Keybindings::default_bindings();
+        let _ = editor.handle_editor_key("enter", &kb);
+        assert_eq!(editor.text(), "xem @test.rs");
     }
 }

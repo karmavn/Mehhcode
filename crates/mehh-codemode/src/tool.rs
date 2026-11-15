@@ -51,6 +51,26 @@ impl CodemodeTool {
     }
 }
 
+const CODEMODE_MAX_OUTPUT_BYTES: usize = 40_000;
+
+fn truncate_codemode_output(text: &str) -> String {
+    if text.len() <= CODEMODE_MAX_OUTPUT_BYTES {
+        return text.to_string();
+    }
+    let mut head_end = 20_000.min(text.len());
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+    let mut tail_start = text.len().saturating_sub(19_000).max(head_end);
+    while tail_start < text.len() && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    let omitted = text[head_end..tail_start].chars().count();
+    let head = &text[..head_end];
+    let tail = &text[tail_start..];
+    format!("{head}\n\n[... {omitted} characters truncated ...]\n\n{tail}")
+}
+
 #[async_trait]
 impl AgentTool for CodemodeTool {
     fn name(&self) -> &str {
@@ -59,7 +79,7 @@ impl AgentTool for CodemodeTool {
 
     fn description(&self) -> &str {
         "Executes JavaScript in an isolated QuickJS sandbox.\n\
-         - Invoke tools: `await tools.<name>(args)` (e.g. `await tools.read_file({ path: '...' })`)\n\
+         - Invoke tools: `await tools.<name>(args)` (e.g. `await tools.read({ path: \"Cargo.toml\" })`)\n\
          - Discover tools: `await searchTools(query, options?)`, `await describeTool(name)`, `await describeNamespace(name)`\n\
          - Models catalog: `models.list()`, `models.resolve(providerOrId, modelId?)`, `models.getAvailableOfType(provider?)`\n\
          - List all tools: `ALL_TOOLS` contains [{ name, description }, ...]\n\
@@ -82,7 +102,7 @@ impl AgentTool for CodemodeTool {
     }
 
     fn execution_mode(&self) -> ToolExecutionMode {
-        ToolExecutionMode::Parallel
+        ToolExecutionMode::Sequential
     }
 
     async fn execute(
@@ -202,14 +222,10 @@ impl AgentTool for CodemodeTool {
             };
         }
 
-        const MAX_OUTPUT_CHARS: usize = 40_000;
-        if combined_text.len() > MAX_OUTPUT_CHARS {
-            let head_len = 20_000;
-            let tail_len = 19_000;
-            let omitted = combined_text.len() - head_len - tail_len;
-            let head = &combined_text[..head_len];
-            let tail = &combined_text[combined_text.len() - tail_len..];
-            combined_text = format!("{head}\n\n[... {omitted} characters truncated ...]\n\n{tail}");
+        combined_text = truncate_codemode_output(&combined_text);
+
+        if !res.ok {
+            return Err(combined_text);
         }
 
         if !combined_text.is_empty() {
@@ -226,5 +242,36 @@ impl AgentTool for CodemodeTool {
             content,
             details: res.value,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_codemode_output_non_ascii_safe() {
+        // 3-byte UTF-8 chars across 20,000 and len - 19,000 boundaries
+        let text = "中".repeat(16_000); // 48,000 bytes
+        let truncated = truncate_codemode_output(&text);
+        assert!(truncated.contains("characters truncated"));
+    }
+
+    #[tokio::test]
+    async fn test_codemode_failed_script_returns_err_and_metadata() {
+        let tool = CodemodeTool::new(Vec::new());
+        assert_eq!(tool.execution_mode(), ToolExecutionMode::Sequential);
+        assert!(tool.description().contains("tools.read("));
+        assert!(!tool.description().contains("read_file"));
+
+        let params = serde_json::json!({ "code": "throw new Error('boom');" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let err = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("boom"));
     }
 }

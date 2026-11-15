@@ -4,16 +4,24 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use anyhow::Context;
-use mehh_ai::oauth::{refresh_oauth_credential, OAuthProviderKind, StoredCredential};
+use mehh_ai::oauth::{
+    acquire_file_lock, get_path_lock_mutex, refresh_oauth_credential, CredentialInfo,
+    CredentialModifyFn, CredentialStore, FileLockGuard, OAuthProviderKind, StoredCredential,
+};
 use mehh_ai::{env_api_key_name, now_ms};
 
 /// Returns default auth path `~/.mehh/agent/auth.json`.
-pub fn default_auth_path() -> PathBuf {
+pub fn default_auth_path() -> anyhow::Result<PathBuf> {
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".mehh").join("agent").join("auth.json")
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot determine default auth path: neither USERPROFILE nor HOME is set"
+            )
+        })?;
+    Ok(home.join(".mehh").join("agent").join("auth.json"))
 }
 
 /// Maps a provider identifier to an OAuthProviderKind, if supported.
@@ -110,7 +118,7 @@ pub fn load_auth_entries(
     let path = match auth_file {
         Some(p) => p,
         None => {
-            path_buf = default_auth_path();
+            path_buf = default_auth_path()?;
             &path_buf
         }
     };
@@ -133,16 +141,157 @@ pub fn load_auth_entries(
 
     let mut entries = HashMap::new();
     for (k, val) in raw_map {
-        if let Some(cred) = parse_stored_credential_value(val) {
-            entries.insert(k, cred);
-        }
+        let cred = parse_stored_credential_value(val).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid credential entry for provider '{k}' in '{}'",
+                path.display()
+            )
+        })?;
+        entries.insert(k, cred);
     }
 
     Ok(entries)
 }
 
+/// File-backed credential store for auth.json with process-safe advisory file locking.
+#[derive(Debug, Clone)]
+pub struct FileCredentialStore {
+    path: PathBuf,
+    lock_path: PathBuf,
+    process_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+}
+
+impl FileCredentialStore {
+    /// Creates a store targeting the default auth path (`~/.mehh/agent/auth.json`).
+    pub fn try_new() -> anyhow::Result<Self> {
+        Ok(Self::for_path(default_auth_path()?))
+    }
+
+    /// Creates a store for a specific auth file path.
+    pub fn for_path(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        let process_lock = get_path_lock_mutex(&lock_path);
+        Self {
+            path,
+            lock_path,
+            process_lock,
+        }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub async fn lock(&self) -> anyhow::Result<FileLockGuard> {
+        acquire_file_lock(&self.lock_path, self.process_lock.clone()).await
+    }
+
+    pub async fn modify_locked(
+        &self,
+        provider_id: &str,
+        modify_fn: CredentialModifyFn,
+    ) -> anyhow::Result<Option<StoredCredential>> {
+        self.modify(provider_id, modify_fn).await
+    }
+}
+
+#[async_trait::async_trait]
+impl CredentialStore for FileCredentialStore {
+    async fn read(&self, provider_id: &str) -> anyhow::Result<Option<StoredCredential>> {
+        let entries = load_auth_entries(Some(&self.path))?;
+        let cred = entries
+            .get(provider_id)
+            .or_else(|| entries.iter().find(|(k, _)| k.eq_ignore_ascii_case(provider_id)).map(|(_, v)| v));
+        Ok(cred.cloned())
+    }
+
+    async fn list(&self) -> anyhow::Result<Vec<CredentialInfo>> {
+        let entries = load_auth_entries(Some(&self.path))?;
+        let mut list: Vec<CredentialInfo> = entries
+            .into_iter()
+            .map(|(k, v)| CredentialInfo::new(k, v.credential_type()))
+            .collect();
+        list.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+        Ok(list)
+    }
+
+    async fn modify(
+        &self,
+        provider_id: &str,
+        modify_fn: CredentialModifyFn,
+    ) -> anyhow::Result<Option<StoredCredential>> {
+        let _lock = self.lock().await?;
+
+        let mut entries = load_auth_entries(Some(&self.path))?;
+        let existing_key = entries
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(provider_id))
+            .cloned();
+        let current = existing_key.as_ref().and_then(|k| entries.get(k)).cloned();
+
+        let next = modify_fn(current.clone()).await?;
+
+        if let Some(ref new_cred) = next {
+            let key = existing_key.unwrap_or_else(|| provider_id.to_string());
+            entries.insert(key, new_cred.clone());
+            let json_str = serde_json::to_string_pretty(&entries)
+                .context("Failed to serialize auth credentials to JSON")?;
+            crate::settings::write_file_atomic(&self.path, json_str.as_bytes(), true)?;
+            Ok(Some(new_cred.clone()))
+        } else {
+            Ok(current)
+        }
+    }
+
+    async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
+        let _lock = self.lock().await?;
+        if !self.path.exists() {
+            return Ok(());
+        }
+
+        let mut entries = load_auth_entries(Some(&self.path))?;
+        let existing_key = entries
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(provider_id))
+            .cloned();
+
+        if let Some(k) = existing_key {
+            entries.remove(&k);
+            let json_str = serde_json::to_string_pretty(&entries)
+                .context("Failed to serialize auth credentials to JSON")?;
+            crate::settings::write_file_atomic(&self.path, json_str.as_bytes(), true)?;
+        }
+        Ok(())
+    }
+}
+
+/// Acquires an advisory file lock on `<path>.lock`, creating parent directories if needed.
+fn acquire_auth_file_lock(path: &Path) -> anyhow::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directories for: {}", path.display()))?;
+    }
+
+    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let lock_file = opts
+        .open(&lock_path)
+        .with_context(|| format!("Failed to open lock file: {}", lock_path.display()))?;
+    lock_file
+        .lock()
+        .with_context(|| format!("Failed to acquire lock on: {}", lock_path.display()))?;
+    Ok(lock_file)
+}
+
 /// Saves a credential to auth file, normalizing provider keys case-insensitively.
-/// Ensures parent directories exist and writes UTF-8 without BOM.
+/// Ensures parent directories exist and writes UTF-8 without BOM under advisory file lock.
 pub fn save_credential(
     provider: &str,
     cred: &StoredCredential,
@@ -152,15 +301,12 @@ pub fn save_credential(
     let path = match auth_file {
         Some(p) => p,
         None => {
-            path_buf = default_auth_path();
+            path_buf = default_auth_path()?;
             &path_buf
         }
     };
 
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create directories for: {}", path.display()))?;
-    }
+    let lock_file = acquire_auth_file_lock(path)?;
 
     let mut entries = load_auth_entries(Some(path))?;
 
@@ -175,13 +321,13 @@ pub fn save_credential(
 
     let json_str = serde_json::to_string_pretty(&entries)
         .context("Failed to serialize auth credentials to JSON")?;
-    std::fs::write(path, json_str.as_bytes())
-        .with_context(|| format!("Failed to write auth file: {}", path.display()))?;
+    crate::settings::write_file_atomic(path, json_str.as_bytes(), true)?;
 
+    let _ = lock_file.unlock();
     Ok(())
 }
 
-/// Removes a credential for provider (case-insensitive) from auth file.
+/// Removes a credential for provider (case-insensitive) from auth file under advisory file lock.
 /// Returns true if an entry was found and removed, false otherwise.
 pub fn remove_credential(
     provider: &str,
@@ -191,7 +337,7 @@ pub fn remove_credential(
     let path = match auth_file {
         Some(p) => p,
         None => {
-            path_buf = default_auth_path();
+            path_buf = default_auth_path()?;
             &path_buf
         }
     };
@@ -200,22 +346,26 @@ pub fn remove_credential(
         return Ok(false);
     }
 
+    let lock_file = acquire_auth_file_lock(path)?;
+
     let mut entries = load_auth_entries(Some(path))?;
     let existing_key = entries
         .keys()
         .find(|k| k.eq_ignore_ascii_case(provider))
         .cloned();
 
-    if let Some(k) = existing_key {
+    let removed = if let Some(k) = existing_key {
         entries.remove(&k);
         let json_str = serde_json::to_string_pretty(&entries)
             .context("Failed to serialize auth credentials to JSON")?;
-        std::fs::write(path, json_str.as_bytes())
-            .with_context(|| format!("Failed to write auth file: {}", path.display()))?;
-        Ok(true)
+        crate::settings::write_file_atomic(path, json_str.as_bytes(), true)?;
+        true
     } else {
-        Ok(false)
-    }
+        false
+    };
+
+    let _ = lock_file.unlock();
+    Ok(removed)
 }
 
 /// Resolves an API key for the requested provider following priority:
@@ -238,7 +388,13 @@ pub fn resolve_api_key(
         return Some(val);
     }
 
-    let entries = load_auth_entries(auth_file).ok()?;
+    let entries = match load_auth_entries(auth_file) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!("Warning: failed to read auth credentials: {e}");
+            return None;
+        }
+    };
     let cred = entries
         .get(provider)
         .or_else(|| entries.iter().find(|(k, _)| k.eq_ignore_ascii_case(provider)).map(|(_, v)| v))?;
@@ -250,7 +406,8 @@ pub fn resolve_api_key(
 }
 
 /// Resolves an API key or OAuth access token asynchronously.
-/// Automatically refreshes OAuth tokens if expired or expiring within 60 seconds.
+/// Automatically refreshes OAuth tokens if expired or expiring within 60 seconds
+/// using double-checked locking under advisory file lock to serialize concurrent refresh callers.
 pub async fn resolve_api_key_async(
     provider: &str,
     explicit_key: Option<&str>,
@@ -267,35 +424,59 @@ pub async fn resolve_api_key_async(
         return Ok(Some(val));
     }
 
-    let entries = load_auth_entries(auth_file)?;
-    let cred = entries
-        .get(provider)
-        .or_else(|| entries.iter().find(|(k, _)| k.eq_ignore_ascii_case(provider)).map(|(_, v)| v));
+    let auth_path = match auth_file {
+        Some(p) => p.to_path_buf(),
+        None => default_auth_path()?,
+    };
+    let store = FileCredentialStore::for_path(auth_path);
 
+    let cred = store.read(provider).await?;
     let cred = match cred {
         Some(c) => c,
         None => return Ok(None),
     };
 
     match cred {
-        StoredCredential::ApiKey { key, .. } => Ok(key.clone()),
+        StoredCredential::ApiKey { key, .. } => Ok(key),
         StoredCredential::OAuth {
             access, expires, ..
         } => {
             let now = now_ms();
-            if now + 60_000 >= *expires {
+            if now + 60_000 >= expires {
                 if let Some(kind) = oauth_kind_for_provider(provider) {
-                    let client = reqwest::Client::new();
-                    let refreshed = refresh_oauth_credential(&client, kind, cred).await?;
-                    let new_access = match &refreshed {
-                        StoredCredential::OAuth { access, .. } => access.clone(),
-                        _ => anyhow::bail!("Refreshed credential is not OAuth"),
-                    };
-                    save_credential(provider, &refreshed, auth_file)?;
-                    return Ok(Some(new_access));
+                    let refreshed_cred = store
+                        .modify(
+                            provider,
+                            Box::new(move |current_opt| {
+                                Box::pin(async move {
+                                    let current = match current_opt {
+                                        Some(c) => c,
+                                        None => return Ok(None),
+                                    };
+                                    let current_expires = match &current {
+                                        StoredCredential::OAuth { expires, .. } => *expires,
+                                        _ => return Ok(Some(current)),
+                                    };
+                                    // Double-check expiry under lock:
+                                    if now_ms() + 60_000 < current_expires {
+                                        // Another task or process refreshed while we waited for lock
+                                        return Ok(Some(current));
+                                    }
+                                    let client = mehh_ai::default_http_client();
+                                    let refreshed =
+                                        refresh_oauth_credential(&client, kind, &current).await?;
+                                    Ok(Some(refreshed))
+                                })
+                            }),
+                        )
+                        .await?;
+
+                    if let Some(StoredCredential::OAuth { access, .. }) = refreshed_cred {
+                        return Ok(Some(access));
+                    }
                 }
             }
-            Ok(Some(access.clone()))
+            Ok(Some(access))
         }
     }
 }
@@ -413,5 +594,129 @@ mod tests {
         assert_eq!(oauth_kind_for_provider("OpenAI-ChatGPT"), Some(OAuthProviderKind::OpenAiChatGpt));
         assert_eq!(oauth_kind_for_provider("github-copilot"), Some(OAuthProviderKind::GitHubCopilot));
         assert_eq!(oauth_kind_for_provider("mistral"), None);
+    }
+
+    #[test]
+    fn test_auth_corrupt_json_fails_closed_on_load_and_returns_none_on_resolve() {
+        let dir = crate::TempTestDir::new("auth_corrupt");
+        let auth_file = dir.path().join("auth.json");
+        std::fs::write(&auth_file, b"{corrupt-auth-json").unwrap();
+
+        assert!(load_auth_entries(Some(&auth_file)).is_err());
+        assert_eq!(resolve_api_key("openai", None, Some(&auth_file)), None);
+
+        // A single malformed entry inside valid JSON must also fail closed instead of being dropped.
+        std::fs::write(&auth_file, r#"{"openai": {"type": "api_key", "key": "sk-ok"}, "broken": 123}"#)
+            .unwrap();
+        assert!(load_auth_entries(Some(&auth_file)).is_err());
+    }
+
+    #[tokio::test]
+    async fn file_credential_store_serializes_concurrent_refresh() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let post_count = Arc::new(AtomicUsize::new(0));
+        let post_count_clone = post_count.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let server_task = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = match tokio::time::timeout(Duration::from_secs(3), listener.accept()).await {
+                    Ok(Ok(pair)) => pair,
+                    _ => break,
+                };
+                let mut buf = [0u8; 2048];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let req_str = String::from_utf8_lossy(&buf[..n]);
+                if req_str.starts_with("POST /token") || req_str.contains("/token") {
+                    post_count_clone.fetch_add(1, Ordering::SeqCst);
+                    // Artificially hold the response briefly so concurrent caller hits lock
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let resp_body = serde_json::json!({
+                        "access_token": "refreshed_access_token_123",
+                        "refresh_token": "refreshed_refresh_token_123",
+                        "expires_in": 3600
+                    })
+                    .to_string();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                    let _ = socket.flush().await;
+                }
+            }
+        });
+
+        struct EnvVarGuard {
+            key: &'static str,
+            prev: Option<String>,
+        }
+
+        impl EnvVarGuard {
+            fn set(key: &'static str, value: &str) -> Self {
+                let prev = std::env::var(key).ok();
+                unsafe {
+                    std::env::set_var(key, value);
+                }
+                Self { key, prev }
+            }
+        }
+
+        impl Drop for EnvVarGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.prev {
+                        Some(v) => std::env::set_var(self.key, v),
+                        None => std::env::remove_var(self.key),
+                    }
+                }
+            }
+        }
+
+        // Set ANTHROPIC_TOKEN_URL to point to local mock using RAII guard
+        let token_url = format!("http://127.0.0.1:{port}/token");
+        let _env_guard = EnvVarGuard::set("ANTHROPIC_TOKEN_URL", &token_url);
+
+        let dir = crate::TempTestDir::new("auth_concurrent_refresh");
+        let auth_path = dir.path().join("auth.json");
+
+        // Seed with an expired OAuth token
+        let expired_cred = StoredCredential::OAuth {
+            access: "old_access_token".to_string(),
+            refresh: "old_refresh_token".to_string(),
+            expires: 1000, // Long expired
+            client_id: Some("test_client".to_string()),
+            scopes: None,
+            available_model_ids: None,
+        };
+        save_credential("anthropic", &expired_cred, Some(&auth_path)).unwrap();
+
+        // Spawn two concurrent resolve_api_key_async calls
+        let auth_path_clone = auth_path.clone();
+        let h1 = tokio::spawn(async move {
+            resolve_api_key_async("anthropic", None, Some(&auth_path_clone)).await
+        });
+        let h2 = tokio::spawn(async move {
+            resolve_api_key_async("anthropic", None, Some(&auth_path)).await
+        });
+
+        let (res1, res2) = tokio::join!(h1, h2);
+        let key1 = res1.unwrap().unwrap();
+        let key2 = res2.unwrap().unwrap();
+
+        assert_eq!(key1, Some("refreshed_access_token_123".to_string()));
+        assert_eq!(key2, Some("refreshed_access_token_123".to_string()));
+
+        // Crucial invariant: only 1 HTTP POST to /token was performed
+        assert_eq!(post_count.load(Ordering::SeqCst), 1, "Expected exactly 1 refresh POST under file lock");
+
+        let _ = server_task.await;
     }
 }

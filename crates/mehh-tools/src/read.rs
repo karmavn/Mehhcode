@@ -6,6 +6,9 @@ use mehh_ai::{ImageContent, ToolResultContentBlock};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+const MAX_IMAGE_FILE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_TEXT_FILE_BYTES: u64 = 50 * 1024 * 1024;
+
 #[derive(Debug, Clone)]
 pub struct ReadTool {
     pub cwd: PathBuf,
@@ -65,9 +68,13 @@ impl AgentTool for ReadTool {
         &self,
         _tool_call_id: &str,
         params: serde_json::Map<String, serde_json::Value>,
-        _cancel: CancellationToken,
+        cancel: CancellationToken,
         _on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, String> {
+        if cancel.is_cancelled() {
+            return Err("Tool execution cancelled".to_string());
+        }
+
         let path_str = params
             .get("path")
             .and_then(|v| v.as_str())
@@ -87,8 +94,18 @@ impl AgentTool for ReadTool {
 
         let full_path = self.resolve_path(path_str);
 
-        if !full_path.exists() {
-            return Err(format!("File not found: {}", path_str));
+        let meta = match tokio::fs::metadata(&full_path).await {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("File not found: {}", path_str));
+            }
+            Err(e) => {
+                return Err(format!("Failed to stat file {}: {}", path_str, e));
+            }
+        };
+
+        if meta.is_dir() {
+            return Err(format!("Path is a directory: {}", path_str));
         }
 
         let ext = full_path
@@ -105,7 +122,14 @@ impl AgentTool for ReadTool {
             _ => None,
         };
 
+        let file_size = meta.len();
         if let Some(mime_type) = image_mime {
+            if file_size > MAX_IMAGE_FILE_BYTES {
+                return Err(format!(
+                    "Image file {} is too large ({} bytes exceeds {} byte limit)",
+                    path_str, file_size, MAX_IMAGE_FILE_BYTES
+                ));
+            }
             let bytes = tokio::fs::read(&full_path)
                 .await
                 .map_err(|e| format!("Failed to read image file {}: {}", path_str, e))?;
@@ -119,6 +143,13 @@ impl AgentTool for ReadTool {
             });
         }
 
+        if file_size > MAX_TEXT_FILE_BYTES {
+            return Err(format!(
+                "File {} is too large ({} bytes exceeds {} byte limit)",
+                path_str, file_size, MAX_TEXT_FILE_BYTES
+            ));
+        }
+
         let bytes = tokio::fs::read(&full_path)
             .await
             .map_err(|e| format!("Failed to read file {}: {}", path_str, e))?;
@@ -129,14 +160,23 @@ impl AgentTool for ReadTool {
 
         let content_str = String::from_utf8_lossy(&bytes);
 
-        let all_lines: Vec<&str> = content_str
-            .split('\n')
-            .map(|l| l.strip_suffix('\r').unwrap_or(l))
-            .collect();
-
-        let total_lines = all_lines.len();
-
         let start_line = offset - 1;
+        let mut total_lines = 0usize;
+        let mut formatted_lines = Vec::with_capacity(limit.min(2048));
+        for (idx, raw_line) in content_str.split('\n').enumerate() {
+            total_lines = idx + 1;
+            if idx >= start_line && formatted_lines.len() < limit {
+                let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+                if line.len() > 2000 {
+                    if let Some((cut, _)) = line.char_indices().nth(2000) {
+                        formatted_lines.push(format!("{}... [truncated]", &line[..cut]));
+                        continue;
+                    }
+                }
+                formatted_lines.push(line.to_string());
+            }
+        }
+
         if start_line >= total_lines {
             return Err(format!(
                 "Offset {} is beyond end of file ({} lines total)",
@@ -144,17 +184,7 @@ impl AgentTool for ReadTool {
             ));
         }
 
-        let end_line = (start_line + limit).min(total_lines);
-
-        let mut formatted_lines = Vec::with_capacity(end_line - start_line);
-        for line in &all_lines[start_line..end_line] {
-            if line.chars().count() > 2000 {
-                let truncated: String = line.chars().take(2000).collect();
-                formatted_lines.push(format!("{}... [truncated]", truncated));
-            } else {
-                formatted_lines.push(line.to_string());
-            }
-        }
+        let end_line = start_line + formatted_lines.len();
 
         let mut output = formatted_lines.join("\n");
 

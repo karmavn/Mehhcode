@@ -2,6 +2,10 @@
 
 use futures::StreamExt;
 
+use crate::retry::{
+    default_http_client, retry_failure_event, send_with_retry, RetryPolicy,
+    DEFAULT_STREAM_CHUNK_TIMEOUT,
+};
 use crate::sse::{SseEvent, SseParser};
 use crate::stream::{create_event_stream, AssistantEventSender, AssistantEventStream, LlmProvider};
 use crate::types::*;
@@ -26,7 +30,7 @@ impl GoogleProvider {
 impl Default for GoogleProvider {
     fn default() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: default_http_client(),
         }
     }
 }
@@ -50,70 +54,43 @@ impl LlmProvider for GoogleProvider {
             let body = build_google_request(&model, &context, &options);
             let url = resolve_google_endpoint(&model);
 
-            let mut req = client.post(&url);
-            req = req.header("content-type", "application/json");
+            let resp = match send_with_retry(
+                || {
+                    let mut req = client.post(&url);
+                    req = req.header("content-type", "application/json");
 
-            if model.api == "google-vertex" {
-                if let Some(api_key) = &options.api_key {
-                    req = req.header("authorization", format!("Bearer {api_key}"));
-                } else if let Ok(token) = std::env::var("GOOGLE_CLOUD_API_KEY") {
-                    req = req.header("authorization", format!("Bearer {token}"));
-                }
-            } else if let Some(api_key) = &options.api_key {
-                req = req.header("x-goog-api-key", api_key);
-            }
-            if let Some(headers) = &model.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            if let Some(headers) = &options.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            req = req.json(&body);
-
-            let resp = tokio::select! {
-                _ = cancel.cancelled() => {
-                    let mut err_msg = AssistantMessage::empty_for_model(&model);
-                    err_msg.stop_reason = StopReason::Aborted;
-                    err_msg.error_message = Some("Request was cancelled".to_string());
-                    sender.push(AssistantMessageEvent::Error {
-                        reason: StopReason::Aborted,
-                        error: err_msg,
-                    });
-                    return;
-                }
-                res = req.send() => {
-                    match res {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let mut err_msg = AssistantMessage::empty_for_model(&model);
-                            err_msg.stop_reason = StopReason::Error;
-                            err_msg.error_message = Some(e.to_string());
-                            sender.push(AssistantMessageEvent::Error {
-                                reason: StopReason::Error,
-                                error: err_msg,
-                            });
-                            return;
+                    if model.api == "google-vertex" {
+                        if let Some(api_key) = &options.api_key {
+                            req = req.header("authorization", format!("Bearer {api_key}"));
+                        } else if let Ok(token) = std::env::var("GOOGLE_CLOUD_API_KEY") {
+                            req = req.header("authorization", format!("Bearer {token}"));
+                        }
+                    } else if let Some(api_key) = &options.api_key {
+                        req = req.header("x-goog-api-key", api_key);
+                    }
+                    if let Some(headers) = &model.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
                         }
                     }
+                    if let Some(headers) = &options.headers {
+                        for (k, v) in headers {
+                            req = req.header(k, v);
+                        }
+                    }
+                    req.json(&body)
+                },
+                &RetryPolicy::default(),
+                &cancel,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(failure) => {
+                    sender.send(retry_failure_event(failure, &model)).await;
+                    return;
                 }
             };
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                let mut err_msg = AssistantMessage::empty_for_model(&model);
-                err_msg.stop_reason = StopReason::Error;
-                err_msg.error_message = Some(format!("HTTP {status}: {text}"));
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
-                    error: err_msg,
-                });
-                return;
-            }
 
             let mut byte_stream = resp.bytes_stream();
             let mut sse_parser = SseParser::new();
@@ -122,45 +99,64 @@ impl LlmProvider for GoogleProvider {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        let mut err_msg = state.finish(&sender);
-                        err_msg.stop_reason = StopReason::Aborted;
-                        err_msg.error_message = Some("Request was cancelled".to_string());
-                        sender.push(AssistantMessageEvent::Error {
-                            reason: StopReason::Aborted,
-                            error: err_msg,
-                        });
+                        state.mark_aborted("Request was cancelled");
+                        let mut batch = Vec::new();
+                        state.finish_into(&mut batch);
+                        sender.send_batch(batch).await;
                         return;
                     }
-                    chunk_opt = byte_stream.next() => {
+                    chunk_opt = tokio::time::timeout(DEFAULT_STREAM_CHUNK_TIMEOUT, byte_stream.next()) => {
                         match chunk_opt {
-                            Some(Ok(bytes)) => {
-                                let chunk_str = String::from_utf8_lossy(&bytes);
-                                let events = sse_parser.feed(&chunk_str);
-                                for ev in events {
-                                    state.process_chunk(&ev.data, &sender);
+                            Ok(Some(Ok(bytes))) => {
+                                let events = sse_parser.feed_bytes(&bytes);
+                                if sse_parser.has_overflowed() {
+                                    state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+                                    let mut batch = Vec::new();
+                                    state.finish_into(&mut batch);
+                                    sender.send_batch(batch).await;
+                                    return;
                                 }
+                                let mut batch = Vec::new();
+                                for ev in events {
+                                    state.process_chunk_into(&ev.data, &mut batch);
+                                }
+                                sender.send_batch(batch).await;
                             }
-                            Some(Err(e)) => {
-                                let mut err_msg = state.finish(&sender);
-                                err_msg.stop_reason = StopReason::Error;
-                                err_msg.error_message = Some(e.to_string());
-                                sender.push(AssistantMessageEvent::Error {
-                                    reason: StopReason::Error,
-                                    error: err_msg,
-                                });
+                            Ok(Some(Err(e))) => {
+                                state.mark_error(e.to_string());
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
                                 return;
                             }
-                            None => break,
+                            Err(_) => {
+                                state.mark_error(format!(
+                                    "Stream read timed out after {} seconds",
+                                    DEFAULT_STREAM_CHUNK_TIMEOUT.as_secs()
+                                ));
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
+                                return;
+                            }
+                            Ok(None) => break,
                         }
                     }
                 }
             }
 
             let remaining = sse_parser.finish();
+            let mut batch = Vec::new();
             for ev in remaining {
-                state.process_chunk(&ev.data, &sender);
+                state.process_chunk_into(&ev.data, &mut batch);
             }
-            state.finish(&sender);
+            if sse_parser.has_overflowed() {
+                state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+            } else if sse_parser.has_pending_bytes() || !state.received_terminal {
+                state.mark_error("Stream ended prematurely before Google completion");
+            }
+            state.finish_into(&mut batch);
+            sender.send_batch(batch).await;
         });
 
         stream
@@ -201,41 +197,82 @@ pub fn resolve_google_endpoint(model: &Model) -> String {
     }
 }
 
+fn get_gemini_major_version(model_id: &str) -> Option<u32> {
+    let lower = model_id.to_lowercase();
+    let prefix = if let Some(stripped) = lower.strip_prefix("gemini-live-") {
+        stripped
+    } else {
+        lower.strip_prefix("gemini-")?
+    };
+    let num_str: String = prefix.chars().take_while(|c| c.is_ascii_digit()).collect();
+    num_str.parse().ok()
+}
+
+pub fn requires_tool_call_id(model_id: &str) -> bool {
+    model_id.starts_with("claude-")
+        || model_id.starts_with("gpt-oss-")
+        || get_gemini_major_version(model_id).map(|v| v >= 3).unwrap_or(false)
+}
+
+fn normalize_google_tool_call_id(id: &str, model: &Model) -> String {
+    if !requires_tool_call_id(&model.id) {
+        return id.to_string();
+    }
+    let sanitized: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if sanitized.len() > 64 {
+        sanitized[..64].to_string()
+    } else {
+        sanitized
+    }
+}
+
 /// Builds the JSON request payload for Google Generative AI API.
 pub fn build_google_request(
     model: &Model,
     context: &Context,
     options: &StreamOptions,
 ) -> serde_json::Value {
+    use crate::transform_messages::transform_messages;
+    use crate::unicode::sanitize_surrogates;
+
     let mut system_texts = Vec::new();
     if let Some(sys) = &context.system_prompt {
         if !sys.is_empty() {
-            system_texts.push(sys.clone());
+            system_texts.push(sanitize_surrogates(sys));
         }
     }
     for msg in &context.messages {
         if let Message::System(sys) = msg {
             if !sys.content.is_empty() {
-                system_texts.push(sys.content.clone());
+                system_texts.push(sanitize_surrogates(&sys.content));
             }
         }
     }
 
+    let transformed_messages = transform_messages(
+        &context.messages,
+        model,
+        Some(|id: &str, m: &Model, _a: &AssistantMessage| normalize_google_tool_call_id(id, m)),
+    );
+
     let mut contents: Vec<serde_json::Value> = Vec::new();
 
-    for msg in &context.messages {
+    for msg in &transformed_messages {
         match msg {
             Message::System(_) => {}
             Message::User(u) => {
                 let parts: Vec<serde_json::Value> = match &u.content {
                     UserContent::Text(text) => {
-                        vec![serde_json::json!({ "text": text })]
+                        vec![serde_json::json!({ "text": sanitize_surrogates(text) })]
                     }
                     UserContent::Blocks(blocks) => blocks
                         .iter()
                         .map(|b| match b {
                             UserContentBlock::Text(tc) => {
-                                serde_json::json!({ "text": tc.text })
+                                serde_json::json!({ "text": sanitize_surrogates(&tc.text) })
                             }
                             UserContentBlock::Image(img) => {
                                 serde_json::json!({
@@ -256,27 +293,44 @@ pub fn build_google_request(
                 }
             }
             Message::Assistant(a) => {
+                let is_same_model = a.provider == model.provider && a.model == model.id;
                 let mut parts: Vec<serde_json::Value> = Vec::new();
                 for block in &a.content {
                     match block {
                         AssistantContentBlock::Text(tc) => {
-                            if !tc.text.is_empty() || tc.text_signature.is_some() {
+                            let thought_sig = if is_same_model {
+                                tc.text_signature.as_deref()
+                            } else {
+                                None
+                            };
+                            let sanitized = sanitize_surrogates(&tc.text);
+                            if !sanitized.trim().is_empty() || thought_sig.is_some() {
                                 let mut p = serde_json::Map::new();
-                                p.insert("text".to_string(), serde_json::json!(tc.text));
-                                if let Some(sig) = &tc.text_signature {
+                                p.insert("text".to_string(), serde_json::json!(sanitized));
+                                if let Some(sig) = thought_sig {
                                     p.insert("thoughtSignature".to_string(), serde_json::json!(sig));
                                 }
                                 parts.push(serde_json::Value::Object(p));
                             }
                         }
                         AssistantContentBlock::Thinking(th) => {
-                            let mut p = serde_json::Map::new();
-                            p.insert("thought".to_string(), serde_json::json!(true));
-                            p.insert("text".to_string(), serde_json::json!(th.thinking));
-                            if let Some(sig) = &th.thinking_signature {
-                                p.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                            if is_same_model {
+                                let sanitized = sanitize_surrogates(&th.thinking);
+                                let mut p = serde_json::Map::new();
+                                p.insert("thought".to_string(), serde_json::json!(true));
+                                p.insert("text".to_string(), serde_json::json!(sanitized));
+                                if let Some(sig) = &th.thinking_signature {
+                                    p.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                                }
+                                parts.push(serde_json::Value::Object(p));
+                            } else {
+                                let sanitized = sanitize_surrogates(&th.thinking);
+                                if !sanitized.trim().is_empty() {
+                                    let mut p = serde_json::Map::new();
+                                    p.insert("text".to_string(), serde_json::json!(sanitized));
+                                    parts.push(serde_json::Value::Object(p));
+                                }
                             }
-                            parts.push(serde_json::Value::Object(p));
                         }
                         AssistantContentBlock::ToolCall(tc) => {
                             let mut fc = serde_json::Map::new();
@@ -290,8 +344,10 @@ pub fn build_google_request(
                             }
                             let mut p = serde_json::Map::new();
                             p.insert("functionCall".to_string(), serde_json::Value::Object(fc));
-                            if let Some(sig) = &tc.thought_signature {
-                                p.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                            if is_same_model {
+                                if let Some(sig) = &tc.thought_signature {
+                                    p.insert("thoughtSignature".to_string(), serde_json::json!(sig));
+                                }
                             }
                             parts.push(serde_json::Value::Object(p));
                         }
@@ -309,7 +365,7 @@ pub fn build_google_request(
                     .content
                     .iter()
                     .filter_map(|b| match b {
-                        ToolResultContentBlock::Text(tc) => Some(tc.text.as_str()),
+                        ToolResultContentBlock::Text(tc) => Some(sanitize_surrogates(&tc.text)),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -429,6 +485,7 @@ pub struct GoogleStreamState {
     output: AssistantMessage,
     started: bool,
     done: bool,
+    pub received_terminal: bool,
     active_thinking_index: Option<usize>,
     active_text_index: Option<usize>,
     tool_call_counter: usize,
@@ -442,16 +499,42 @@ impl GoogleStreamState {
             output: AssistantMessage::empty_for_model(model),
             started: false,
             done: false,
+            received_terminal: false,
             active_thinking_index: None,
             active_text_index: None,
             tool_call_counter: 0,
         }
     }
 
-    /// Processes a raw SSE data payload string.
+    /// Marks the stream as aborted so `finish_into` emits an aborted terminal event.
+    pub fn mark_aborted(&mut self, msg: &str) {
+        self.output.stop_reason = StopReason::Aborted;
+        self.output.error_message = Some(msg.to_string());
+    }
+
+    /// Marks the stream as failed so `finish_into` emits an error terminal event.
+    pub fn mark_error(&mut self, msg: impl Into<String>) {
+        self.output.stop_reason = StopReason::Error;
+        self.output.error_message = Some(msg.into());
+    }
+
+    /// Processes a raw SSE data payload string and sends produced events.
     pub fn process_chunk(&mut self, data: &str, sender: &AssistantEventSender) {
+        let mut batch = Vec::new();
+        self.process_chunk_into(data, &mut batch);
+        for ev in batch {
+            sender.push(ev);
+        }
+    }
+
+    /// Processes a raw SSE data payload string, appending produced events to `events`.
+    pub fn process_chunk_into(&mut self, data: &str, events: &mut Vec<AssistantMessageEvent>) {
         let trimmed = data.trim();
-        if trimmed.is_empty() || trimmed == "[DONE]" {
+        if trimmed.is_empty() {
+            return;
+        }
+        if trimmed == "[DONE]" {
+            self.received_terminal = true;
             return;
         }
 
@@ -467,7 +550,7 @@ impl GoogleStreamState {
 
         if !self.started {
             self.started = true;
-            sender.push(AssistantMessageEvent::Start {
+            events.push(AssistantMessageEvent::Start {
                 partial: self.output.clone(),
             });
         }
@@ -508,16 +591,24 @@ impl GoogleStreamState {
 
         if let Some(candidate) = json.get("candidates").and_then(|c| c.get(0)) {
             if let Some(finish_reason) = candidate.get("finishReason").and_then(|r| r.as_str()) {
-                self.output.stop_reason = match finish_reason {
-                    "STOP" => StopReason::Stop,
-                    "MAX_TOKENS" => StopReason::Length,
-                    "SAFETY" | "RECITATION" => {
-                        self.output.error_message =
-                            Some(format!("Provider finishReason: {finish_reason}"));
-                        StopReason::Error
-                    }
-                    _ => StopReason::Stop,
-                };
+                if !finish_reason.is_empty() {
+                    self.received_terminal = true;
+                    self.output.stop_reason = match finish_reason {
+                        "STOP" => StopReason::Stop,
+                        "MAX_TOKENS" => StopReason::Length,
+                        "SAFETY"
+                        | "RECITATION"
+                        | "BLOCKLIST"
+                        | "PROHIBITED_CONTENT"
+                        | "SPII"
+                        | "MALFORMED_FUNCTION_CALL" => {
+                            self.output.error_message =
+                                Some(format!("Provider finishReason: {finish_reason}"));
+                            StopReason::Error
+                        }
+                        _ => StopReason::Stop,
+                    };
+                }
             }
 
             if let Some(parts) = candidate
@@ -544,7 +635,7 @@ impl GoogleStreamState {
                             } else {
                                 String::new()
                             };
-                            sender.push(AssistantMessageEvent::TextEnd {
+                            events.push(AssistantMessageEvent::TextEnd {
                                 content_index: text_idx,
                                 content: text_content,
                                 partial: self.output.clone(),
@@ -563,7 +654,7 @@ impl GoogleStreamState {
                                     }));
                                 let idx = self.output.content.len() - 1;
                                 self.active_thinking_index = Some(idx);
-                                sender.push(AssistantMessageEvent::ThinkingStart {
+                                events.push(AssistantMessageEvent::ThinkingStart {
                                     content_index: idx,
                                     partial: self.output.clone(),
                                 });
@@ -581,10 +672,10 @@ impl GoogleStreamState {
                                         tc.thinking_signature = thought_sig;
                                     }
                                 }
-                                sender.push(AssistantMessageEvent::ThinkingDelta {
+                                events.push(AssistantMessageEvent::ThinkingDelta {
                                     content_index,
                                     delta: text.to_string(),
-                                    partial: self.output.clone(),
+                                    partial: self.output.metadata_clone(),
                                 });
                             }
                         }
@@ -597,7 +688,7 @@ impl GoogleStreamState {
                             } else {
                                 String::new()
                             };
-                            sender.push(AssistantMessageEvent::ThinkingEnd {
+                            events.push(AssistantMessageEvent::ThinkingEnd {
                                 content_index: thinking_idx,
                                 content: thinking_content,
                                 partial: self.output.clone(),
@@ -615,7 +706,7 @@ impl GoogleStreamState {
                                     }));
                                 let idx = self.output.content.len() - 1;
                                 self.active_text_index = Some(idx);
-                                sender.push(AssistantMessageEvent::TextStart {
+                                events.push(AssistantMessageEvent::TextStart {
                                     content_index: idx,
                                     partial: self.output.clone(),
                                 });
@@ -632,10 +723,10 @@ impl GoogleStreamState {
                                     tc.text_signature = thought_sig;
                                 }
                             }
-                            sender.push(AssistantMessageEvent::TextDelta {
+                            events.push(AssistantMessageEvent::TextDelta {
                                 content_index,
                                 delta: text.to_string(),
-                                partial: self.output.clone(),
+                                partial: self.output.metadata_clone(),
                             });
                         }
                     } else if let Some(fc) = part.get("functionCall") {
@@ -647,7 +738,7 @@ impl GoogleStreamState {
                             } else {
                                 String::new()
                             };
-                            sender.push(AssistantMessageEvent::ThinkingEnd {
+                            events.push(AssistantMessageEvent::ThinkingEnd {
                                 content_index: thinking_idx,
                                 content: thinking_content,
                                 partial: self.output.clone(),
@@ -661,7 +752,7 @@ impl GoogleStreamState {
                             } else {
                                 String::new()
                             };
-                            sender.push(AssistantMessageEvent::TextEnd {
+                            events.push(AssistantMessageEvent::TextEnd {
                                 content_index: text_idx,
                                 content: text_content,
                                 partial: self.output.clone(),
@@ -703,17 +794,17 @@ impl GoogleStreamState {
                             .push(AssistantContentBlock::ToolCall(tool_call.clone()));
                         let content_index = self.output.content.len() - 1;
 
-                        sender.push(AssistantMessageEvent::ToolCallStart {
+                        events.push(AssistantMessageEvent::ToolCallStart {
                             content_index,
                             partial: self.output.clone(),
                         });
-                        sender.push(AssistantMessageEvent::ToolCallDelta {
+                        events.push(AssistantMessageEvent::ToolCallDelta {
                             content_index,
                             delta: serde_json::to_string(&tool_call.arguments)
                                 .unwrap_or_else(|_| "{}".to_string()),
-                            partial: self.output.clone(),
+                            partial: self.output.metadata_clone(),
                         });
-                        sender.push(AssistantMessageEvent::ToolCallEnd {
+                        events.push(AssistantMessageEvent::ToolCallEnd {
                             content_index,
                             tool_call,
                             partial: self.output.clone(),
@@ -726,6 +817,16 @@ impl GoogleStreamState {
 
     /// Closes any remaining active blocks and emits the terminal completion event if needed.
     pub fn finish(&mut self, sender: &AssistantEventSender) -> AssistantMessage {
+        let mut batch = Vec::new();
+        let out = self.finish_into(&mut batch);
+        for ev in batch {
+            sender.push(ev);
+        }
+        out
+    }
+
+    /// Closes any remaining active blocks and appends the terminal completion event to `events`.
+    pub fn finish_into(&mut self, events: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
         if let Some(thinking_idx) = self.active_thinking_index.take() {
             let content = if let Some(AssistantContentBlock::Thinking(tc)) =
                 self.output.content.get(thinking_idx)
@@ -734,7 +835,7 @@ impl GoogleStreamState {
             } else {
                 String::new()
             };
-            sender.push(AssistantMessageEvent::ThinkingEnd {
+            events.push(AssistantMessageEvent::ThinkingEnd {
                 content_index: thinking_idx,
                 content,
                 partial: self.output.clone(),
@@ -749,7 +850,7 @@ impl GoogleStreamState {
             } else {
                 String::new()
             };
-            sender.push(AssistantMessageEvent::TextEnd {
+            events.push(AssistantMessageEvent::TextEnd {
                 content_index: text_idx,
                 content,
                 partial: self.output.clone(),
@@ -768,13 +869,16 @@ impl GoogleStreamState {
 
         if !self.done {
             self.done = true;
-            if self.output.stop_reason == StopReason::Error {
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
+            if matches!(
+                self.output.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            ) {
+                events.push(AssistantMessageEvent::Error {
+                    reason: self.output.stop_reason,
                     error: self.output.clone(),
                 });
             } else {
-                sender.push(AssistantMessageEvent::Done {
+                events.push(AssistantMessageEvent::Done {
                     reason: self.output.stop_reason,
                     message: self.output.clone(),
                 });
@@ -820,6 +924,7 @@ mod tests {
             context_window: 1_000_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         }
     }
 
@@ -891,6 +996,7 @@ mod tests {
             reasoning: Some(ThinkingLevel::High),
             session_id: None,
             headers: None,
+            ..Default::default()
         };
 
         let req = build_google_request(&model, &context, &options);
@@ -1067,6 +1173,7 @@ mod tests {
             context_window: 1_000_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         };
 
         let endpoint = resolve_google_endpoint(&model);
@@ -1088,11 +1195,95 @@ mod tests {
             reasoning: None,
             session_id: None,
             headers: None,
+            ..Default::default()
         };
 
         let req = build_google_request(&model, &context, &options);
         assert_eq!(req["systemInstruction"]["parts"][0]["text"], "Vertex system prompt");
         assert_eq!(req["contents"][0]["role"], "user");
         assert_eq!(req["contents"][0]["parts"][0]["text"], "Hello Vertex");
+    }
+
+    #[test]
+    fn build_request_normalizes_ids_for_gemini_3_and_drops_foreign_thinking() {
+        let model = Model {
+            id: "gemini-3-pro".to_string(),
+            name: "Gemini 3 Pro".to_string(),
+            api: "google-generative-ai".to_string(),
+            provider: "google".to_string(),
+            base_url: "".to_string(),
+            reasoning: true,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 1_000_000,
+            max_tokens: 8192,
+            headers: None,
+            ..Default::default()
+        };
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Calculate something".to_string()),
+                    timestamp: 100,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![
+                        AssistantContentBlock::Thinking(crate::types::ThinkingContent {
+                            thinking: "Foreign reasoning that must be dropped".to_string(),
+                            thinking_signature: Some("foreign_sig".to_string()),
+                            redacted: None,
+                        }),
+                        AssistantContentBlock::ToolCall(ToolCall {
+                            id: "call_abc123|item_xyz789".to_string(),
+                            name: "calculator".to_string(),
+                            arguments: serde_json::Map::new(),
+                            arguments_error: None,
+                            thought_signature: Some("foreign_tool_sig".to_string()),
+                        }),
+                    ],
+                    api: "openai-responses".to_string(),
+                    provider: "openai".to_string(),
+                    model: "gpt-5".to_string(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 200,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "call_abc123|item_xyz789".to_string(),
+                    tool_name: "calculator".to_string(),
+                    content: vec![ToolResultContentBlock::Text(TextContent {
+                        text: "42".to_string(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 300,
+                }),
+            ],
+            tools: None,
+        };
+
+        let req = build_google_request(&model, &context, &StreamOptions::default());
+        let contents = req["contents"].as_array().expect("contents array");
+        assert_eq!(contents.len(), 3);
+
+        let model_msg = &contents[1];
+        assert_eq!(model_msg["role"], "model");
+        let parts = model_msg["parts"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "Foreign thinking block must be dropped");
+        let fc = &parts[0]["functionCall"];
+        assert_eq!(fc["name"], "calculator");
+        assert_eq!(fc["id"], "call_abc123_item_xyz789");
+        assert!(parts[0].get("thoughtSignature").is_none(), "foreign thought_signature must be stripped");
+
+        let user_msg = &contents[2];
+        assert_eq!(user_msg["role"], "user");
+        let fr = &user_msg["parts"][0]["functionResponse"];
+        assert_eq!(fr["name"], "calculator");
+        assert_eq!(fr["id"], "call_abc123_item_xyz789");
     }
 }

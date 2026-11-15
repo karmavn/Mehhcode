@@ -58,37 +58,233 @@ pub struct McpAuthEntry {
     pub tokens_expire_at: Option<i64>,
 }
 
+const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_OAUTH_BODY_BYTES: usize = 256 * 1024;
+const MAX_OAUTH_ERROR_BYTES: usize = 16 * 1024;
+const MAX_OAUTH_DISCOVERY_DEPTH: u8 = 1;
+
 /// Returns the standard default path for MCP authentication state: `~/.mehh/agent/mcp-auth.json`.
-pub fn default_mcp_auth_path() -> PathBuf {
-    if let Ok(home) = std::env::var("USERPROFILE").or_else(|_| std::env::var("HOME")) {
-        PathBuf::from(home)
-            .join(".mehh")
-            .join("agent")
-            .join("mcp-auth.json")
-    } else {
-        PathBuf::from(".mehh").join("agent").join("mcp-auth.json")
+/// Fails closed if neither `USERPROFILE` nor `HOME` is set to a non-empty path.
+pub fn default_mcp_auth_path() -> anyhow::Result<PathBuf> {
+    let home = std::env::var("USERPROFILE")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::var("HOME").ok().filter(|s| !s.trim().is_empty()))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot resolve MCP auth path: neither USERPROFILE nor HOME is set"
+            )
+        })?;
+    Ok(PathBuf::from(home)
+        .join(".mehh")
+        .join("agent")
+        .join("mcp-auth.json"))
+}
+
+/// Validates that an OAuth URL uses `https://` or loopback `http://` (`localhost`, `127.0.0.1`, `[::1]`).
+pub fn validate_oauth_url(raw: &str) -> anyhow::Result<reqwest::Url> {
+    let url = reqwest::Url::parse(raw)
+        .with_context(|| format!("Invalid OAuth URL '{raw}'"))?;
+    let host = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("OAuth URL '{raw}' is missing a host"))?;
+
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if is_loopback_host(host) => Ok(url),
+        "http" => anyhow::bail!(
+            "Insecure non-loopback HTTP scheme rejected for OAuth URL '{raw}'"
+        ),
+        other => anyhow::bail!("Unsupported URL scheme '{other}' in OAuth URL '{raw}'"),
     }
+}
+
+/// Builds an HTTP client for OAuth requests with timeouts and HTTP redirects disabled.
+pub fn oauth_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(OAUTH_HTTP_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new())
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let clean = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    if clean.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
+        return ip.is_loopback();
+    }
+    false
+}
+
+fn is_local_or_internal_hostname(host: &str) -> bool {
+    let clean = host
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.');
+    let lower = clean.to_ascii_lowercase();
+    lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower == "localhost.localdomain"
+        || lower.ends_with(".localhost.localdomain")
+}
+
+fn is_private_or_local_ip(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+            let is_this_net = octets[0] == 0;
+            v4.is_loopback()
+                || v4.is_private()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_multicast()
+                || is_cgnat
+                || is_this_net
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
+                return true;
+            }
+            let segs = v6.segments();
+            // ::ffff:0:0/96 (IPv4-mapped IPv6) or ::0.0.0.0/96 (IPv4-compatible IPv6)
+            if segs[0..5] == [0, 0, 0, 0, 0] && (segs[5] == 0xffff || segs[5] == 0) {
+                let v4 = std::net::Ipv4Addr::new(
+                    (segs[6] >> 8) as u8,
+                    segs[6] as u8,
+                    (segs[7] >> 8) as u8,
+                    segs[7] as u8,
+                );
+                return is_private_or_local_ip(std::net::IpAddr::V4(v4));
+            }
+            // fc00::/7 (ULA) or fe80::/10 (link-local)
+            (segs[0] & 0xfe00) == 0xfc00 || (segs[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+fn is_disallowed_discovery_redirect(parent_url: &reqwest::Url, target_url: &reqwest::Url) -> bool {
+    let parent_is_loopback = parent_url.host_str().is_some_and(is_loopback_host);
+    if parent_is_loopback {
+        return false;
+    }
+    let Some(host) = target_url.host_str() else {
+        return true;
+    };
+    if is_local_or_internal_hostname(host) {
+        return true;
+    }
+    let clean = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
+        return is_private_or_local_ip(ip);
+    }
+    false
+}
+
+async fn validate_oauth_target_dns(
+    allow_local: bool,
+    target_url: &reqwest::Url,
+) -> anyhow::Result<()> {
+    if allow_local {
+        return Ok(());
+    }
+    let host = target_url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("OAuth URL '{target_url}' is missing a host"))?;
+    if is_local_or_internal_hostname(host) {
+        anyhow::bail!("Local OAuth host '{host}' rejected for non-loopback server");
+    }
+    let clean = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
+        if is_private_or_local_ip(ip) {
+            anyhow::bail!("Private or local OAuth IP '{ip}' rejected for '{target_url}'");
+        }
+        return Ok(());
+    }
+    let port = target_url.port_or_known_default().unwrap_or(443);
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((clean, port))
+        .await
+        .with_context(|| format!("Failed to resolve OAuth host '{clean}'"))?
+        .collect();
+    if addrs.is_empty() {
+        anyhow::bail!("OAuth host '{clean}' resolved to no addresses");
+    }
+    for addr in addrs {
+        if is_private_or_local_ip(addr.ip()) {
+            anyhow::bail!(
+                "OAuth host '{clean}' resolved to disallowed private/local IP '{}'",
+                addr.ip()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Validates an outbound OAuth URL (scheme, host literals, and DNS IPs when non-loopback).
+pub async fn validate_oauth_request_url(raw: &str) -> anyhow::Result<reqwest::Url> {
+    let url = validate_oauth_url(raw)?;
+    let allow_local = url.host_str().is_some_and(is_loopback_host);
+    validate_oauth_target_dns(allow_local, &url).await?;
+    Ok(url)
+}
+
+async fn read_bounded_oauth_bytes(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            anyhow::bail!("OAuth HTTP response Content-Length ({len} bytes) exceeds limit of {max_bytes} bytes");
+        }
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(OAUTH_HTTP_TIMEOUT, resp.chunk())
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out reading OAuth HTTP response body"))??
+    {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("OAuth HTTP response body exceeded limit of {max_bytes} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Persistent store for MCP OAuth credentials keyed by `format!("{server_name}|{server_url}")`.
 pub struct McpAuthStore {
     path: PathBuf,
+    lock_path: PathBuf,
+    process_lock: Arc<tokio::sync::Mutex<()>>,
     entries: RwLock<HashMap<String, McpAuthEntry>>,
 }
 
 impl McpAuthStore {
-    /// Creates a store with the default path `~/.mehh/agent/mcp-auth.json`.
-    pub fn new() -> Self {
-        Self::with_path(default_mcp_auth_path())
+    /// Creates a store at `~/.mehh/agent/mcp-auth.json`, failing closed on missing HOME or corrupt JSON.
+    pub fn try_new() -> anyhow::Result<Self> {
+        Self::try_with_path(default_mcp_auth_path()?)
     }
 
-    /// Creates a store with a custom file path.
-    pub fn with_path(path: PathBuf) -> Self {
-        let entries = Self::load_from_path(&path).unwrap_or_default();
-        Self {
+    /// Creates a store at `path`, failing closed on invalid JSON or read errors other than `NotFound`.
+    pub fn try_with_path(path: PathBuf) -> anyhow::Result<Self> {
+        let entries = Self::load_from_path(&path)?;
+        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        let process_lock = mehh_ai::oauth::get_path_lock_mutex(&lock_path);
+        Ok(Self {
             path,
+            lock_path,
+            process_lock,
             entries: RwLock::new(entries),
-        }
+        })
     }
 
     /// Generates key formatted as `server_name|server_url`.
@@ -96,73 +292,143 @@ impl McpAuthStore {
         format!("{server_name}|{server_url}")
     }
 
+    /// Acquires an advisory file lock on `<path>.lock`.
+    pub async fn lock(&self) -> anyhow::Result<mehh_ai::oauth::FileLockGuard> {
+        mehh_ai::oauth::acquire_file_lock(&self.lock_path, self.process_lock.clone()).await
+    }
+
     fn load_from_path(path: &Path) -> anyhow::Result<HashMap<String, McpAuthEntry>> {
-        if !path.exists() {
-            return Ok(HashMap::new());
-        }
-        let content = std::fs::read_to_string(path)?;
-        let map = serde_json::from_str(&content)?;
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to read MCP auth store '{}'", path.display())
+                });
+            }
+        };
+        let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+        let map = serde_json::from_str(clean).with_context(|| {
+            format!("Failed to parse MCP auth store '{}'", path.display())
+        })?;
         Ok(map)
     }
 
     fn save_internal(&self, map: &HashMap<String, McpAuthEntry>) -> anyhow::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
+        let parent = self.path.parent().ok_or_else(|| {
+            anyhow::anyhow!("MCP auth store path '{}' has no parent directory", self.path.display())
+        })?;
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create directory '{}'", parent.display())
+        })?;
+
         let json = serde_json::to_string_pretty(map)?;
-        std::fs::write(&self.path, json)?;
-        Ok(())
+        let file_name = self
+            .path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("mcp-auth.json");
+        let tmp_path = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+        let write_res: anyhow::Result<()> = (|| {
+            use std::io::Write;
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            let mut file = opts.open(&tmp_path).with_context(|| {
+                format!("Failed to create temp auth file '{}'", tmp_path.display())
+            })?;
+            file.write_all(json.as_bytes())?;
+            file.sync_all()?;
+            drop(file);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
+            }
+            std::fs::rename(&tmp_path, &self.path).with_context(|| {
+                format!(
+                    "Failed to atomically replace '{}' with '{}'",
+                    self.path.display(),
+                    tmp_path.display()
+                )
+            })?;
+            Ok(())
+        })();
+
+        if write_res.is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+        }
+        write_res
     }
 
     /// Retrieves the stored entry for a server if present.
     pub async fn get(&self, server_name: &str, server_url: &str) -> Option<McpAuthEntry> {
         let key = Self::store_key(server_name, server_url);
-        let map = self.entries.read().await;
-        map.get(&key).cloned()
+        {
+            let map = self.entries.read().await;
+            if let Some(entry) = map.get(&key) {
+                return Some(entry.clone());
+            }
+        }
+        if let Ok(disk_map) = Self::load_from_path(&self.path) {
+            let res = disk_map.get(&key).cloned();
+            *self.entries.write().await = disk_map;
+            res
+        } else {
+            None
+        }
     }
 
-    /// Saves an entry for a server to memory and persists to disk.
+    /// Saves an entry for a server to memory and persists to disk under advisory file lock.
     pub async fn set(
         &self,
         server_name: &str,
         server_url: &str,
         entry: McpAuthEntry,
     ) -> anyhow::Result<()> {
+        let _lock = self.lock().await?;
         let key = Self::store_key(server_name, server_url);
-        let mut map = self.entries.write().await;
-        map.insert(key, entry);
-        self.save_internal(&map)?;
+        let mut disk_map = Self::load_from_path(&self.path)?;
+        disk_map.insert(key, entry);
+        self.save_internal(&disk_map)?;
+        *self.entries.write().await = disk_map;
         Ok(())
     }
 
-    /// Removes an entry for a server from memory and disk.
+    /// Removes an entry for a server from memory and disk under advisory file lock.
     pub async fn remove(
         &self,
         server_name: &str,
         server_url: &str,
     ) -> anyhow::Result<Option<McpAuthEntry>> {
+        let _lock = self.lock().await?;
         let key = Self::store_key(server_name, server_url);
-        let mut map = self.entries.write().await;
-        let removed = map.remove(&key);
+        let mut disk_map = Self::load_from_path(&self.path)?;
+        let removed = disk_map.remove(&key);
         if removed.is_some() {
-            self.save_internal(&map)?;
+            self.save_internal(&disk_map)?;
         }
+        *self.entries.write().await = disk_map;
         Ok(removed)
     }
 
     /// Returns all stored entries.
     pub async fn list(&self) -> HashMap<String, McpAuthEntry> {
-        self.entries.read().await.clone()
+        if let Ok(disk_map) = Self::load_from_path(&self.path) {
+            *self.entries.write().await = disk_map.clone();
+            disk_map
+        } else {
+            self.entries.read().await.clone()
+        }
     }
 
     pub fn path(&self) -> &Path {
         &self.path
-    }
-}
-
-impl Default for McpAuthStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -211,38 +477,82 @@ pub async fn discover_oauth_metadata(
     client: &reqwest::Client,
     server_url: &str,
 ) -> anyhow::Result<OAuthMetadata> {
+    discover_oauth_metadata_inner(client, server_url, 0).await
+}
+
+async fn discover_oauth_metadata_inner(
+    client: &reqwest::Client,
+    server_url: &str,
+    depth: u8,
+) -> anyhow::Result<OAuthMetadata> {
+    let base_parsed = validate_oauth_url(server_url)?;
+    let parent_is_loopback = base_parsed.host_str().is_some_and(is_loopback_host);
+    validate_oauth_target_dns(parent_is_loopback, &base_parsed).await?;
     let urls = build_discovery_urls(server_url);
 
     for url in &urls {
-        let resp = match client
-            .get(url)
-            .header("Accept", "application/json")
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await
+        let Ok(candidate_url) = validate_oauth_url(url) else {
+            continue;
+        };
+        if is_disallowed_discovery_redirect(&base_parsed, &candidate_url)
+            || validate_oauth_target_dns(parent_is_loopback, &candidate_url)
+                .await
+                .is_err()
         {
-            Ok(r) => r,
-            Err(_) => continue,
+            continue;
+        }
+        let resp = match tokio::time::timeout(
+            OAUTH_HTTP_TIMEOUT,
+            client
+                .get(url)
+                .header("Accept", "application/json")
+                .send(),
+        )
+        .await
+        {
+            Ok(Ok(r)) => r,
+            _ => continue,
         };
 
         if !resp.status().is_success() {
             continue;
         }
 
-        let body_val: serde_json::Value = match resp.json().await {
+        let body_bytes = match read_bounded_oauth_bytes(resp, MAX_OAUTH_BODY_BYTES).await {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        let body_val: serde_json::Value = match serde_json::from_slice(&body_bytes) {
             Ok(v) => v,
             Err(_) => continue,
         };
 
-        // If protected resource metadata points to authorization servers, follow the first one
-        if let Some(auth_servers) = body_val
-            .get("authorization_servers")
-            .and_then(|v| v.as_array())
-        {
-            for auth_srv in auth_servers {
-                if let Some(srv_str) = auth_srv.as_str() {
-                    if let Ok(meta) = Box::pin(discover_oauth_metadata(client, srv_str)).await {
-                        return Ok(meta);
+        // If protected resource metadata points to authorization servers, follow at most 1 hop safely
+        if depth < MAX_OAUTH_DISCOVERY_DEPTH {
+            if let Some(auth_servers) = body_val
+                .get("authorization_servers")
+                .and_then(|v| v.as_array())
+            {
+                for auth_srv in auth_servers {
+                    if let Some(srv_str) = auth_srv.as_str() {
+                        if let Ok(srv_url) = validate_oauth_url(srv_str) {
+                            if is_disallowed_discovery_redirect(&base_parsed, &srv_url)
+                                || validate_oauth_target_dns(parent_is_loopback, &srv_url)
+                                    .await
+                                    .is_err()
+                            {
+                                continue;
+                            }
+                            if let Ok(meta) = Box::pin(discover_oauth_metadata_inner(
+                                client,
+                                srv_str,
+                                depth + 1,
+                            ))
+                            .await
+                            {
+                                return Ok(meta);
+                            }
+                        }
                     }
                 }
             }
@@ -255,12 +565,42 @@ pub async fn discover_oauth_metadata(
         let token_ep = body_val.get("token_endpoint").and_then(|v| v.as_str());
 
         if let (Some(auth_endpoint), Some(token_endpoint)) = (auth_ep, token_ep) {
+            let Ok(auth_url) = validate_oauth_url(auth_endpoint) else {
+                continue;
+            };
+            let Ok(token_url) = validate_oauth_url(token_endpoint) else {
+                continue;
+            };
+            if is_disallowed_discovery_redirect(&base_parsed, &auth_url)
+                || is_disallowed_discovery_redirect(&base_parsed, &token_url)
+                || validate_oauth_target_dns(parent_is_loopback, &auth_url)
+                    .await
+                    .is_err()
+                || validate_oauth_target_dns(parent_is_loopback, &token_url)
+                    .await
+                    .is_err()
+            {
+                continue;
+            }
+            let registration_endpoint = match body_val
+                .get("registration_endpoint")
+                .and_then(|v| v.as_str())
+            {
+                Some(ep) => match validate_oauth_url(ep) {
+                    Ok(u)
+                        if !is_disallowed_discovery_redirect(&base_parsed, &u)
+                            && validate_oauth_target_dns(parent_is_loopback, &u)
+                                .await
+                                .is_ok() =>
+                    {
+                        Some(ep.to_string())
+                    }
+                    _ => None,
+                },
+                None => None,
+            };
             let issuer = body_val
                 .get("issuer")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let registration_endpoint = body_val
-                .get("registration_endpoint")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             let scopes_supported = body_val
@@ -305,6 +645,7 @@ pub async fn register_dynamic_client(
         .registration_endpoint
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("OAuth metadata does not provide a registration_endpoint"))?;
+    validate_oauth_request_url(reg_endpoint).await?;
 
     let payload = serde_json::json!({
         "client_name": client_name,
@@ -315,22 +656,30 @@ pub async fn register_dynamic_client(
         "application_type": "native"
     });
 
-    let resp = client
-        .post(reg_endpoint)
-        .header("Content-Type", "application/json")
-        .header("Accept", "application/json")
-        .json(&payload)
-        .send()
-        .await
-        .with_context(|| format!("Failed to send dynamic client registration to '{reg_endpoint}'"))?;
+    let resp = tokio::time::timeout(
+        OAUTH_HTTP_TIMEOUT,
+        client
+            .post(reg_endpoint)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(&payload)
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Timed out registering OAuth client at '{reg_endpoint}'"))?
+    .with_context(|| format!("Failed to send dynamic client registration to '{reg_endpoint}'"))?;
 
     let status = resp.status();
     if !status.is_success() {
-        let err_text = resp.text().await.unwrap_or_default();
+        let err_bytes = read_bounded_oauth_bytes(resp, MAX_OAUTH_ERROR_BYTES)
+            .await
+            .unwrap_or_default();
+        let err_text = String::from_utf8_lossy(&err_bytes);
         anyhow::bail!("Dynamic client registration failed ({status}): {err_text}");
     }
 
-    let body: serde_json::Value = resp.json().await?;
+    let body_bytes = read_bounded_oauth_bytes(resp, MAX_OAUTH_BODY_BYTES).await?;
+    let body: serde_json::Value = serde_json::from_slice(&body_bytes)?;
     let client_id = body
         .get("client_id")
         .and_then(|v| v.as_str())
@@ -447,27 +796,36 @@ pub async fn refresh_mcp_tokens(
     client_id: &str,
     refresh_token: &str,
 ) -> anyhow::Result<OAuthTokens> {
+    validate_oauth_request_url(token_endpoint).await?;
     let params = [
         ("grant_type", "refresh_token"),
         ("client_id", client_id),
         ("refresh_token", refresh_token),
     ];
 
-    let resp = client
-        .post(token_endpoint)
-        .form(&params)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .with_context(|| format!("Failed to POST refresh token request to '{token_endpoint}'"))?;
+    let resp = tokio::time::timeout(
+        OAUTH_HTTP_TIMEOUT,
+        client
+            .post(token_endpoint)
+            .form(&params)
+            .header("Accept", "application/json")
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Timed out refreshing OAuth token at '{token_endpoint}'"))?
+    .with_context(|| format!("Failed to POST refresh token request to '{token_endpoint}'"))?;
 
     let status = resp.status();
     if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
+        let err_bytes = read_bounded_oauth_bytes(resp, MAX_OAUTH_ERROR_BYTES)
+            .await
+            .unwrap_or_default();
+        let body = String::from_utf8_lossy(&err_bytes);
         anyhow::bail!("OAuth token refresh failed ({status}): {body}");
     }
 
-    let tokens: OAuthTokens = resp.json().await?;
+    let body_bytes = read_bounded_oauth_bytes(resp, MAX_OAUTH_BODY_BYTES).await?;
+    let tokens: OAuthTokens = serde_json::from_slice(&body_bytes)?;
     Ok(tokens)
 }
 
@@ -500,11 +858,12 @@ impl StoredMcpBearerProvider {
         server_url: impl Into<String>,
         token_endpoint: Option<String>,
     ) -> Self {
+        let client = oauth_http_client();
         Self {
             auth_store,
             server_name: server_name.into(),
             server_url: server_url.into(),
-            client: reqwest::Client::new(),
+            client,
             token_endpoint: Arc::new(RwLock::new(token_endpoint)),
             refresh_lock: Mutex::new(()),
         }
@@ -650,7 +1009,7 @@ mod tests {
             SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
         ));
         let path = temp_dir.join("mcp-auth.json");
-        let store = McpAuthStore::with_path(path.clone());
+        let store = McpAuthStore::try_with_path(path.clone()).unwrap();
 
         let entry = McpAuthEntry {
             server_url: "https://example.com/mcp".to_string(),
@@ -675,7 +1034,7 @@ mod tests {
         assert_eq!(r.tokens.unwrap().access_token, "token-abc");
 
         // Verify persistence from new store reading same path
-        let store2 = McpAuthStore::with_path(path);
+        let store2 = McpAuthStore::try_with_path(path).unwrap();
         let retrieved2 = store2.get("test_server", "https://example.com/mcp").await;
         assert!(retrieved2.is_some());
 
@@ -685,6 +1044,65 @@ mod tests {
         assert!(store.get("test_server", "https://example.com/mcp").await.is_none());
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_validate_oauth_url_rules() {
+        assert!(validate_oauth_url("https://auth.example.com/token").is_ok());
+        assert!(validate_oauth_url("http://localhost:8080/cb").is_ok());
+        assert!(validate_oauth_url("http://127.0.0.1:8080/cb").is_ok());
+        assert!(validate_oauth_url("http://[::1]:8080/cb").is_ok());
+        assert!(validate_oauth_url("http://example.com/token").is_err());
+        assert!(validate_oauth_url("file:///etc/passwd").is_err());
+
+        let pub_parent = validate_oauth_url("https://mcp.example.com/mcp").unwrap();
+        let local_target = validate_oauth_url("http://127.0.0.1:9000/").unwrap();
+        let mapped_loopback = validate_oauth_url("https://[::ffff:127.0.0.1]/token").unwrap();
+        let mapped_metadata = validate_oauth_url("https://[::ffff:169.254.169.254]/token").unwrap();
+        let cgnat_target = validate_oauth_url("https://100.64.0.1/token").unwrap();
+        let mapped_cgnat = validate_oauth_url("https://[::ffff:100.64.0.1]/token").unwrap();
+        let sub_localhost = validate_oauth_url("https://meta.localhost/token").unwrap();
+        let dot_localhost = validate_oauth_url("https://sub.LOCALHOST./token").unwrap();
+        let pub_target = validate_oauth_url("https://auth.example.com/").unwrap();
+        assert!(is_disallowed_discovery_redirect(&pub_parent, &local_target));
+        assert!(is_disallowed_discovery_redirect(&pub_parent, &mapped_loopback));
+        assert!(is_disallowed_discovery_redirect(&pub_parent, &mapped_metadata));
+        assert!(is_disallowed_discovery_redirect(&pub_parent, &cgnat_target));
+        assert!(is_disallowed_discovery_redirect(&pub_parent, &mapped_cgnat));
+        assert!(is_disallowed_discovery_redirect(&pub_parent, &sub_localhost));
+        assert!(is_disallowed_discovery_redirect(&pub_parent, &dot_localhost));
+        assert!(!is_disallowed_discovery_redirect(&pub_parent, &pub_target));
+        let _no_redirect_client = oauth_http_client();
+    }
+
+    #[tokio::test]
+    async fn test_validate_oauth_request_url_rejects_local_and_cgnat() {
+        assert!(validate_oauth_request_url("https://100.64.0.1/token")
+            .await
+            .is_err());
+        assert!(validate_oauth_request_url("https://[::ffff:169.254.169.254]/token")
+            .await
+            .is_err());
+        assert!(validate_oauth_request_url("https://meta.localhost/token")
+            .await
+            .is_err());
+        assert!(validate_oauth_request_url("http://127.0.0.1:8080/callback")
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn test_mcp_auth_store_fails_closed_on_corrupt_json_and_strips_bom() {
+        let dir = crate::TempTestDir::new("oauth_store");
+        let bad_path = dir.path().join("bad.json");
+        std::fs::write(&bad_path, "{ not json").unwrap();
+        assert!(McpAuthStore::try_with_path(bad_path).is_err());
+
+        let bom_path = dir.path().join("bom.json");
+        std::fs::write(&bom_path, "\u{feff}{}").unwrap();
+        let ok_store = McpAuthStore::try_with_path(bom_path).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        assert!(rt.block_on(ok_store.list()).is_empty());
     }
 
     #[tokio::test]
@@ -712,5 +1130,45 @@ mod tests {
 
         let code_res = server_task.await.unwrap();
         assert_eq!(code_res.unwrap(), "test_code_auth");
+    }
+
+    #[tokio::test]
+    async fn mcp_auth_store_lock_preserves_concurrent_server_writes() {
+        let dir = crate::TempTestDir::new("mcp_concurrent_writes");
+        let auth_path = dir.path().join("mcp-auth.json");
+
+        let store1 = McpAuthStore::try_with_path(auth_path.clone()).unwrap();
+        let store2 = McpAuthStore::try_with_path(auth_path.clone()).unwrap();
+
+        let t1 = tokio::spawn(async move {
+            let entry1 = McpAuthEntry {
+                server_url: "http://server1.local".to_string(),
+                client_id: Some("client1".to_string()),
+                client_secret: None,
+                tokens: None,
+                tokens_expire_at: None,
+            };
+            store1.set("server1", "http://server1.local", entry1).await.unwrap();
+        });
+
+        let t2 = tokio::spawn(async move {
+            let entry2 = McpAuthEntry {
+                server_url: "http://server2.local".to_string(),
+                client_id: Some("client2".to_string()),
+                client_secret: None,
+                tokens: None,
+                tokens_expire_at: None,
+            };
+            store2.set("server2", "http://server2.local", entry2).await.unwrap();
+        });
+
+        t1.await.unwrap();
+        t2.await.unwrap();
+
+        let verify_store = McpAuthStore::try_with_path(auth_path).unwrap();
+        let list = verify_store.list().await;
+        assert_eq!(list.len(), 2, "Expected both concurrent writes to be retained in store without clobbering");
+        assert!(list.contains_key("server1|http://server1.local"));
+        assert!(list.contains_key("server2|http://server2.local"));
     }
 }

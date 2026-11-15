@@ -4,28 +4,67 @@
 pub mod agent_session;
 pub mod auth;
 pub mod compaction;
+pub mod file_complete;
 pub mod interactive;
 pub mod mcp_manager;
+pub mod models_config;
 pub mod modes;
 pub mod prompt_templates;
 pub mod rpc;
 pub mod session;
 pub mod settings;
 pub mod skills;
+pub mod subagent;
 pub mod system_prompt;
+pub mod tool_search;
+pub mod trust;
 
 pub use agent_session::*;
 pub use auth::*;
 pub use compaction::*;
+pub use file_complete::*;
 pub use interactive::*;
 pub use mcp_manager::*;
+pub use models_config::*;
 pub use modes::*;
 pub use prompt_templates::*;
 pub use rpc::*;
 pub use session::*;
 pub use settings::*;
 pub use skills::*;
+pub use subagent::*;
 pub use system_prompt::*;
+pub use tool_search::*;
+pub use trust::*;
+
+#[cfg(test)]
+pub(crate) struct TempTestDir(std::path::PathBuf);
+
+#[cfg(test)]
+impl TempTestDir {
+    pub(crate) fn new(prefix: &str) -> Self {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!(
+            "mehh_ca_test_{prefix}_{}_{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+
+    pub(crate) fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TempTestDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -288,6 +327,7 @@ mod tests {
             context_window: 100_000,
             max_tokens: 4096,
             headers: None,
+            ..Default::default()
         };
 
         // Turn 1: Assistant calls write tool
@@ -442,6 +482,7 @@ mod tests {
             context_window: 100_000,
             max_tokens: 4096,
             headers: None,
+            ..Default::default()
         };
         let mut session = AgentSession::new(
             temp_dir.clone(),

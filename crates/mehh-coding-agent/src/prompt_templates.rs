@@ -205,7 +205,8 @@ fn load_templates_from_dir(dir: &Path, out: &mut Vec<PromptTemplate>) {
                     };
 
                     if let Ok(raw) = std::fs::read_to_string(&path) {
-                        let (fm, body) = parse_frontmatter(&raw);
+                        let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+    let (fm, body) = parse_frontmatter(clean);
                         let body_trimmed = body.trim();
 
                         let description = if let Some(desc) = fm.get("description") {
@@ -240,11 +241,13 @@ fn load_templates_from_dir(dir: &Path, out: &mut Vec<PromptTemplate>) {
 
 /// Loads prompt templates from `~/.mehh/agent/prompts/*.md` and `<cwd>/.mehh/prompts/*.md`.
 /// Project-level templates override global templates with the same name.
-pub fn load_prompt_templates(cwd: &Path) -> Vec<PromptTemplate> {
+/// Loads global prompt templates and, when `trusted` is true, project-local `.mehh/prompts`.
+pub fn load_prompt_templates_with_trust(cwd: &Path, trusted: bool) -> Vec<PromptTemplate> {
     let mut template_map: HashMap<String, PromptTemplate> = HashMap::new();
 
     let home = std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
+        .filter(|s| !s.is_empty())
         .map(PathBuf::from);
 
     if let Some(home_path) = home {
@@ -256,16 +259,23 @@ pub fn load_prompt_templates(cwd: &Path) -> Vec<PromptTemplate> {
         }
     }
 
-    let local_dir = cwd.join(".mehh").join("prompts");
-    let mut local_templates = Vec::new();
-    load_templates_from_dir(&local_dir, &mut local_templates);
-    for t in local_templates {
-        template_map.insert(t.name.clone(), t);
+    if trusted {
+        let local_dir = cwd.join(".mehh").join("prompts");
+        let mut local_templates = Vec::new();
+        load_templates_from_dir(&local_dir, &mut local_templates);
+        for t in local_templates {
+            template_map.insert(t.name.clone(), t);
+        }
     }
 
     let mut result: Vec<PromptTemplate> = template_map.into_values().collect();
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result
+}
+
+/// Loads global prompt templates only (untrusted default). Call `load_prompt_templates_with_trust` for trusted projects.
+pub fn load_prompt_templates(cwd: &Path) -> Vec<PromptTemplate> {
+    load_prompt_templates_with_trust(cwd, false)
 }
 
 /// Expands `/<name> [args]` command input into substituted template content.
@@ -344,5 +354,27 @@ mod tests {
 
         let skill_passthrough = expand_prompt_template("/skill:review arg", &templates);
         assert!(skill_passthrough.is_none());
+    }
+
+    #[test]
+    fn test_load_prompt_templates_respects_trust_and_strips_bom() {
+        let dir = std::env::temp_dir().join(format!("mehh_prompt_trust_{}", uuid::Uuid::now_v7()));
+        let tpl_dir = dir.join(".mehh").join("prompts");
+        std::fs::create_dir_all(&tpl_dir).unwrap();
+        std::fs::write(
+            tpl_dir.join("audit.md"),
+            "\u{feff}---\ndescription: Audit template\n---\nCheck $@",
+        )
+        .unwrap();
+
+        let untrusted = load_prompt_templates_with_trust(&dir, false);
+        assert!(!untrusted.iter().any(|t| t.name == "audit"));
+
+        let trusted = load_prompt_templates_with_trust(&dir, true);
+        let found = trusted.iter().find(|t| t.name == "audit").unwrap();
+        assert_eq!(found.description, "Audit template");
+        assert_eq!(found.content, "Check $@");
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

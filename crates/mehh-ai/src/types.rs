@@ -245,6 +245,21 @@ impl AssistantMessage {
         }
     }
 
+    /// Clones metadata and usage without cloning accumulated content blocks.
+    pub fn metadata_clone(&self) -> Self {
+        Self {
+            content: Vec::new(),
+            api: self.api.clone(),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            response_id: self.response_id.clone(),
+            usage: self.usage.clone(),
+            stop_reason: self.stop_reason,
+            error_message: self.error_message.clone(),
+            timestamp: self.timestamp,
+        }
+    }
+
     pub fn text_content(&self) -> String {
         self.content
             .iter()
@@ -306,7 +321,89 @@ pub struct Context {
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelCompat {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_long_cache_retention: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_cache_control_on_tools: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force_adaptive_thinking: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_mid_convo_effort: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_temperature: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_empty_signature: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supports_strict_tools: Option<bool>,
+}
+
+pub type ThinkingLevelMap = HashMap<String, Option<String>>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ThinkingBudgets {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub minimal: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub low: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub medium: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub high: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CacheRetention {
+    None,
+    Short,
+    Long,
+}
+
+/// Resolves the cache retention policy from an explicit option and an optional environment value.
+/// Explicit takes priority. When explicit is None, "none" resolves to `CacheRetention::None`,
+/// "long" resolves to `CacheRetention::Long`, and any other value (or None) resolves to `CacheRetention::Short`.
+pub fn resolve_cache_retention_from(
+    explicit: Option<CacheRetention>,
+    env_value: Option<&str>,
+) -> CacheRetention {
+    if let Some(explicit) = explicit {
+        return explicit;
+    }
+    match env_value {
+        Some(v) if v.eq_ignore_ascii_case("none") => CacheRetention::None,
+        Some(v) if v.eq_ignore_ascii_case("long") => CacheRetention::Long,
+        _ => CacheRetention::Short,
+    }
+}
+
+/// Resolves the cache retention policy from an explicit option and the `PI_CACHE_RETENTION` environment variable.
+pub fn resolve_cache_retention(explicit: Option<CacheRetention>) -> CacheRetention {
+    let env_val = std::env::var("PI_CACHE_RETENTION").ok();
+    resolve_cache_retention_from(explicit, env_val.as_deref())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicEffort {
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AnthropicThinkingDisplay {
+    Summarized,
+    Omitted,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Model {
     pub id: String,
@@ -321,6 +418,10 @@ pub struct Model {
     pub max_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<ModelCompat>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level_map: Option<ThinkingLevelMap>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -338,6 +439,18 @@ pub struct StreamOptions {
     pub session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub headers: Option<HashMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_retention: Option<CacheRetention>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budgets: Option<ThinkingBudgets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_budget_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<AnthropicEffort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_display: Option<AnthropicThinkingDisplay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interleaved_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -496,6 +609,7 @@ mod tests {
             context_window: 1000,
             max_tokens: 100,
             headers: None,
+            ..Default::default()
         };
         let mut msg = AssistantMessage::empty_for_model(&model);
         assert_eq!(msg.model, "test-model");
@@ -550,6 +664,7 @@ mod tests {
             context_window: 1000,
             max_tokens: 100,
             headers: None,
+            ..Default::default()
         };
         let msg = AssistantMessage::empty_for_model(&model);
         let start_ev = AssistantMessageEvent::Start {
@@ -587,5 +702,124 @@ mod tests {
             Message::Assistant(a) => assert_eq!(a.model, "test-model"),
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn model_and_stream_options_default_new_optional_fields() {
+        // Deserializing existing JSON without compat or cacheRetention succeeds with None
+        let model_json = r#"{
+            "id": "test-1",
+            "name": "Test 1",
+            "api": "test",
+            "provider": "test",
+            "baseUrl": "https://example.com",
+            "reasoning": false,
+            "input": ["text"],
+            "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0},
+            "contextWindow": 1000,
+            "maxTokens": 100
+        }"#;
+        let model: Model = serde_json::from_str(model_json).unwrap();
+        assert_eq!(model.compat, None);
+        assert_eq!(model.thinking_level_map, None);
+
+        // Serializing skips None fields
+        let serialized_model = serde_json::to_string(&model).unwrap();
+        assert!(!serialized_model.contains("compat"));
+        assert!(!serialized_model.contains("thinkingLevelMap"));
+
+        // StreamOptions deserializing without new fields succeeds with None
+        let opts_json = r#"{
+            "apiKey": "test-key"
+        }"#;
+        let opts: StreamOptions = serde_json::from_str(opts_json).unwrap();
+        assert_eq!(opts.cache_retention, None);
+        assert_eq!(opts.thinking_budgets, None);
+        assert_eq!(opts.thinking_budget_tokens, None);
+        assert_eq!(opts.effort, None);
+        assert_eq!(opts.thinking_display, None);
+        assert_eq!(opts.interleaved_thinking, None);
+
+        // Serializing StreamOptions skips None fields
+        let serialized_opts = serde_json::to_string(&opts).unwrap();
+        assert!(!serialized_opts.contains("cacheRetention"));
+        assert!(!serialized_opts.contains("thinkingBudgets"));
+        assert!(!serialized_opts.contains("thinkingBudgetTokens"));
+        assert!(!serialized_opts.contains("effort"));
+        assert!(!serialized_opts.contains("thinkingDisplay"));
+        assert!(!serialized_opts.contains("interleavedThinking"));
+
+        // Round-trip with all new fields populated
+        let full_opts = StreamOptions {
+            cache_retention: Some(CacheRetention::Long),
+            thinking_budgets: Some(ThinkingBudgets {
+                minimal: Some(100),
+                low: Some(500),
+                medium: Some(1000),
+                high: Some(2000),
+            }),
+            thinking_budget_tokens: Some(4096),
+            effort: Some(AnthropicEffort::High),
+            thinking_display: Some(AnthropicThinkingDisplay::Summarized),
+            interleaved_thinking: Some(true),
+            ..Default::default()
+        };
+        let full_json = serde_json::to_string(&full_opts).unwrap();
+        assert!(full_json.contains(r#""cacheRetention":"long""#));
+        assert!(full_json.contains(r#""effort":"high""#));
+        assert!(full_json.contains(r#""thinkingDisplay":"summarized""#));
+        assert!(full_json.contains(r#""interleavedThinking":true"#));
+
+        let deserialized_full: StreamOptions = serde_json::from_str(&full_json).unwrap();
+        assert_eq!(deserialized_full, full_opts);
+    }
+
+    #[test]
+    fn test_resolve_cache_retention_from() {
+        // Explicit overrides env_value
+        assert_eq!(
+            resolve_cache_retention_from(Some(CacheRetention::None), Some("long")),
+            CacheRetention::None
+        );
+        assert_eq!(
+            resolve_cache_retention_from(Some(CacheRetention::Long), Some("none")),
+            CacheRetention::Long
+        );
+        assert_eq!(
+            resolve_cache_retention_from(Some(CacheRetention::Short), Some("none")),
+            CacheRetention::Short
+        );
+
+        // Env value takes effect when explicit is None
+        assert_eq!(
+            resolve_cache_retention_from(None, Some("none")),
+            CacheRetention::None
+        );
+        assert_eq!(
+            resolve_cache_retention_from(None, Some("NONE")),
+            CacheRetention::None
+        );
+        assert_eq!(
+            resolve_cache_retention_from(None, Some("long")),
+            CacheRetention::Long
+        );
+        assert_eq!(
+            resolve_cache_retention_from(None, Some("LONG")),
+            CacheRetention::Long
+        );
+        assert_eq!(
+            resolve_cache_retention_from(None, Some("short")),
+            CacheRetention::Short
+        );
+
+        // Default when unset or unknown is Short
+        assert_eq!(
+            resolve_cache_retention_from(None, None),
+            CacheRetention::Short
+        );
+        assert_eq!(
+            resolve_cache_retention_from(None, Some("invalid")),
+            CacheRetention::Short
+        );
     }
 }

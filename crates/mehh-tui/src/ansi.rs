@@ -46,16 +46,27 @@ pub fn ansi_code_len(s: &str, pos: usize) -> usize {
 
 /// Strip CSI, OSC, and APC ANSI sequences from `s`.
 pub fn strip_ansi(s: &str) -> String {
+    let b = s.as_bytes();
+    if !b.contains(&0x1b) {
+        return s.to_string();
+    }
     let mut result = String::with_capacity(s.len());
     let mut i = 0;
-    while i < s.len() {
-        let len = ansi_code_len(s, i);
-        if len > 0 {
-            i += len;
+    while i < b.len() {
+        if b[i] == 0x1b {
+            let len = ansi_code_len(s, i);
+            if len > 0 {
+                i += len;
+            } else {
+                result.push('\x1b');
+                i += 1;
+            }
+        } else if let Some(rel_esc) = b[i..].iter().position(|&c| c == 0x1b) {
+            result.push_str(&s[i..i + rel_esc]);
+            i += rel_esc;
         } else {
-            let ch = s[i..].chars().next().unwrap();
-            result.push(ch);
-            i += ch.len_utf8();
+            result.push_str(&s[i..]);
+            break;
         }
     }
     result
@@ -81,7 +92,11 @@ pub fn visible_width(s: &str) -> usize {
         return s.len();
     }
 
-    let clean = strip_ansi(s);
+    let clean: std::borrow::Cow<'_, str> = if b.contains(&0x1b) {
+        std::borrow::Cow::Owned(strip_ansi(s))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    };
     let mut width = 0;
     for g in clean.graphemes(true) {
         if g == "\t" {

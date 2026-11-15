@@ -221,6 +221,8 @@ impl Agent {
             stream_options: self.stream_options.clone(),
             system_prompt: self.system_prompt.clone(),
             tools: self.tools.clone(),
+            dynamic_tools: None,
+            max_turns: Some(crate::agent_loop::DEFAULT_MAX_AGENT_TURNS),
             steering_queue: self.steering_queue.clone(),
             follow_up_queue: self.follow_up_queue.clone(),
             steering_mode: self.steering_mode,

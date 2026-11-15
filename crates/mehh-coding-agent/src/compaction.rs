@@ -15,8 +15,65 @@ use crate::session::{SessionEntry, SessionEntryKind};
 /// Default token threshold retained at the tail of the active branch.
 pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 20_000;
 
+/// Default headroom reserved before `context_window` to trigger proactive auto-compaction.
+pub const DEFAULT_RESERVE_TOKENS: usize = 16_384;
+
 /// Maximum character limit for tool results in serialized conversation transcripts.
 pub const TOOL_RESULT_MAX_CHARS: usize = 2000;
+
+/// Budget settings controlling proactive and overflow-triggered compaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionSettings {
+    pub enabled: bool,
+    pub reserve_tokens: usize,
+    pub keep_recent_tokens: usize,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            reserve_tokens: DEFAULT_RESERVE_TOKENS,
+            keep_recent_tokens: DEFAULT_KEEP_RECENT_TOKENS,
+        }
+    }
+}
+
+impl CompactionSettings {
+    /// Scales reserve and keep-recent budgets proportionally for smaller context windows.
+    pub fn for_context_window(context_window: u64, enabled: bool) -> Self {
+        let cw = usize::try_from(context_window).unwrap_or(usize::MAX);
+        if cw == 0 {
+            return Self {
+                enabled,
+                ..Self::default()
+            };
+        }
+        let reserve_tokens = DEFAULT_RESERVE_TOKENS.min(cw / 5).max(1024);
+        let keep_recent_tokens = DEFAULT_KEEP_RECENT_TOKENS.min(cw / 4).max(2048);
+        Self {
+            enabled,
+            reserve_tokens,
+            keep_recent_tokens,
+        }
+    }
+}
+
+/// Returns true when auto-compaction is enabled and `context_tokens >= context_window - reserve_tokens`.
+pub fn should_auto_compact(
+    context_tokens: usize,
+    context_window: usize,
+    settings: &CompactionSettings,
+) -> bool {
+    settings.enabled
+        && context_window > 0
+        && context_tokens >= context_window.saturating_sub(settings.reserve_tokens)
+}
+
+/// Estimates total token usage across a slice of conversation messages.
+pub fn estimate_context_tokens(messages: &[Message]) -> usize {
+    messages.iter().map(estimate_message_tokens).sum()
+}
 
 /// System prompt used for the summarization LLM call.
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = r#"You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
@@ -97,6 +154,28 @@ Use this EXACT format:
 
 Keep each section concise. Preserve exact file paths, function names, and error messages."#;
 
+struct ByteCountWriter(usize);
+
+impl std::io::Write for ByteCountWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_serialized_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
+    let mut counter = ByteCountWriter(0);
+    if serde_json::to_writer(&mut counter, value).is_ok() {
+        counter.0
+    } else {
+        0
+    }
+}
+
 /// Estimated token count for a message using the `chars.div_ceil(4)` heuristic.
 pub fn estimate_message_tokens(msg: &Message) -> usize {
     let chars = match msg {
@@ -121,10 +200,7 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
                     AssistantContentBlock::Text(t) => sum += t.text.len(),
                     AssistantContentBlock::Thinking(th) => sum += th.thinking.len(),
                     AssistantContentBlock::ToolCall(tc) => {
-                        sum += tc.name.len();
-                        if let Ok(s) = serde_json::to_string(&tc.arguments) {
-                            sum += s.len();
-                        }
+                        sum += tc.name.len() + json_serialized_len(&tc.arguments);
                     }
                 }
             }
@@ -139,9 +215,7 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
                 }
             }
             if let Some(details) = &tr.details {
-                if let Ok(s) = serde_json::to_string(details) {
-                    sum += s.len();
-                }
+                sum += json_serialized_len(details);
             }
             sum
         }
@@ -216,11 +290,12 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                     .collect::<Vec<_>>()
                     .join("\n");
 
-                let truncated = if content_text.len() > TOOL_RESULT_MAX_CHARS {
-                    let remaining = content_text.len() - TOOL_RESULT_MAX_CHARS;
+                let mut char_iter = content_text.char_indices();
+                let truncated = if let Some((byte_end, _)) = char_iter.nth(TOOL_RESULT_MAX_CHARS) {
+                    let remaining = 1 + char_iter.count();
                     format!(
                         "{}\n\n[... {remaining} more characters truncated]",
-                        &content_text[..TOOL_RESULT_MAX_CHARS]
+                        &content_text[..byte_end]
                     )
                 } else {
                     content_text
@@ -320,7 +395,8 @@ pub fn prepare_compaction(
         cut_index = cut_point_candidates[0];
     }
 
-    // Check if the cut splits a turn (cut point is Assistant message)
+    // Check if the cut splits a turn (cut point is Assistant message).
+    // Always align kept history on a User message so post-compaction context never starts with Assistant.
     let cut_entry = &entries[cut_index];
     let is_assistant_cut = matches!(
         &cut_entry.kind,
@@ -329,8 +405,7 @@ pub fn prepare_compaction(
         }
     );
 
-    let (history_end, turn_start_index) = if is_assistant_cut {
-        // Find the user message starting this turn
+    let first_kept_index = if is_assistant_cut {
         let mut turn_start = None;
         for i in (boundary_start..=cut_index).rev() {
             if let SessionEntryKind::Message {
@@ -342,32 +417,37 @@ pub fn prepare_compaction(
             }
         }
         match turn_start {
-            Some(ts) => (ts, Some(ts)),
-            None => (cut_index, None),
+            Some(ts) => ts,
+            None => entries[cut_index + 1..]
+                .iter()
+                .position(|e| {
+                    matches!(
+                        &e.kind,
+                        SessionEntryKind::Message {
+                            message: Message::User(_)
+                        }
+                    )
+                })
+                .map(|rel| cut_index + 1 + rel)?,
         }
     } else {
-        (cut_index, None)
+        cut_index
     };
 
     let mut messages_to_summarize = Vec::new();
-    for entry in &entries[boundary_start..history_end] {
+    for entry in &entries[boundary_start..first_kept_index] {
         if let SessionEntryKind::Message { message } = &entry.kind {
             messages_to_summarize.push(message.clone());
         }
     }
 
-    let mut turn_prefix_messages = Vec::new();
-    if let Some(ts) = turn_start_index {
-        for entry in &entries[ts..cut_index] {
-            if let SessionEntryKind::Message { message } = &entry.kind {
-                turn_prefix_messages.push(message.clone());
-            }
-        }
-    }
+    let turn_prefix_messages = Vec::new();
 
-    if messages_to_summarize.is_empty() && turn_prefix_messages.is_empty() {
+    if messages_to_summarize.is_empty() {
         return None;
     }
+
+    let first_kept_entry = &entries[first_kept_index];
 
     // Extract file operations from read, write, and edit tool calls
     let mut read_files_set = BTreeSet::new();
@@ -398,7 +478,7 @@ pub fn prepare_compaction(
     let modified_files: Vec<String> = modified_files_set.into_iter().collect();
 
     Some(CompactionPreparation {
-        first_kept_entry_id: cut_entry.id.clone(),
+        first_kept_entry_id: first_kept_entry.id.clone(),
         messages_to_summarize,
         turn_prefix_messages,
         tokens_before: tokens_before as u64,
@@ -457,10 +537,10 @@ pub async fn compact_with_provider(
     let mut stream = provider.stream(model, &context, &options, cancel);
     let final_msg = stream.collect_final_message().await?;
 
-    if final_msg.stop_reason == StopReason::Error {
+    if matches!(final_msg.stop_reason, StopReason::Error | StopReason::Aborted) {
         let err = final_msg
             .error_message
-            .unwrap_or_else(|| "Unknown error from model".to_string());
+            .unwrap_or_else(|| format!("Compaction stopped with {:?}", final_msg.stop_reason));
         return Err(anyhow!("Compaction model stream failed: {err}"));
     }
 
@@ -502,6 +582,7 @@ mod tests {
             context_window: 100_000,
             max_tokens: 4096,
             headers: None,
+            ..Default::default()
         }
     }
 
@@ -690,5 +771,79 @@ mod tests {
         assert!(result.contains("## Goal\nBuild a parser."));
         assert!(result.contains("<read-files>\nparser.rs\n</read-files>"));
         assert!(result.contains("<modified-files>\nmain.rs\n</modified-files>"));
+    }
+
+    #[test]
+    fn test_compaction_non_ascii_truncation_and_assistant_cut_starts_with_user() {
+        // Non-ASCII tool output around byte 2000 must not panic when serialized for compaction.
+        let mut big = "a".repeat(TOOL_RESULT_MAX_CHARS - 2);
+        big.push_str("你好世界🙂extra");
+        let serialized = serialize_conversation(&[Message::ToolResult(mehh_ai::ToolResultMessage {
+            tool_call_id: "c1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![mehh_ai::ToolResultContentBlock::Text(mehh_ai::TextContent {
+                text: big,
+                text_signature: None,
+            })],
+            details: None,
+            is_error: false,
+            timestamp: now_ms(),
+        })]);
+        assert!(serialized.contains("more characters truncated"));
+
+        // Cutting on an assistant entry mid-turn must anchor first_kept_entry_id on that turn's User entry.
+        let long_text = "word ".repeat(3000);
+        let mk_user = |id: &str, parent: Option<&str>, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            timestamp: "2026-11-12T10:00:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: now_ms(),
+                }),
+            },
+        };
+        let mk_ast = |id: &str, parent: &str, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            timestamp: "2026-11-12T10:01:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::Assistant(mehh_ai::faux_assistant_message(text)),
+            },
+        };
+
+        let entries = vec![
+            mk_user("u1", None, "first turn"),
+            mk_ast("a1", "u1", "first reply"),
+            mk_user("u2", Some("a1"), "second turn question"),
+            mk_ast("a2", "u2", &long_text),
+            mk_ast("a3", "a2", &long_text),
+        ];
+
+        let prep = prepare_compaction(&entries, DEFAULT_KEEP_RECENT_TOKENS).unwrap();
+        assert_eq!(prep.first_kept_entry_id, "u2");
+        assert_eq!(prep.messages_to_summarize.len(), 2);
+        assert!(prep.turn_prefix_messages.is_empty());
+    }
+
+    #[test]
+    fn test_compaction_settings_and_should_auto_compact() {
+        let small = CompactionSettings::for_context_window(8_000, true);
+        assert!(small.reserve_tokens <= 1600);
+        assert!(small.keep_recent_tokens >= 2048);
+
+        let default_settings = CompactionSettings::default();
+        assert!(default_settings.enabled);
+        assert!(should_auto_compact(190_000, 200_000, &default_settings));
+        assert!(!should_auto_compact(100_000, 200_000, &default_settings));
+        assert!(!should_auto_compact(
+            190_000,
+            200_000,
+            &CompactionSettings {
+                enabled: false,
+                ..default_settings
+            }
+        ));
     }
 }

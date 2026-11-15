@@ -25,6 +25,119 @@ impl MarkdownView {
     }
 }
 
+fn sanitize_markdown_text(s: &str, allow_newlines: bool) -> String {
+    let stripped = crate::ansi::strip_ansi(s);
+    let mut out = String::with_capacity(stripped.len());
+    for ch in stripped.chars() {
+        match ch {
+            '\n' if allow_newlines => out.push(ch),
+            '\r' if allow_newlines => {}
+            '\t' => out.push_str("   "),
+            c if (c as u32) < 0x20 || c == '\x7f' || ('\u{0080}'..='\u{009f}').contains(&c) => {}
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn sanitize_osc8_url(raw: &str) -> Option<String> {
+    let clean = sanitize_markdown_text(raw, false);
+    let trimmed = clean.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("javascript:") || lower.starts_with("data:") {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn format_markdown_table(
+    rows: &[Vec<String>],
+    has_header: bool,
+    max_width: usize,
+    border_color: &str,
+) -> Vec<String> {
+    if rows.is_empty() || max_width == 0 {
+        return Vec::new();
+    }
+    let col_count = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+    if col_count == 0 {
+        return Vec::new();
+    }
+
+    let mut col_widths = vec![3usize; col_count];
+    for row in rows {
+        for (c, cell) in row.iter().enumerate() {
+            col_widths[c] = col_widths[c].max(visible_width(cell));
+        }
+    }
+
+    let overhead = col_count * 3 + 1;
+    if max_width > overhead {
+        let avail_cells = max_width - overhead;
+        while col_widths.iter().sum::<usize>() > avail_cells {
+            if let Some((idx, _)) = col_widths
+                .iter()
+                .enumerate()
+                .filter(|(_, &w)| w > 1)
+                .max_by_key(|(_, &w)| w)
+            {
+                col_widths[idx] -= 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    for (r_idx, row) in rows.iter().enumerate() {
+        let mut line = format!("{border_color}|\x1b[0m");
+        for (c_idx, &col_w) in col_widths.iter().enumerate() {
+            let cell = row.get(c_idx).map(String::as_str).unwrap_or("");
+            let formatted = crate::ansi::truncate_to_width(cell, col_w, "…", true);
+            line.push(' ');
+            if has_header && r_idx == 0 {
+                line.push_str("\x1b[1m");
+                line.push_str(&formatted);
+                line.push_str("\x1b[0m");
+            } else {
+                line.push_str(&formatted);
+            }
+            line.push_str(&format!(" {border_color}|\x1b[0m"));
+        }
+        lines.push(line);
+
+        if has_header && r_idx == 0 {
+            let mut sep = format!("{border_color}|");
+            for &col_w in &col_widths {
+                sep.push_str(&"─".repeat(col_w + 2));
+                sep.push('|');
+            }
+            sep.push_str("\x1b[0m");
+            lines.push(sep);
+        }
+    }
+    lines
+}
+
+fn push_blockquote_lines(
+    target: &mut Vec<String>,
+    lines: Vec<String>,
+    quote_depth: usize,
+    quote_color: &str,
+) {
+    if quote_depth == 0 {
+        target.extend(lines);
+        return;
+    }
+    let quote_prefix = format!("{quote_color}│\x1b[0m ").repeat(quote_depth);
+    for l in lines {
+        target.push(format!("{quote_prefix}{l}"));
+    }
+}
+
 impl Component for MarkdownView {
     fn render(&self, width: usize) -> Vec<String> {
         if width == 0 {
@@ -43,28 +156,40 @@ impl Component for MarkdownView {
 
         let mut in_code_block = false;
         let mut code_block_lang = String::new();
-        let mut code_block_lines: Vec<String> = Vec::new();
+        let mut code_block_buf = String::new();
 
-        let mut blockquote_depth = 0;
+        let mut in_table = false;
+        let mut table_has_header = false;
+        let mut table_rows: Vec<Vec<String>> = Vec::new();
+        let mut table_current_row: Vec<String> = Vec::new();
+
+        let mut blockquote_depth = 0usize;
         let mut list_stack: Vec<Option<u64>> = Vec::new();
+        let mut link_osc8_stack: Vec<bool> = Vec::new();
 
         let quote_color = if !self.theme.md_quote.is_empty() {
             &self.theme.md_quote
         } else {
             "\x1b[2m"
         };
-
-        let flush_current_line = |current: &mut String, lines: &mut Vec<String>, quote_depth: usize| {
-            if !current.is_empty() {
-                let line_content = std::mem::take(current);
-                if quote_depth > 0 {
-                    let quote_prefix = format!("{quote_color}│\x1b[0m ").repeat(quote_depth);
-                    lines.push(format!("{quote_prefix}{line_content}"));
-                } else {
-                    lines.push(line_content);
-                }
-            }
+        let border_color = if !self.theme.border_muted.is_empty() {
+            &self.theme.border_muted
+        } else {
+            "\x1b[2m"
         };
+        let code_color = if !self.theme.md_code.is_empty() {
+            &self.theme.md_code
+        } else {
+            "\x1b[33m"
+        };
+
+        let flush_current_line =
+            |current: &mut String, lines: &mut Vec<String>, quote_depth: usize| {
+                if !current.is_empty() {
+                    let line_content = std::mem::take(current);
+                    push_blockquote_lines(lines, vec![line_content], quote_depth, quote_color);
+                }
+            };
 
         for event in parser {
             match event {
@@ -111,44 +236,120 @@ impl Component for MarkdownView {
                     flush_current_line(&mut current_line, &mut output_lines, blockquote_depth);
                     in_code_block = true;
                     code_block_lang = match kind {
-                        CodeBlockKind::Fenced(lang) => lang.to_string(),
+                        CodeBlockKind::Fenced(lang) => sanitize_markdown_text(&lang, false),
                         CodeBlockKind::Indented => String::new(),
                     };
-                    code_block_lines.clear();
+                    code_block_buf.clear();
                 }
                 Event::End(TagEnd::CodeBlock) => {
                     in_code_block = false;
-                    let inner_w = width.saturating_sub(4).max(10);
-                    let border_color = if !self.theme.border_muted.is_empty() {
-                        &self.theme.border_muted
+                    let clean_code = sanitize_markdown_text(&code_block_buf, true);
+                    code_block_buf.clear();
+
+                    let raw_lines: Vec<&str> = if clean_code.is_empty() {
+                        vec![""]
                     } else {
-                        "\x1b[2m"
-                    };
-                    let code_color = if !self.theme.md_code.is_empty() {
-                        &self.theme.md_code
-                    } else {
-                        "\x1b[33m"
+                        clean_code.lines().collect()
                     };
 
-                    // Top border with optional language tag
-                    let lang_str = if code_block_lang.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" {} ", code_block_lang)
-                    };
-                    let lang_w = visible_width(&lang_str);
-                    let bar_w = inner_w.saturating_sub(lang_w);
-                    let top = format!("{border_color}┌─{lang_str}{}\x1b[0m", "─".repeat(bar_w));
-                    output_lines.push(top);
+                    let effective_w = width.saturating_sub(blockquote_depth * 2).max(1);
+                    let mut block_lines = Vec::new();
 
-                    for line in &code_block_lines {
-                        output_lines.push(format!("{border_color}│\x1b[0m {code_color}{line}\x1b[0m"));
+                    if effective_w < 5 {
+                        for line in raw_lines {
+                            for wrapped in wrap_text_with_ansi(line, effective_w) {
+                                block_lines.push(format!("{code_color}{wrapped}\x1b[0m"));
+                            }
+                        }
+                    } else {
+                        let middle_w = effective_w - 2;
+                        let inner_w = effective_w - 4;
+                        let lang_tag = if code_block_lang.trim().is_empty() {
+                            String::new()
+                        } else {
+                            crate::ansi::truncate_to_width(
+                                &format!(" {} ", code_block_lang.trim()),
+                                middle_w.saturating_sub(1),
+                                "…",
+                                false,
+                            )
+                        };
+                        let lang_w = visible_width(&lang_tag);
+                        let right_dashes = middle_w.saturating_sub(1 + lang_w);
+                        let top = format!(
+                            "{border_color}┌─{lang_tag}{}┐\x1b[0m",
+                            "─".repeat(right_dashes)
+                        );
+                        block_lines.push(top);
+
+                        for line in raw_lines {
+                            let wrapped = wrap_text_with_ansi(line, inner_w);
+                            for wline in wrapped {
+                                let fitted =
+                                    crate::ansi::truncate_to_width(&wline, inner_w, "", true);
+                                block_lines.push(format!(
+                                    "{border_color}│\x1b[0m {code_color}{fitted}\x1b[0m {border_color}│\x1b[0m"
+                                ));
+                            }
+                        }
+
+                        let bottom =
+                            format!("{border_color}└{}┘\x1b[0m", "─".repeat(middle_w));
+                        block_lines.push(bottom);
                     }
 
-                    let bottom = format!("{border_color}└{}\x1b[0m", "─".repeat(inner_w + 2));
-                    output_lines.push(bottom);
+                    push_blockquote_lines(
+                        &mut output_lines,
+                        block_lines,
+                        blockquote_depth,
+                        quote_color,
+                    );
                     output_lines.push(String::new());
-                    code_block_lines.clear();
+                }
+                Event::Start(Tag::Table(_)) => {
+                    flush_current_line(&mut current_line, &mut output_lines, blockquote_depth);
+                    in_table = true;
+                    table_has_header = false;
+                    table_rows.clear();
+                    table_current_row.clear();
+                }
+                Event::End(TagEnd::Table) => {
+                    in_table = false;
+                    let effective_w = width.saturating_sub(blockquote_depth * 2).max(1);
+                    let table_lines = format_markdown_table(
+                        &table_rows,
+                        table_has_header,
+                        effective_w,
+                        border_color,
+                    );
+                    push_blockquote_lines(
+                        &mut output_lines,
+                        table_lines,
+                        blockquote_depth,
+                        quote_color,
+                    );
+                    output_lines.push(String::new());
+                    table_rows.clear();
+                    table_current_row.clear();
+                }
+                Event::Start(Tag::TableHead) => {
+                    table_current_row.clear();
+                }
+                Event::End(TagEnd::TableHead) => {
+                    table_has_header = true;
+                    table_rows.push(std::mem::take(&mut table_current_row));
+                }
+                Event::Start(Tag::TableRow) => {
+                    table_current_row.clear();
+                }
+                Event::End(TagEnd::TableRow) => {
+                    table_rows.push(std::mem::take(&mut table_current_row));
+                }
+                Event::Start(Tag::TableCell) => {
+                    current_line.clear();
+                }
+                Event::End(TagEnd::TableCell) => {
+                    table_current_row.push(std::mem::take(&mut current_line).trim().to_string());
                 }
                 Event::Start(Tag::List(first_num)) => {
                     flush_current_line(&mut current_line, &mut output_lines, blockquote_depth);
@@ -175,6 +376,13 @@ impl Component for MarkdownView {
                 Event::End(TagEnd::Item) => {
                     flush_current_line(&mut current_line, &mut output_lines, blockquote_depth);
                 }
+                Event::TaskListMarker(checked) => {
+                    if checked {
+                        current_line.push_str("\x1b[32m[x]\x1b[0m ");
+                    } else {
+                        current_line.push_str("\x1b[2m[ ]\x1b[0m ");
+                    }
+                }
                 Event::Start(Tag::Emphasis) => {
                     current_line.push_str("\x1b[3m");
                 }
@@ -194,55 +402,52 @@ impl Component for MarkdownView {
                     current_line.push_str("\x1b[29m");
                 }
                 Event::Start(Tag::Link { dest_url, .. }) => {
-                    let url = dest_url.to_string();
                     let link_style = if !self.theme.md_link.is_empty() {
                         &self.theme.md_link
                     } else {
                         "\x1b[4;34m"
                     };
-                    current_line.push_str(&format!("\x1b]8;;{url}\x07{link_style}"));
+                    if let Some(safe_url) = sanitize_osc8_url(&dest_url) {
+                        current_line.push_str(&format!("\x1b]8;;{safe_url}\x07{link_style}"));
+                        link_osc8_stack.push(true);
+                    } else {
+                        current_line.push_str(link_style);
+                        link_osc8_stack.push(false);
+                    }
                 }
                 Event::End(TagEnd::Link) => {
-                    current_line.push_str("\x1b]8;;\x07\x1b[0m");
+                    let opened = link_osc8_stack.pop().unwrap_or(false);
+                    if opened {
+                        current_line.push_str("\x1b]8;;\x07\x1b[0m");
+                    } else {
+                        current_line.push_str("\x1b[0m");
+                    }
                 }
                 Event::Code(text) => {
                     if in_code_block {
-                        for l in text.split('\n') {
-                            code_block_lines.push(l.trim_end_matches('\r').to_string());
-                        }
+                        code_block_buf.push_str(&text);
                     } else {
-                        let code_color = if !self.theme.md_code.is_empty() {
-                            &self.theme.md_code
-                        } else {
-                            "\x1b[33m"
-                        };
-                        current_line.push_str(&format!("{code_color}{text}\x1b[0m"));
+                        let clean = sanitize_markdown_text(&text, false);
+                        current_line.push_str(&format!("{code_color}{clean}\x1b[0m"));
                     }
                 }
                 Event::Text(text) => {
                     if in_code_block {
-                        for l in text.split('\n') {
-                            code_block_lines.push(l.trim_end_matches('\r').to_string());
-                        }
+                        code_block_buf.push_str(&text);
                     } else {
-                        current_line.push_str(&text);
+                        current_line.push_str(&sanitize_markdown_text(&text, false));
                     }
                 }
                 Event::Rule => {
                     flush_current_line(&mut current_line, &mut output_lines, blockquote_depth);
                     let rule_w = width.min(40);
-                    let border_color = if !self.theme.border_muted.is_empty() {
-                        &self.theme.border_muted
-                    } else {
-                        "\x1b[2m"
-                    };
                     output_lines.push(format!("{border_color}{}\x1b[0m", "─".repeat(rule_w)));
                     output_lines.push(String::new());
                 }
-                Event::SoftBreak if !in_code_block => {
+                Event::SoftBreak if !in_code_block && !in_table => {
                     current_line.push(' ');
                 }
-                Event::HardBreak if !in_code_block => {
+                Event::HardBreak if !in_code_block && !in_table => {
                     flush_current_line(&mut current_line, &mut output_lines, blockquote_depth);
                 }
                 _ => {}
@@ -269,5 +474,61 @@ impl Component for MarkdownView {
         }
 
         final_lines
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ansi::strip_ansi;
+
+    #[test]
+    fn test_markdown_renders_tables_and_tasklists() {
+        let src = "\
+| Name | Status |
+| --- | --- |
+| Auth | OK |
+
+- [x] Done task
+- [ ] Pending task";
+        let lines = MarkdownView::new(src).render(50);
+        let plain = lines
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(plain.contains("Name"));
+        assert!(plain.contains("Auth"));
+        assert!(plain.contains("──"));
+        assert!(plain.contains("[x] Done task"));
+        assert!(plain.contains("[ ] Pending task"));
+    }
+
+    #[test]
+    fn test_markdown_strips_terminal_control_sequences() {
+        let src = "Hello \x1b[31mRED\x1b[0m and \x1b]2;pwned\x07world\n\n```rust\nlet s = \"\x1b[2Jclear\";\n```";
+        let lines = MarkdownView::new(src).render(60);
+        let joined = lines.join("\n");
+        assert!(!joined.contains("\x1b[31m"));
+        assert!(!joined.contains("\x1b]2;pwned"));
+        assert!(!joined.contains("\x1b[2J"));
+        let plain: String = lines.iter().map(|l| strip_ansi(l)).collect::<Vec<_>>().join("\n");
+        assert!(plain.contains("Hello RED and world"));
+    }
+
+    #[test]
+    fn test_markdown_code_block_fits_narrow_width() {
+        let src = "```rust\nlet very_long_identifier = \"abcdefghijklmnopqrstuvwxyz\";\n```";
+        for w in [10usize, 24, 40] {
+            let lines = MarkdownView::new(src).render(w);
+            for line in &lines {
+                assert!(
+                    visible_width(line) <= w,
+                    "Line width {} exceeded box width {w}: {line:?}",
+                    visible_width(line)
+                );
+            }
+        }
     }
 }

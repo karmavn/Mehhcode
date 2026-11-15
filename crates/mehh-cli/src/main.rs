@@ -2,14 +2,15 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use clap::Parser;
-use mehh_agent::AgentTool;
 use mehh_ai::{catalog, faux, LlmProvider, Model, ModelCost, ThinkingLevel};
-use mehh_coding_agent::{
-    build_system_prompt_with_skills, list_sessions, perform_login, perform_logout, rpc,
-    run_interactive_mode, run_print_mode, AgentSession, McpManager, OutputMode, SessionManager,
-    SessionSummary, SettingsManager,
-};
 use mehh_coding_agent::auth::resolve_api_key_async;
+use mehh_coding_agent::models_config::ModelRegistry;
+use mehh_coding_agent::trust::resolve_project_trust;
+use mehh_coding_agent::{
+    list_sessions, perform_login, perform_logout, rpc, run_interactive_mode, run_print_mode,
+    AgentSession, McpManager, OutputMode, SessionManager, SessionSummary, Settings,
+    SettingsManager,
+};
 
 #[derive(clap::Parser, Debug, Clone, PartialEq, Eq)]
 #[command(name = "mehh", version, about = "mehh coding agent CLI")]
@@ -75,6 +76,9 @@ pub struct CliArgs {
 
     #[arg(long = "list-models")]
     pub list_models: bool,
+
+    #[arg(long = "trust")]
+    pub trust: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,14 +127,6 @@ pub fn parse_thinking_level(s: &str) -> anyhow::Result<ThinkingLevel> {
     }
 }
 
-pub fn parse_output_mode(s: &str) -> anyhow::Result<OutputMode> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "text" => Ok(OutputMode::Text),
-        "json" => Ok(OutputMode::Json),
-        other => anyhow::bail!("Invalid output mode '{}'. Allowed: text, json", other),
-    }
-}
-
 /// Returns the request format used for a provider's API.
 pub fn api_for_provider(provider: &str) -> &'static str {
     match provider.to_ascii_lowercase().as_str() {
@@ -161,41 +157,112 @@ pub fn base_url_for_provider(provider: &str) -> String {
     }
 }
 
-/// Resolves a model from the builtin catalog or constructs a fallback custom Model
-/// with reasonable defaults for unlisted models.
+/// Selects effective `(model_arg, provider_arg)` so an explicit `--model` is never overridden by `settings.default_provider`.
+pub fn select_cli_model_and_provider<'a>(
+    args_model: Option<&'a str>,
+    args_provider: Option<&'a str>,
+    settings: &'a Settings,
+) -> (Option<&'a str>, Option<&'a str>) {
+    if let Some(m) = args_model {
+        (Some(m), args_provider)
+    } else {
+        (
+            settings.default_model.as_deref(),
+            args_provider.or(settings.default_provider.as_deref()),
+        )
+    }
+}
+
+/// Applies `--thinking` only when explicitly provided so `settings.default_thinking_level` is preserved otherwise.
+pub fn apply_cli_thinking_override(
+    session: &mut AgentSession,
+    cli_thinking: Option<ThinkingLevel>,
+) {
+    if let Some(level) = cli_thinking {
+        session.set_thinking_level(Some(level));
+    }
+}
+
+/// Resolves a model from the built-in catalog or constructs a fallback custom `Model`.
 pub fn resolve_or_custom_model(
+    model_arg: Option<&str>,
+    provider_arg: Option<&str>,
+    default_provider: Option<&str>,
+) -> Option<Model> {
+    resolve_or_custom_model_with_registry(
+        &ModelRegistry::builtin_only(),
+        model_arg,
+        provider_arg,
+        default_provider,
+    )
+}
+
+/// Resolves a model from `registry` (built-in catalog + `models.json`) or constructs a fallback custom `Model`.
+pub fn resolve_or_custom_model_with_registry(
+    registry: &ModelRegistry,
     model_arg: Option<&str>,
     provider_arg: Option<&str>,
     default_provider: Option<&str>,
 ) -> Option<Model> {
     if let Some(m) = model_arg {
         let resolved = if let Some(p) = provider_arg {
-            catalog::resolve_model(p, Some(m))
+            registry.resolve(p, Some(m))
         } else {
-            catalog::resolve_model(m, None)
+            registry.resolve(m, None)
         };
 
         if let Some(model) = resolved {
             return Some(model);
         }
 
-        // Custom / unlisted fallback model
+        // Custom / unlisted fallback model: infer provider from explicit flag, slash prefix, or model prefix
+        // before falling back to `default_provider`.
+        let lower_m = m.to_ascii_lowercase();
         let (provider, id) = if let Some(p) = provider_arg {
             (p.to_ascii_lowercase(), m.to_string())
         } else if let Some((p, rest)) = m.split_once('/') {
             (p.to_ascii_lowercase(), rest.to_string())
-        } else if m.starts_with("claude-") {
+        } else if lower_m.starts_with("claude-") {
             ("anthropic".to_string(), m.to_string())
-        } else if m.starts_with("gemini-") {
+        } else if lower_m.starts_with("gpt-")
+            || lower_m.starts_with("chatgpt-")
+            || lower_m == "o1"
+            || lower_m.starts_with("o1-")
+            || lower_m == "o3"
+            || lower_m.starts_with("o3-")
+            || lower_m == "o4"
+            || lower_m.starts_with("o4-")
+        {
+            ("openai".to_string(), m.to_string())
+        } else if lower_m.starts_with("gemini-") {
             ("google".to_string(), m.to_string())
+        } else if lower_m.starts_with("mistral-")
+            || lower_m.starts_with("codestral-")
+            || lower_m.starts_with("pixtral-")
+            || lower_m.starts_with("magistral-")
+        {
+            ("mistral".to_string(), m.to_string())
+        } else if lower_m.starts_with("grok-") {
+            ("xai".to_string(), m.to_string())
+        } else if lower_m.starts_with("deepseek-") {
+            ("deepseek".to_string(), m.to_string())
         } else if let Some(dp) = default_provider {
-            (dp.to_string(), m.to_string())
+            (dp.to_ascii_lowercase(), m.to_string())
         } else {
             ("openai".to_string(), m.to_string())
         };
 
-        let api = api_for_provider(&provider).to_string();
-        let base_url = base_url_for_provider(&provider);
+        let custom_cfg = registry.provider_config(&provider);
+        let api = custom_cfg
+            .and_then(|c| c.api.clone())
+            .unwrap_or_else(|| api_for_provider(&provider).to_string());
+        let base_url = custom_cfg
+            .and_then(|c| c.base_url.clone())
+            .unwrap_or_else(|| base_url_for_provider(&provider));
+        let headers = custom_cfg.and_then(|c| c.headers.clone());
+        if base_url.trim().is_empty() {
+            return None;
+        }
 
         let reasoning = id.starts_with("o1")
             || id.starts_with("o3")
@@ -214,14 +281,15 @@ pub fn resolve_or_custom_model(
             cost: ModelCost::default(),
             context_window: 128_000,
             max_tokens: 16_384,
-            headers: None,
+            headers,
+            ..Default::default()
         })
     } else if let Some(p) = provider_arg {
-        catalog::resolve_model(p, None)
+        registry.resolve(p, None)
     } else if let Some(dp) = default_provider {
-        catalog::resolve_model(dp, None)
+        registry.resolve(dp, None)
     } else {
-        catalog::resolve_model("claude-sonnet-4-5", None)
+        registry.resolve("claude-sonnet-4-5", None)
     }
 }
 
@@ -320,10 +388,8 @@ pub fn parse_session_choice(input: &str, count: usize) -> anyhow::Result<usize> 
     Ok(idx)
 }
 
-/// Builds the system prompt for a session from its final tool list.
-///
-/// The prompt is assembled after the MCP and codemode tools are installed so that
-/// a custom prompt or an addendum is never dropped by a later tool sync.
+/// Builds the system prompt for a session from its final tool list (used by unit tests).
+#[cfg(test)]
 pub fn assemble_system_prompt(
     session: &AgentSession,
     cwd: &Path,
@@ -331,7 +397,7 @@ pub fn assemble_system_prompt(
     append_prompt: Option<&str>,
 ) -> String {
     let tool_names: Vec<&str> = session.tools().iter().map(|t| t.name()).collect();
-    build_system_prompt_with_skills(
+    mehh_coding_agent::build_system_prompt_with_skills(
         cwd,
         custom_prompt,
         append_prompt,
@@ -396,20 +462,15 @@ pub fn resolve_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<Ses
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
 
-    if args.list_models {
-        for m in catalog::builtin_models() {
-            println!(
-                "{}/{} - {} ({} tokens)",
-                m.provider, m.id, m.name, m.context_window
-            );
-        }
-        return Ok(());
-    }
+    // Validate CLI mode and thinking level early before loading sessions, credentials, or MCP.
+    let cli_mode = parse_cli_mode(&args.mode)?;
+    let cli_thinking = args
+        .thinking
+        .as_deref()
+        .map(parse_thinking_level)
+        .transpose()?;
 
-    let cwd = std::env::current_dir()?;
-    let settings = SettingsManager::load(&cwd);
-
-    // Credential management short-circuits before a session is created.
+    // Credential management short-circuits before a session or trust check is created.
     if let Some(provider) = args.login.as_deref() {
         let message = perform_login(provider, args.api_key.as_deref(), None).await?;
         println!("{message}");
@@ -424,6 +485,22 @@ async fn main() -> anyhow::Result<()> {
         }
         return Ok(());
     }
+
+    let model_registry = ModelRegistry::load_default()?;
+    if args.list_models {
+        for m in model_registry.models() {
+            println!(
+                "{}/{} - {} ({} tokens)",
+                m.provider, m.id, m.name, m.context_window
+            );
+        }
+        return Ok(());
+    }
+
+    let cwd = std::env::current_dir()?;
+    let is_interactive = should_run_interactive(&args, cli_mode, io::stdin().is_terminal());
+    let trusted = resolve_project_trust(&cwd, args.trust, is_interactive)?;
+    let settings = SettingsManager::try_load_with_trust(&cwd, trusted)?;
 
     let (model, provider): (Model, Arc<dyn LlmProvider>) = {
         let is_faux = args
@@ -445,16 +522,14 @@ async fn main() -> anyhow::Result<()> {
             ));
             (model, Arc::new(faux_prov))
         } else {
-            let model_arg = args
-                .model
-                .as_deref()
-                .or(settings.default_model.as_deref());
-            let provider_arg = args
-                .provider
-                .as_deref()
-                .or(settings.default_provider.as_deref());
+            let (model_arg, provider_arg) = select_cli_model_and_provider(
+                args.model.as_deref(),
+                args.provider.as_deref(),
+                &settings,
+            );
 
-            let model = resolve_or_custom_model(
+            let model = resolve_or_custom_model_with_registry(
+                &model_registry,
                 model_arg,
                 provider_arg,
                 settings.default_provider.as_deref(),
@@ -474,36 +549,50 @@ async fn main() -> anyhow::Result<()> {
 
     let session_mgr = resolve_session_manager(&args, &cwd)?;
 
-    let mut agent_session = AgentSession::new(
+    let mut agent_session = AgentSession::new_with_trust(
         cwd.clone(),
         model.clone(),
         provider,
         session_mgr,
         settings,
+        trusted,
     );
 
-    let tools: Vec<Arc<dyn AgentTool>> = if args.no_tools {
-        Vec::new()
-    } else {
-        mehh_tools::create_coding_tools(cwd.clone())
-    };
-
-    agent_session.set_tools(tools);
+    if args.no_tools {
+        agent_session.set_tools(Vec::new());
+    }
 
     // Resolve the key asynchronously so expired OAuth tokens are refreshed first.
-    let api_key = resolve_api_key_async(&model.provider, args.api_key.as_deref(), None::<&Path>).await?;
-    agent_session.set_api_key(api_key);
-
-    let thinking_level = match &args.thinking {
-        Some(t) => Some(parse_thinking_level(t)?),
-        None => None,
-    };
-    agent_session.set_thinking_level(thinking_level);
-
-    let cli_mode = parse_cli_mode(&args.mode)?;
+    let has_explicit_api_key = args
+        .api_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty());
+    let api_key = resolve_api_key_async(&model.provider, args.api_key.as_deref(), None::<&Path>)
+        .await?
+        .or_else(|| {
+            model_registry
+                .provider_api_key(&model.provider)
+                .map(str::to_string)
+        });
+    if has_explicit_api_key {
+        agent_session.set_explicit_api_key(api_key);
+    } else {
+        agent_session.set_api_key(api_key);
+    }
+    apply_cli_thinking_override(&mut agent_session, cli_thinking);
 
     let (mut mcp_manager, mcp_tools) = if !args.no_tools && !args.no_mcp {
-        let mgr = McpManager::connect_from_configs(&cwd).await;
+        let mgr = McpManager::connect_from_configs_with_trust(&cwd, trusted).await?;
+        if !is_interactive {
+            for summary in mgr.summaries() {
+                if let Some(ref err) = summary.error {
+                    eprintln!(
+                        "Warning: MCP server '{}' failed to connect: {}",
+                        summary.server, err
+                    );
+                }
+            }
+        }
         let tools = mgr.tools().to_vec();
         (Some(mgr), tools)
     } else {
@@ -514,17 +603,12 @@ async fn main() -> anyhow::Result<()> {
         agent_session.enable_mcp_and_codemode(mcp_tools, args.codemode);
     }
 
-    // The system prompt is built after the final tool list is known so that the
-    // MCP/codemode tool sync cannot drop a custom prompt or an addendum.
-    let system_prompt = assemble_system_prompt(
-        &agent_session,
-        &cwd,
-        args.system_prompt.as_deref(),
-        args.append_system_prompt.as_deref(),
+    agent_session.set_custom_system_prompt(
+        args.system_prompt.clone(),
+        args.append_system_prompt.clone(),
     );
-    agent_session.set_system_prompt(system_prompt);
 
-    if should_run_interactive(&args, cli_mode, io::stdin().is_terminal()) {
+    if is_interactive {
         let summaries = mcp_manager
             .as_ref()
             .map(|mgr| mgr.summaries().to_vec())
@@ -584,8 +668,7 @@ async fn run_print_flow(
         );
     }
 
-    let expanded = agent_session.expand_input(&prompt_text);
-    run_print_mode(agent_session, &expanded, output_mode).await?;
+    run_print_mode(agent_session, &prompt_text, output_mode).await?;
     Ok(())
 }
 
@@ -899,15 +982,6 @@ mod tests {
         assert_eq!(parse_thinking_level("x-high").unwrap(), ThinkingLevel::Xhigh);
         assert_eq!(parse_thinking_level("max").unwrap(), ThinkingLevel::Max);
         assert!(parse_thinking_level("unknown").is_err());
-    }
-
-    #[test]
-    fn test_parse_output_mode() {
-        assert!(matches!(parse_output_mode("text").unwrap(), OutputMode::Text));
-        assert!(matches!(parse_output_mode("json").unwrap(), OutputMode::Json));
-        assert!(matches!(parse_output_mode("TEXT").unwrap(), OutputMode::Text));
-        assert!(matches!(parse_output_mode("JSON").unwrap(), OutputMode::Json));
-        assert!(parse_output_mode("yaml").is_err());
     }
 
     #[test]
@@ -1266,5 +1340,56 @@ mod tests {
         assert_eq!(sm.file_path(), Some(explicit_file.as_path()));
 
         let _ = std::fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_cli_model_precedence_and_thinking_preservation() {
+        let dir = make_temp_dir("mehh_cli_prec");
+        let settings = Settings {
+            default_provider: Some("anthropic".to_string()),
+            default_model: Some("claude-sonnet-4-5".to_string()),
+            default_thinking_level: Some(ThinkingLevel::High),
+            ..Settings::default()
+        };
+
+        // Explicit --model gpt-4o without --provider ignores settings.default_provider ("anthropic")
+        let (model_arg, prov_arg) =
+            select_cli_model_and_provider(Some("gpt-4o"), None, &settings);
+        assert_eq!(model_arg, Some("gpt-4o"));
+        assert_eq!(prov_arg, None);
+        let resolved = resolve_or_custom_model(
+            model_arg,
+            prov_arg,
+            settings.default_provider.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(resolved.provider, "openai");
+        assert_eq!(resolved.id, "gpt-4o");
+
+        // Unlisted gpt model also infers openai before falling back to settings.default_provider
+        let unlisted_gpt = resolve_or_custom_model(
+            Some("gpt-5-future"),
+            None,
+            settings.default_provider.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(unlisted_gpt.provider, "openai");
+
+        // Omitting --thinking preserves settings.default_thinking_level
+        let mut session = AgentSession::new_with_trust(
+            dir.clone(),
+            faux::faux_model(),
+            Arc::new(faux::FauxProvider::new()),
+            SessionManager::in_memory(&dir),
+            settings,
+            false,
+        );
+        apply_cli_thinking_override(&mut session, None);
+        assert_eq!(session.thinking_level(), Some(ThinkingLevel::High));
+
+        apply_cli_thinking_override(&mut session, Some(ThinkingLevel::Low));
+        assert_eq!(session.thinking_level(), Some(ThinkingLevel::Low));
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

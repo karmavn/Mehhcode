@@ -186,6 +186,7 @@ mod tests {
             context_window: 1000,
             max_tokens: 100,
             headers: None,
+            ..Default::default()
         };
         AssistantMessage::empty_for_model(&model)
     }

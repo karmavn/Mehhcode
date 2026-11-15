@@ -3,13 +3,23 @@
 use std::collections::HashMap;
 use futures::StreamExt;
 
+use crate::retry::{
+    default_http_client, send_with_retry, RetryFailure, RetryPolicy, DEFAULT_STREAM_CHUNK_TIMEOUT,
+};
 use crate::sse::{SseEvent, SseParser};
 use crate::stream::{create_event_stream, AssistantEventSender, AssistantEventStream, LlmProvider};
+use crate::streaming_json::ToolCallArgumentsStream;
 use crate::types::*;
 
 /// Provider for the Anthropic Messages API.
 pub struct AnthropicProvider {
     client: reqwest::Client,
+}
+
+impl Default for AnthropicProvider {
+    fn default() -> Self {
+        Self::new(default_http_client())
+    }
 }
 
 impl AnthropicProvider {
@@ -35,119 +45,346 @@ impl LlmProvider for AnthropicProvider {
         let options = options.clone();
 
         tokio::spawn(async move {
-            let body = build_anthropic_request(&model, &context, &options);
+            let is_oauth = options.api_key.as_deref().map(is_oauth_token).unwrap_or(false);
+            let body = build_anthropic_request(&model, &context, &options, is_oauth);
             let url = if model.base_url.ends_with("/messages") {
                 model.base_url.clone()
             } else {
                 format!("{}/messages", model.base_url.trim_end_matches('/'))
             };
 
-            let mut req = client.post(&url);
-            req = req.header("content-type", "application/json");
-            req = req.header("anthropic-version", "2023-06-01");
-
-            if let Some(api_key) = &options.api_key {
-                req = req.header("x-api-key", api_key);
-            }
-            if let Some(headers) = &model.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            if let Some(headers) = &options.headers {
-                for (k, v) in headers {
-                    req = req.header(k, v);
-                }
-            }
-            req = req.json(&body);
-
-            let resp = tokio::select! {
-                _ = cancel.cancelled() => {
+            let resp = match send_with_retry(
+                || {
+                    let mut req = client.post(&url);
+                    let headers = build_anthropic_headers(&model, &options, is_oauth);
+                    for (k, v) in headers {
+                        req = req.header(k, v);
+                    }
+                    req.json(&body)
+                },
+                &RetryPolicy::default(),
+                &cancel,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(RetryFailure::Cancelled) => {
                     let mut err_msg = AssistantMessage::empty_for_model(&model);
                     err_msg.stop_reason = StopReason::Aborted;
                     err_msg.error_message = Some("Request was cancelled".to_string());
-                    sender.push(AssistantMessageEvent::Error {
-                        reason: StopReason::Aborted,
-                        error: err_msg,
-                    });
+                    sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Aborted,
+                            error: err_msg,
+                        })
+                        .await;
                     return;
                 }
-                res = req.send() => {
-                    match res {
-                        Ok(r) => r,
-                        Err(e) => {
-                            let mut err_msg = AssistantMessage::empty_for_model(&model);
-                            err_msg.stop_reason = StopReason::Error;
-                            err_msg.error_message = Some(e.to_string());
-                            sender.push(AssistantMessageEvent::Error {
-                                reason: StopReason::Error,
-                                error: err_msg,
-                            });
-                            return;
-                        }
-                    }
+                Err(RetryFailure::HttpStatus { status, body }) => {
+                    let mut err_msg = AssistantMessage::empty_for_model(&model);
+                    err_msg.stop_reason = StopReason::Error;
+                    err_msg.error_message = Some(format!("HTTP {status}: {body}"));
+                    sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: err_msg,
+                        })
+                        .await;
+                    return;
+                }
+                Err(RetryFailure::Transport(e)) => {
+                    let mut err_msg = AssistantMessage::empty_for_model(&model);
+                    err_msg.stop_reason = StopReason::Error;
+                    err_msg.error_message = Some(e);
+                    sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: err_msg,
+                        })
+                        .await;
+                    return;
                 }
             };
-
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                let mut err_msg = AssistantMessage::empty_for_model(&model);
-                err_msg.stop_reason = StopReason::Error;
-                err_msg.error_message = Some(format!("HTTP {status}: {text}"));
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
-                    error: err_msg,
-                });
-                return;
-            }
 
             let mut byte_stream = resp.bytes_stream();
             let mut sse_parser = SseParser::new();
             let mut state = AnthropicStreamState::new(&model);
+            if is_oauth {
+                state.set_oauth(true);
+                if let Some(tools) = &context.tools {
+                    state.set_declared_tools(tools.clone());
+                }
+            }
 
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
-                        let mut err_msg = state.finish(&sender);
-                        err_msg.stop_reason = StopReason::Aborted;
-                        err_msg.error_message = Some("Request was cancelled".to_string());
-                        sender.push(AssistantMessageEvent::Error {
-                            reason: StopReason::Aborted,
-                            error: err_msg,
-                        });
+                        state.mark_aborted("Request was cancelled");
+                        let mut batch = Vec::new();
+                        state.finish_into(&mut batch);
+                        sender.send_batch(batch).await;
                         return;
                     }
-                    chunk_opt = byte_stream.next() => {
+                    chunk_opt = tokio::time::timeout(DEFAULT_STREAM_CHUNK_TIMEOUT, byte_stream.next()) => {
                         match chunk_opt {
-                            Some(Ok(bytes)) => {
-                                let chunk_str = String::from_utf8_lossy(&bytes);
-                                let events = sse_parser.feed(&chunk_str);
-                                state.process_events(&events, &sender);
+                            Ok(Some(Ok(bytes))) => {
+                                let events = sse_parser.feed_bytes(&bytes);
+                                if sse_parser.has_overflowed() {
+                                    state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+                                    let mut batch = Vec::new();
+                                    state.finish_into(&mut batch);
+                                    sender.send_batch(batch).await;
+                                    return;
+                                }
+                                let mut batch = Vec::new();
+                                for ev in &events {
+                                    state.process_event_into(ev, &mut batch);
+                                }
+                                sender.send_batch(batch).await;
                             }
-                            Some(Err(e)) => {
-                                let mut err_msg = state.finish(&sender);
-                                err_msg.stop_reason = StopReason::Error;
-                                err_msg.error_message = Some(e.to_string());
-                                sender.push(AssistantMessageEvent::Error {
-                                    reason: StopReason::Error,
-                                    error: err_msg,
-                                });
+                            Ok(Some(Err(e))) => {
+                                state.mark_error(e.to_string());
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
                                 return;
                             }
-                            None => break,
+                            Err(_) => {
+                                state.mark_error(format!(
+                                    "Stream read timed out after {} seconds",
+                                    DEFAULT_STREAM_CHUNK_TIMEOUT.as_secs()
+                                ));
+                                let mut batch = Vec::new();
+                                state.finish_into(&mut batch);
+                                sender.send_batch(batch).await;
+                                return;
+                            }
+                            Ok(None) => break,
                         }
                     }
                 }
             }
 
             let remaining = sse_parser.finish();
-            state.process_events(&remaining, &sender);
-            state.finish(&sender);
+            let mut batch = Vec::new();
+            for ev in &remaining {
+                state.process_event_into(ev, &mut batch);
+            }
+            if sse_parser.has_overflowed() {
+                state.mark_error("SSE event exceeded maximum buffer size (16 MiB)");
+            } else if sse_parser.has_pending_bytes() || !state.received_terminal {
+                state.mark_error("Stream ended prematurely before Anthropic message_stop");
+            }
+            state.finish_into(&mut batch);
+            sender.send_batch(batch).await;
         });
 
         stream
     }
+}
+
+fn normalize_anthropic_tool_call_id(id: &str) -> String {
+    let sanitized: String = id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
+        .collect();
+    if sanitized.len() > 64 {
+        sanitized[..64].to_string()
+    } else {
+        sanitized
+    }
+}
+
+/// Constant minimum number of tokens reserved for the answer under a shared budget ceiling.
+pub const MIN_ANSWER_TOKENS: u64 = 1024;
+
+/// Canonical Claude Code CLI version string.
+pub const CLAUDE_CODE_VERSION: &str = "2.1.322";
+
+/// Canonical Claude Code 2.x tool names.
+pub const CLAUDE_CODE_TOOLS: &[&str] = &[
+    "Read",
+    "Write",
+    "Edit",
+    "Bash",
+    "Grep",
+    "Glob",
+    "AskUserQuestion",
+    "EnterPlanMode",
+    "ExitPlanMode",
+    "KillShell",
+    "NotebookEdit",
+    "Skill",
+    "Task",
+    "TaskOutput",
+    "TodoWrite",
+    "WebFetch",
+    "WebSearch",
+];
+
+/// Checks if an API key is an Anthropic OAuth token (contains "sk-ant-oat").
+pub fn is_oauth_token(api_key: &str) -> bool {
+    api_key.contains("sk-ant-oat")
+}
+
+/// Converts a tool name to its Claude Code canonical casing if matched.
+pub fn to_claude_code_name(name: &str) -> String {
+    for &tool in CLAUDE_CODE_TOOLS {
+        if tool.eq_ignore_ascii_case(name) {
+            return tool.to_string();
+        }
+    }
+    name.to_string()
+}
+
+/// Restores a Claude Code canonical tool name back to the declared tool name.
+pub fn from_claude_code_name(name: &str, declared_tools: &[ToolDefinition]) -> String {
+    for tool in declared_tools {
+        if tool.name.eq_ignore_ascii_case(name) {
+            return tool.name.clone();
+        }
+    }
+    name.to_string()
+}
+
+/// Cap a thinking budget so at least MIN_ANSWER_TOKENS remain under a shared response ceiling.
+pub fn clamp_thinking_budget_to_answer_room(thinking_budget: u64, ceiling: u64) -> u64 {
+    thinking_budget.min(ceiling.saturating_sub(MIN_ANSWER_TOKENS))
+}
+
+pub fn thinking_budget_for_level(
+    reasoning_level: &ThinkingLevel,
+    custom_budgets: Option<&ThinkingBudgets>,
+) -> u64 {
+    match reasoning_level {
+        ThinkingLevel::Off => 0,
+        ThinkingLevel::Minimal => custom_budgets.and_then(|b| b.minimal).unwrap_or(1024),
+        ThinkingLevel::Low => custom_budgets.and_then(|b| b.low).unwrap_or(2048),
+        ThinkingLevel::Medium => custom_budgets.and_then(|b| b.medium).unwrap_or(8192),
+        ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => {
+            custom_budgets.and_then(|b| b.high).unwrap_or(16384)
+        }
+    }
+}
+
+/// Adjusts max_tokens and thinking_budget according to reasoning level and custom budgets.
+pub fn adjust_max_tokens_for_thinking(
+    base_max_tokens: Option<u64>,
+    model_max_tokens: u64,
+    reasoning_level: &ThinkingLevel,
+    custom_budgets: Option<&ThinkingBudgets>,
+) -> (u64, u64) {
+    let mut thinking_budget = thinking_budget_for_level(reasoning_level, custom_budgets);
+    let max_tokens = match base_max_tokens {
+        None => model_max_tokens,
+        Some(base) => (base + thinking_budget).min(model_max_tokens),
+    };
+
+    if max_tokens <= thinking_budget {
+        thinking_budget = clamp_thinking_budget_to_answer_room(thinking_budget, max_tokens);
+    }
+
+    (max_tokens, thinking_budget)
+}
+
+/// Resolves beta headers for Anthropic API requests.
+pub fn resolve_anthropic_beta_headers(
+    model: &Model,
+    options: &StreamOptions,
+    is_oauth: bool,
+) -> String {
+    let mut configured: Option<String> = None;
+    if let Some(headers) = &model.headers {
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case("anthropic-beta") {
+                configured = Some(v.clone());
+            }
+        }
+    }
+    if let Some(headers) = &options.headers {
+        for (k, v) in headers {
+            if k.eq_ignore_ascii_case("anthropic-beta") {
+                configured = Some(v.clone());
+            }
+        }
+    }
+    if let Some(conf) = configured {
+        let mut unique: Vec<&str> = Vec::new();
+        for p in conf.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !unique.contains(&p) {
+                unique.push(p);
+            }
+        }
+        return unique.join(",");
+    }
+
+    let mut features: Vec<String> = Vec::new();
+    if is_oauth {
+        features.push("claude-code-20250219".to_string());
+        features.push("oauth-2025-04-20".to_string());
+    }
+    if model.reasoning
+        && options.reasoning.as_ref().is_some_and(|r| *r != ThinkingLevel::Off)
+        && options.interleaved_thinking.unwrap_or(true)
+        && model.compat.as_ref().and_then(|c| c.force_adaptive_thinking) != Some(true)
+    {
+        features.push("interleaved-thinking-2025-05-14".to_string());
+    }
+    if model.compat.as_ref().and_then(|c| c.supports_mid_convo_effort) == Some(true) {
+        features.push("mid-conversation-output-config-2026-07-01".to_string());
+        features.push("thinking-binding-controls-2026-08-01".to_string());
+    }
+
+    let mut unique_features = Vec::new();
+    for f in features {
+        if !unique_features.contains(&f) {
+            unique_features.push(f);
+        }
+    }
+    unique_features.join(",")
+}
+
+/// Builds the headers for an Anthropic Messages API request.
+pub fn build_anthropic_headers(
+    model: &Model,
+    options: &StreamOptions,
+    is_oauth: bool,
+) -> Vec<(String, String)> {
+    let mut headers = Vec::new();
+    headers.push(("content-type".to_string(), "application/json".to_string()));
+    headers.push(("anthropic-version".to_string(), "2023-06-01".to_string()));
+
+    let beta_headers = resolve_anthropic_beta_headers(model, options, is_oauth);
+    if !beta_headers.is_empty() {
+        headers.push(("anthropic-beta".to_string(), beta_headers));
+    }
+
+    if let Some(api_key) = &options.api_key {
+        if is_oauth {
+            headers.push(("authorization".to_string(), format!("Bearer {api_key}")));
+            headers.push(("user-agent".to_string(), format!("claude-cli/{CLAUDE_CODE_VERSION}")));
+            headers.push(("x-app".to_string(), "cli".to_string()));
+        } else {
+            headers.push(("x-api-key".to_string(), api_key.clone()));
+        }
+    }
+
+    if let Some(m_headers) = &model.headers {
+        for (k, v) in m_headers {
+            if !k.eq_ignore_ascii_case("anthropic-beta") {
+                headers.push((k.clone(), v.clone()));
+            }
+        }
+    }
+    if let Some(o_headers) = &options.headers {
+        for (k, v) in o_headers {
+            if !k.eq_ignore_ascii_case("anthropic-beta") {
+                headers.push((k.clone(), v.clone()));
+            }
+        }
+    }
+
+    headers
 }
 
 /// Builds the JSON request payload for the Anthropic Messages API.
@@ -155,31 +392,64 @@ pub fn build_anthropic_request(
     model: &Model,
     context: &Context,
     options: &StreamOptions,
+    is_oauth: bool,
 ) -> serde_json::Value {
+    use crate::transform_messages::{split_error_tool_result_images, transform_messages};
+    use crate::unicode::sanitize_surrogates;
+
+    let resolved_cache_retention = resolve_cache_retention(options.cache_retention);
+
+    let cache_control = match resolved_cache_retention {
+        CacheRetention::Short => Some(serde_json::json!({ "type": "ephemeral" })),
+        CacheRetention::Long => {
+            let supports_long = model
+                .compat
+                .as_ref()
+                .and_then(|c| c.supports_long_cache_retention)
+                .unwrap_or(true);
+            if supports_long {
+                Some(serde_json::json!({ "type": "ephemeral", "ttl": "1h" }))
+            } else {
+                Some(serde_json::json!({ "type": "ephemeral" }))
+            }
+        }
+        CacheRetention::None => None,
+    };
+
     let mut system_text = String::new();
     if let Some(sp) = &context.system_prompt {
         if !sp.is_empty() {
-            system_text.push_str(sp);
+            system_text.push_str(&sanitize_surrogates(sp));
         }
     }
+
+    let transformed_messages = transform_messages(
+        &context.messages,
+        model,
+        Some(|id: &str, _m: &Model, _a: &AssistantMessage| normalize_anthropic_tool_call_id(id)),
+    );
 
     let mut messages: Vec<serde_json::Value> = Vec::new();
     let mut has_seen_non_system = false;
 
-    for msg in &context.messages {
+    let mut i = 0;
+    while i < transformed_messages.len() {
+        let msg = &transformed_messages[i];
         match msg {
             Message::System(sys) => {
+                let sanitized_content = sanitize_surrogates(&sys.content);
                 if !has_seen_non_system {
                     if !system_text.is_empty() {
                         system_text.push_str("\n\n");
                     }
-                    system_text.push_str(&sys.content);
+                    system_text.push_str(&sanitized_content);
                 } else {
                     push_user_block(&mut messages, serde_json::json!({
                         "type": "text",
-                        "text": sys.content,
+                        "text": sanitized_content,
                     }));
                 }
+                i += 1;
             }
             Message::User(u) => {
                 has_seen_non_system = true;
@@ -187,7 +457,7 @@ pub fn build_anthropic_request(
                     UserContent::Text(text) => {
                         push_user_block(&mut messages, serde_json::json!({
                             "type": "text",
-                            "text": text,
+                            "text": sanitize_surrogates(text),
                         }));
                     }
                     UserContent::Blocks(blocks) => {
@@ -196,7 +466,7 @@ pub fn build_anthropic_request(
                                 UserContentBlock::Text(tc) => {
                                     push_user_block(&mut messages, serde_json::json!({
                                         "type": "text",
-                                        "text": tc.text,
+                                        "text": sanitize_surrogates(&tc.text),
                                     }));
                                 }
                                 UserContentBlock::Image(img) => {
@@ -213,37 +483,76 @@ pub fn build_anthropic_request(
                         }
                     }
                 }
+                i += 1;
             }
-            Message::ToolResult(tr) => {
+            Message::ToolResult(_) => {
                 has_seen_non_system = true;
-                let mut tool_contents = Vec::new();
-                for b in &tr.content {
-                    match b {
-                        ToolResultContentBlock::Text(tc) => {
-                            tool_contents.push(serde_json::json!({
-                                "type": "text",
-                                "text": tc.text,
-                            }));
-                        }
-                        ToolResultContentBlock::Image(img) => {
-                            tool_contents.push(serde_json::json!({
-                                "type": "image",
-                                "source": {
-                                    "type": "base64",
-                                    "media_type": img.mime_type,
-                                    "data": img.data,
+                let mut tool_results: Vec<serde_json::Value> = Vec::new();
+                let mut error_images: Vec<serde_json::Value> = Vec::new();
+                let mut j = i;
+                while j < transformed_messages.len() {
+                    if let Message::ToolResult(tr) = &transformed_messages[j] {
+                        let split = split_error_tool_result_images(tr);
+                        let content_blocks = if let Some(ref s) = split {
+                            &s.content
+                        } else {
+                            &tr.content
+                        };
+                        let mut tool_contents = Vec::new();
+                        for b in content_blocks {
+                            match b {
+                                ToolResultContentBlock::Text(tc) => {
+                                    tool_contents.push(serde_json::json!({
+                                        "type": "text",
+                                        "text": sanitize_surrogates(&tc.text),
+                                    }));
                                 }
-                            }));
+                                ToolResultContentBlock::Image(img) => {
+                                    tool_contents.push(serde_json::json!({
+                                        "type": "image",
+                                        "source": {
+                                            "type": "base64",
+                                            "media_type": img.mime_type,
+                                            "data": img.data,
+                                        }
+                                    }));
+                                }
+                            }
                         }
+                        tool_results.push(serde_json::json!({
+                            "type": "tool_result",
+                            "tool_use_id": tr.tool_call_id,
+                            "content": tool_contents,
+                            "is_error": tr.is_error,
+                        }));
+                        if let Some(s) = split {
+                            error_images.push(serde_json::json!({
+                                "type": "text",
+                                "text": sanitize_surrogates(&s.caption),
+                            }));
+                            for img in s.images {
+                                error_images.push(serde_json::json!({
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": img.mime_type,
+                                        "data": img.data,
+                                    }
+                                }));
+                            }
+                        }
+                        j += 1;
+                    } else {
+                        break;
                     }
                 }
-                let tool_block = serde_json::json!({
-                    "type": "tool_result",
-                    "tool_use_id": tr.tool_call_id,
-                    "content": tool_contents,
-                    "is_error": tr.is_error,
-                });
-                push_user_block(&mut messages, tool_block);
+                i = j;
+
+                let mut combined_user_blocks = tool_results;
+                combined_user_blocks.extend(error_images);
+                for block in combined_user_blocks {
+                    push_user_block(&mut messages, block);
+                }
             }
             Message::Assistant(a) => {
                 has_seen_non_system = true;
@@ -253,7 +562,7 @@ pub fn build_anthropic_request(
                         AssistantContentBlock::Text(tc) => {
                             assistant_blocks.push(serde_json::json!({
                                 "type": "text",
-                                "text": tc.text,
+                                "text": sanitize_surrogates(&tc.text),
                             }));
                         }
                         AssistantContentBlock::Thinking(tc) => {
@@ -265,7 +574,7 @@ pub fn build_anthropic_request(
                             } else {
                                 let mut block = serde_json::json!({
                                     "type": "thinking",
-                                    "thinking": tc.thinking,
+                                    "thinking": sanitize_surrogates(&tc.thinking),
                                 });
                                 if let Some(sig) = &tc.thinking_signature {
                                     block.as_object_mut().unwrap().insert(
@@ -277,10 +586,15 @@ pub fn build_anthropic_request(
                             }
                         }
                         AssistantContentBlock::ToolCall(tc) => {
+                            let call_name = if is_oauth {
+                                to_claude_code_name(&tc.name)
+                            } else {
+                                tc.name.clone()
+                            };
                             assistant_blocks.push(serde_json::json!({
                                 "type": "tool_use",
                                 "id": tc.id,
-                                "name": tc.name,
+                                "name": call_name,
                                 "input": serde_json::Value::Object(tc.arguments.clone()),
                             }));
                         }
@@ -291,6 +605,7 @@ pub fn build_anthropic_request(
                     if last.get("role").and_then(|r| r.as_str()) == Some("assistant") {
                         if let Some(content) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
                             content.extend(assistant_blocks);
+                            i += 1;
                             continue;
                         }
                     }
@@ -299,6 +614,21 @@ pub fn build_anthropic_request(
                     "role": "assistant",
                     "content": assistant_blocks,
                 }));
+                i += 1;
+            }
+        }
+    }
+
+    if let Some(cc) = &cache_control {
+        if let Some(last_msg) = messages.last_mut() {
+            if last_msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                if let Some(content_arr) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                    if let Some(last_block) = content_arr.last_mut() {
+                        if let Some(obj) = last_block.as_object_mut() {
+                            obj.insert("cache_control".to_string(), cc.clone());
+                        }
+                    }
+                }
             }
         }
     }
@@ -308,54 +638,182 @@ pub fn build_anthropic_request(
     req_map.insert("messages".to_string(), serde_json::Value::Array(messages));
     req_map.insert("stream".to_string(), serde_json::json!(true));
 
-    if !system_text.is_empty() {
+    if is_oauth {
+        let mut sys_blocks = Vec::new();
+        let mut identity_block = serde_json::json!({
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+        });
+        if let Some(cc) = &cache_control {
+            identity_block
+                .as_object_mut()
+                .unwrap()
+                .insert("cache_control".to_string(), cc.clone());
+        }
+        sys_blocks.push(identity_block);
+
+        if !system_text.is_empty() {
+            let mut text_block = serde_json::json!({
+                "type": "text",
+                "text": system_text,
+            });
+            if let Some(cc) = &cache_control {
+                text_block
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("cache_control".to_string(), cc.clone());
+            }
+            sys_blocks.push(text_block);
+        }
+        req_map.insert("system".to_string(), serde_json::Value::Array(sys_blocks));
+    } else if let Some(cc) = &cache_control {
+        if !system_text.is_empty() {
+            req_map.insert(
+                "system".to_string(),
+                serde_json::json!([
+                    {
+                        "type": "text",
+                        "text": system_text,
+                        "cache_control": cc
+                    }
+                ]),
+            );
+        }
+    } else if !system_text.is_empty() {
         req_map.insert("system".to_string(), serde_json::json!(system_text));
     }
+
+    let tool_cache_control = if model
+        .compat
+        .as_ref()
+        .and_then(|c| c.supports_cache_control_on_tools)
+        .unwrap_or(true)
+    {
+        cache_control.clone()
+    } else {
+        None
+    };
 
     if let Some(tools) = &context.tools {
         if !tools.is_empty() {
             let tool_vals: Vec<serde_json::Value> = tools
                 .iter()
-                .map(|t| {
-                    serde_json::json!({
-                        "name": t.name,
+                .enumerate()
+                .map(|(idx, t)| {
+                    let tool_name = if is_oauth {
+                        to_claude_code_name(&t.name)
+                    } else {
+                        t.name.clone()
+                    };
+                    let mut tool_obj = serde_json::json!({
+                        "name": tool_name,
                         "description": t.description,
                         "input_schema": t.parameters,
-                    })
+                    });
+                    if let Some(ref cc) = tool_cache_control {
+                        if idx == tools.len() - 1 {
+                            tool_obj.as_object_mut().unwrap().insert(
+                                "cache_control".to_string(),
+                                cc.clone(),
+                            );
+                        }
+                    }
+                    tool_obj
                 })
                 .collect();
             req_map.insert("tools".to_string(), serde_json::Value::Array(tool_vals));
         }
     }
 
-    let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
+    let is_reasoning_off = options.reasoning.as_ref() == Some(&ThinkingLevel::Off);
     let is_reasoning_enabled = model.reasoning
         && options.reasoning.as_ref().is_some_and(|r| *r != ThinkingLevel::Off);
 
-    if is_reasoning_enabled {
+    if is_reasoning_off && model.reasoning {
+        let is_off_mapped_to_null = model
+            .thinking_level_map
+            .as_ref()
+            .and_then(|m| m.get("off"))
+            == Some(&None);
+        if !is_off_mapped_to_null {
+            req_map.insert(
+                "thinking".to_string(),
+                serde_json::json!({ "type": "disabled" }),
+            );
+        }
+        let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
+        req_map.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+        if let Some(temp) = options.temperature {
+            req_map.insert("temperature".to_string(), serde_json::json!(temp));
+        }
+    } else if is_reasoning_enabled {
         let reasoning_level = options.reasoning.as_ref().unwrap();
-        let budget = match reasoning_level {
-            ThinkingLevel::Off => 0,
-            ThinkingLevel::Minimal => 1024,
-            ThinkingLevel::Low => 2048,
-            ThinkingLevel::Medium => 8192,
-            ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => 16384,
-        };
-        let effective_budget = budget.max(1024);
-        let effective_max_tokens = max_tokens.max(effective_budget + 1024);
+        let is_force_adaptive = model
+            .compat
+            .as_ref()
+            .and_then(|c| c.force_adaptive_thinking)
+            == Some(true);
 
-        req_map.insert(
-            "max_tokens".to_string(),
-            serde_json::json!(effective_max_tokens),
-        );
-        req_map.insert(
-            "thinking".to_string(),
-            serde_json::json!({
+        if is_force_adaptive {
+            let display_str = match options.thinking_display {
+                Some(AnthropicThinkingDisplay::Omitted) => "omitted",
+                _ => "summarized",
+            };
+            req_map.insert(
+                "thinking".to_string(),
+                serde_json::json!({
+                    "type": "adaptive",
+                    "display": display_str,
+                }),
+            );
+            if let Some(effort) = options.effort {
+                let effort_str = match effort {
+                    AnthropicEffort::Low => "low",
+                    AnthropicEffort::Medium => "medium",
+                    AnthropicEffort::High => "high",
+                    AnthropicEffort::Xhigh => "xhigh",
+                    AnthropicEffort::Max => "max",
+                };
+                req_map.insert(
+                    "output_config".to_string(),
+                    serde_json::json!({ "effort": effort_str }),
+                );
+            }
+            let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
+            req_map.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+        } else {
+            let (adj_max_tokens, adj_budget) = adjust_max_tokens_for_thinking(
+                options.max_tokens,
+                model.max_tokens,
+                reasoning_level,
+                options.thinking_budgets.as_ref(),
+            );
+            let final_budget = options
+                .thinking_budget_tokens
+                .unwrap_or(adj_budget)
+                .max(1024);
+
+            req_map.insert("max_tokens".to_string(), serde_json::json!(adj_max_tokens));
+
+            let display_str = match options.thinking_display {
+                Some(AnthropicThinkingDisplay::Omitted) => "omitted",
+                _ => "summarized",
+            };
+
+            let mut thinking_obj = serde_json::json!({
                 "type": "enabled",
-                "budget_tokens": effective_budget,
-            }),
-        );
+                "budget_tokens": final_budget,
+            });
+            if options.thinking_display.is_some() {
+                thinking_obj
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("display".to_string(), serde_json::json!(display_str));
+            }
+            req_map.insert("thinking".to_string(), thinking_obj);
+        }
     } else {
+        let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
         req_map.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         if let Some(temp) = options.temperature {
             req_map.insert("temperature".to_string(), serde_json::json!(temp));
@@ -386,7 +844,7 @@ enum AnthropicOpenBlock {
     Thinking { content_index: usize },
     ToolCall {
         content_index: usize,
-        json_buffer: String,
+        stream: Box<ToolCallArgumentsStream>,
     },
 }
 
@@ -396,7 +854,10 @@ pub struct AnthropicStreamState {
     output: AssistantMessage,
     started: bool,
     done: bool,
+    received_terminal: bool,
     open_blocks: HashMap<usize, AnthropicOpenBlock>,
+    pub is_oauth: bool,
+    pub declared_tools: Vec<ToolDefinition>,
 }
 
 impl AnthropicStreamState {
@@ -407,19 +868,57 @@ impl AnthropicStreamState {
             output: AssistantMessage::empty_for_model(model),
             started: false,
             done: false,
+            received_terminal: false,
             open_blocks: HashMap::new(),
+            is_oauth: false,
+            declared_tools: Vec::new(),
         }
+    }
+
+    /// Configures whether the stream should mimic Claude Code OAuth tool name mapping.
+    pub fn set_oauth(&mut self, is_oauth: bool) {
+        self.is_oauth = is_oauth;
+    }
+
+    /// Sets declared tools for restoring original tool names.
+    pub fn set_declared_tools(&mut self, tools: Vec<ToolDefinition>) {
+        self.declared_tools = tools;
+    }
+
+    /// Marks the stream state as failed with an error message before finalizing.
+    pub fn mark_error(&mut self, msg: impl Into<String>) {
+        self.output.stop_reason = StopReason::Error;
+        self.output.error_message = Some(msg.into());
+    }
+
+    /// Marks the stream state as aborted before finalizing.
+    pub fn mark_aborted(&mut self, msg: impl Into<String>) {
+        self.output.stop_reason = StopReason::Aborted;
+        self.output.error_message = Some(msg.into());
     }
 
     /// Processes a slice of SSE events and emits corresponding AssistantMessageEvents.
     pub fn process_events(&mut self, events: &[SseEvent], sender: &AssistantEventSender) {
+        let mut out = Vec::new();
         for event in events {
-            self.process_event(event, sender);
+            self.process_event_into(event, &mut out);
+        }
+        for ev in out {
+            sender.push(ev);
         }
     }
 
     /// Processes a single SSE event.
     pub fn process_event(&mut self, sse_event: &SseEvent, sender: &AssistantEventSender) {
+        let mut out = Vec::new();
+        self.process_event_into(sse_event, &mut out);
+        for ev in out {
+            sender.push(ev);
+        }
+    }
+
+    /// Processes a single SSE event and appends emitted `AssistantMessageEvent`s into `out`.
+    pub fn process_event_into(&mut self, sse_event: &SseEvent, out: &mut Vec<AssistantMessageEvent>) {
         let Ok(json) = serde_json::from_str::<serde_json::Value>(&sse_event.data) else {
             return;
         };
@@ -442,7 +941,7 @@ impl AnthropicStreamState {
                 }
                 if !self.started {
                     self.started = true;
-                    sender.push(AssistantMessageEvent::Start {
+                    out.push(AssistantMessageEvent::Start {
                         partial: self.output.clone(),
                     });
                 }
@@ -465,7 +964,7 @@ impl AnthropicStreamState {
                             let content_index = self.output.content.len() - 1;
                             self.open_blocks
                                 .insert(index, AnthropicOpenBlock::Text { content_index });
-                            sender.push(AssistantMessageEvent::TextStart {
+                            out.push(AssistantMessageEvent::TextStart {
                                 content_index,
                                 partial: self.output.clone(),
                             });
@@ -490,7 +989,7 @@ impl AnthropicStreamState {
                             let content_index = self.output.content.len() - 1;
                             self.open_blocks
                                 .insert(index, AnthropicOpenBlock::Thinking { content_index });
-                            sender.push(AssistantMessageEvent::ThinkingStart {
+                            out.push(AssistantMessageEvent::ThinkingStart {
                                 content_index,
                                 partial: self.output.clone(),
                             });
@@ -510,7 +1009,7 @@ impl AnthropicStreamState {
                             let content_index = self.output.content.len() - 1;
                             self.open_blocks
                                 .insert(index, AnthropicOpenBlock::Thinking { content_index });
-                            sender.push(AssistantMessageEvent::ThinkingStart {
+                            out.push(AssistantMessageEvent::ThinkingStart {
                                 content_index,
                                 partial: self.output.clone(),
                             });
@@ -521,11 +1020,16 @@ impl AnthropicStreamState {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let name = block
+                            let raw_name = block
                                 .get("name")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
+                            let name = if self.is_oauth {
+                                from_claude_code_name(&raw_name, &self.declared_tools)
+                            } else {
+                                raw_name
+                            };
                             self.output
                                 .content
                                 .push(AssistantContentBlock::ToolCall(ToolCall {
@@ -540,10 +1044,10 @@ impl AnthropicStreamState {
                                 index,
                                 AnthropicOpenBlock::ToolCall {
                                     content_index,
-                                    json_buffer: String::new(),
+                                    stream: Box::new(ToolCallArgumentsStream::new()),
                                 },
                             );
-                            sender.push(AssistantMessageEvent::ToolCallStart {
+                            out.push(AssistantMessageEvent::ToolCallStart {
                                 content_index,
                                 partial: self.output.clone(),
                             });
@@ -572,10 +1076,10 @@ impl AnthropicStreamState {
                                 {
                                     tc.text.push_str(&text_delta);
                                 }
-                                sender.push(AssistantMessageEvent::TextDelta {
+                                out.push(AssistantMessageEvent::TextDelta {
                                     content_index,
                                     delta: text_delta,
-                                    partial: self.output.clone(),
+                                    partial: self.output.metadata_clone(),
                                 });
                             }
                         }
@@ -594,10 +1098,10 @@ impl AnthropicStreamState {
                                 {
                                     tc.thinking.push_str(&thinking_delta);
                                 }
-                                sender.push(AssistantMessageEvent::ThinkingDelta {
+                                out.push(AssistantMessageEvent::ThinkingDelta {
                                     content_index,
                                     delta: thinking_delta,
-                                    partial: self.output.clone(),
+                                    partial: self.output.metadata_clone(),
                                 });
                             }
                         }
@@ -623,7 +1127,7 @@ impl AnthropicStreamState {
                         "input_json_delta" => {
                             if let Some(AnthropicOpenBlock::ToolCall {
                                 content_index,
-                                json_buffer,
+                                stream,
                             }) = self.open_blocks.get_mut(&index)
                             {
                                 let content_index = *content_index;
@@ -632,8 +1136,13 @@ impl AnthropicStreamState {
                                     .and_then(|v| v.as_str())
                                     .unwrap_or("")
                                     .to_string();
-                                json_buffer.push_str(&partial_json);
-                                sender.push(AssistantMessageEvent::ToolCallDelta {
+                                let args = stream.append(&partial_json);
+                                if let Some(AssistantContentBlock::ToolCall(tc)) =
+                                    self.output.content.get_mut(content_index)
+                                {
+                                    tc.arguments = args;
+                                }
+                                out.push(AssistantMessageEvent::ToolCallDelta {
                                     content_index,
                                     delta: partial_json,
                                     partial: self.output.clone(),
@@ -656,7 +1165,7 @@ impl AnthropicStreamState {
                             } else {
                                 String::new()
                             };
-                            sender.push(AssistantMessageEvent::TextEnd {
+                            out.push(AssistantMessageEvent::TextEnd {
                                 content_index,
                                 content,
                                 partial: self.output.clone(),
@@ -670,7 +1179,7 @@ impl AnthropicStreamState {
                             } else {
                                 String::new()
                             };
-                            sender.push(AssistantMessageEvent::ThinkingEnd {
+                            out.push(AssistantMessageEvent::ThinkingEnd {
                                 content_index,
                                 content,
                                 partial: self.output.clone(),
@@ -678,47 +1187,26 @@ impl AnthropicStreamState {
                         }
                         AnthropicOpenBlock::ToolCall {
                             content_index,
-                            json_buffer,
+                            stream,
                         } => {
-                            let mut tool_call = if let Some(AssistantContentBlock::ToolCall(tc)) =
-                                self.output.content.get(content_index)
+                            let (args, err) = stream.finish();
+                            let tool_call = if let Some(AssistantContentBlock::ToolCall(tc)) =
+                                self.output.content.get_mut(content_index)
                             {
+                                tc.arguments = args;
+                                tc.arguments_error = err;
                                 tc.clone()
                             } else {
                                 ToolCall {
                                     id: String::new(),
                                     name: String::new(),
-                                    arguments: serde_json::Map::new(),
-                                    arguments_error: None,
+                                    arguments: args,
+                                    arguments_error: err,
                                     thought_signature: None,
                                 }
                             };
 
-                            if json_buffer.is_empty() {
-                                tool_call.arguments = serde_json::Map::new();
-                            } else {
-                                match serde_json::from_str::<serde_json::Value>(&json_buffer) {
-                                    Ok(serde_json::Value::Object(map)) => {
-                                        tool_call.arguments = map;
-                                    }
-                                    Ok(val) => {
-                                        let mut map = serde_json::Map::new();
-                                        map.insert("input".to_string(), val);
-                                        tool_call.arguments = map;
-                                    }
-                                    Err(e) => {
-                                        tool_call.arguments_error = Some(e.to_string());
-                                    }
-                                }
-                            }
-
-                            if let Some(AssistantContentBlock::ToolCall(tc)) =
-                                self.output.content.get_mut(content_index)
-                            {
-                                *tc = tool_call.clone();
-                            }
-
-                            sender.push(AssistantMessageEvent::ToolCallEnd {
+                            out.push(AssistantMessageEvent::ToolCallEnd {
                                 content_index,
                                 tool_call,
                                 partial: self.output.clone(),
@@ -751,15 +1239,17 @@ impl AnthropicStreamState {
                 }
             }
             "message_stop" => {
+                self.received_terminal = true;
                 if !self.done {
                     self.done = true;
-                    sender.push(AssistantMessageEvent::Done {
+                    out.push(AssistantMessageEvent::Done {
                         reason: self.output.stop_reason,
                         message: self.output.clone(),
                     });
                 }
             }
             "error" => {
+                self.received_terminal = true;
                 self.output.stop_reason = StopReason::Error;
                 let msg = json
                     .get("error")
@@ -768,7 +1258,7 @@ impl AnthropicStreamState {
                     .unwrap_or("Anthropic API error");
                 self.output.error_message = Some(msg.to_string());
                 self.done = true;
-                sender.push(AssistantMessageEvent::Error {
+                out.push(AssistantMessageEvent::Error {
                     reason: StopReason::Error,
                     error: self.output.clone(),
                 });
@@ -777,8 +1267,8 @@ impl AnthropicStreamState {
         }
     }
 
-    /// Closes any unclosed content blocks and emits the terminal completion event if needed.
-    pub fn finish(&mut self, sender: &AssistantEventSender) -> AssistantMessage {
+    /// Closes any unclosed content blocks and appends the terminal completion event into `out`.
+    pub fn finish_into(&mut self, out: &mut Vec<AssistantMessageEvent>) -> AssistantMessage {
         // Close any trailing open blocks
         let open_indices: Vec<usize> = self.open_blocks.keys().copied().collect();
         for index in open_indices {
@@ -792,7 +1282,7 @@ impl AnthropicStreamState {
                         } else {
                             String::new()
                         };
-                        sender.push(AssistantMessageEvent::TextEnd {
+                        out.push(AssistantMessageEvent::TextEnd {
                             content_index,
                             content,
                             partial: self.output.clone(),
@@ -806,7 +1296,7 @@ impl AnthropicStreamState {
                         } else {
                             String::new()
                         };
-                        sender.push(AssistantMessageEvent::ThinkingEnd {
+                        out.push(AssistantMessageEvent::ThinkingEnd {
                             content_index,
                             content,
                             partial: self.output.clone(),
@@ -814,45 +1304,26 @@ impl AnthropicStreamState {
                     }
                     AnthropicOpenBlock::ToolCall {
                         content_index,
-                        json_buffer,
+                        stream,
                     } => {
-                        let mut tool_call = if let Some(AssistantContentBlock::ToolCall(tc)) =
-                            self.output.content.get(content_index)
+                        let (args, err) = stream.finish();
+                        let tool_call = if let Some(AssistantContentBlock::ToolCall(tc)) =
+                            self.output.content.get_mut(content_index)
                         {
+                            tc.arguments = args;
+                            tc.arguments_error = err;
                             tc.clone()
                         } else {
                             ToolCall {
                                 id: String::new(),
                                 name: String::new(),
-                                arguments: serde_json::Map::new(),
-                                arguments_error: None,
+                                arguments: args,
+                                arguments_error: err,
                                 thought_signature: None,
                             }
                         };
 
-                        if !json_buffer.is_empty() {
-                            match serde_json::from_str::<serde_json::Value>(&json_buffer) {
-                                Ok(serde_json::Value::Object(map)) => {
-                                    tool_call.arguments = map;
-                                }
-                                Ok(val) => {
-                                    let mut map = serde_json::Map::new();
-                                    map.insert("input".to_string(), val);
-                                    tool_call.arguments = map;
-                                }
-                                Err(e) => {
-                                    tool_call.arguments_error = Some(e.to_string());
-                                }
-                            }
-                        }
-
-                        if let Some(AssistantContentBlock::ToolCall(tc)) =
-                            self.output.content.get_mut(content_index)
-                        {
-                            *tc = tool_call.clone();
-                        }
-
-                        sender.push(AssistantMessageEvent::ToolCallEnd {
+                        out.push(AssistantMessageEvent::ToolCallEnd {
                             content_index,
                             tool_call,
                             partial: self.output.clone(),
@@ -864,13 +1335,13 @@ impl AnthropicStreamState {
 
         if !self.done {
             self.done = true;
-            if self.output.stop_reason == StopReason::Error {
-                sender.push(AssistantMessageEvent::Error {
-                    reason: StopReason::Error,
+            if matches!(self.output.stop_reason, StopReason::Error | StopReason::Aborted) {
+                out.push(AssistantMessageEvent::Error {
+                    reason: self.output.stop_reason,
                     error: self.output.clone(),
                 });
             } else {
-                sender.push(AssistantMessageEvent::Done {
+                out.push(AssistantMessageEvent::Done {
                     reason: self.output.stop_reason,
                     message: self.output.clone(),
                 });
@@ -878,6 +1349,16 @@ impl AnthropicStreamState {
         }
 
         self.output.clone()
+    }
+
+    /// Closes any unclosed content blocks and emits the terminal completion event if needed.
+    pub fn finish(&mut self, sender: &AssistantEventSender) -> AssistantMessage {
+        let mut out = Vec::new();
+        let res = self.finish_into(&mut out);
+        for ev in out {
+            sender.push(ev);
+        }
+        res
     }
 
     fn update_usage(&mut self, usage: &serde_json::Value) {
@@ -934,6 +1415,7 @@ mod tests {
             context_window: 200_000,
             max_tokens: 8192,
             headers: None,
+            ..Default::default()
         }
     }
 
@@ -996,17 +1478,24 @@ mod tests {
             reasoning: Some(ThinkingLevel::Medium),
             session_id: None,
             headers: None,
+            ..Default::default()
         };
 
-        let req = build_anthropic_request(&model, &context, &options);
+        let req = build_anthropic_request(&model, &context, &options, false);
 
         assert_eq!(req["model"], "claude-3-7-sonnet-20250219");
         assert_eq!(req["stream"], true);
-        assert_eq!(req["system"], "You are a helpful assistant.");
+        assert_eq!(
+            req["system"],
+            serde_json::json!([{
+                "type": "text",
+                "text": "You are a helpful assistant.",
+                "cache_control": { "type": "ephemeral" }
+            }])
+        );
         assert_eq!(req["thinking"]["type"], "enabled");
-        assert_eq!(req["thinking"]["budget_tokens"], 8192);
-        // Effective max_tokens should be expanded to budget + 1024 if needed
-        assert!(req["max_tokens"].as_u64().unwrap() >= 8192 + 1024);
+        assert_eq!(req["thinking"]["budget_tokens"], 7168);
+        assert_eq!(req["max_tokens"], 8192);
 
         let tools = req["tools"].as_array().expect("tools array");
         assert_eq!(tools.len(), 1);
@@ -1231,5 +1720,583 @@ mod tests {
             }
             _ => panic!("Expected ToolCall content block at index 2"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_anthropic_stream_fails_on_premature_eof() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = tokio::io::AsyncReadExt::read(&mut socket, &mut buf).await;
+            let body = "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Partial\"}}\n\n";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        });
+
+        let mut model = test_model();
+        model.base_url = format!("http://{addr}/v1");
+        let provider = AnthropicProvider::default();
+        let context = Context {
+            system_prompt: None,
+            messages: vec![],
+            tools: None,
+        };
+        let options = StreamOptions {
+            api_key: Some("test-key".to_string()),
+            ..Default::default()
+        };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut stream = provider.stream(&model, &context, &options, cancel);
+        let msg = stream.collect_final_message().await.unwrap();
+        assert_eq!(msg.stop_reason, StopReason::Error);
+        assert!(msg
+            .error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("prematurely"));
+    }
+
+    #[test]
+    fn build_request_transforms_cross_model_and_splits_error_images() {
+        let model = test_model();
+        let context = Context {
+            system_prompt: Some("You are helpful.".to_string()),
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Run tool".to_string()),
+                    timestamp: 100,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![
+                        AssistantContentBlock::Thinking(crate::types::ThinkingContent {
+                            thinking: "Foreign thinking to be dropped".to_string(),
+                            thinking_signature: None,
+                            redacted: None,
+                        }),
+                        AssistantContentBlock::ToolCall(ToolCall {
+                            id: "call_abc123|foreign_item_def456".to_string(),
+                            name: "take_screenshot".to_string(),
+                            arguments: serde_json::Map::new(),
+                            arguments_error: None,
+                            thought_signature: None,
+                        }),
+                    ],
+                    api: "openai-responses".to_string(),
+                    provider: "openai".to_string(),
+                    model: "gpt-5".to_string(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 200,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "call_abc123|foreign_item_def456".to_string(),
+                    tool_name: "take_screenshot".to_string(),
+                    content: vec![
+                        ToolResultContentBlock::Text(TextContent {
+                            text: "Error running tool".to_string(),
+                            text_signature: None,
+                        }),
+                        ToolResultContentBlock::Image(ImageContent {
+                            mime_type: "image/png".to_string(),
+                            data: "base64data".to_string(),
+                        }),
+                    ],
+                    details: None,
+                    is_error: true,
+                    timestamp: 300,
+                }),
+            ],
+            tools: None,
+        };
+
+        let req = build_anthropic_request(&model, &context, &StreamOptions::default(), false);
+        let messages = req["messages"].as_array().expect("messages array");
+        assert_eq!(messages.len(), 3);
+
+        let assistant_msg = &messages[1];
+        assert_eq!(assistant_msg["role"], "assistant");
+        let assistant_blocks = assistant_msg["content"].as_array().unwrap();
+        assert_eq!(assistant_blocks.len(), 1, "Foreign thinking block must be dropped");
+        assert_eq!(assistant_blocks[0]["type"], "tool_use");
+        assert_eq!(assistant_blocks[0]["id"], "call_abc123_foreign_item_def456");
+
+        let tool_user_msg = &messages[2];
+        assert_eq!(tool_user_msg["role"], "user");
+        let user_blocks = tool_user_msg["content"].as_array().unwrap();
+        assert_eq!(user_blocks.len(), 3, "Expected tool_result, caption, and image");
+        assert_eq!(user_blocks[0]["type"], "tool_result");
+        assert_eq!(user_blocks[0]["tool_use_id"], "call_abc123_foreign_item_def456");
+        let tool_result_content = user_blocks[0]["content"].as_array().unwrap();
+        assert_eq!(tool_result_content[0]["text"], "Error running tool");
+        assert_eq!(tool_result_content[1]["text"], "(image attached after the tool results)");
+
+        assert_eq!(user_blocks[1]["type"], "text");
+        assert!(user_blocks[1]["text"].as_str().unwrap().contains("Images from the error result of tool call call_abc123_foreign_item_def456"));
+
+        assert_eq!(user_blocks[2]["type"], "image");
+        assert_eq!(user_blocks[2]["source"]["data"], "base64data");
+    }
+
+    #[test]
+    fn anthropic_sse_updates_partial_tool_arguments_incrementally() {
+        let model = Model {
+            id: "claude-3-7-sonnet".to_string(),
+            name: "Claude 3.7 Sonnet".to_string(),
+            api: "anthropic-messages".to_string(),
+            provider: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            reasoning: true,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 200000,
+            max_tokens: 8192,
+            headers: None,
+            compat: None,
+            ..Default::default()
+        };
+
+        let mut state = AnthropicStreamState::new(&model);
+        let mut events = Vec::new();
+
+        state.process_event_into(
+            &SseEvent {
+                event: Some("message_start".to_string()),
+                data: serde_json::json!({
+                    "type": "message_start",
+                    "message": { "id": "msg_123", "usage": { "input_tokens": 10, "output_tokens": 0 } }
+                }).to_string(),
+            },
+            &mut events,
+        );
+
+        state.process_event_into(
+            &SseEvent {
+                event: Some("content_block_start".to_string()),
+                data: serde_json::json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_01",
+                        "name": "search"
+                    }
+                }).to_string(),
+            },
+            &mut events,
+        );
+
+        events.clear();
+        state.process_event_into(
+            &SseEvent {
+                event: Some("content_block_delta".to_string()),
+                data: serde_json::json!({
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": r#"{"query":"hel"#
+                    }
+                }).to_string(),
+            },
+            &mut events,
+        );
+
+        assert_eq!(events.len(), 1);
+        let delta_event = &events[0];
+        match delta_event {
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+                partial,
+            } => {
+                assert_eq!(*content_index, 0);
+                assert_eq!(delta, r#"{"query":"hel"#);
+                assert!(!partial.content.is_empty(), "partial.content must not be empty in ToolCallDelta");
+                match &partial.content[0] {
+                    AssistantContentBlock::ToolCall(tc) => {
+                        assert_eq!(
+                            tc.arguments.get("query").and_then(|v| v.as_str()),
+                            Some("hel"),
+                            "ToolCallDelta partial AssistantMessage must reflect parsed partial arguments before content_block_stop"
+                        );
+                    }
+                    _ => panic!("Expected ToolCall at index 0"),
+                }
+            }
+            _ => panic!("Expected ToolCallDelta event"),
+        }
+    }
+
+    #[test]
+    fn test_cache_control_placed_on_system_last_tool_and_last_turn_message() {
+        let mut model = test_model();
+        model.compat = Some(ModelCompat {
+            supports_cache_control_on_tools: Some(true),
+            supports_long_cache_retention: Some(true),
+            ..Default::default()
+        });
+
+        let context = Context {
+            system_prompt: Some("System instructions".to_string()),
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Hello".to_string()),
+                    timestamp: 1,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContentBlock::Text(TextContent {
+                        text: "Hi".to_string(),
+                        text_signature: None,
+                    })],
+                    api: "anthropic-messages".to_string(),
+                    provider: "anthropic".to_string(),
+                    model: model.id.clone(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: 2,
+                }),
+                Message::User(UserMessage {
+                    content: UserContent::Text("Second turn".to_string()),
+                    timestamp: 3,
+                }),
+            ],
+            tools: Some(vec![
+                ToolDefinition {
+                    name: "tool_a".to_string(),
+                    description: "Tool A".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+                ToolDefinition {
+                    name: "tool_b".to_string(),
+                    description: "Tool B".to_string(),
+                    parameters: serde_json::json!({"type": "object"}),
+                },
+            ]),
+        };
+
+        // Case 1: CacheRetention::Short
+        let short_opts = StreamOptions {
+            cache_retention: Some(CacheRetention::Short),
+            ..Default::default()
+        };
+        let req_short = build_anthropic_request(&model, &context, &short_opts, false);
+
+        // System block has {"type": "ephemeral"}
+        let sys_short = req_short["system"].as_array().expect("system array");
+        assert_eq!(sys_short[0]["cache_control"], serde_json::json!({"type": "ephemeral"}));
+
+        // Only final tool has cache_control
+        let tools_short = req_short["tools"].as_array().expect("tools array");
+        assert!(tools_short[0].get("cache_control").is_none());
+        assert_eq!(tools_short[1]["cache_control"], serde_json::json!({"type": "ephemeral"}));
+
+        // Final block of last user message has cache_control
+        let msgs_short = req_short["messages"].as_array().expect("messages array");
+        let last_msg_short = &msgs_short[msgs_short.len() - 1];
+        let last_content_short = last_msg_short["content"].as_array().expect("content array");
+        assert_eq!(
+            last_content_short[last_content_short.len() - 1]["cache_control"],
+            serde_json::json!({"type": "ephemeral"})
+        );
+
+        // Case 2: CacheRetention::Long with supports_long_cache_retention = true
+        let long_opts = StreamOptions {
+            cache_retention: Some(CacheRetention::Long),
+            ..Default::default()
+        };
+        let req_long = build_anthropic_request(&model, &context, &long_opts, false);
+        let sys_long = req_long["system"].as_array().expect("system array");
+        assert_eq!(
+            sys_long[0]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        let tools_long = req_long["tools"].as_array().expect("tools array");
+        assert_eq!(
+            tools_long[1]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+        let msgs_long = req_long["messages"].as_array().expect("messages array");
+        let last_msg_long = &msgs_long[msgs_long.len() - 1];
+        let last_content_long = last_msg_long["content"].as_array().expect("content array");
+        assert_eq!(
+            last_content_long[last_content_long.len() - 1]["cache_control"],
+            serde_json::json!({"type": "ephemeral", "ttl": "1h"})
+        );
+
+        // Case 3: CacheRetention::None
+        let none_opts = StreamOptions {
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+        let req_none = build_anthropic_request(&model, &context, &none_opts, false);
+        if let Some(sys_arr) = req_none["system"].as_array() {
+            assert!(sys_arr[0].get("cache_control").is_none());
+        }
+        let tools_none = req_none["tools"].as_array().expect("tools array");
+        assert!(tools_none[0].get("cache_control").is_none());
+        assert!(tools_none[1].get("cache_control").is_none());
+        let msgs_none = req_none["messages"].as_array().expect("messages array");
+        let last_msg_none = &msgs_none[msgs_none.len() - 1];
+        let last_content_none = last_msg_none["content"].as_array().expect("content array");
+        assert!(last_content_none[last_content_none.len() - 1].get("cache_control").is_none());
+    }
+
+    #[test]
+    fn test_thinking_budgets_adaptive_and_disabled_modes() {
+        let mut model = test_model();
+        model.max_tokens = 4096;
+        model.reasoning = true;
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("Hello".to_string()),
+                timestamp: 1,
+            })],
+            tools: None,
+        };
+
+        // 1. Clamping test
+        let (adj_max, adj_budget) = adjust_max_tokens_for_thinking(
+            Some(4096),
+            4096,
+            &ThinkingLevel::High,
+            None,
+        );
+        assert_eq!(adj_max, 4096);
+        assert_eq!(adj_budget, 4096 - MIN_ANSWER_TOKENS);
+        assert_eq!(clamp_thinking_budget_to_answer_room(16384, 4096), 3072);
+
+        let budget_opts = StreamOptions {
+            max_tokens: Some(4096),
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let req_budget = build_anthropic_request(&model, &context, &budget_opts, false);
+        assert_eq!(req_budget["max_tokens"], 4096);
+        assert_eq!(req_budget["thinking"]["type"], "enabled");
+        assert_eq!(req_budget["thinking"]["budget_tokens"], 3072);
+
+        // 2. force_adaptive_thinking = Some(true)
+        model.compat = Some(ModelCompat {
+            force_adaptive_thinking: Some(true),
+            ..Default::default()
+        });
+        let adaptive_opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            effort: Some(AnthropicEffort::High),
+            thinking_display: Some(AnthropicThinkingDisplay::Summarized),
+            ..Default::default()
+        };
+        let req_adaptive = build_anthropic_request(&model, &context, &adaptive_opts, false);
+        assert_eq!(
+            req_adaptive["thinking"],
+            serde_json::json!({
+                "type": "adaptive",
+                "display": "summarized"
+            })
+        );
+        assert_eq!(
+            req_adaptive["output_config"],
+            serde_json::json!({
+                "effort": "high"
+            })
+        );
+
+        // 3. Explicit off emitting {"type": "disabled"}
+        let off_opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let req_off = build_anthropic_request(&model, &context, &off_opts, false);
+        assert_eq!(
+            req_off["thinking"],
+            serde_json::json!({
+                "type": "disabled"
+            })
+        );
+        assert!(req_off.get("output_config").is_none());
+    }
+
+    #[test]
+    fn test_oauth_token_switches_to_bearer_and_maps_claude_code_tool_names() {
+        let oauth_key = "sk-ant-oat-test-token-12345";
+        assert!(is_oauth_token(oauth_key));
+        assert!(!is_oauth_token("sk-ant-api-regular-key"));
+
+        let model = test_model();
+        let declared_tools = vec![
+            ToolDefinition {
+                name: "read".to_string(),
+                description: "Read file".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+            ToolDefinition {
+                name: "custom_tool".to_string(),
+                description: "Custom".to_string(),
+                parameters: serde_json::json!({"type": "object"}),
+            },
+        ];
+
+        let context = Context {
+            system_prompt: Some("Custom system prompt".to_string()),
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Read file please".to_string()),
+                    timestamp: 1,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContentBlock::ToolCall(ToolCall {
+                        id: "call_123".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::Map::new(),
+                        arguments_error: None,
+                        thought_signature: None,
+                    })],
+                    api: "anthropic-messages".to_string(),
+                    provider: "anthropic".to_string(),
+                    model: model.id.clone(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 2,
+                }),
+            ],
+            tools: Some(declared_tools.clone()),
+        };
+
+        let opts = StreamOptions {
+            api_key: Some(oauth_key.to_string()),
+            ..Default::default()
+        };
+
+        // Tool name mapping: read -> Read in request
+        assert_eq!(to_claude_code_name("read"), "Read");
+        assert_eq!(to_claude_code_name("BASH"), "Bash");
+        assert_eq!(to_claude_code_name("custom_tool"), "custom_tool");
+
+        let req = build_anthropic_request(&model, &context, &opts, true);
+
+        // System prompt starts with Claude Code identity
+        let sys_arr = req["system"].as_array().expect("system array");
+        assert_eq!(
+            sys_arr[0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(sys_arr[1]["text"], "Custom system prompt");
+
+        // Tool name mapped to "Read" in tools definition
+        let tools = req["tools"].as_array().expect("tools array");
+        assert_eq!(tools[0]["name"], "Read");
+        assert_eq!(tools[1]["name"], "custom_tool");
+
+        // Tool name in assistant message mapped to "Read"
+        let msgs = req["messages"].as_array().expect("messages array");
+        assert_eq!(msgs[1]["content"][0]["name"], "Read");
+
+        // Beta headers: claude-code-20250219,oauth-2025-04-20
+        let beta_headers = resolve_anthropic_beta_headers(&model, &opts, true);
+        assert!(beta_headers.contains("claude-code-20250219"));
+        assert!(beta_headers.contains("oauth-2025-04-20"));
+
+        // Reverse tool name mapping in streamed ToolCall: Read -> read
+        assert_eq!(from_claude_code_name("Read", &declared_tools), "read");
+        assert_eq!(from_claude_code_name("custom_tool", &declared_tools), "custom_tool");
+
+        let mut state = AnthropicStreamState::new(&model);
+        state.set_oauth(true);
+        state.set_declared_tools(declared_tools);
+
+        let sse_event = SseEvent {
+            event: Some("content_block_start".to_string()),
+            data: serde_json::json!({
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": "toolu_01",
+                    "name": "Read",
+                    "input": {}
+                }
+            }).to_string(),
+        };
+        let mut batch = Vec::new();
+        state.process_event_into(&sse_event, &mut batch);
+        assert_eq!(batch.len(), 1);
+        match &batch[0] {
+            AssistantMessageEvent::ToolCallStart { partial, .. } => {
+                match &partial.content[0] {
+                    AssistantContentBlock::ToolCall(tc) => {
+                        assert_eq!(tc.name, "read");
+                    }
+                    _ => panic!("expected ToolCall block"),
+                }
+            }
+            _ => panic!("expected ToolCallStart event"),
+        }
+    }
+
+    #[test]
+    fn test_build_anthropic_headers_avoids_duplicate_beta_header() {
+        let model = test_model();
+        let mut model_with_headers = model.clone();
+        let mut m_headers = HashMap::new();
+        m_headers.insert("anthropic-beta".to_string(), "custom-beta-1".to_string());
+        m_headers.insert("x-custom-model-header".to_string(), "val1".to_string());
+        model_with_headers.headers = Some(m_headers);
+
+        let mut opts_headers = HashMap::new();
+        opts_headers.insert("anthropic-beta".to_string(), "custom-beta-2".to_string());
+        opts_headers.insert("x-custom-opt-header".to_string(), "val2".to_string());
+        let options = StreamOptions {
+            api_key: Some("test-key".to_string()),
+            headers: Some(opts_headers),
+            ..Default::default()
+        };
+
+        let headers = build_anthropic_headers(&model_with_headers, &options, false);
+
+        let beta_headers: Vec<&(String, String)> = headers
+            .iter()
+            .filter(|(k, _)| k.eq_ignore_ascii_case("anthropic-beta"))
+            .collect();
+
+        assert_eq!(beta_headers.len(), 1, "anthropic-beta header must appear exactly once");
+        assert!(headers.iter().any(|(k, v)| k == "x-custom-model-header" && v == "val1"));
+        assert!(headers.iter().any(|(k, v)| k == "x-custom-opt-header" && v == "val2"));
+    }
+
+    #[test]
+    fn test_resolve_anthropic_beta_headers_deduplicates_non_consecutive() {
+        let model = test_model();
+        let mut opts_headers = HashMap::new();
+        opts_headers.insert(
+            "anthropic-beta".to_string(),
+            "beta-1,beta-2,beta-1,beta-3,beta-2,beta-1".to_string(),
+        );
+        let options = StreamOptions {
+            headers: Some(opts_headers),
+            ..Default::default()
+        };
+
+        let result = resolve_anthropic_beta_headers(&model, &options, false);
+        assert_eq!(result, "beta-1,beta-2,beta-3");
     }
 }

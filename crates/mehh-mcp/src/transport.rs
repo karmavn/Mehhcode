@@ -93,11 +93,94 @@ impl McpTransport for InMemoryTransport {
 // ---------------------------------------------------------------------------
 
 /// Stdio transport launching a local subprocess communicating over stdin/stdout.
+const HTTP_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_HTTP_ERROR_BYTES: usize = 16 * 1024;
+
+async fn read_bounded_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    max_bytes: usize,
+) -> anyhow::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    loop {
+        let available = reader
+            .fill_buf()
+            .await
+            .map_err(|e| anyhow::anyhow!("I/O error reading child process stdout: {e}"))?;
+        if available.is_empty() {
+            if buf.is_empty() {
+                return Ok(None);
+            }
+            return Ok(Some(buf));
+        }
+
+        if let Some(newline_pos) = available.iter().position(|&b| b == b'\n') {
+            let take_len = newline_pos + 1;
+            let new_len = buf.len().saturating_add(take_len);
+            if new_len > max_bytes {
+                return Err(anyhow::anyhow!(
+                    "MCP stdio message length {new_len} exceeds limit of {max_bytes} bytes"
+                ));
+            }
+            buf.extend_from_slice(&available[..take_len]);
+            reader.consume(take_len);
+            return Ok(Some(buf));
+        } else {
+            let avail_len = available.len();
+            let new_len = buf.len().saturating_add(avail_len);
+            if new_len > max_bytes {
+                return Err(anyhow::anyhow!(
+                    "MCP stdio message length {new_len} exceeds limit of {max_bytes} bytes"
+                ));
+            }
+            buf.extend_from_slice(available);
+            reader.consume(avail_len);
+        }
+    }
+}
+
+async fn read_limited_body(
+    resp: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(content_length) = resp.content_length() {
+        if content_length > max_bytes as u64 {
+            anyhow::bail!(
+                "MCP HTTP response Content-Length ({content_length} bytes) exceeds limit of {max_bytes} bytes"
+            );
+        }
+    }
+
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    loop {
+        let next = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, stream.next())
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out while reading MCP HTTP response body"))?;
+        match next {
+            Some(Ok(chunk)) => {
+                let new_len = buf.len().saturating_add(chunk.len());
+                if new_len > max_bytes {
+                    anyhow::bail!(
+                        "MCP HTTP response body exceeded limit of {max_bytes} bytes"
+                    );
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Some(Err(e)) => {
+                return Err(anyhow::anyhow!("Error reading MCP HTTP response body: {e}"));
+            }
+            None => return Ok(buf),
+        }
+    }
+}
+
 pub struct StdioTransport {
     stdin: Mutex<Option<ChildStdin>>,
     stdout: Mutex<Option<BufReader<ChildStdout>>>,
     child: Mutex<Option<Child>>,
     stderr_tail: Arc<Mutex<VecDeque<u8>>>,
+    stderr_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     max_message_bytes: usize,
     closed: AtomicBool,
 }
@@ -133,9 +216,9 @@ impl StdioTransport {
 
         let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(DEFAULT_MAX_STDERR_BYTES)));
 
-        if let Some(mut err_reader) = stderr {
+        let stderr_task = if let Some(mut err_reader) = stderr {
             let tail_clone = stderr_tail.clone();
-            tokio::spawn(async move {
+            Some(tokio::spawn(async move {
                 let mut buf = [0u8; 4096];
                 while let Ok(n) = err_reader.read(&mut buf).await {
                     if n == 0 {
@@ -149,14 +232,17 @@ impl StdioTransport {
                         tail.push_back(b);
                     }
                 }
-            });
-        }
+            }))
+        } else {
+            None
+        };
 
         Ok(Self {
             stdin: Mutex::new(stdin),
             stdout: Mutex::new(stdout),
             child: Mutex::new(Some(child)),
             stderr_tail,
+            stderr_task: Mutex::new(stderr_task),
             max_message_bytes: DEFAULT_MAX_MESSAGE_BYTES,
             closed: AtomicBool::new(false),
         })
@@ -195,18 +281,18 @@ impl McpTransport for StdioTransport {
         let mut stdout_guard = self.stdout.lock().await;
         let reader = stdout_guard.as_mut()?;
 
-        let mut line = String::new();
         loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => return None, // EOF reached
-                Ok(n) => {
-                    if n > self.max_message_bytes {
-                        return Some(Err(anyhow::anyhow!(
-                            "MCP stdio message length {n} exceeds limit of {} bytes",
-                            self.max_message_bytes
-                        )));
-                    }
+            match read_bounded_line(reader, self.max_message_bytes).await {
+                Ok(None) => return None, // EOF reached
+                Ok(Some(bytes)) => {
+                    let line = match std::str::from_utf8(&bytes) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Some(Err(anyhow::anyhow!(
+                                "MCP child stdout contained invalid UTF-8: {e}"
+                            )));
+                        }
+                    };
                     let trimmed = line.trim();
                     if trimmed.is_empty() {
                         continue;
@@ -221,9 +307,9 @@ impl McpTransport for StdioTransport {
                     }
                 }
                 Err(e) => {
-                    return Some(Err(anyhow::anyhow!(
-                        "I/O error reading child process stdout: {e}"
-                    )))
+                    // Drop stdout reader on framing/size error so partial giant frames are not re-parsed.
+                    let _ = stdout_guard.take();
+                    return Some(Err(e));
                 }
             }
         }
@@ -231,6 +317,9 @@ impl McpTransport for StdioTransport {
 
     async fn close(&self) -> anyhow::Result<()> {
         self.closed.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.stderr_task.lock().await.take() {
+            handle.abort();
+        }
         {
             let mut stdin_guard = self.stdin.lock().await;
             let _ = stdin_guard.take(); // Drops stdin pipe, signalling EOF to child
@@ -239,6 +328,7 @@ impl McpTransport for StdioTransport {
             let mut child_guard = self.child.lock().await;
             if let Some(mut child) = child_guard.take() {
                 let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
             }
         }
         Ok(())
@@ -249,6 +339,23 @@ impl McpTransport for StdioTransport {
 // StreamableHttpTransport
 // ---------------------------------------------------------------------------
 
+async fn forward_sse_events(
+    events: Vec<mehh_ai::sse::SseEvent>,
+    tx: &mpsc::Sender<anyhow::Result<JsonRpcMessage>>,
+) -> bool {
+    for ev in events {
+        if ev.data.is_empty() {
+            continue;
+        }
+        let item = serde_json::from_str::<JsonRpcMessage>(&ev.data)
+            .map_err(|e| anyhow::anyhow!("Invalid JSON-RPC payload in MCP SSE event: {e}"));
+        if tx.send(item).await.is_err() {
+            return false;
+        }
+    }
+    true
+}
+
 /// Streamable HTTP transport for remote MCP servers using POST, SSE streams, and session tracking.
 pub struct StreamableHttpTransport {
     client: reqwest::Client,
@@ -257,8 +364,9 @@ pub struct StreamableHttpTransport {
     session_id: Arc<RwLock<Option<String>>>,
     protocol_version: Arc<RwLock<Option<String>>>,
     auth_provider: Option<Arc<dyn McpBearerProvider>>,
-    incoming_tx: mpsc::Sender<JsonRpcMessage>,
-    incoming_rx: Mutex<mpsc::Receiver<JsonRpcMessage>>,
+    incoming_tx: mpsc::Sender<anyhow::Result<JsonRpcMessage>>,
+    incoming_rx: Mutex<mpsc::Receiver<anyhow::Result<JsonRpcMessage>>>,
+    sse_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     closed: AtomicBool,
 }
 
@@ -266,8 +374,12 @@ impl StreamableHttpTransport {
     /// Creates a new Streamable HTTP transport targeting the given endpoint URL.
     pub fn new(url: impl Into<String>, headers: HashMap<String, String>) -> Self {
         let (tx, rx) = mpsc::channel(256);
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
         Self {
-            client: reqwest::Client::new(),
+            client,
             url: url.into(),
             headers,
             session_id: Arc::new(RwLock::new(None)),
@@ -275,6 +387,7 @@ impl StreamableHttpTransport {
             auth_provider: None,
             incoming_tx: tx,
             incoming_rx: Mutex::new(rx),
+            sse_tasks: Arc::new(Mutex::new(Vec::new())),
             closed: AtomicBool::new(false),
         }
     }
@@ -336,10 +449,9 @@ impl McpTransport for StreamableHttpTransport {
             req = req.header("MCP-Protocol-Version", pv);
         }
 
-        let mut resp = req
-            .body(body.clone())
-            .send()
+        let mut resp = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, req.body(body.clone()).send())
             .await
+            .map_err(|_| anyhow::anyhow!("Timed out connecting to MCP server '{}'", self.url))?
             .with_context(|| format!("Failed to POST JSON-RPC to '{}'", self.url))?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED {
@@ -357,11 +469,17 @@ impl McpTransport for StreamableHttpTransport {
                     if let Some(pv) = self.protocol_version.read().await.as_ref() {
                         retry_req = retry_req.header("MCP-Protocol-Version", pv);
                     }
-                    resp = retry_req
-                        .body(body)
-                        .send()
+                    resp = tokio::time::timeout(HTTP_REQUEST_TIMEOUT, retry_req.body(body).send())
                         .await
-                        .with_context(|| format!("Failed to retry POST JSON-RPC to '{}'", self.url))?;
+                        .map_err(|_| {
+                            anyhow::anyhow!(
+                                "Timed out retrying authenticated POST to MCP server '{}'",
+                                self.url
+                            )
+                        })?
+                        .with_context(|| {
+                            format!("Failed to retry POST JSON-RPC to '{}'", self.url)
+                        })?;
                 }
             }
         }
@@ -376,7 +494,10 @@ impl McpTransport for StreamableHttpTransport {
 
         let status = resp.status();
         if !status.is_success() {
-            let err_body = resp.text().await.unwrap_or_default();
+            let err_bytes = read_limited_body(resp, MAX_HTTP_ERROR_BYTES)
+                .await
+                .unwrap_or_default();
+            let err_body = String::from_utf8_lossy(&err_bytes);
             anyhow::bail!("MCP HTTP request failed ({status}): {err_body}");
         }
 
@@ -392,42 +513,71 @@ impl McpTransport for StreamableHttpTransport {
             let mut sse_parser = mehh_ai::sse::SseParser::new();
             let tx = self.incoming_tx.clone();
 
-            tokio::spawn(async move {
-                while let Some(chunk_res) = byte_stream.next().await {
-                    match chunk_res {
-                        Ok(chunk) => {
-                            let text = String::from_utf8_lossy(&chunk);
-                            let events = sse_parser.feed(&text);
-                            for ev in events {
-                                if !ev.data.is_empty() {
-                                    if let Ok(m) = serde_json::from_str::<JsonRpcMessage>(&ev.data) {
-                                        let _ = tx.send(m).await;
-                                    }
-                                }
+            let handle = tokio::spawn(async move {
+                loop {
+                    let next = tokio::time::timeout(SSE_IDLE_TIMEOUT, byte_stream.next()).await;
+                    match next {
+                        Ok(Some(Ok(chunk))) => {
+                            let events = sse_parser.feed_bytes(&chunk);
+                            if sse_parser.has_overflowed() {
+                                let _ = tx
+                                    .send(Err(anyhow::anyhow!(
+                                        "MCP SSE buffer exceeded {} byte limit",
+                                        DEFAULT_MAX_MESSAGE_BYTES
+                                    )))
+                                    .await;
+                                return;
+                            }
+                            if !forward_sse_events(events, &tx).await {
+                                return;
                             }
                         }
-                        Err(_) => break,
+                        Ok(Some(Err(e))) => {
+                            let _ = tx
+                                .send(Err(anyhow::anyhow!("MCP SSE stream error: {e}")))
+                                .await;
+                            return;
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            let _ = tx
+                                .send(Err(anyhow::anyhow!("MCP SSE stream idle timeout")))
+                                .await;
+                            return;
+                        }
                     }
                 }
                 let final_events = sse_parser.finish();
-                for ev in final_events {
-                    if !ev.data.is_empty() {
-                        if let Ok(m) = serde_json::from_str::<JsonRpcMessage>(&ev.data) {
-                            let _ = tx.send(m).await;
-                        }
-                    }
+                if sse_parser.has_overflowed() {
+                    let _ = tx
+                        .send(Err(anyhow::anyhow!(
+                            "MCP SSE buffer exceeded {} byte limit",
+                            DEFAULT_MAX_MESSAGE_BYTES
+                        )))
+                        .await;
+                    return;
                 }
+                let _ = forward_sse_events(final_events, &tx).await;
             });
+
+            let mut tasks = self.sse_tasks.lock().await;
+            tasks.retain(|h| !h.is_finished());
+            tasks.push(handle);
         } else if content_type.contains("application/json") {
-            let text = resp.text().await?;
+            let raw = read_limited_body(resp, DEFAULT_MAX_MESSAGE_BYTES).await?;
+            let text = std::str::from_utf8(&raw)
+                .map_err(|e| anyhow::anyhow!("Invalid UTF-8 in MCP JSON response: {e}"))?;
             let trimmed = text.trim();
             if !trimmed.is_empty() {
                 if let Ok(m) = serde_json::from_str::<JsonRpcMessage>(trimmed) {
-                    let _ = self.incoming_tx.send(m).await;
+                    let _ = self.incoming_tx.send(Ok(m)).await;
                 } else if let Ok(msgs) = serde_json::from_str::<Vec<JsonRpcMessage>>(trimmed) {
                     for m in msgs {
-                        let _ = self.incoming_tx.send(m).await;
+                        let _ = self.incoming_tx.send(Ok(m)).await;
                     }
+                } else {
+                    let preview: String = trimmed.chars().take(200).collect();
+                    anyhow::bail!("Invalid JSON-RPC payload in MCP HTTP response: {preview}");
                 }
             }
         }
@@ -440,11 +590,17 @@ impl McpTransport for StreamableHttpTransport {
             return None;
         }
         let mut rx = self.incoming_rx.lock().await;
-        rx.recv().await.map(Ok)
+        rx.recv().await
     }
 
     async fn close(&self) -> anyhow::Result<()> {
         self.closed.store(true, Ordering::SeqCst);
+        {
+            let mut tasks = self.sse_tasks.lock().await;
+            for handle in tasks.drain(..) {
+                handle.abort();
+            }
+        }
         let sid = self.session_id.read().await.clone();
         if let Some(session_id) = sid {
             let mut req = self
@@ -463,5 +619,32 @@ impl McpTransport for StreamableHttpTransport {
             let _ = tokio::time::timeout(Duration::from_secs(1), req.send()).await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[tokio::test]
+    async fn test_read_bounded_line_rejects_oversized_before_eof() {
+        let oversized = vec![b'a'; 200];
+        let mut reader = BufReader::with_capacity(32, Cursor::new(oversized));
+        let err = read_bounded_line(&mut reader, 64).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"));
+    }
+
+    #[tokio::test]
+    async fn test_read_bounded_line_valid_multiline() {
+        let data = b"{\"jsonrpc\":\"2.0\"}\n  \n{\"ok\":true}";
+        let mut reader = BufReader::with_capacity(8, Cursor::new(data.as_slice()));
+        let first = read_bounded_line(&mut reader, 128).await.unwrap().unwrap();
+        assert_eq!(first, b"{\"jsonrpc\":\"2.0\"}\n");
+        let second = read_bounded_line(&mut reader, 128).await.unwrap().unwrap();
+        assert_eq!(second, b"  \n");
+        let third = read_bounded_line(&mut reader, 128).await.unwrap().unwrap();
+        assert_eq!(third, b"{\"ok\":true}");
+        assert!(read_bounded_line(&mut reader, 128).await.unwrap().is_none());
     }
 }

@@ -1,5 +1,8 @@
 //! Server-Sent Events (SSE) streaming parser.
 
+/// Default maximum buffered bytes for incomplete SSE lines and multi-line events (16 MiB).
+pub const MAX_SSE_BUFFER_BYTES: usize = 16 * 1024 * 1024;
+
 /// A parsed Server-Sent Event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SseEvent {
@@ -9,54 +12,157 @@ pub struct SseEvent {
     pub data: String,
 }
 
-/// Incremental parser for Server-Sent Events streams.
-#[derive(Debug, Default)]
+/// Incremental byte-level parser for Server-Sent Events streams.
+#[derive(Debug)]
 pub struct SseParser {
-    buffer: String,
+    raw_buffer: Vec<u8>,
     current_event: Option<String>,
     current_data: Vec<String>,
+    data_bytes: usize,
+    max_buffer_bytes: usize,
+    overflowed: bool,
+    incomplete_at_eof: bool,
+}
+
+impl Default for SseParser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl SseParser {
-    /// Creates a new empty SSE parser.
+    /// Creates a new empty SSE parser with the default 16 MiB buffer limit.
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            raw_buffer: Vec::new(),
+            current_event: None,
+            current_data: Vec::new(),
+            data_bytes: 0,
+            max_buffer_bytes: MAX_SSE_BUFFER_BYTES,
+            overflowed: false,
+            incomplete_at_eof: false,
+        }
     }
 
-    /// Feeds a chunk of text into the parser and returns any completed SSE events.
-    pub fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
-        self.buffer.push_str(chunk);
-        let mut events = Vec::new();
-
-        while let Some(pos) = self.buffer.find('\n') {
-            let line = self.buffer[..pos].to_string();
-            self.buffer.drain(..=pos);
-            let trimmed = line.strip_suffix('\r').unwrap_or(&line);
-            self.process_line(trimmed, &mut events);
+    /// Creates a new SSE parser with a custom buffer limit in bytes.
+    pub fn with_max_buffer_bytes(max_buffer_bytes: usize) -> Self {
+        Self {
+            max_buffer_bytes,
+            ..Self::new()
         }
+    }
+
+    /// Returns true if buffered SSE data exceeded `max_buffer_bytes`.
+    pub fn has_overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// Returns true if any incomplete line, truncated field, or unflushed event data remains at EOF.
+    pub fn has_pending_bytes(&self) -> bool {
+        self.incomplete_at_eof
+            || !self.raw_buffer.is_empty()
+            || !self.current_data.is_empty()
+            || self.current_event.is_some()
+    }
+
+    /// Feeds raw bytes into the parser, decoding UTF-8 only on complete `\n`-terminated lines.
+    pub fn feed_bytes(&mut self, chunk: &[u8]) -> Vec<SseEvent> {
+        if self.overflowed {
+            return Vec::new();
+        }
+        if self.raw_buffer.len().saturating_add(chunk.len()).saturating_add(self.data_bytes)
+            > self.max_buffer_bytes
+        {
+            self.overflowed = true;
+            self.raw_buffer.clear();
+            self.current_event = None;
+            self.current_data.clear();
+            self.data_bytes = 0;
+            return Vec::new();
+        }
+
+        self.raw_buffer.extend_from_slice(chunk);
+        let mut events = Vec::new();
+        let mut raw_buf = std::mem::take(&mut self.raw_buffer);
+        let mut cursor = 0usize;
+
+        while let Some(rel_pos) = raw_buf[cursor..].iter().position(|&b| b == b'\n') {
+            let pos = cursor + rel_pos;
+            let mut line_end = pos;
+            if line_end > cursor && raw_buf[line_end - 1] == b'\r' {
+                line_end -= 1;
+            }
+            let next_cursor = pos + 1;
+            let remaining_raw_bytes = raw_buf.len() - next_cursor;
+            let line = String::from_utf8_lossy(&raw_buf[cursor..line_end]);
+            self.process_line(&line, remaining_raw_bytes, &mut events);
+            cursor = next_cursor;
+            if self.overflowed {
+                return Vec::new();
+            }
+        }
+
+        if cursor > 0 {
+            raw_buf.drain(..cursor);
+        }
+        self.raw_buffer = raw_buf;
 
         events
     }
 
+    /// Feeds a chunk of text into the parser and returns any completed SSE events.
+    pub fn feed(&mut self, chunk: &str) -> Vec<SseEvent> {
+        self.feed_bytes(chunk.as_bytes())
+    }
+
     /// Flushes any remaining buffered data and returns any final event.
     pub fn finish(&mut self) -> Vec<SseEvent> {
-        let mut events = Vec::new();
-        if !self.buffer.is_empty() {
-            let line = std::mem::take(&mut self.buffer);
-            let trimmed = line.strip_suffix('\r').unwrap_or(&line);
-            self.process_line(trimmed, &mut events);
+        if self.overflowed {
+            return Vec::new();
         }
-        if !self.current_data.is_empty() || self.current_event.is_some() {
+        let mut events = Vec::new();
+        if !self.raw_buffer.is_empty() {
+            let mut line_bytes = std::mem::take(&mut self.raw_buffer);
+            if line_bytes.last() == Some(&b'\r') {
+                line_bytes.pop();
+            }
+            let line = String::from_utf8(line_bytes)
+                .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+            let recognized = line.is_empty()
+                || line.starts_with(':')
+                || line == "data"
+                || line.starts_with("data:")
+                || line == "event"
+                || line.starts_with("event:")
+                || line == "id"
+                || line.starts_with("id:")
+                || line == "retry"
+                || line.starts_with("retry:");
+            if !recognized {
+                self.incomplete_at_eof = true;
+            }
+            self.process_line(&line, 0, &mut events);
+        }
+        if !self.current_data.is_empty() {
             events.push(SseEvent {
                 event: self.current_event.take(),
                 data: self.current_data.join("\n"),
             });
             self.current_data.clear();
+            self.data_bytes = 0;
+        } else if self.current_event.is_some() {
+            self.current_event = None;
+            self.incomplete_at_eof = true;
         }
         events
     }
 
-    fn process_line(&mut self, line: &str, events: &mut Vec<SseEvent>) {
+    fn process_line(
+        &mut self,
+        line: &str,
+        remaining_raw_bytes: usize,
+        events: &mut Vec<SseEvent>,
+    ) {
         if line.is_empty() {
             // An empty line signals the boundary between SSE events
             if !self.current_data.is_empty() || self.current_event.is_some() {
@@ -65,6 +171,7 @@ impl SseParser {
                     data: self.current_data.join("\n"),
                 });
                 self.current_data.clear();
+                self.data_bytes = 0;
             }
             return;
         }
@@ -76,6 +183,15 @@ impl SseParser {
 
         if let Some(rest) = line.strip_prefix("data:") {
             let val = rest.strip_prefix(' ').unwrap_or(rest);
+            self.data_bytes = self.data_bytes.saturating_add(val.len());
+            if remaining_raw_bytes.saturating_add(self.data_bytes) > self.max_buffer_bytes {
+                self.overflowed = true;
+                self.raw_buffer.clear();
+                self.current_event = None;
+                self.current_data.clear();
+                self.data_bytes = 0;
+                return;
+            }
             self.current_data.push(val.to_string());
         } else if line == "data" {
             self.current_data.push(String::new());
@@ -148,5 +264,37 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event.as_deref(), Some("end"));
         assert_eq!(events[0].data, "final chunk");
+    }
+
+    #[test]
+    fn test_feed_bytes_preserves_split_multibyte_utf8() {
+        let mut parser = SseParser::new();
+        let payload = "data: hello 世界 🎉\n\n".as_bytes();
+        // Split right inside "世" (bytes 12..15) and inside "🎉"
+        let split1 = 13;
+        let split2 = payload.len() - 4;
+        assert!(parser.feed_bytes(&payload[..split1]).is_empty());
+        assert!(parser.feed_bytes(&payload[split1..split2]).is_empty());
+        let events = parser.feed_bytes(&payload[split2..]);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].data, "hello 世界 🎉");
+        assert!(!events[0].data.contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn test_feed_bytes_caps_buffer() {
+        let mut parser = SseParser::with_max_buffer_bytes(64);
+        let events = parser.feed_bytes(&vec![b'a'; 100]);
+        assert!(events.is_empty());
+        assert!(parser.has_overflowed());
+    }
+
+    #[test]
+    fn test_finish_marks_incomplete_at_eof_for_truncated_frame() {
+        let mut parser = SseParser::new();
+        assert!(parser.feed_bytes(b"event: content_block_delta\nda").is_empty());
+        let events = parser.finish();
+        assert!(events.is_empty());
+        assert!(parser.has_pending_bytes());
     }
 }

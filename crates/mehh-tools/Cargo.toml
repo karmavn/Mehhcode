@@ -17,4 +17,3 @@ regex = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }
 similar = { workspace = true }
-tracing = { workspace = true }

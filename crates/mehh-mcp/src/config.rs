@@ -114,30 +114,73 @@ pub fn global_mcp_config_path() -> Option<PathBuf> {
     Some(home.join(".mehh").join("agent").join("mcp.json"))
 }
 
-/// Loads and merges MCP configurations from global (`~/.mehh/agent/mcp.json`) and
-/// workspace (`<cwd>/.mehh/mcp.json`).
-pub fn load_mcp_configs(cwd: &Path) -> anyhow::Result<HashMap<String, McpServerConfig>> {
+pub(crate) fn load_mcp_configs_from_paths(
+    global_path: Option<&Path>,
+    cwd: &Path,
+    trusted: bool,
+) -> anyhow::Result<HashMap<String, McpServerConfig>> {
     let mut servers = HashMap::new();
 
     // 1. Load global configurations
-    if let Some(global_path) = global_mcp_config_path() {
-        if let Some(file) = read_mcp_config_file(&global_path)? {
+    if let Some(path) = global_path {
+        if let Some(file) = read_mcp_config_file(path)? {
             servers.extend(file.mcp_servers);
         }
     }
 
-    // 2. Load and merge local project configurations
-    let local_path = cwd.join(".mehh").join("mcp.json");
-    if let Some(local_file) = read_mcp_config_file(&local_path)? {
-        for (name, local_cfg) in local_file.mcp_servers {
-            servers
-                .entry(name)
-                .and_modify(|base| merge_server_config(base, local_cfg.clone()))
-                .or_insert(local_cfg);
+    // 2. Load and merge local project configurations only when workspace is trusted.
+    if trusted {
+        let local_path = cwd.join(".mehh").join("mcp.json");
+        if let Some(local_file) = read_mcp_config_file(&local_path)? {
+            for (name, local_cfg) in local_file.mcp_servers {
+                servers
+                    .entry(name)
+                    .and_modify(|base| merge_server_config(base, local_cfg.clone()))
+                    .or_insert(local_cfg);
+            }
         }
     }
 
     Ok(servers)
+}
+
+/// Loads and merges MCP configurations from global (`~/.mehh/agent/mcp.json`) and,
+/// when `trusted` is `true`, workspace (`<cwd>/.mehh/mcp.json`).
+pub fn load_mcp_configs_with_trust(
+    cwd: &Path,
+    trusted: bool,
+) -> anyhow::Result<HashMap<String, McpServerConfig>> {
+    let global_path = global_mcp_config_path();
+    load_mcp_configs_from_paths(global_path.as_deref(), cwd, trusted)
+}
+
+/// Loads MCP configurations in fail-closed mode (global only, project config skipped).
+/// Prefer [`load_mcp_configs_with_trust`] when workspace trust has been evaluated.
+pub fn load_mcp_configs(cwd: &Path) -> anyhow::Result<HashMap<String, McpServerConfig>> {
+    load_mcp_configs_with_trust(cwd, false)
+}
+
+#[cfg(test)]
+mod trust_tests {
+    use super::*;
+
+    #[test]
+    fn test_load_mcp_configs_with_trust_gates_project_config() {
+        let dir = crate::TempTestDir::new("config_trust");
+        let mehh_dir = dir.path().join(".mehh");
+        std::fs::create_dir_all(&mehh_dir).unwrap();
+        std::fs::write(
+            mehh_dir.join("mcp.json"),
+            r#"{"mcpServers": {"local_srv": {"command": "echo", "args": ["hi"]}}}"#,
+        )
+        .unwrap();
+
+        let untrusted = load_mcp_configs_from_paths(None, dir.path(), false).unwrap();
+        assert!(!untrusted.contains_key("local_srv"));
+
+        let trusted = load_mcp_configs_from_paths(None, dir.path(), true).unwrap();
+        assert!(trusted.contains_key("local_srv"));
+    }
 }
 
 #[cfg(test)]

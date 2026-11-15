@@ -2,6 +2,96 @@
 
 use std::path::{Path, PathBuf};
 use anyhow::Context;
+
+static ATOMIC_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Atomically writes `bytes` to `path` via a unique temp file in the same directory and `rename`.
+/// When `restricted` is true on Unix, creates the temp file with `0o600` permissions.
+pub(crate) fn write_file_atomic(
+    path: &Path,
+    bytes: &[u8],
+    restricted: bool,
+) -> anyhow::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("Failed to create directories for: {}", path.display()))?;
+
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
+    let pid = std::process::id();
+
+    let mut attempt = 0u32;
+    let (tmp_path, mut file) = loop {
+        let seq = ATOMIC_TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(format!(".{file_name}.tmp.{pid}.{seq}"));
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        if restricted {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        match opts.open(&candidate) {
+            Ok(f) => break (candidate, f),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to create temporary file: {}", candidate.display())
+                });
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let _ = restricted;
+
+    let write_res = (|| -> std::io::Result<()> {
+        use std::io::Write;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| {
+            format!("Failed to write temporary file: {}", tmp_path.display())
+        });
+    }
+
+    #[cfg(unix)]
+    if restricted {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) =
+            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+        {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e).with_context(|| {
+                format!("Failed to set 0600 permissions on: {}", tmp_path.display())
+            });
+        }
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e).with_context(|| {
+            format!(
+                "Failed to rename '{}' to '{}'",
+                tmp_path.display(),
+                path.display()
+            )
+        });
+    }
+
+    Ok(())
+}
 use serde::{Deserialize, Serialize};
 
 use mehh_ai::ThinkingLevel;
@@ -39,12 +129,17 @@ pub struct SettingsManager;
 
 impl SettingsManager {
     /// Returns the global settings file path `~/.mehh/agent/settings.json`.
-    pub fn global_path() -> PathBuf {
+    pub fn global_path() -> anyhow::Result<PathBuf> {
         let home = std::env::var_os("USERPROFILE")
             .or_else(|| std::env::var_os("HOME"))
+            .filter(|s| !s.is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        home.join(".mehh").join("agent").join("settings.json")
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot determine global settings path: neither USERPROFILE nor HOME is set"
+                )
+            })?;
+        Ok(home.join(".mehh").join("agent").join("settings.json"))
     }
 
     /// Returns the project-local settings file path `<cwd>/.mehh/settings.json`.
@@ -73,23 +168,16 @@ impl SettingsManager {
     }
 
     /// Saves settings to a specific file path, writing pretty UTF-8 JSON without BOM
-    /// and ensuring parent directories exist.
+    /// atomically (creating temp file with restricted permissions on Unix).
     pub fn save_file(path: &Path, settings: &Settings) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directories for: {}", path.display()))?;
-        }
-
         let json = serde_json::to_string_pretty(settings)
             .context("Failed to serialize settings to JSON")?;
-        std::fs::write(path, json.as_bytes())
-            .with_context(|| format!("Failed to write settings file: {}", path.display()))?;
-        Ok(())
+        write_file_atomic(path, json.as_bytes(), true)
     }
 
     /// Saves settings to global path `~/.mehh/agent/settings.json`.
     pub fn save_global(settings: &Settings) -> anyhow::Result<()> {
-        Self::save_file(&Self::global_path(), settings)
+        Self::save_file(&Self::global_path()?, settings)
     }
 
     /// Saves settings to project-local path `<cwd>/.mehh/settings.json`.
@@ -117,10 +205,29 @@ impl SettingsManager {
     }
 
     /// Loads and merges global and project settings for the given working directory.
-    pub fn load(cwd: &Path) -> Settings {
-        let global = Self::load_file(&Self::global_path()).unwrap_or_default();
-        let local = Self::load_file(&Self::project_path(cwd)).unwrap_or_default();
-        Self::merge(global, local)
+    pub fn try_load(cwd: &Path) -> anyhow::Result<Settings> {
+        Self::try_load_with_trust(cwd, true)
+    }
+
+    /// Loads global settings and, only when `trusted` is true, merges `<cwd>/.mehh/settings.json`.
+    /// Fails closed on corrupt JSON or read errors other than `NotFound`.
+    pub fn try_load_with_trust(cwd: &Path, trusted: bool) -> anyhow::Result<Settings> {
+        let global_path = Self::global_path()?;
+        let project_path = Self::project_path(cwd);
+        Self::try_load_from_paths(&global_path, &project_path, trusted)
+    }
+
+    pub(crate) fn try_load_from_paths(
+        global_path: &Path,
+        project_path: &Path,
+        trusted: bool,
+    ) -> anyhow::Result<Settings> {
+        let global = Self::load_file(global_path)?;
+        if !trusted {
+            return Ok(global);
+        }
+        let local = Self::load_file(project_path)?;
+        Ok(Self::merge(global, local))
     }
 }
 
@@ -219,5 +326,30 @@ mod tests {
         assert!(SettingsManager::load_file(&file_path).is_err());
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_try_load_with_trust_gates_project_settings_and_fails_closed() {
+        let dir = crate::TempTestDir::new("settings_trust");
+        let global_path = dir.path().join("global-settings.json");
+        let project_path = dir.path().join("project-settings.json");
+
+        std::fs::write(&global_path, r#"{"defaultProvider":"anthropic","autoCompact":true}"#).unwrap();
+        std::fs::write(&project_path, r#"{"defaultProvider":"openai","autoCompact":false}"#).unwrap();
+
+        let untrusted = SettingsManager::try_load_from_paths(&global_path, &project_path, false).unwrap();
+        assert_eq!(untrusted.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(untrusted.auto_compact, Some(true));
+
+        let trusted = SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
+        assert_eq!(trusted.default_provider.as_deref(), Some("openai"));
+        assert_eq!(trusted.auto_compact, Some(false));
+
+        // Corrupt project JSON must fail closed when trusted
+        std::fs::write(&project_path, b"{corrupt").unwrap();
+        assert!(SettingsManager::try_load_from_paths(&global_path, &project_path, true).is_err());
+        // Corrupt global JSON always fails closed
+        std::fs::write(&global_path, b"{corrupt").unwrap();
+        assert!(SettingsManager::try_load_from_paths(&global_path, &project_path, false).is_err());
     }
 }
