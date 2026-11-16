@@ -236,29 +236,29 @@ impl SelectList {
     }
 
     pub fn filtered_indices(&self) -> Vec<usize> {
-        let filter_lower = self.filter.to_lowercase();
-        self.items
-            .iter()
-            .enumerate()
-            .filter(|(_, item)| {
-                if filter_lower.is_empty() {
-                    true
-                } else {
-                    item.label.to_lowercase().contains(&filter_lower)
-                        || item.id.to_lowercase().contains(&filter_lower)
-                }
-            })
-            .map(|(i, _)| i)
-            .collect()
+        if self.filter.trim().is_empty() {
+            return (0..self.items.len()).collect();
+        }
+        crate::fuzzy::fuzzy_filter_indexed(&self.items, &self.filter, |item| {
+            if let Some(desc) = &item.description {
+                format!("{} {} {}", item.label, item.id, desc)
+            } else {
+                format!("{} {}", item.label, item.id)
+            }
+        })
+        .into_iter()
+        .map(|(idx, _)| idx)
+        .collect()
     }
 
     pub fn move_up(&mut self) {
         let filtered = self.filtered_indices();
         if !filtered.is_empty() {
-            if self.selected == 0 {
+            let cur = self.selected.min(filtered.len() - 1);
+            if cur == 0 {
                 self.selected = filtered.len() - 1;
             } else {
-                self.selected -= 1;
+                self.selected = cur - 1;
             }
         }
     }
@@ -266,13 +266,36 @@ impl SelectList {
     pub fn move_down(&mut self) {
         let filtered = self.filtered_indices();
         if !filtered.is_empty() {
-            self.selected = (self.selected + 1) % filtered.len();
+            let cur = self.selected.min(filtered.len() - 1);
+            self.selected = (cur + 1) % filtered.len();
         }
+    }
+
+    pub fn page_up(&mut self) {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let cur = self.selected.min(filtered.len() - 1);
+        self.selected = cur.saturating_sub(self.max_visible);
+    }
+
+    pub fn page_down(&mut self) {
+        let filtered = self.filtered_indices();
+        if filtered.is_empty() {
+            return;
+        }
+        let cur = self.selected.min(filtered.len() - 1);
+        self.selected = (cur + self.max_visible).min(filtered.len() - 1);
     }
 
     pub fn selected_item(&self) -> Option<&SelectItem> {
         let filtered = self.filtered_indices();
-        filtered.get(self.selected).map(|&idx| &self.items[idx])
+        if filtered.is_empty() {
+            return None;
+        }
+        let sel = self.selected.min(filtered.len() - 1);
+        Some(&self.items[filtered[sel]])
     }
 }
 
@@ -284,19 +307,17 @@ impl Component for SelectList {
         }
 
         let total = filtered.len();
+        let selected = self.selected.min(total.saturating_sub(1));
         let max_vis = self.max_visible.min(total);
-        let start = if self.selected >= max_vis {
-            self.selected + 1 - max_vis
-        } else {
-            0
-        };
+        let start = (selected as isize - (max_vis as isize / 2))
+            .clamp(0, (total as isize - max_vis as isize).max(0)) as usize;
         let end = (start + max_vis).min(total);
 
         let mut lines = Vec::new();
         for (vis_idx, &item_idx) in filtered[start..end].iter().enumerate() {
             let actual_idx = start + vis_idx;
             let item = &self.items[item_idx];
-            let is_selected = actual_idx == self.selected;
+            let is_selected = actual_idx == selected;
 
             let desc_str = if let Some(ref d) = item.description {
                 format!(" \x1b[2m{d}\x1b[0m")
@@ -326,7 +347,77 @@ impl Component for SelectList {
                 self.move_down();
                 true
             }
+            "pageup" => {
+                self.page_up();
+                true
+            }
+            "pagedown" => {
+                self.page_down();
+                true
+            }
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_select_list_out_of_bounds_highlights_clamped_item() {
+        let items = vec![
+            SelectItem::new("1", "Apple"),
+            SelectItem::new("2", "Banana"),
+        ];
+        let mut list = SelectList::new(items, 5);
+        list.selected = 10;
+        let lines = list.render(30);
+        assert!(lines[1].contains('>'));
+        assert!(lines[1].contains("Banana"));
+        assert_eq!(list.selected_item().map(|it| it.label.as_str()), Some("Banana"));
+    }
+
+    #[test]
+    fn test_select_list_viewport_centering() {
+        let items: Vec<SelectItem> = (0..10)
+            .map(|i| SelectItem::new(i.to_string(), format!("Item {i}")))
+            .collect();
+        let mut list = SelectList::new(items, 5);
+        list.selected = 3;
+        let lines = list.render(30);
+        assert_eq!(lines.len(), 5);
+        // Centered window for selected=3 with max_visible=5 should start at 1 (3 - 5/2 = 1) -> Items 1, 2, 3, 4, 5
+        assert!(lines[0].contains("Item 1"));
+        assert!(lines[2].contains("Item 3"));
+        assert!(lines[2].contains('>'));
+        assert!(lines[4].contains("Item 5"));
+    }
+
+    #[test]
+    fn test_select_list_page_up_page_down() {
+        let items: Vec<SelectItem> = (0..12)
+            .map(|i| SelectItem::new(i.to_string(), format!("Item {i}")))
+            .collect();
+        let mut list = SelectList::new(items, 5);
+        assert_eq!(list.selected, 0);
+
+        assert!(list.handle_key("pagedown"));
+        assert_eq!(list.selected, 5);
+
+        assert!(list.handle_key("pagedown"));
+        assert_eq!(list.selected, 10);
+
+        assert!(list.handle_key("pagedown"));
+        assert_eq!(list.selected, 11); // clamped to total - 1
+
+        assert!(list.handle_key("pageup"));
+        assert_eq!(list.selected, 6);
+
+        assert!(list.handle_key("pageup"));
+        assert_eq!(list.selected, 1);
+
+        assert!(list.handle_key("pageup"));
+        assert_eq!(list.selected, 0); // clamped to 0
     }
 }

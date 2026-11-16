@@ -1,6 +1,7 @@
 //! MCP tool adapter exposing MCP tools as `mehh_agent::AgentTool` implementations.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
@@ -9,6 +10,56 @@ use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
 use crate::client::{McpCallToolResult, McpClient, McpContentBlock, McpToolInfo};
+
+pub type McpOutputSaver = Arc<
+    dyn Fn(Vec<u8>, String) -> futures::future::BoxFuture<'static, anyhow::Result<PathBuf>>
+        + Send
+        + Sync,
+>;
+
+/// Persists raw MCP output or binary blob to a private temporary file.
+pub fn save_mcp_output_file(data: &[u8], ext: &str) -> anyhow::Result<PathBuf> {
+    let base_dir = std::env::temp_dir().join("mehh-mcp");
+    std::fs::create_dir_all(&base_dir)?;
+
+    let clean_ext = if ext.starts_with('.') {
+        ext.to_string()
+    } else {
+        format!(".{ext}")
+    };
+
+    let filename = format!("mcp-output-{}{clean_ext}", uuid::Uuid::new_v4());
+    let file_path = base_dir.join(filename);
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true).mode(0o600);
+        let mut file = opts.open(&file_path)?;
+        use std::io::Write;
+        file.write_all(data)?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        let mut file = opts.open(&file_path)?;
+        use std::io::Write;
+        file.write_all(data)?;
+    }
+
+    Ok(file_path)
+}
+
+fn is_text_mime_type(mime: &str) -> bool {
+    let clean = mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+    clean.starts_with("text/")
+        || clean == "application/json"
+        || clean.ends_with("+json")
+        || clean.ends_with("+xml")
+}
 
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 4096;
@@ -192,8 +243,12 @@ fn push_capped_image(
     }
 }
 
-/// Converts an MCP tool call result into an `AgentToolResult` conforming to `mehh_agent`.
-pub fn convert_mcp_result(call_res: McpCallToolResult) -> AgentToolResult {
+/// Converts an MCP tool call result into an `AgentToolResult` conforming to `mehh_agent`,
+/// persisting oversized text (>20KB) and non-image binary resource blobs to disk.
+pub async fn convert_mcp_result_with_saver(
+    call_res: McpCallToolResult,
+    saver: Option<McpOutputSaver>,
+) -> AgentToolResult {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
     let mut total_image_bytes = 0usize;
@@ -230,11 +285,53 @@ pub fn convert_mcp_result(call_res: McpCallToolResult) -> AgentToolResult {
                             &mut total_image_bytes,
                         );
                     } else {
-                        text_parts.push("[binary resource omitted]".to_string());
+                        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, blob) {
+                            Ok(data) => {
+                                if is_text_mime_type(mime) {
+                                    if let Ok(text) = String::from_utf8(data) {
+                                        text_parts.push(text);
+                                    } else {
+                                        text_parts.push("[resource omitted]".to_string());
+                                    }
+                                } else {
+                                    let uri = resource.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                                    let ext = if uri.contains('.') {
+                                        let clean = uri.split('?').next().unwrap_or(uri);
+                                        std::path::Path::new(clean)
+                                            .extension()
+                                            .and_then(|s| s.to_str())
+                                            .map(|e| format!(".{e}"))
+                                            .unwrap_or_else(|| ".bin".to_string())
+                                    } else {
+                                        ".bin".to_string()
+                                    };
+                                    let save_res = if let Some(ref s) = saver {
+                                        s(data, ext).await
+                                    } else {
+                                        save_mcp_output_file(&data, &ext)
+                                    };
+                                    match save_res {
+                                        Ok(p) => {
+                                            text_parts.push(format!("[Binary resource {uri} saved to {}]", p.display()));
+                                        }
+                                        Err(e) => {
+                                            text_parts.push(format!("[Binary resource {uri} could not be saved: {e}]"));
+                                        }
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                let uri = resource.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                                text_parts.push(format!("[Binary resource {uri} failed to decode base64: {e}]"));
+                            }
+                        }
                     }
                 } else {
                     text_parts.push("[resource omitted]".to_string());
                 }
+            }
+            McpContentBlock::Unknown => {
+                text_parts.push("[unknown content block omitted]".to_string());
             }
         }
     }
@@ -250,8 +347,18 @@ pub fn convert_mcp_result(call_res: McpCallToolResult) -> AgentToolResult {
     let mut blocks = Vec::new();
 
     if let Some(truncated) = truncate_middle(&combined_text, MCP_OUTPUT_MAX_BYTES) {
+        let save_res = if let Some(ref s) = saver {
+            s(combined_text.as_bytes().to_vec(), ".txt".to_string()).await.ok()
+        } else {
+            save_mcp_output_file(combined_text.as_bytes(), ".txt").ok()
+        };
+        let suffix = if let Some(p) = save_res {
+            format!("\n\n[Full output: {} (read it with offset/limit)]", p.display())
+        } else {
+            String::new()
+        };
         blocks.push(ToolResultContentBlock::Text(TextContent {
-            text: truncated,
+            text: format!("{truncated}{suffix}"),
             text_signature: None,
         }));
     } else if !combined_text.is_empty() {
@@ -265,8 +372,14 @@ pub fn convert_mcp_result(call_res: McpCallToolResult) -> AgentToolResult {
 
     AgentToolResult {
         content: blocks,
-        details: call_res.structured_content,
+        structured_content: call_res.structured_content,
+        ..Default::default()
     }
+}
+
+/// Converts an MCP tool call result into an `AgentToolResult` conforming to `mehh_agent`.
+pub async fn convert_mcp_result(call_res: McpCallToolResult) -> AgentToolResult {
+    convert_mcp_result_with_saver(call_res, None).await
 }
 
 /// Agent tool adapter wrapping an MCP tool registered on an MCP client.
@@ -351,22 +464,43 @@ impl AgentTool for McpAgentTool {
         _tool_call_id: &str,
         params: serde_json::Map<String, serde_json::Value>,
         cancel: tokio_util::sync::CancellationToken,
-        _on_update: Option<AgentToolUpdateCallback>,
+        on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, String> {
         if cancel.is_cancelled() {
             return Err("Tool execution cancelled".to_string());
         }
 
         let arguments = serde_json::Value::Object(params);
-        let call_fut = self.client.call_tool(&self.tool_name, arguments, None);
+        let progress_cb = on_update.map(|cb| {
+            Arc::new(move |prog: crate::client::McpProgressNotification| {
+                let mut msg = format!("Progress: {:.0}%", prog.progress * 100.0);
+                if let Some(m) = &prog.message {
+                    msg.push_str(&format!(" - {m}"));
+                }
+                cb(AgentToolResult {
+                    content: vec![ToolResultContentBlock::Text(TextContent {
+                        text: msg,
+                        text_signature: None,
+                    })],
+                    ..Default::default()
+                });
+            }) as crate::client::ProgressCallback
+        });
 
-        let res = tokio::select! {
-            r = call_fut => r.map_err(|e| e.to_string())?,
-            _ = cancel.cancelled() => return Err("Tool execution cancelled".to_string()),
+        let options = crate::client::McpRequestOptions {
+            timeout: None,
+            cancel: Some(cancel.clone()),
+            on_progress: progress_cb,
         };
 
+        let res = self
+            .client
+            .call_tool_with_options(&self.tool_name, arguments, options)
+            .await
+            .map_err(|e| e.to_string())?;
+
         let is_error = res.is_error;
-        let tool_res = convert_mcp_result(res);
+        let tool_res = convert_mcp_result_with_saver(res, None).await;
 
         if is_error {
             let err_text = tool_res
@@ -533,6 +667,7 @@ impl AgentTool for ListMcpResourcesTool {
                 text_signature: None,
             })],
             details: Some(result_json),
+            ..Default::default()
         })
     }
 }
@@ -657,6 +792,7 @@ impl AgentTool for ListMcpResourceTemplatesTool {
                 text_signature: None,
             })],
             details: Some(result_json),
+            ..Default::default()
         })
     }
 }
@@ -783,6 +919,7 @@ impl AgentTool for ReadMcpResourceTool {
         Ok(AgentToolResult {
             content: blocks,
             details: Some(res),
+            ..Default::default()
         })
     }
 }
@@ -790,6 +927,7 @@ impl AgentTool for ReadMcpResourceTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::McpTransport;
 
     #[test]
     fn test_create_mcp_tool_name_normal() {
@@ -840,8 +978,8 @@ mod tests {
         assert!(clean.len() <= MAX_TOOL_DESCRIPTION_BYTES);
     }
 
-    #[test]
-    fn test_convert_mcp_result_caps_oversized_images() {
+    #[tokio::test]
+    async fn test_convert_mcp_result_caps_oversized_images() {
         let big_img = "A".repeat(MCP_RESOURCE_MAX_BYTES + 10);
         let res = McpCallToolResult {
             content: vec![McpContentBlock::Image {
@@ -851,7 +989,7 @@ mod tests {
             is_error: false,
             structured_content: None,
         };
-        let converted = convert_mcp_result(res);
+        let converted = convert_mcp_result(res).await;
         assert_eq!(converted.content.len(), 1);
         match &converted.content[0] {
             ToolResultContentBlock::Text(t) => assert!(t.text.contains("exceeds")),
@@ -873,5 +1011,181 @@ mod tests {
         assert!(res.contains("head"));
         assert!(res.contains("tail"));
         assert!(res.contains("chars truncated"));
+    }
+
+    #[tokio::test]
+    async fn convert_mcp_result_saves_binary_blob_and_oversized_text() {
+        let big_text = "line 1\n".to_string() + &"x".repeat(30_000) + "\nlast line";
+        let pdf_bytes = b"%PDF-1.4 mock binary data";
+        let b64_blob = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, pdf_bytes);
+
+        let res = McpCallToolResult {
+            content: vec![
+                McpContentBlock::Text { text: big_text.clone() },
+                McpContentBlock::Resource {
+                    resource: serde_json::json!({
+                        "uri": "file:///tmp/sample.pdf",
+                        "mimeType": "application/pdf",
+                        "blob": b64_blob,
+                    }),
+                },
+            ],
+            is_error: false,
+            structured_content: None,
+        };
+
+        let converted = convert_mcp_result_with_saver(res, None).await;
+        let mut full_output_path = None;
+        let mut binary_saved_path = None;
+
+        for block in &converted.content {
+            if let ToolResultContentBlock::Text(t) = block {
+                if t.text.contains("[Full output: ") {
+                    let start = t.text.find("[Full output: ").unwrap() + 14;
+                    let end = t.text[start..].find(" (read it with offset/limit)]").unwrap() + start;
+                    full_output_path = Some(std::path::PathBuf::from(&t.text[start..end]));
+                }
+                if t.text.contains("[Binary resource file:///tmp/sample.pdf") && t.text.contains(" saved to ") {
+                    let marker = " saved to ";
+                    let start = t.text.find(marker).unwrap() + marker.len();
+                    let end = t.text[start..].find(']').unwrap() + start;
+                    binary_saved_path = Some(std::path::PathBuf::from(&t.text[start..end]));
+                }
+            }
+        }
+
+        let full_p = full_output_path.expect("must have saved oversized text to disk");
+        assert!(full_p.exists());
+        let saved_text = std::fs::read_to_string(&full_p).unwrap();
+        assert!(saved_text.contains("line 1"));
+        assert!(saved_text.contains("last line"));
+        let _ = std::fs::remove_file(full_p);
+
+        let bin_p = binary_saved_path.expect("must have saved binary blob to disk");
+        assert!(bin_p.exists());
+        let saved_bytes = std::fs::read(&bin_p).unwrap();
+        assert_eq!(saved_bytes, pdf_bytes);
+        let _ = std::fs::remove_file(bin_p);
+    }
+
+    #[tokio::test]
+    async fn test_binary_resource_invalid_base64_returns_error_string() {
+        let raw_res = serde_json::json!({
+            "content": [
+                {
+                    "type": "resource",
+                    "resource": {
+                        "uri": "file:///tmp/corrupt.bin",
+                        "mimeType": "application/octet-stream",
+                        "blob": "not-valid-base64-!!!"
+                    }
+                }
+            ]
+        });
+
+        let call_res: McpCallToolResult = serde_json::from_value(raw_res).unwrap();
+        let agent_res = convert_mcp_result_with_saver(call_res, None).await;
+        let text = match &agent_res.content[0] {
+            ToolResultContentBlock::Text(t) => &t.text,
+            _ => panic!("expected text content"),
+        };
+        assert!(text.contains("[Binary resource file:///tmp/corrupt.bin failed to decode base64:"));
+    }
+
+    #[tokio::test]
+    async fn mcp_agent_tool_forwards_progress_to_on_update_and_cancels_server() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+        use crate::jsonrpc::{JsonRpcMessage, JsonRpcNotification, JsonRpcResponse};
+
+        let (client_transport, server_transport) = crate::transport::InMemoryTransport::pair();
+        let client_transport = Arc::new(client_transport);
+        let server_transport = Arc::new(server_transport);
+
+        tokio::spawn({
+            let server_transport = server_transport.clone();
+            async move {
+                if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                    let resp = JsonRpcResponse::success(
+                        req.id,
+                        serde_json::json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                        }),
+                    );
+                    server_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+                }
+                let _ = server_transport.recv().await;
+
+                // Tool call
+                if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                    let token = req
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("_meta"))
+                        .and_then(|m| m.get("progressToken"))
+                        .cloned()
+                        .expect("progressToken present");
+
+                    // Send progress frame
+                    let p = JsonRpcNotification::new(
+                        "notifications/progress",
+                        Some(serde_json::json!({
+                            "progressToken": token,
+                            "progress": 0.5,
+                            "total": 1.0,
+                            "message": "working"
+                        })),
+                    );
+                    server_transport.send(JsonRpcMessage::Notification(p)).await.unwrap();
+
+                    // Wait for cancel or complete
+                    let mut cancelled = false;
+                    while let Some(Ok(msg)) = server_transport.recv().await {
+                        if let JsonRpcMessage::Notification(notif) = msg {
+                            if notif.method == "notifications/cancelled" {
+                                cancelled = true;
+                                break;
+                            }
+                        }
+                    }
+                    assert!(cancelled);
+                }
+            }
+        });
+
+        let client = Arc::new(McpClient::connect(client_transport).await.unwrap());
+        let tool_info = McpToolInfo {
+            name: "test_tool".to_string(),
+            description: Some("desc".to_string()),
+            input_schema: serde_json::json!({ "type": "object" }),
+        };
+        let agent_tool = McpAgentTool::new("mock_server", tool_info, client);
+
+        let update_received = Arc::new(AtomicBool::new(false));
+        let update_clone = update_received.clone();
+        let on_update: mehh_agent::AgentToolUpdateCallback = Arc::new(move |_res| {
+            update_clone.store(true, Ordering::SeqCst);
+        });
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            cancel_clone.cancel();
+        });
+
+        let res = agent_tool
+            .execute(
+                "call-1",
+                serde_json::Map::new(),
+                cancel,
+                Some(on_update),
+            )
+            .await;
+
+        assert!(res.is_err());
+        assert!(update_received.load(Ordering::SeqCst));
     }
 }

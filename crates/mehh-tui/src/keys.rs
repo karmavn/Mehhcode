@@ -37,7 +37,7 @@ pub fn normalize_crossterm_key(event: KeyEvent) -> Option<String> {
         KeyCode::Char(c) => {
             if has_ctrl || has_alt || has_super {
                 let lower = c.to_ascii_lowercase().to_string();
-                Some(make_mod_str(&lower, has_shift && c.is_ascii_uppercase()))
+                Some(make_mod_str(&lower, has_shift || c.is_ascii_uppercase()))
             } else {
                 Some(c.to_string())
             }
@@ -71,18 +71,29 @@ pub fn normalize_crossterm_key(event: KeyEvent) -> Option<String> {
 }
 
 fn canonicalize_key_spec(spec: &str) -> (BTreeSet<String>, String) {
-    let lower = spec.trim().to_ascii_lowercase();
-    let parts: Vec<&str> = lower.split('+').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if spec == " " {
+        return (BTreeSet::new(), " ".to_string());
+    }
+    let trimmed = spec.trim();
+    if trimmed.is_empty() {
+        return (BTreeSet::new(), String::new());
+    }
 
-    let mut modifiers = BTreeSet::new();
-    let raw_base = if parts.is_empty() {
-        ""
+    let (raw_mods, raw_base): (Vec<&str>, &str) = if trimmed == "+" {
+        (Vec::new(), "+")
+    } else if let Some(prefix) = trimmed.strip_suffix("++") {
+        (prefix.split('+').filter(|s| !s.is_empty()).collect(), "+")
+    } else if let Some(idx) = trimmed.rfind('+') {
+        let prefix = &trimmed[..idx];
+        let base = &trimmed[idx + 1..];
+        (prefix.split('+').filter(|s| !s.is_empty()).collect(), base)
     } else {
-        parts[parts.len() - 1]
+        (Vec::new(), trimmed)
     };
 
-    for &m in &parts[..parts.len().saturating_sub(1)] {
-        match m {
+    let mut modifiers = BTreeSet::new();
+    for m in raw_mods {
+        match m.to_ascii_lowercase().as_str() {
             "ctrl" | "control" => {
                 modifiers.insert("ctrl".to_string());
             }
@@ -101,16 +112,19 @@ fn canonicalize_key_spec(spec: &str) -> (BTreeSet<String>, String) {
         }
     }
 
-    let base = match raw_base {
+    let lower_base = raw_base.to_ascii_lowercase();
+    let base = match lower_base.as_str() {
         "esc" => "escape",
         "return" => "enter",
+        "space" => " ",
+        "plus" => "+",
         "backtab" => {
             modifiers.insert("shift".to_string());
             "tab"
         }
         "page_up" => "pageup",
         "page_down" => "pagedown",
-        other => other,
+        _ => raw_base,
     };
 
     (modifiers, base.to_string())
@@ -144,9 +158,11 @@ pub enum TuiAction {
     Backspace,
     Delete,
     DeleteWordBackward,
+    DeleteWordForward,
     KillToEnd,
     KillToStart,
     Yank,
+    YankPop,
     Undo,
     HistoryPrev,
     HistoryNext,
@@ -212,9 +228,14 @@ impl Keybindings {
             TuiAction::DeleteWordBackward,
             vec!["ctrl+w".into(), "alt+backspace".into()],
         );
+        map.insert(
+            TuiAction::DeleteWordForward,
+            vec!["alt+d".into(), "alt+delete".into()],
+        );
         map.insert(TuiAction::KillToEnd, vec!["ctrl+k".into()]);
         map.insert(TuiAction::KillToStart, vec!["ctrl+u".into()]);
         map.insert(TuiAction::Yank, vec!["ctrl+y".into()]);
+        map.insert(TuiAction::YankPop, vec!["alt+y".into()]);
         map.insert(
             TuiAction::Undo,
             vec!["ctrl+z".into(), "ctrl+-".into()],
@@ -272,3 +293,35 @@ impl Keybindings {
         self.bindings.get(&action).map(|v| v.as_slice())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_crossterm_key_ctrl_shift_lowercase_char() {
+        // When user presses Ctrl+Shift+P, crossterm may deliver KeyCode::Char('p') with CONTROL | SHIFT.
+        let ev = KeyEvent::new(
+            KeyCode::Char('p'),
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        assert_eq!(
+            normalize_crossterm_key(ev),
+            Some("ctrl+shift+p".to_string())
+        );
+    }
+
+    #[test]
+    fn test_canonicalize_plus_key_spec() {
+        assert!(matches_key("+", "+"));
+        assert!(matches_key("ctrl++", "ctrl++"));
+        assert!(matches_key("ctrl+shift++", "ctrl+shift++"));
+    }
+
+    #[test]
+    fn test_matches_key_space_alias() {
+        assert!(matches_key(" ", "space"));
+        assert!(matches_key("space", " "));
+    }
+}
+

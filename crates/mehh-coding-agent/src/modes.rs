@@ -27,6 +27,21 @@ pub async fn run_print_mode(
     prompt: &str,
     mode: OutputMode,
 ) -> Result<String> {
+    run_print_mode_content(
+        session,
+        mehh_ai::UserContent::Text(prompt.to_string()),
+        mode,
+    )
+    .await
+}
+
+/// Executes arbitrary user content in print mode, streaming events according to `mode`.
+/// Returns the text content of the final assistant message.
+pub async fn run_print_mode_content(
+    session: &mut AgentSession,
+    content: mehh_ai::UserContent,
+    mode: OutputMode,
+) -> Result<String> {
     let streamed_any = Arc::new(AtomicBool::new(false));
     let streamed_flag = streamed_any.clone();
 
@@ -49,7 +64,7 @@ pub async fn run_print_mode(
         }),
     };
 
-    let new_messages = session.prompt(prompt, Some(on_event)).await?;
+    let new_messages = session.prompt_content(content, Some(on_event)).await?;
 
     let final_assistant = new_messages.iter().rev().find_map(|m| match m {
         Message::Assistant(a) => Some(a),

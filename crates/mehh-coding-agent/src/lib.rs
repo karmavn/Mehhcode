@@ -3,6 +3,8 @@
 
 pub mod agent_session;
 pub mod auth;
+pub mod branch_summarization;
+pub mod clipboard;
 pub mod compaction;
 pub mod file_complete;
 pub mod interactive;
@@ -21,6 +23,8 @@ pub mod trust;
 
 pub use agent_session::*;
 pub use auth::*;
+pub use branch_summarization::*;
+pub use clipboard::*;
 pub use compaction::*;
 pub use file_complete::*;
 pub use interactive::*;

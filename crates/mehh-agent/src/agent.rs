@@ -5,10 +5,11 @@ use mehh_ai::{
     now_ms, LlmProvider, Message, Model, StreamOptions, ThinkingLevel, UserContent,
     UserMessage,
 };
-use crate::agent_loop::{run_agent_loop, AgentLoopConfig};
+use crate::agent_loop::{run_agent_loop, AgentLoopConfig, DynamicToolsList};
 use crate::types::{
-    AfterToolCallContext, AfterToolCallHook, AfterToolCallResult, AgentEvent, AgentTool,
-    BeforeToolCallContext, BeforeToolCallHook, BeforeToolCallResult, QueueMode,
+    AfterToolCallContext, AfterToolCallHook, AfterToolCallResult, AgentEvent, AgentState, AgentTool,
+    BeforeToolCallContext, BeforeToolCallHook, BeforeToolCallResult, FinishTurnHook,
+    PrepareNextTurnHook, PrepareRequestHook, QueueMode, TransformContextHook,
 };
 
 pub struct Agent {
@@ -25,11 +26,29 @@ pub struct Agent {
     listeners: Vec<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
     before_tool_call: Option<BeforeToolCallHook>,
     after_tool_call: Option<AfterToolCallHook>,
+    dynamic_tools: Option<DynamicToolsList>,
+    max_turns: Option<usize>,
+    prepare_request: Option<PrepareRequestHook>,
+    prepare_next_turn: Option<PrepareNextTurnHook>,
+    transform_context: Option<TransformContextHook>,
+    finish_turn: Option<FinishTurnHook>,
     cancel: CancellationToken,
+    state: Arc<std::sync::RwLock<AgentState>>,
 }
 
 impl Agent {
     pub fn new(model: Model, provider: Arc<dyn LlmProvider>) -> Self {
+        let initial_state = AgentState {
+            system_prompt: String::new(),
+            model: model.clone(),
+            thinking_level: None,
+            tools: Vec::new(),
+            messages: Vec::new(),
+            is_streaming: false,
+            streaming_message: None,
+            pending_tool_calls: std::collections::HashSet::new(),
+            error_message: None,
+        };
         Self {
             model,
             provider,
@@ -44,27 +63,39 @@ impl Agent {
             listeners: Vec::new(),
             before_tool_call: None,
             after_tool_call: None,
+            dynamic_tools: None,
+            max_turns: Some(crate::agent_loop::DEFAULT_MAX_AGENT_TURNS),
+            prepare_request: None,
+            prepare_next_turn: None,
+            transform_context: None,
+            finish_turn: None,
             cancel: CancellationToken::new(),
+            state: Arc::new(std::sync::RwLock::new(initial_state)),
         }
     }
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
-        self.system_prompt = Some(prompt.into());
+        let p = prompt.into();
+        self.state.write().unwrap().system_prompt = p.clone();
+        self.system_prompt = Some(p);
         self
     }
 
     pub fn with_tools(mut self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
+        self.state.write().unwrap().tools = tools.clone();
         self.tools = tools;
         self
     }
 
     pub fn with_stream_options(mut self, options: StreamOptions) -> Self {
+        self.state.write().unwrap().thinking_level = options.reasoning;
         self.stream_options = options;
         self
     }
 
     pub fn with_thinking_level(mut self, level: Option<ThinkingLevel>) -> Self {
         self.stream_options.reasoning = level;
+        self.state.write().unwrap().thinking_level = level;
         self
     }
 
@@ -72,7 +103,10 @@ impl Agent {
         mut self,
         hook: impl Fn(&BeforeToolCallContext) -> BeforeToolCallResult + Send + Sync + 'static,
     ) -> Self {
-        self.before_tool_call = Some(Arc::new(hook));
+        self.before_tool_call = Some(Arc::new(move |ctx, _cancel| {
+            let res = hook(&ctx);
+            Box::pin(async move { res })
+        }));
         self
     }
 
@@ -80,23 +114,60 @@ impl Agent {
         mut self,
         hook: impl Fn(&AfterToolCallContext) -> AfterToolCallResult + Send + Sync + 'static,
     ) -> Self {
-        self.after_tool_call = Some(Arc::new(hook));
+        self.after_tool_call = Some(Arc::new(move |ctx, _cancel| {
+            let res = hook(&ctx);
+            Box::pin(async move { res })
+        }));
+        self
+    }
+
+    pub fn with_dynamic_tools(mut self, dt: DynamicToolsList) -> Self {
+        self.dynamic_tools = Some(dt);
+        self
+    }
+
+    pub fn with_max_turns(mut self, max_turns: Option<usize>) -> Self {
+        self.max_turns = max_turns;
+        self
+    }
+
+    pub fn with_prepare_request(mut self, hook: PrepareRequestHook) -> Self {
+        self.prepare_request = Some(hook);
+        self
+    }
+
+    pub fn with_prepare_next_turn(mut self, hook: PrepareNextTurnHook) -> Self {
+        self.prepare_next_turn = Some(hook);
+        self
+    }
+
+    pub fn with_transform_context(mut self, hook: TransformContextHook) -> Self {
+        self.transform_context = Some(hook);
+        self
+    }
+
+    pub fn with_finish_turn(mut self, hook: FinishTurnHook) -> Self {
+        self.finish_turn = Some(hook);
         self
     }
 
     pub fn set_system_prompt(&mut self, prompt: Option<String>) {
+        self.state.write().unwrap().system_prompt = prompt.clone().unwrap_or_default();
         self.system_prompt = prompt;
     }
 
     pub fn set_model(&mut self, model: Model) {
+        self.state.write().unwrap().model = model.clone();
         self.model = model;
     }
 
     pub fn set_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) {
+        self.state.write().unwrap().tools = tools.clone();
         self.tools = tools;
     }
 
     pub fn set_thinking_level(&mut self, level: Option<ThinkingLevel>) {
+        self.state.write().unwrap().thinking_level = level;
         self.stream_options.reasoning = level;
     }
 
@@ -112,6 +183,46 @@ impl Agent {
         hook: Option<AfterToolCallHook>,
     ) {
         self.after_tool_call = hook;
+    }
+
+    pub fn set_dynamic_tools(&mut self, dt: Option<DynamicToolsList>) {
+        self.dynamic_tools = dt;
+    }
+
+    pub fn set_max_turns(&mut self, max_turns: Option<usize>) {
+        self.max_turns = max_turns;
+    }
+
+    pub fn set_prepare_request(&mut self, hook: Option<PrepareRequestHook>) {
+        self.prepare_request = hook;
+    }
+
+    pub fn set_prepare_next_turn(&mut self, hook: Option<PrepareNextTurnHook>) {
+        self.prepare_next_turn = hook;
+    }
+
+    pub fn set_transform_context(&mut self, hook: Option<TransformContextHook>) {
+        self.transform_context = hook;
+    }
+
+    pub fn set_finish_turn(&mut self, hook: Option<FinishTurnHook>) {
+        self.finish_turn = hook;
+    }
+
+    pub fn state(&self) -> AgentState {
+        self.state.read().unwrap().clone()
+    }
+
+    pub fn reset(&mut self) {
+        self.clear_messages();
+        let mut st = self.state.write().unwrap();
+        st.messages.clear();
+        st.is_streaming = false;
+        st.streaming_message = None;
+        st.pending_tool_calls.clear();
+        st.error_message = None;
+        self.steering_queue.lock().unwrap().clear();
+        self.follow_up_queue.lock().unwrap().clear();
     }
 
     pub fn steer(&self, message: Message) {
@@ -148,6 +259,7 @@ impl Agent {
 
     pub fn clear_messages(&mut self) {
         self.messages.clear();
+        self.state.write().unwrap().messages.clear();
     }
 
     pub fn steering_queue(&self) -> Arc<Mutex<VecDeque<Message>>> {
@@ -179,6 +291,13 @@ impl Agent {
             self.cancel = CancellationToken::new();
         }
 
+        {
+            let mut st = self.state.write().unwrap();
+            st.is_streaming = true;
+            st.streaming_message = None;
+            st.error_message = None;
+        }
+
         let config = self.build_loop_config();
         let on_event = self.build_on_event();
 
@@ -190,6 +309,13 @@ impl Agent {
         )
         .await;
 
+        {
+            let mut st = self.state.write().unwrap();
+            st.is_streaming = false;
+            st.streaming_message = None;
+            st.pending_tool_calls.clear();
+        }
+
         self.messages.extend(new_messages.clone());
         new_messages
     }
@@ -197,6 +323,13 @@ impl Agent {
     pub async fn continue_turn(&mut self) -> Vec<Message> {
         if self.cancel.is_cancelled() {
             self.cancel = CancellationToken::new();
+        }
+
+        {
+            let mut st = self.state.write().unwrap();
+            st.is_streaming = true;
+            st.streaming_message = None;
+            st.error_message = None;
         }
 
         let config = self.build_loop_config();
@@ -210,6 +343,13 @@ impl Agent {
         )
         .await;
 
+        {
+            let mut st = self.state.write().unwrap();
+            st.is_streaming = false;
+            st.streaming_message = None;
+            st.pending_tool_calls.clear();
+        }
+
         self.messages.extend(new_messages.clone());
         new_messages
     }
@@ -221,29 +361,57 @@ impl Agent {
             stream_options: self.stream_options.clone(),
             system_prompt: self.system_prompt.clone(),
             tools: self.tools.clone(),
-            dynamic_tools: None,
-            max_turns: Some(crate::agent_loop::DEFAULT_MAX_AGENT_TURNS),
+            dynamic_tools: self.dynamic_tools.clone(),
+            max_turns: self.max_turns,
             steering_queue: self.steering_queue.clone(),
             follow_up_queue: self.follow_up_queue.clone(),
             steering_mode: self.steering_mode,
             follow_up_mode: self.follow_up_mode,
             before_tool_call: self.before_tool_call.clone(),
             after_tool_call: self.after_tool_call.clone(),
+            prepare_request: self.prepare_request.clone(),
+            prepare_next_turn: self.prepare_next_turn.clone(),
+            transform_context: self.transform_context.clone(),
+            finish_turn: self.finish_turn.clone(),
             cancel: self.cancel.clone(),
         }
     }
 
     fn build_on_event(&self) -> Option<Arc<dyn Fn(AgentEvent) + Send + Sync>> {
-        if self.listeners.is_empty() {
-            None
-        } else {
-            let listeners = self.listeners.clone();
-            Some(Arc::new(move |event: AgentEvent| {
-                for listener in &listeners {
-                    listener(event.clone());
+        let state_lock = self.state.clone();
+        let listeners = self.listeners.clone();
+        Some(Arc::new(move |event: AgentEvent| {
+            {
+                let mut st = state_lock.write().unwrap();
+                match &event {
+                    AgentEvent::MessageStart { message } => {
+                        st.streaming_message = Some(message.clone());
+                    }
+                    AgentEvent::MessageUpdate { message, .. } => {
+                        st.streaming_message = Some(Message::Assistant(message.clone()));
+                    }
+                    AgentEvent::MessageEnd { message } => {
+                        st.streaming_message = None;
+                        st.messages.push(message.clone());
+                    }
+                    AgentEvent::ToolExecutionStart { tool_call_id, .. } => {
+                        st.pending_tool_calls.insert(tool_call_id.clone());
+                    }
+                    AgentEvent::ToolExecutionEnd { tool_call_id, .. } => {
+                        st.pending_tool_calls.remove(tool_call_id);
+                    }
+                    AgentEvent::TurnEnd { message, .. } => {
+                        if let mehh_ai::StopReason::Error = message.stop_reason {
+                            st.error_message = message.error_message.clone();
+                        }
+                    }
+                    _ => {}
                 }
-            }))
-        }
+            }
+            for listener in &listeners {
+                listener(event.clone());
+            }
+        }))
     }
 }
 
@@ -732,5 +900,63 @@ mod tests {
             }
             _ => panic!("expected tool result"),
         }
+    }
+
+    #[tokio::test]
+    async fn agent_state_tracks_streaming_pending_tools_and_reset() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_tool_call_message(vec![
+            faux_tool_call("c1", "echo", serde_json::json!({ "input": "hello" })),
+        ]));
+        provider.add_response(faux_assistant_message("Done echoing"));
+
+        let mut agent = Agent::new(faux_model(), provider)
+            .with_system_prompt("You are a helpful test agent")
+            .with_tools(vec![Arc::new(EchoTool)]);
+
+        let initial_state = agent.state();
+        assert_eq!(initial_state.system_prompt, "You are a helpful test agent");
+        assert_eq!(initial_state.tools.len(), 1);
+        assert!(!initial_state.is_streaming);
+        assert!(initial_state.streaming_message.is_none());
+        assert!(initial_state.pending_tool_calls.is_empty());
+        assert!(initial_state.error_message.is_none());
+
+        let out = agent.prompt_text("Say hi").await;
+        assert_eq!(out.len(), 4);
+
+        let post_state = agent.state();
+        assert!(!post_state.is_streaming);
+        assert!(post_state.streaming_message.is_none());
+        assert!(post_state.pending_tool_calls.is_empty());
+        assert_eq!(post_state.messages.len(), 4);
+
+        agent.reset();
+        let reset_state = agent.state();
+        assert!(reset_state.messages.is_empty());
+        assert!(!reset_state.is_streaming);
+        assert!(reset_state.streaming_message.is_none());
+        assert!(reset_state.pending_tool_calls.is_empty());
+        assert!(reset_state.error_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn agent_builder_hooks_and_max_turns() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_assistant_message("Hello from model"));
+
+        let transform_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let tc_flag = transform_called.clone();
+
+        let mut agent = Agent::new(faux_model(), provider)
+            .with_max_turns(Some(5))
+            .with_transform_context(Arc::new(move |messages, _cancel| {
+                tc_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move { messages })
+            }));
+
+        let msgs = agent.prompt_text("test prompt").await;
+        assert_eq!(msgs.len(), 2);
+        assert!(transform_called.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

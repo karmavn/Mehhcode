@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use mehh_ai::{now_ms, Message, SystemMessage, ThinkingLevel};
+use mehh_ai::{now_ms, Message, SystemMessage, ThinkingLevel, UserMessage};
 
 /// Generates an ISO 8601 UTC timestamp string (e.g. `2026-11-12T13:17:17.000Z`).
 pub fn now_iso8601() -> String {
@@ -117,6 +117,124 @@ pub struct SessionHeader {
     pub parent_session: Option<String>,
 }
 
+/// Content that an append-only context edit may replace.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ContextEditableContent {
+    Text(String),
+    ToolResult(Vec<mehh_ai::ToolResultContentBlock>),
+    User(Vec<mehh_ai::UserContentBlock>),
+    Assistant(Vec<mehh_ai::AssistantContentBlock>),
+    Value(serde_json::Value),
+}
+
+impl ContextEditableContent {
+    pub fn to_text(&self) -> String {
+        match self {
+            Self::Text(s) => s.clone(),
+            Self::ToolResult(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    mehh_ai::ToolResultContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Self::User(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    mehh_ai::UserContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Self::Assistant(blocks) => blocks
+                .iter()
+                .filter_map(|b| match b {
+                    mehh_ai::AssistantContentBlock::Text(t) => Some(t.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Self::Value(v) => {
+                if let Some(s) = v.as_str() {
+                    s.to_string()
+                } else {
+                    v.to_string()
+                }
+            }
+        }
+    }
+
+    pub fn to_user_content(&self) -> mehh_ai::UserContent {
+        match self {
+            Self::Text(s) => mehh_ai::UserContent::Text(s.clone()),
+            Self::User(blocks) => mehh_ai::UserContent::Blocks(blocks.clone()),
+            Self::ToolResult(blocks) => {
+                let user_blocks = blocks
+                    .iter()
+                    .map(|b| match b {
+                        mehh_ai::ToolResultContentBlock::Text(t) => {
+                            mehh_ai::UserContentBlock::Text(t.clone())
+                        }
+                        mehh_ai::ToolResultContentBlock::Image(i) => {
+                            mehh_ai::UserContentBlock::Image(i.clone())
+                        }
+                    })
+                    .collect();
+                mehh_ai::UserContent::Blocks(user_blocks)
+            }
+            Self::Assistant(_) => {
+                let text = self.to_text();
+                mehh_ai::UserContent::Text(text)
+            }
+            Self::Value(v) => {
+                if let Ok(blocks) = serde_json::from_value::<Vec<mehh_ai::UserContentBlock>>(v.clone()) {
+                    mehh_ai::UserContent::Blocks(blocks)
+                } else if let Some(s) = v.as_str() {
+                    mehh_ai::UserContent::Text(s.to_string())
+                } else {
+                    mehh_ai::UserContent::Text(v.to_string())
+                }
+            }
+        }
+    }
+
+    pub fn to_assistant_content(&self) -> Vec<mehh_ai::AssistantContentBlock> {
+        match self {
+            Self::Assistant(blocks) => blocks.clone(),
+            Self::Text(s) => vec![mehh_ai::AssistantContentBlock::Text(mehh_ai::TextContent {
+                text: s.clone(),
+                text_signature: None,
+            })],
+            _ => vec![mehh_ai::AssistantContentBlock::Text(mehh_ai::TextContent {
+                text: self.to_text(),
+                text_signature: None,
+            })],
+        }
+    }
+
+    pub fn to_tool_result_content(&self) -> Vec<mehh_ai::ToolResultContentBlock> {
+        match self {
+            Self::ToolResult(blocks) => blocks.clone(),
+            Self::Text(s) => vec![mehh_ai::ToolResultContentBlock::Text(mehh_ai::TextContent {
+                text: s.clone(),
+                text_signature: None,
+            })],
+            _ => vec![mehh_ai::ToolResultContentBlock::Text(mehh_ai::TextContent {
+                text: self.to_text(),
+                text_signature: None,
+            })],
+        }
+    }
+}
+
+/// Replacement payload for a context edit.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextEditReplacement {
+    pub content: ContextEditableContent,
+}
+
 /// Variant payload of a session entry.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -132,6 +250,17 @@ pub enum SessionEntryKind {
         provider: String,
         #[serde(rename = "modelId")]
         model_id: String,
+    },
+    Usage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        usage: mehh_ai::Usage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
     },
     Compaction {
         summary: String,
@@ -154,6 +283,27 @@ pub enum SessionEntryKind {
         custom_type: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         data: Option<serde_json::Value>,
+    },
+    CustomMessage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display: Option<bool>,
+        #[serde(rename = "customType")]
+        custom_type: String,
+        content: mehh_ai::UserContent,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        details: Option<serde_json::Value>,
+    },
+    ContextEdit {
+        #[serde(rename = "targetId")]
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement: Option<ContextEditReplacement>,
+    },
+    Label {
+        #[serde(rename = "targetId")]
+        target_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
     },
 }
 
@@ -179,6 +329,17 @@ pub struct SessionTreeNode {
     pub is_active: bool,
     pub is_leaf: bool,
     pub is_user_or_branch: bool,
+}
+
+/// Recursive node representing a session entry in an RPC tree projection.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RpcSessionTreeNode {
+    pub id: String,
+    pub parent_id: Option<String>,
+    pub entry: SessionEntryKind,
+    pub labels: Vec<String>,
+    pub children: Vec<RpcSessionTreeNode>,
 }
 
 /// Summary of a stored session on disk.
@@ -267,30 +428,56 @@ pub fn list_sessions(cwd: &Path) -> Result<Vec<SessionSummary>> {
                 }
             } else if PersistedBranchSelection::parse(trimmed).is_some() {
                 continue;
-            } else if let Ok(entry) = serde_json::from_str::<SessionEntry>(trimmed) {
-                entry_count += 1;
-                match &entry.kind {
-                        SessionEntryKind::SessionInfo { name: Some(n) }
-                            if session_name.is_none() =>
-                        {
-                            session_name = Some(n.clone());
+            } else if first_prompt.is_none() {
+                if let Ok(entry) = serde_json::from_str::<SessionEntry>(trimmed) {
+                    entry_count += 1;
+                    match &entry.kind {
+                        SessionEntryKind::SessionInfo { name } => {
+                            session_name = name
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(String::from);
                         }
                         SessionEntryKind::Message {
                             message: Message::User(u),
-                        } if first_prompt.is_none() => {
+                        } => {
                             let txt = u.content.text();
                             let first_line = txt.lines().next().unwrap_or("").trim();
-                            let snippet = if first_line.chars().count() > 80 {
-                                format!("{}...", first_line.chars().take(77).collect::<String>())
-                            } else {
-                                first_line.to_string()
-                            };
-                            first_prompt = Some(snippet);
+                            if !first_line.is_empty() {
+                                let snippet = if first_line.chars().count() > 80 {
+                                    format!("{}...", first_line.chars().take(77).collect::<String>())
+                                } else {
+                                    first_line.to_string()
+                                };
+                                first_prompt = Some(snippet);
+                            }
                         }
                         _ => {}
+                    }
                 }
             } else {
-                continue;
+                #[derive(serde::Deserialize)]
+                struct FastSessionLine<'a> {
+                    id: Option<&'a str>,
+                    #[serde(rename = "type")]
+                    kind: Option<&'a str>,
+                    name: Option<String>,
+                }
+
+                if let Ok(fast) = serde_json::from_str::<FastSessionLine>(trimmed) {
+                    if fast.id.is_some() && fast.kind.is_some() {
+                        entry_count += 1;
+                        if fast.kind == Some("session_info") {
+                            session_name = fast
+                                .name
+                                .as_deref()
+                                .map(str::trim)
+                                .filter(|s| !s.is_empty())
+                                .map(String::from);
+                        }
+                    }
+                }
             }
         }
 
@@ -323,6 +510,32 @@ pub fn default_session_path(cwd: &Path) -> Result<PathBuf> {
 /// Creates a new default file-backed session manager for the given working directory.
 pub fn create_default_file(cwd: impl Into<PathBuf>) -> Result<SessionManager> {
     SessionManager::create_default_file(cwd)
+}
+
+/// Exports a session file to an optional destination file or to stdout.
+pub fn export_session(input_file: &Path, output_file: Option<&Path>, cwd: &Path) -> Result<()> {
+    let sm = SessionManager::open_file(input_file, cwd.to_path_buf())?;
+    if let Some(out) = output_file {
+        if out == Path::new("-") {
+            let mut stdout = std::io::stdout().lock();
+            writeln!(stdout, "{}", serde_json::to_string(&sm.header)?)?;
+            for entry in sm.entries() {
+                writeln!(stdout, "{}", serde_json::to_string(entry)?)?;
+            }
+            std::io::Write::flush(&mut stdout)?;
+        } else {
+            sm.export_jsonl(out)?;
+            eprintln!("Exported session to {}", out.display());
+        }
+    } else {
+        let mut stdout = std::io::stdout().lock();
+        writeln!(stdout, "{}", serde_json::to_string(&sm.header)?)?;
+        for entry in sm.entries() {
+            writeln!(stdout, "{}", serde_json::to_string(entry)?)?;
+        }
+        std::io::Write::flush(&mut stdout)?;
+    }
+    Ok(())
 }
 
 /// Manages session persistence, tree navigation, branching, and context projection.
@@ -526,6 +739,82 @@ impl SessionManager {
         self.append_entry(SessionEntryKind::Message { message })
     }
 
+    /// Appends a model usage entry to the session.
+    pub fn append_usage(
+        &mut self,
+        kind: Option<String>,
+        provider: Option<String>,
+        model: Option<String>,
+        usage: mehh_ai::Usage,
+        note: Option<String>,
+    ) -> Result<String> {
+        self.append_entry(SessionEntryKind::Usage {
+            kind,
+            provider,
+            model,
+            usage,
+            note,
+        })
+    }
+
+    /// Appends a custom message entry participating in model context.
+    pub fn append_custom_message(
+        &mut self,
+        custom_type: impl Into<String>,
+        content: mehh_ai::UserContent,
+        display: Option<bool>,
+        details: Option<serde_json::Value>,
+    ) -> Result<String> {
+        self.append_entry(SessionEntryKind::CustomMessage {
+            display,
+            custom_type: custom_type.into(),
+            content,
+            details,
+        })
+    }
+
+    /// Appends a context edit replacing or omitting an earlier entry from model context.
+    pub fn append_context_edit(
+        &mut self,
+        target_id: impl Into<String>,
+        replacement: Option<ContextEditReplacement>,
+    ) -> Result<String> {
+        self.append_entry(SessionEntryKind::ContextEdit {
+            target_id: target_id.into(),
+            replacement,
+        })
+    }
+
+    /// Appends a label marker on a target entry.
+    pub fn append_label(
+        &mut self,
+        target_id: impl Into<String>,
+        label: Option<String>,
+    ) -> Result<String> {
+        self.append_entry(SessionEntryKind::Label {
+            target_id: target_id.into(),
+            label,
+        })
+    }
+
+    /// Sets or clears the session name via a SessionInfo entry.
+    pub fn set_session_name(&mut self, name: Option<String>) -> Result<()> {
+        let trimmed = name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        self.append_entry(SessionEntryKind::SessionInfo { name: trimmed })?;
+        Ok(())
+    }
+
+    /// Returns the current session name from the latest SessionInfo entry on the active path, if any.
+    pub fn session_name(&self) -> Option<String> {
+        let path = self.active_path_entries();
+        for entry in path.into_iter().rev() {
+            if let SessionEntryKind::SessionInfo { name } = &entry.kind {
+                return name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+            }
+        }
+        None
+    }
+
     /// Branches conversation from the specified entry ID and persists active branch selection.
     pub fn branch_from(&mut self, entry_id: &str) -> Result<()> {
         if self.by_id.contains_key(entry_id) {
@@ -563,6 +852,78 @@ impl SessionManager {
         }
         path_indices.reverse();
 
+        // Collect context edits along the active path
+        let mut edits: HashMap<&str, &Option<ContextEditReplacement>> = HashMap::new();
+        for &idx in &path_indices {
+            if let SessionEntryKind::ContextEdit {
+                target_id,
+                replacement,
+            } = &self.entries[idx].kind
+            {
+                edits.insert(target_id.as_str(), replacement);
+            }
+        }
+
+        let project_entry = |entry: &SessionEntry| -> Vec<Message> {
+            if let Some(edit) = edits.get(entry.id.as_str()) {
+                if edit.is_none() {
+                    // Omitted from context
+                    return Vec::new();
+                }
+            }
+            let replacement = edits.get(entry.id.as_str()).and_then(|r| r.as_ref());
+
+            match &entry.kind {
+                SessionEntryKind::Message { message } => {
+                    if let Some(rep) = replacement {
+                        let mut msg = message.clone();
+                        match &mut msg {
+                            Message::User(u) => {
+                                u.content = rep.content.to_user_content();
+                            }
+                            Message::Assistant(a) => {
+                                a.content = rep.content.to_assistant_content();
+                            }
+                            Message::ToolResult(tr) => {
+                                tr.content = rep.content.to_tool_result_content();
+                            }
+                            Message::System(s) => {
+                                s.content = rep.content.to_text();
+                            }
+                        }
+                        vec![msg]
+                    } else {
+                        vec![message.clone()]
+                    }
+                }
+                SessionEntryKind::CustomMessage { content, .. } => {
+                    let effective_content = if let Some(rep) = replacement {
+                        rep.content.to_user_content()
+                    } else {
+                        content.clone()
+                    };
+                    let ts = parse_iso8601_or_now(&entry.timestamp);
+                    vec![Message::User(UserMessage {
+                        content: effective_content,
+                        timestamp: ts,
+                    })]
+                }
+                SessionEntryKind::BranchSummary { summary, .. } => {
+                    const BRANCH_SUMMARY_PREFIX: &str =
+                        "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+                    const BRANCH_SUMMARY_SUFFIX: &str = "\n</summary>";
+                    let ts = parse_iso8601_or_now(&entry.timestamp);
+                    vec![Message::User(UserMessage {
+                        content: mehh_ai::UserContent::Text(format!(
+                            "{BRANCH_SUMMARY_PREFIX}{summary}{BRANCH_SUMMARY_SUFFIX}"
+                        )),
+                        timestamp: ts,
+                    })]
+                }
+                _ => Vec::new(),
+            }
+        };
+
         // Check if there is a Compaction entry on the active path
         let last_compaction_pos = path_indices.iter().rposition(|&idx| {
             matches!(&self.entries[idx].kind, SessionEntryKind::Compaction { .. })
@@ -589,15 +950,11 @@ impl SessionManager {
                     .unwrap_or(comp_pos);
 
                 for &idx in &path_indices[first_kept_pos..comp_pos] {
-                    if let SessionEntryKind::Message { message } = &self.entries[idx].kind {
-                        messages.push(message.clone());
-                    }
+                    messages.extend(project_entry(&self.entries[idx]));
                 }
 
                 for &idx in &path_indices[comp_pos + 1..] {
-                    if let SessionEntryKind::Message { message } = &self.entries[idx].kind {
-                        messages.push(message.clone());
-                    }
+                    messages.extend(project_entry(&self.entries[idx]));
                 }
 
                 return messages;
@@ -607,9 +964,7 @@ impl SessionManager {
         // No compaction on active path
         let mut messages = Vec::new();
         for &idx in &path_indices {
-            if let SessionEntryKind::Message { message } = &self.entries[idx].kind {
-                messages.push(message.clone());
-            }
+            messages.extend(project_entry(&self.entries[idx]));
         }
         messages
     }
@@ -617,6 +972,26 @@ impl SessionManager {
     /// Returns a slice of all session entries.
     pub fn entries(&self) -> &[SessionEntry] {
         &self.entries
+    }
+
+    /// Looks up an entry by its ID in O(1) time.
+    pub fn get_entry(&self, id: &str) -> Option<&SessionEntry> {
+        let &idx = self.by_id.get(id)?;
+        self.entries.get(idx)
+    }
+
+    /// Exports the entire session as a JSONL file to `output_path`.
+    pub fn export_jsonl(&self, output_path: &Path) -> Result<()> {
+        if let Some(parent) = output_path.parent() {
+            create_dir_all(parent)?;
+        }
+        let mut file = File::create(output_path)?;
+        writeln!(file, "{}", serde_json::to_string(&self.header)?)?;
+        for entry in &self.entries {
+            writeln!(file, "{}", serde_json::to_string(entry)?)?;
+        }
+        file.flush()?;
+        Ok(())
     }
 
     /// Returns the session ID.
@@ -775,9 +1150,65 @@ impl SessionManager {
         tree
     }
 
+    /// Builds a recursive RPC session tree with resolved labels attached to each entry.
+    pub fn build_rpc_tree(&self) -> Vec<RpcSessionTreeNode> {
+        let mut labels_by_target: HashMap<String, Option<String>> = HashMap::new();
+        for entry in &self.entries {
+            if let SessionEntryKind::Label { target_id, label } = &entry.kind {
+                labels_by_target.insert(target_id.clone(), label.clone());
+            }
+        }
+
+        let mut children_map: HashMap<Option<&str>, Vec<&SessionEntry>> = HashMap::new();
+        for entry in &self.entries {
+            let p = entry.parent_id.as_deref().filter(|pid| self.by_id.contains_key(*pid));
+            children_map.entry(p).or_default().push(entry);
+        }
+
+        fn build_rpc_node(
+            entry: &SessionEntry,
+            children_map: &HashMap<Option<&str>, Vec<&SessionEntry>>,
+            labels_by_target: &HashMap<String, Option<String>>,
+        ) -> RpcSessionTreeNode {
+            let labels = match labels_by_target.get(&entry.id) {
+                Some(Some(lbl)) if !lbl.is_empty() => vec![lbl.clone()],
+                _ => Vec::new(),
+            };
+            let children = children_map
+                .get(&Some(entry.id.as_str()))
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|child| build_rpc_node(child, children_map, labels_by_target))
+                .collect();
+
+            RpcSessionTreeNode {
+                id: entry.id.clone(),
+                parent_id: entry.parent_id.clone(),
+                entry: entry.kind.clone(),
+                labels,
+                children,
+            }
+        }
+
+        children_map
+            .get(&None)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|entry| build_rpc_node(entry, &children_map, &labels_by_target))
+            .collect()
+    }
+
     /// Forks session at `target_entry_id` (or current leaf if None), copying the branch path
     /// into a new session file with `parent_session` set to this session's file path.
     pub fn fork_at(&self, target_entry_id: Option<&str>) -> Result<SessionManager> {
+        if let Some(target_id) = target_entry_id {
+            if !self.by_id.contains_key(target_id) {
+                anyhow::bail!("Target entry ID not found in session: {target_id}");
+            }
+        }
+
         let target = target_entry_id.or(self.leaf_id.as_deref());
         let mut path_indices = Vec::new();
         let mut curr = target;
@@ -965,6 +1396,40 @@ fn entry_to_label(entry: &SessionEntry) -> String {
             format!("Session: {}", name.as_deref().unwrap_or("unnamed"))
         }
         SessionEntryKind::Custom { custom_type, .. } => format!("Custom: {custom_type}"),
+        SessionEntryKind::Usage { kind, model, .. } => {
+            let k = kind.as_deref().unwrap_or("usage");
+            let m = model.as_deref().unwrap_or("");
+            if m.is_empty() {
+                format!("Usage: {k}")
+            } else {
+                format!("Usage: {k} ({m})")
+            }
+        }
+        SessionEntryKind::CustomMessage { custom_type, content, .. } => {
+            let txt = content.text();
+            let line = txt.lines().next().unwrap_or("").trim();
+            if line.chars().count() > 40 {
+                format!("CustomMessage [{custom_type}]: {}...", line.chars().take(30).collect::<String>())
+            } else if line.is_empty() {
+                format!("CustomMessage [{custom_type}]")
+            } else {
+                format!("CustomMessage [{custom_type}]: {line}")
+            }
+        }
+        SessionEntryKind::ContextEdit { target_id, replacement } => {
+            if replacement.is_some() {
+                format!("ContextEdit: replace {target_id}")
+            } else {
+                format!("ContextEdit: hide {target_id}")
+            }
+        }
+        SessionEntryKind::Label { target_id, label } => {
+            if let Some(lbl) = label {
+                format!("Label: {lbl} -> {target_id}")
+            } else {
+                format!("Label: clear -> {target_id}")
+            }
+        }
     }
 }
 
@@ -1209,5 +1674,241 @@ mod tests {
         assert!(ts > 0);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn usage_custom_message_context_edit_and_label_roundtrip() {
+        let usage = mehh_ai::Usage {
+            input: 100,
+            output: 50,
+            cache_read: 20,
+            cache_write: 10,
+            total_tokens: 150,
+            cost: Default::default(),
+        };
+        let usage_entry = SessionEntry {
+            id: "entry_usage".to_string(),
+            parent_id: None,
+            timestamp: "2026-11-15T12:00:00.000Z".to_string(),
+            kind: SessionEntryKind::Usage {
+                kind: Some("cache_warm".to_string()),
+                provider: Some("anthropic".to_string()),
+                model: Some("claude-3-5-sonnet".to_string()),
+                usage: usage.clone(),
+                note: Some("prewarm".to_string()),
+            },
+        };
+        let json_usage = serde_json::to_string(&usage_entry).unwrap();
+        assert!(json_usage.contains(r#""type":"usage""#));
+        assert!(json_usage.contains(r#""kind":"cache_warm""#));
+        let de_usage: SessionEntry = serde_json::from_str(&json_usage).unwrap();
+        assert_eq!(de_usage.kind, usage_entry.kind);
+
+        let custom_msg_entry = SessionEntry {
+            id: "entry_custom".to_string(),
+            parent_id: Some("entry_usage".to_string()),
+            timestamp: "2026-11-15T12:01:00.000Z".to_string(),
+            kind: SessionEntryKind::CustomMessage {
+                display: Some(true),
+                custom_type: "notification".to_string(),
+                content: UserContent::Text("Build finished".to_string()),
+                details: Some(serde_json::json!({ "buildId": "123" })),
+            },
+        };
+        let json_custom = serde_json::to_string(&custom_msg_entry).unwrap();
+        assert!(json_custom.contains(r#""type":"custom_message""#));
+        assert!(json_custom.contains(r#""customType":"notification""#));
+        let de_custom: SessionEntry = serde_json::from_str(&json_custom).unwrap();
+        assert_eq!(de_custom.kind, custom_msg_entry.kind);
+
+        let context_edit_entry = SessionEntry {
+            id: "entry_edit".to_string(),
+            parent_id: Some("entry_custom".to_string()),
+            timestamp: "2026-11-15T12:02:00.000Z".to_string(),
+            kind: SessionEntryKind::ContextEdit {
+                target_id: "target_123".to_string(),
+                replacement: Some(ContextEditReplacement {
+                    content: ContextEditableContent::Text("Edited message content".to_string()),
+                }),
+            },
+        };
+        let json_edit = serde_json::to_string(&context_edit_entry).unwrap();
+        assert!(json_edit.contains(r#""type":"context_edit""#));
+        assert!(json_edit.contains(r#""targetId":"target_123""#));
+        let de_edit: SessionEntry = serde_json::from_str(&json_edit).unwrap();
+        assert_eq!(de_edit.kind, context_edit_entry.kind);
+
+        let label_entry = SessionEntry {
+            id: "entry_label".to_string(),
+            parent_id: Some("entry_edit".to_string()),
+            timestamp: "2026-11-15T12:03:00.000Z".to_string(),
+            kind: SessionEntryKind::Label {
+                target_id: "target_123".to_string(),
+                label: Some("checkpoint-1".to_string()),
+            },
+        };
+        let json_label = serde_json::to_string(&label_entry).unwrap();
+        assert!(json_label.contains(r#""type":"label""#));
+        assert!(json_label.contains(r#""targetId":"target_123""#));
+        assert!(json_label.contains(r#""label":"checkpoint-1""#));
+        let de_label: SessionEntry = serde_json::from_str(&json_label).unwrap();
+        assert_eq!(de_label.kind, label_entry.kind);
+    }
+
+    #[test]
+    fn context_edit_hides_and_replaces_without_mutating_tree() {
+        let mut session = SessionManager::in_memory(std::env::temp_dir());
+
+        let m1 = session
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("Message 1 to hide".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        let m2 = session
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("Message 2 to replace".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        let _m3 = session
+            .append_custom_message(
+                "custom_ext",
+                UserContent::Text("Custom 3 to keep".to_string()),
+                Some(true),
+                None,
+            )
+            .unwrap();
+
+        // 3 messages visible before edits
+        let msgs_before = session.build_context_messages();
+        assert_eq!(msgs_before.len(), 3);
+
+        // Append ContextEdit hiding m1 (replacement = None)
+        session.append_context_edit(&m1, None).unwrap();
+
+        // Append ContextEdit replacing m2 content
+        session
+            .append_context_edit(
+                &m2,
+                Some(ContextEditReplacement {
+                    content: ContextEditableContent::Text("Replaced Message 2".to_string()),
+                }),
+            )
+            .unwrap();
+
+        // Check context messages
+        let msgs_after = session.build_context_messages();
+        assert_eq!(msgs_after.len(), 2);
+        // m1 is hidden, so first message is m2 with replaced content
+        match &msgs_after[0] {
+            Message::User(u) => assert_eq!(u.content.text(), "Replaced Message 2"),
+            _ => panic!("Expected user message"),
+        }
+        // second message is m3 (custom message projected as User)
+        match &msgs_after[1] {
+            Message::User(u) => assert_eq!(u.content.text(), "Custom 3 to keep"),
+            _ => panic!("Expected user message from custom message"),
+        }
+
+        // Tree is intact (contains all entries: m1, m2, m3, edit1, edit2)
+        assert_eq!(session.entries().len(), 5);
+    }
+
+    #[test]
+    fn label_entries_track_latest_bookmark_per_target() {
+        let mut session = SessionManager::in_memory(std::env::temp_dir());
+
+        let m1 = session
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("Task 1".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        let m2 = session
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("Task 2".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        // Set label on m1
+        session.append_label(&m1, Some("v1.0".to_string())).unwrap();
+
+        let rpc_tree = session.build_rpc_tree();
+        assert_eq!(rpc_tree.len(), 1);
+        let root = &rpc_tree[0];
+        assert_eq!(root.id, m1);
+        assert_eq!(root.labels, vec!["v1.0".to_string()]);
+
+        // Overwrite label on m1 and set label on m2
+        session.append_label(&m1, Some("v2.0".to_string())).unwrap();
+        session.append_label(&m2, Some("feature".to_string())).unwrap();
+
+        let rpc_tree2 = session.build_rpc_tree();
+        assert_eq!(rpc_tree2[0].labels, vec!["v2.0".to_string()]);
+
+        // Clear label on m1 (None)
+        session.append_label(&m1, None).unwrap();
+        let rpc_tree3 = session.build_rpc_tree();
+        assert!(rpc_tree3[0].labels.is_empty());
+    }
+
+    #[test]
+    fn test_fork_at_rejects_unknown_target_entry_id() {
+        let temp = crate::TempTestDir::new("fork_reject");
+        let session = SessionManager::create_default_file(temp.path()).unwrap();
+        let res = session.fork_at(Some("non_existent_id"));
+        match res {
+            Err(e) => assert!(e.to_string().contains("Target entry ID not found in session: non_existent_id")),
+            Ok(_) => panic!("Expected fork_at to fail for non_existent_id"),
+        }
+    }
+
+    #[test]
+    fn test_list_sessions_reflects_latest_renamed_session_name() {
+        let temp = crate::TempTestDir::new("list_rename");
+        let mut session = SessionManager::create_default_file(temp.path()).unwrap();
+        session.set_session_name(Some("Original Name".to_string())).unwrap();
+        session.set_session_name(Some("Renamed Name".to_string())).unwrap();
+
+        let list = list_sessions(temp.path()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name.as_deref(), Some("Renamed Name"));
+    }
+
+    #[test]
+    fn test_list_sessions_skips_empty_user_message_for_first_prompt_and_trims_whitespace_name() {
+        let temp = crate::TempTestDir::new("list_empty_prompt");
+        let mut session = SessionManager::create_default_file(temp.path()).unwrap();
+        session.set_session_name(Some("   ".to_string())).unwrap();
+
+        // First user message is whitespace
+        session
+            .append_entry(SessionEntryKind::Message {
+                message: Message::User(UserMessage {
+                    content: UserContent::Text("   \n  ".to_string()),
+                    timestamp: now_ms(),
+                }),
+            })
+            .unwrap();
+
+        // Second user message has real text
+        session
+            .append_entry(SessionEntryKind::Message {
+                message: Message::User(UserMessage {
+                    content: UserContent::Text("Actual user goal here".to_string()),
+                    timestamp: now_ms(),
+                }),
+            })
+            .unwrap();
+
+        let list = list_sessions(temp.path()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name, None);
+        assert_eq!(list[0].first_prompt.as_deref(), Some("Actual user goal here"));
     }
 }

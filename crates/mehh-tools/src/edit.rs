@@ -39,6 +39,72 @@ struct MatchedEdit {
     new_text: String,
 }
 
+fn split_bom(s: &str) -> (&str, &str) {
+    if let Some(stripped) = s.strip_prefix('\u{feff}') {
+        ("\u{feff}", stripped)
+    } else {
+        ("", s)
+    }
+}
+
+fn apply_replacements_to_original(original: &str, replacements: &[MatchedEdit]) -> String {
+    let mut crlf_before = 0usize;
+    let crlf_indices: Vec<usize> = original
+        .match_indices("\r\n")
+        .map(|(idx, _)| idx)
+        .collect();
+    let mut next_crlf_idx = 0usize;
+
+    let mut to_original = |offset: usize| -> usize {
+        while next_crlf_idx < crlf_indices.len() && crlf_indices[next_crlf_idx] - crlf_before < offset {
+            crlf_before += 1;
+            next_crlf_idx += 1;
+        }
+        offset + crlf_before
+    };
+
+    let get_line_ending_at = |content: &str, offset: usize| -> &'static str {
+        let after = &content[offset..];
+        if let Some(lf_pos) = after.find('\n') {
+            let abs_lf = offset + lf_pos;
+            if abs_lf > 0 && content.as_bytes()[abs_lf - 1] == b'\r' {
+                return "\r\n";
+            } else {
+                return "\n";
+            }
+        }
+        if let Some(lf_pos) = content[..offset].rfind('\n') {
+            if lf_pos > 0 && content.as_bytes()[lf_pos - 1] == b'\r' {
+                return "\r\n";
+            } else {
+                return "\n";
+            }
+        }
+        if content.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        }
+    };
+
+    let mut parts = String::with_capacity(original.len());
+    let mut position = 0usize;
+
+    for m in replacements {
+        let start = to_original(m.start);
+        parts.push_str(&original[position..start]);
+        let ending = get_line_ending_at(original, start);
+        if ending == "\n" {
+            parts.push_str(&m.new_text);
+        } else {
+            parts.push_str(&m.new_text.replace('\n', ending));
+        }
+        position = to_original(m.end);
+    }
+    parts.push_str(&original[position..]);
+    parts
+}
+
 fn parse_edits(params: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<SingleEdit>, String> {
     let mut edits = Vec::new();
 
@@ -101,15 +167,24 @@ fn parse_edits(params: &serde_json::Map<String, serde_json::Value>) -> Result<Ve
     Ok(edits)
 }
 
+use crate::file_mutation_queue::with_file_mutation_queue;
+
 const CLOSEST_HINT_MIN_SCORE: f64 = 0.4;
 
 /// Normalizes CRLF line endings and strips trailing horizontal whitespace per line.
 pub fn normalize_for_fuzzy_match(s: &str) -> String {
-    s.replace("\r\n", "\n")
-        .split('\n')
-        .map(|line| line.trim_end_matches([' ', '\t']))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::with_capacity(s.len());
+    let mut first = true;
+    for line in s.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        let trimmed = line.trim_end_matches([' ', '\t']);
+        if !first {
+            out.push('\n');
+        }
+        first = false;
+        out.push_str(trimmed);
+    }
+    out
 }
 
 fn split_lines_with_offsets(s: &str) -> Vec<(usize, usize, &str)> {
@@ -130,9 +205,9 @@ fn find_fuzzy_matches(content: &str, old_norm: &str) -> Vec<(usize, usize)> {
     } else {
         old_norm
     };
-    let pat_lines: Vec<String> = pat_body
+    let pat_lines: Vec<&str> = pat_body
         .split('\n')
-        .map(|l| l.trim_end_matches([' ', '\t']).to_string())
+        .map(|l| l.trim_end_matches([' ', '\t']))
         .collect();
     let content_lines = split_lines_with_offsets(content);
 
@@ -142,13 +217,13 @@ fn find_fuzzy_matches(content: &str, old_norm: &str) -> Vec<(usize, usize)> {
     }
 
     if pat_lines.len() == 1 && !had_trailing_nl {
-        let pat = &pat_lines[0];
+        let pat = pat_lines[0];
         if pat.is_empty() {
             return matches;
         }
         for &(l_start, l_end, l_text) in &content_lines {
             let trimmed = l_text.trim_end_matches([' ', '\t']);
-            for (rel_idx, _) in trimmed.match_indices(pat.as_str()) {
+            for (rel_idx, _) in trimmed.match_indices(pat) {
                 let abs_start = l_start + rel_idx;
                 let abs_end = if rel_idx + pat.len() == trimmed.len() {
                     // Consume trailing whitespace on that line when matching up to line end
@@ -169,7 +244,7 @@ fn find_fuzzy_matches(content: &str, old_norm: &str) -> Vec<(usize, usize)> {
     for r in 0..=content_lines.len() - pat_lines.len() {
         let all_match = pat_lines.iter().enumerate().all(|(k, pat_line)| {
             let trimmed = content_lines[r + k].2.trim_end_matches([' ', '\t']);
-            trimmed == pat_line
+            trimmed == *pat_line
         });
         if all_match {
             let start = content_lines[r].0;
@@ -193,8 +268,10 @@ fn line_similarity(a: &str, b: &str) -> f64 {
         return 1.0;
     }
     if b.contains(a) || a.contains(b) {
-        let min_len = a.chars().count().min(b.chars().count()) as f64;
-        let max_len = a.chars().count().max(b.chars().count()) as f64;
+        let a_len = if a.is_ascii() { a.len() } else { a.chars().count() };
+        let b_len = if b.is_ascii() { b.len() } else { b.chars().count() };
+        let min_len = a_len.min(b_len) as f64;
+        let max_len = a_len.max(b_len) as f64;
         return (min_len / max_len).max(0.6);
     }
     let a_chars: Vec<char> = a.chars().collect();
@@ -222,10 +299,10 @@ fn closest_line_hint(content: &str, old_norm: &str) -> Option<String> {
             continue;
         }
         let score = line_similarity(target, candidate);
-        if score >= CLOSEST_HINT_MIN_SCORE {
-            if best.is_none_or(|(_, best_s, _)| score > best_s) {
-                best = Some((idx + 1, score, candidate));
-            }
+        if score >= CLOSEST_HINT_MIN_SCORE
+            && best.is_none_or(|(_, best_s, _)| score > best_s)
+        {
+            best = Some((idx + 1, score, candidate));
         }
     }
     best.map(|(line_num, _, preview)| {
@@ -306,122 +383,127 @@ impl AgentTool for EditTool {
         let edits = parse_edits(&params)?;
 
         let full_path = self.resolve_path(path_str);
-        if !full_path.exists() {
-            return Err(format!("File not found: {}", path_str));
-        }
+        with_file_mutation_queue(&full_path, async {
+            if !full_path.exists() {
+                return Err(format!("File not found: {}", path_str));
+            }
 
-        let raw_bytes = tokio::fs::read(&full_path)
-            .await
-            .map_err(|e| format!("Failed to read {}: {}", path_str, e))?;
+            let raw_bytes = tokio::fs::read(&full_path)
+                .await
+                .map_err(|e| format!("Failed to read {}: {}", path_str, e))?;
 
-        let raw_content = String::from_utf8(raw_bytes)
-            .map_err(|e| format!("File {} is not valid UTF-8: {}", path_str, e))?;
+            let raw_content = String::from_utf8(raw_bytes)
+                .map_err(|e| format!("File {} is not valid UTF-8: {}", path_str, e))?;
 
-        let is_crlf = raw_content.contains("\r\n");
-        let normalized_content = raw_content.replace("\r\n", "\n");
+            let (bom, content) = split_bom(&raw_content);
+            let normalized_content = content.replace("\r\n", "\n");
 
-        let mut matched_edits: Vec<MatchedEdit> = Vec::with_capacity(edits.len());
+            let mut matched_edits: Vec<MatchedEdit> = Vec::with_capacity(edits.len());
 
-        for (i, edit) in edits.iter().enumerate() {
-            let old_norm = edit.old_text.replace("\r\n", "\n");
-            let new_norm = edit.new_text.replace("\r\n", "\n");
+            for (i, edit) in edits.iter().enumerate() {
+                let old_norm = edit.old_text.replace("\r\n", "\n");
+                let new_norm = edit.new_text.replace("\r\n", "\n");
 
-            let exact_matches: Vec<(usize, usize)> = normalized_content
-                .match_indices(&old_norm)
-                .map(|(start, _)| (start, start + old_norm.len()))
-                .collect();
+                let exact_matches: Vec<(usize, usize)> = normalized_content
+                    .match_indices(&old_norm)
+                    .map(|(start, _)| (start, start + old_norm.len()))
+                    .collect();
 
-            let (start, end) = if exact_matches.len() == 1 {
-                exact_matches[0]
-            } else if exact_matches.len() > 1 {
-                return Err(format!(
-                    "Found {} occurrences of edits[{}] in {}. Each oldText must be unique. Please provide more context to make it unique.",
-                    exact_matches.len(), i, path_str
-                ));
-            } else {
-                let fuzzy_matches = find_fuzzy_matches(&normalized_content, &old_norm);
-                if fuzzy_matches.len() == 1 {
-                    fuzzy_matches[0]
-                } else if fuzzy_matches.len() > 1 {
+                let (start, end) = if exact_matches.len() == 1 {
+                    exact_matches[0]
+                } else if exact_matches.len() > 1 {
                     return Err(format!(
-                        "Found {} fuzzy matches for edits[{}] in {}. Each oldText must be unique. Please provide more context to make it unique.",
-                        fuzzy_matches.len(), i, path_str
+                        "Found {} occurrences of edits[{}] in {}. Each oldText must be unique. Please provide more context to make it unique.",
+                        exact_matches.len(), i, path_str
                     ));
                 } else {
-                    let hint = closest_line_hint(&normalized_content, &old_norm)
-                        .map(|h| format!("\n{h}"))
-                        .unwrap_or_default();
+                    let fuzzy_matches = find_fuzzy_matches(&normalized_content, &old_norm);
+                    if fuzzy_matches.len() == 1 {
+                        fuzzy_matches[0]
+                    } else if fuzzy_matches.len() > 1 {
+                        return Err(format!(
+                            "Found {} fuzzy matches for edits[{}] in {}. Each oldText must be unique. Please provide more context to make it unique.",
+                            fuzzy_matches.len(), i, path_str
+                        ));
+                    } else {
+                        let hint = closest_line_hint(&normalized_content, &old_norm)
+                            .map(|h| format!("\n{h}"))
+                            .unwrap_or_default();
+                        return Err(format!(
+                            "Could not find edits[{}] in {}. The oldText must match exact or trailing-whitespace-normalized text.{hint}",
+                            i, path_str
+                        ));
+                    }
+                };
+
+                matched_edits.push(MatchedEdit {
+                    index: i,
+                    start,
+                    end,
+                    new_text: new_norm,
+                });
+            }
+
+            matched_edits.sort_by_key(|m| m.start);
+            for i in 1..matched_edits.len() {
+                let prev = &matched_edits[i - 1];
+                let curr = &matched_edits[i];
+                if prev.end > curr.start {
                     return Err(format!(
-                        "Could not find edits[{}] in {}. The oldText must match exact or trailing-whitespace-normalized text.{hint}",
-                        i, path_str
+                        "edits[{}] and edits[{}] overlap in {}. Merge them into one edit or target disjoint regions.",
+                        prev.index, curr.index, path_str
                     ));
                 }
-            };
+            }
 
-            matched_edits.push(MatchedEdit {
-                index: i,
-                start,
-                end,
-                new_text: new_norm,
-            });
-        }
+            let mut new_normalized = String::with_capacity(normalized_content.len());
+            let mut last_idx = 0;
+            for m in &matched_edits {
+                new_normalized.push_str(&normalized_content[last_idx..m.start]);
+                new_normalized.push_str(&m.new_text);
+                last_idx = m.end;
+            }
+            new_normalized.push_str(&normalized_content[last_idx..]);
 
-        matched_edits.sort_by_key(|m| m.start);
-        for i in 1..matched_edits.len() {
-            let prev = &matched_edits[i - 1];
-            let curr = &matched_edits[i];
-            if prev.end > curr.start {
+            if new_normalized == normalized_content {
                 return Err(format!(
-                    "edits[{}] and edits[{}] overlap in {}. Merge them into one edit or target disjoint regions.",
-                    prev.index, curr.index, path_str
+                    "No changes made to {}. Replacement produced identical content.",
+                    path_str
                 ));
             }
-        }
 
-        let mut new_normalized = String::with_capacity(normalized_content.len());
-        let mut last_idx = 0;
-        for m in &matched_edits {
-            new_normalized.push_str(&normalized_content[last_idx..m.start]);
-            new_normalized.push_str(&m.new_text);
-            last_idx = m.end;
-        }
-        new_normalized.push_str(&normalized_content[last_idx..]);
+            let final_body = if content == normalized_content {
+                new_normalized
+            } else {
+                apply_replacements_to_original(content, &matched_edits)
+            };
+            let final_content = format!("{bom}{final_body}");
 
-        if new_normalized == normalized_content {
-            return Err(format!(
-                "No changes made to {}. Replacement produced identical content.",
-                path_str
-            ));
-        }
+            tokio::fs::write(&full_path, final_content.as_bytes())
+                .await
+                .map_err(|e| format!("Failed to write {}: {}", path_str, e))?;
 
-        let final_content = if is_crlf {
-            new_normalized.replace('\n', "\r\n")
-        } else {
-            new_normalized
-        };
+            let diff = similar::TextDiff::from_lines(&raw_content, &final_content)
+                .unified_diff()
+                .context_radius(3)
+                .header(path_str, path_str)
+                .to_string();
 
-        tokio::fs::write(&full_path, final_content.as_bytes())
-            .await
-            .map_err(|e| format!("Failed to write {}: {}", path_str, e))?;
+            let details = json!({
+                "diff": diff,
+                "path": path_str,
+            });
 
-        let diff = similar::TextDiff::from_lines(&raw_content, &final_content)
-            .unified_diff()
-            .context_radius(3)
-            .header(path_str, path_str)
-            .to_string();
-
-        let details = json!({
-            "diff": diff,
-            "path": path_str,
-        });
-
-        Ok(AgentToolResult {
-            content: vec![ToolResultContentBlock::Text(TextContent {
-                text: format!("Successfully edited {}.\n\n{}", path_str, diff),
-                text_signature: None,
-            })],
-            details: Some(details),
+            Ok(AgentToolResult {
+                content: vec![ToolResultContentBlock::Text(TextContent {
+                    text: format!("Successfully edited {}.\n\n{}", path_str, diff),
+                    text_signature: None,
+                })],
+                details: Some(details),
+                ..Default::default()
+            })
         })
+        .await
     }
 }
 
@@ -487,5 +569,48 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err_miss.contains("Closest match near line 1"));
+    }
+
+    #[tokio::test]
+    async fn concurrent_edits_on_same_file_do_not_clobber() {
+        let temp_dir = crate::TempTestDir::new("concurrent_edits");
+        let file = temp_dir.path().join("concurrent.txt");
+        std::fs::write(&file, "SECTION_A_START\nalpha\nSECTION_A_END\nSECTION_B_START\nbeta\nSECTION_B_END\n").unwrap();
+
+        let tool = EditTool::new(temp_dir.path().to_path_buf());
+        let tool_a = tool.clone();
+        let tool_b = tool.clone();
+
+        let task_a = tokio::spawn(async move {
+            let params = serde_json::json!({
+                "path": "concurrent.txt",
+                "oldText": "alpha",
+                "newText": "ALPHA_EDITED"
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            tool_a.execute("tc_a", params, CancellationToken::new(), None).await
+        });
+
+        let task_b = tokio::spawn(async move {
+            let params = serde_json::json!({
+                "path": "concurrent.txt",
+                "oldText": "beta",
+                "newText": "BETA_EDITED"
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            tool_b.execute("tc_b", params, CancellationToken::new(), None).await
+        });
+
+        let (res_a, res_b) = tokio::join!(task_a, task_b);
+        assert!(res_a.unwrap().is_ok());
+        assert!(res_b.unwrap().is_ok());
+
+        let final_content = std::fs::read_to_string(&file).unwrap();
+        assert!(final_content.contains("ALPHA_EDITED"));
+        assert!(final_content.contains("BETA_EDITED"));
     }
 }

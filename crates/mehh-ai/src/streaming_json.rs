@@ -34,12 +34,11 @@ pub fn repair_json(json: &str) -> String {
                 Some('u') => {
                     let next_byte_idx = chars.peek().unwrap().0;
                     let remaining = &json[next_byte_idx..];
-                    let hex_chars: Vec<char> = remaining.chars().skip(1).take(4).collect();
-                    if hex_chars.len() == 4 && hex_chars.iter().all(|c| c.is_ascii_hexdigit()) {
-                        repaired.push_str("\\u");
-                        for c in &hex_chars {
-                            repaired.push(*c);
-                        }
+                    if remaining.len() >= 5
+                        && remaining.as_bytes()[1..5].iter().all(|b| b.is_ascii_hexdigit())
+                    {
+                        repaired.push('\\');
+                        repaired.push_str(&remaining[..5]);
                         for _ in 0..5 {
                             chars.next();
                         }

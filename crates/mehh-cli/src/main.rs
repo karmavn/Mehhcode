@@ -2,12 +2,16 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use clap::Parser;
-use mehh_ai::{catalog, faux, LlmProvider, Model, ModelCost, ThinkingLevel};
+use mehh_ai::{
+    catalog, faux, ImageContent, LlmProvider, Model, ModelCost, TextContent, ThinkingLevel,
+    UserContentBlock,
+};
 use mehh_coding_agent::auth::resolve_api_key_async;
+use mehh_coding_agent::base64_encode;
 use mehh_coding_agent::models_config::ModelRegistry;
-use mehh_coding_agent::trust::resolve_project_trust;
+use mehh_coding_agent::trust::{resolve_project_trust_with_override, TrustOverride};
 use mehh_coding_agent::{
-    list_sessions, perform_login, perform_logout, rpc, run_interactive_mode, run_print_mode,
+    list_sessions, perform_login, perform_logout, rpc, run_interactive_mode, run_print_mode_content,
     AgentSession, McpManager, OutputMode, SessionManager, SessionSummary, Settings,
     SettingsManager,
 };
@@ -79,6 +83,203 @@ pub struct CliArgs {
 
     #[arg(long = "trust")]
     pub trust: bool,
+
+    #[arg(long = "name", value_name = "NAME")]
+    pub name: Option<String>,
+
+    #[arg(long = "session-id", value_name = "ID")]
+    pub session_id: Option<String>,
+
+    #[arg(long = "session-dir", value_name = "PATH")]
+    pub session_dir: Option<PathBuf>,
+
+    #[arg(long = "fork", value_name = "ENTRY_ID")]
+    pub fork: Option<String>,
+
+    #[arg(long = "models", value_name = "MODELS")]
+    pub models: Option<String>,
+
+    #[arg(long = "tools", value_name = "TOOLS")]
+    pub tools: Option<String>,
+
+    #[arg(long = "exclude-tools", value_name = "TOOLS")]
+    pub exclude_tools: Option<String>,
+
+    #[arg(long = "no-builtin-tools")]
+    pub no_builtin_tools: bool,
+
+    #[arg(long = "export", value_name = "SESSION_FILE")]
+    pub export: Option<PathBuf>,
+
+    #[arg(long = "skills")]
+    pub skills: bool,
+
+    #[arg(long = "no-skills")]
+    pub no_skills: bool,
+
+    #[arg(long = "prompt-templates")]
+    pub prompt_templates: bool,
+
+    #[arg(long = "no-prompt-templates")]
+    pub no_prompt_templates: bool,
+
+    #[arg(long = "use-theme", value_name = "THEME")]
+    pub use_theme: Option<String>,
+
+    #[arg(long = "no-themes")]
+    pub no_themes: bool,
+
+    #[arg(long = "no-context-files")]
+    pub no_context_files: bool,
+
+    #[arg(short = 'v', long = "verbose")]
+    pub verbose: bool,
+
+    #[arg(long = "approve")]
+    pub approve: bool,
+
+    #[arg(long = "no-approve")]
+    pub no_approve: bool,
+}
+
+impl CliArgs {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if (self.approve || self.trust) && self.no_approve {
+            anyhow::bail!("Cannot specify both --approve/--trust and --no-approve");
+        }
+        if self.no_session
+            && (self.continue_session || self.resume.is_some() || self.session.is_some())
+        {
+            anyhow::bail!(
+                "Cannot specify --no-session with session resumption or session file flags"
+            );
+        }
+        if self.continue_session && self.session.is_some() {
+            anyhow::bail!("Cannot specify both -c/--continue and --session");
+        }
+        if self.skills && self.no_skills {
+            anyhow::bail!("Cannot specify both --skills and --no-skills");
+        }
+        if self.prompt_templates && self.no_prompt_templates {
+            anyhow::bail!("Cannot specify both --prompt-templates and --no-prompt-templates");
+        }
+        if self.use_theme.is_some() && self.no_themes {
+            anyhow::bail!("Cannot specify both --use-theme and --no-themes");
+        }
+        Ok(())
+    }
+
+    pub fn trust_override(&self) -> TrustOverride {
+        if self.no_approve {
+            TrustOverride::NoApprove
+        } else if self.approve || self.trust {
+            TrustOverride::Approve
+        } else {
+            TrustOverride::None
+        }
+    }
+}
+
+pub fn resolve_cli_tools(
+    args: &CliArgs,
+    cwd: PathBuf,
+) -> anyhow::Result<Vec<Arc<dyn mehh_agent::AgentTool>>> {
+    if args.no_tools || args.no_builtin_tools {
+        return Ok(Vec::new());
+    }
+    let include = args.tools.as_deref().map(|s| {
+        s.split(',')
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .collect::<Vec<_>>()
+    });
+    let exclude = args
+        .exclude_tools
+        .as_deref()
+        .map(|s| {
+            s.split(',')
+                .map(|t| t.trim().to_string())
+                .filter(|t| !t.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    mehh_tools::select_coding_tools(cwd, include.as_deref(), &exclude)
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcessedPromptArgs {
+    pub text: String,
+    pub blocks: Vec<UserContentBlock>,
+}
+
+pub fn process_file_arguments(cwd: &Path, args: &[String]) -> anyhow::Result<ProcessedPromptArgs> {
+    let mut text_parts = Vec::new();
+    let mut blocks = Vec::new();
+
+    for arg in args {
+        if let Some(path_str) = arg.strip_prefix('@') {
+            let p = Path::new(path_str);
+            let full_path = if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                cwd.join(p)
+            };
+
+            if full_path.is_file() {
+                let ext = full_path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+
+                if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+                    let bytes = std::fs::read(&full_path)?;
+                    let mime_type = match ext.as_str() {
+                        "png" => "image/png",
+                        "jpg" | "jpeg" => "image/jpeg",
+                        "gif" => "image/gif",
+                        "webp" => "image/webp",
+                        _ => "application/octet-stream",
+                    };
+                    let b64 = base64_encode(&bytes);
+                    blocks.push(UserContentBlock::Image(ImageContent {
+                        data: b64,
+                        mime_type: mime_type.to_string(),
+                    }));
+                    continue;
+                } else {
+                    let bytes = std::fs::read(&full_path)?;
+                    let raw = String::from_utf8_lossy(&bytes);
+                    let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
+                    let tag = format!("<file name=\"{path_str}\">\n{clean}\n</file>");
+                    text_parts.push(tag);
+                    continue;
+                }
+            }
+        }
+        text_parts.push(arg.clone());
+    }
+
+    let text = text_parts.join(" ");
+    if !text.is_empty() {
+        blocks.insert(
+            0,
+            UserContentBlock::Text(TextContent {
+                text: text.clone(),
+                text_signature: None,
+            }),
+        );
+    }
+
+    Ok(ProcessedPromptArgs { text, blocks })
+}
+
+pub fn handle_export(
+    input_file: &Path,
+    output_file: Option<&Path>,
+    cwd: &Path,
+) -> anyhow::Result<()> {
+    mehh_coding_agent::session::export_session(input_file, output_file, cwd)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,11 +465,12 @@ pub fn resolve_or_custom_model_with_registry(
             return None;
         }
 
-        let reasoning = id.starts_with("o1")
-            || id.starts_with("o3")
-            || id.starts_with("o4")
-            || id.contains("claude")
-            || id.contains("gemini-2.5");
+        let lower_id = id.to_ascii_lowercase();
+        let reasoning = lower_id.starts_with("o1")
+            || lower_id.starts_with("o3")
+            || lower_id.starts_with("o4")
+            || lower_id.contains("claude")
+            || lower_id.contains("gemini-2.5");
 
         Some(Model {
             id: id.clone(),
@@ -346,7 +548,7 @@ pub fn resolve_resume_path(
     }
 
     let candidate = PathBuf::from(trimmed);
-    if candidate.exists() {
+    if candidate.is_file() {
         return Ok(candidate);
     }
 
@@ -434,33 +636,45 @@ pub fn prompt_session_selection(sessions: &[SessionSummary]) -> anyhow::Result<P
 
 /// Selects the session manager for this run, honouring the session related flags.
 pub fn resolve_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<SessionManager> {
-    if args.no_session {
-        return create_session_manager(true, None, cwd);
-    }
-    if let Some(path) = args.session.as_deref() {
-        return create_session_manager(false, Some(path), cwd);
-    }
-    if args.continue_session {
+    let mut sm = if args.no_session {
+        create_session_manager(true, None, cwd)?
+    } else if let Some(path) = args.session.as_deref() {
+        create_session_manager(false, Some(path), cwd)?
+    } else if args.continue_session {
         let sessions = list_sessions(cwd)?;
         let latest = sessions.first().ok_or_else(|| {
             anyhow::anyhow!("No previous session found for {}", cwd.display())
         })?;
-        return create_session_manager(false, Some(&latest.path), cwd);
-    }
-    if let Some(spec) = args.resume.as_ref() {
+        create_session_manager(false, Some(&latest.path), cwd)?
+    } else if let Some(spec) = args.resume.as_ref() {
         let sessions = list_sessions(cwd)?;
         let path = match spec {
             Some(target) => resolve_resume_path(&sessions, target)?,
             None => prompt_session_selection(&sessions)?,
         };
-        return create_session_manager(false, Some(&path), cwd);
+        create_session_manager(false, Some(&path), cwd)?
+    } else if let Some(dir) = args.session_dir.as_deref() {
+        let ts = mehh_ai::now_ms();
+        let sid = args.session_id.as_deref().unwrap_or("default");
+        let path = dir.join(format!("{ts}_{sid}.jsonl"));
+        SessionManager::open_file(path, cwd)?
+    } else {
+        create_session_manager(false, None, cwd)?
+    };
+
+    if let Some(ref fork_entry_id) = args.fork {
+        sm = sm.fork_at(Some(fork_entry_id.as_str()))?;
     }
-    create_session_manager(false, None, cwd)
+    if let Some(ref name) = args.name {
+        sm.set_session_name(Some(name.clone()))?;
+    }
+    Ok(sm)
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
+    args.validate()?;
 
     // Validate CLI mode and thinking level early before loading sessions, credentials, or MCP.
     let cli_mode = parse_cli_mode(&args.mode)?;
@@ -486,6 +700,13 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    let cwd = std::env::current_dir()?;
+
+    if let Some(ref export_input) = args.export {
+        let export_output = args.prompt.first().map(Path::new);
+        return handle_export(export_input, export_output, &cwd);
+    }
+
     let model_registry = ModelRegistry::load_default()?;
     if args.list_models {
         for m in model_registry.models() {
@@ -497,9 +718,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let cwd = std::env::current_dir()?;
     let is_interactive = should_run_interactive(&args, cli_mode, io::stdin().is_terminal());
-    let trusted = resolve_project_trust(&cwd, args.trust, is_interactive)?;
+    let trusted = resolve_project_trust_with_override(&cwd, args.trust_override(), is_interactive)?;
     let settings = SettingsManager::try_load_with_trust(&cwd, trusted)?;
 
     let (model, provider): (Model, Arc<dyn LlmProvider>) = {
@@ -552,14 +772,69 @@ async fn main() -> anyhow::Result<()> {
     let mut agent_session = AgentSession::new_with_trust(
         cwd.clone(),
         model.clone(),
-        provider,
+        provider.clone(),
         session_mgr,
         settings,
         trusted,
     );
 
-    if args.no_tools {
-        agent_session.set_tools(Vec::new());
+    let mut cli_tools = resolve_cli_tools(&args, cwd.clone())?;
+    let should_include_subagent = if args.no_tools || args.no_builtin_tools {
+        false
+    } else if let Some(ref inc) = args.tools {
+        inc.split(',').any(|s| s.trim() == "subagent")
+    } else {
+        !args
+            .exclude_tools
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .any(|s| s.trim() == "subagent")
+    };
+
+    if should_include_subagent {
+        let base_tools = cli_tools.clone();
+        let subagent = Arc::new(mehh_coding_agent::subagent::SubagentTool::new(
+            cwd.clone(),
+            model.clone(),
+            provider.clone(),
+            None,
+            base_tools,
+            0,
+        ));
+        cli_tools.push(subagent);
+    }
+
+    agent_session.set_tools(cli_tools);
+
+    if let Some(ref models_str) = args.models {
+        let mut resolved = Vec::new();
+        for token in models_str.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
+            let parts: Vec<&str> = token.split('/').collect();
+            let model_opt = if parts.len() == 2 {
+                model_registry.resolve_exact(parts[0], parts[1])
+            } else {
+                model_registry.resolve(token, None)
+            };
+            if let Some(m) = model_opt {
+                resolved.push(m);
+            }
+        }
+        agent_session.set_scoped_models(resolved);
+    }
+
+    if args.no_skills {
+        agent_session.skills.clear();
+        agent_session.rebuild_system_prompt();
+    }
+    if args.no_prompt_templates {
+        agent_session.prompt_templates.clear();
+    }
+
+    if args.no_themes {
+        agent_session.settings.theme = Some("dark".to_string());
+    } else if let Some(ref th) = args.use_theme {
+        agent_session.settings.theme = Some(th.clone());
     }
 
     // Resolve the key asynchronously so expired OAuth tokens are refreshed first.
@@ -655,20 +930,47 @@ async fn run_print_flow(
     args: &CliArgs,
     output_mode: OutputMode,
 ) -> anyhow::Result<()> {
-    let mut prompt_text = args.prompt.join(" ");
-    if prompt_text.trim().is_empty() && !io::stdin().is_terminal() {
+    let processed = if args.no_context_files {
+        ProcessedPromptArgs {
+            text: args.prompt.join(" "),
+            blocks: Vec::new(),
+        }
+    } else {
+        process_file_arguments(&agent_session.cwd, &args.prompt)?
+    };
+    let mut prompt_text = processed.text;
+    let mut blocks = processed.blocks;
+    if prompt_text.trim().is_empty() && blocks.is_empty() && !io::stdin().is_terminal() {
         let mut stdin_input = String::new();
         io::stdin().read_to_string(&mut stdin_input)?;
-        prompt_text = stdin_input;
+        prompt_text = stdin_input.trim_start_matches('\u{feff}').to_string();
     }
 
-    if prompt_text.trim().is_empty() {
+    if prompt_text.trim().is_empty() && blocks.is_empty() {
         anyhow::bail!(
             "Prompt is required. Pass a prompt argument, pipe input via stdin, or use --mode rpc."
         );
     }
 
-    run_print_mode(agent_session, &prompt_text, output_mode).await?;
+    let user_content = if blocks.is_empty() {
+        mehh_ai::UserContent::Text(prompt_text)
+    } else {
+        if !prompt_text.trim().is_empty() {
+            let has_text = blocks.iter().any(|b| matches!(b, mehh_ai::UserContentBlock::Text(_)));
+            if !has_text {
+                blocks.insert(
+                    0,
+                    mehh_ai::UserContentBlock::Text(mehh_ai::TextContent {
+                        text: prompt_text,
+                        text_signature: None,
+                    }),
+                );
+            }
+        }
+        mehh_ai::UserContent::Blocks(blocks)
+    };
+
+    run_print_mode_content(agent_session, user_content, output_mode).await?;
     Ok(())
 }
 
@@ -1392,4 +1694,146 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(dir);
     }
+
+    #[test]
+    fn cli_rejects_conflicting_approve_and_no_approve() {
+        let args1 = CliArgs::try_parse_from(["mehh", "--approve", "--no-approve"]).unwrap();
+        assert!(args1.validate().is_err());
+
+        let args2 = CliArgs::try_parse_from(["mehh", "--trust", "--no-approve"]).unwrap();
+        assert!(args2.validate().is_err());
+
+        let args3 = CliArgs::try_parse_from(["mehh", "--approve"]).unwrap();
+        assert!(args3.validate().is_ok());
+        assert_eq!(args3.trust_override(), mehh_coding_agent::TrustOverride::Approve);
+
+        let args4 = CliArgs::try_parse_from(["mehh", "--no-approve"]).unwrap();
+        assert!(args4.validate().is_ok());
+        assert_eq!(args4.trust_override(), mehh_coding_agent::TrustOverride::NoApprove);
+    }
+
+    #[test]
+    fn cli_parses_export_input_and_optional_output() {
+        let args = CliArgs::try_parse_from(["mehh", "--export", "in_session.jsonl", "out.jsonl"]).unwrap();
+        assert_eq!(args.export, Some(PathBuf::from("in_session.jsonl")));
+        assert_eq!(args.prompt, vec!["out.jsonl"]);
+
+        let args_no_out = CliArgs::try_parse_from(["mehh", "--export", "in_session.jsonl"]).unwrap();
+        assert_eq!(args_no_out.export, Some(PathBuf::from("in_session.jsonl")));
+        assert!(args_no_out.prompt.is_empty());
+    }
+
+    #[test]
+    fn tool_selection_flags_respect_tools_exclude_tools_and_no_builtin_tools() {
+        let temp_dir = make_temp_dir("mehh_tools_test");
+
+        // 1. Default tools (7 tools, powershell is opt-in)
+        let args_def = CliArgs::try_parse_from(["mehh"]).unwrap();
+        let tools_def = resolve_cli_tools(&args_def, temp_dir.clone()).unwrap();
+        assert_eq!(tools_def.len(), 7);
+        assert!(!tools_def.iter().any(|t| t.name() == "powershell"));
+
+        // 2. Opt-in powershell via --tools
+        let args_ps = CliArgs::try_parse_from(["mehh", "--tools", "powershell"]).unwrap();
+        let tools_ps = resolve_cli_tools(&args_ps, temp_dir.clone()).unwrap();
+        assert_eq!(tools_ps.len(), 1);
+        assert_eq!(tools_ps[0].name(), "powershell");
+
+        // 3. Exclude tools
+        let args_ex = CliArgs::try_parse_from(["mehh", "--exclude-tools", "bash,edit"]).unwrap();
+        let tools_ex = resolve_cli_tools(&args_ex, temp_dir.clone()).unwrap();
+        assert_eq!(tools_ex.len(), 5);
+        assert!(!tools_ex.iter().any(|t| t.name() == "bash" || t.name() == "edit"));
+
+        // 4. --no-builtin-tools
+        let args_nobuiltin = CliArgs::try_parse_from(["mehh", "--no-builtin-tools"]).unwrap();
+        let tools_nobuiltin = resolve_cli_tools(&args_nobuiltin, temp_dir.clone()).unwrap();
+        assert!(tools_nobuiltin.is_empty());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn process_file_arguments_expands_at_text_with_bom_strip_and_at_images() {
+        let temp_dir = make_temp_dir("mehh_file_args");
+
+        let notes_path = temp_dir.join("notes.txt");
+        let bom_notes = "\u{feff}notes content".to_string();
+        std::fs::write(&notes_path, bom_notes.as_bytes()).unwrap();
+
+        let img_path = temp_dir.join("sample.png");
+        let fake_png_bytes = b"\x89PNG\r\n\x1a\nfakeimagebytes";
+        std::fs::write(&img_path, fake_png_bytes).unwrap();
+
+        let args = vec![
+            "summarize".to_string(),
+            "@notes.txt".to_string(),
+            "with".to_string(),
+            "@sample.png".to_string(),
+        ];
+
+        let processed = process_file_arguments(&temp_dir, &args).unwrap();
+        assert!(processed.text.contains("summarize"));
+        assert!(processed.text.contains("<file name=\"notes.txt\">"));
+        assert!(processed.text.contains("notes content"));
+        assert!(processed.text.contains("</file>"));
+        assert!(processed.text.contains("with"));
+        assert!(!processed.text.contains('\u{feff}'));
+
+        let img_block = processed.blocks.iter().find(|b| matches!(b, mehh_ai::UserContentBlock::Image(_)));
+        assert!(img_block.is_some());
+        if let Some(mehh_ai::UserContentBlock::Image(img)) = img_block {
+            assert_eq!(img.mime_type, "image/png");
+            assert_eq!(img.data, mehh_coding_agent::base64_encode(fake_png_bytes));
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn cli_rejects_conflicting_session_and_feature_flags() {
+        let args_no_sess_cont = CliArgs::try_parse_from(["mehh", "--no-session", "-c"]).unwrap();
+        assert!(args_no_sess_cont.validate().is_err());
+
+        let args_no_sess_resume = CliArgs::try_parse_from(["mehh", "--no-session", "-r"]).unwrap();
+        assert!(args_no_sess_resume.validate().is_err());
+
+        let args_no_sess_sess = CliArgs::try_parse_from(["mehh", "--no-session", "--session", "foo.jsonl"]).unwrap();
+        assert!(args_no_sess_sess.validate().is_err());
+
+        let args_cont_sess = CliArgs::try_parse_from(["mehh", "-c", "--session", "foo.jsonl"]).unwrap();
+        assert!(args_cont_sess.validate().is_err());
+
+        let args_skills = CliArgs::try_parse_from(["mehh", "--skills", "--no-skills"]).unwrap();
+        assert!(args_skills.validate().is_err());
+
+        let args_prompt_tpl = CliArgs::try_parse_from(["mehh", "--prompt-templates", "--no-prompt-templates"]).unwrap();
+        assert!(args_prompt_tpl.validate().is_err());
+
+        let args_theme = CliArgs::try_parse_from(["mehh", "--use-theme", "dark", "--no-themes"]).unwrap();
+        assert!(args_theme.validate().is_err());
+    }
+
+    #[test]
+    fn resolve_resume_path_rejects_directories() {
+        let temp_dir = make_temp_dir("mehh_resume_dir");
+        let sub_dir = temp_dir.join("not_a_session_dir");
+        std::fs::create_dir_all(&sub_dir).unwrap();
+
+        let sessions = vec![];
+        let res = resolve_resume_path(&sessions, sub_dir.to_str().unwrap());
+        assert!(res.is_err(), "resolve_resume_path must not return a directory: {:?}", res);
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn resolve_or_custom_model_reasoning_case_insensitive() {
+        let m = resolve_or_custom_model(Some("O1-preview"), Some("openai"), None).unwrap();
+        assert!(m.reasoning, "O1-preview must have reasoning: true regardless of casing");
+
+        let m_claude = resolve_or_custom_model(Some("Claude-3-7-sonnet"), Some("anthropic"), None).unwrap();
+        assert!(m_claude.reasoning, "Claude-3-7-sonnet must have reasoning: true regardless of casing");
+    }
 }
+

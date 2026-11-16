@@ -1,12 +1,12 @@
 {
     "label":  "baseline",
-    "measured_at":  "2026-11-15T06:38:37.4770280+07:00",
-    "machine":  "DESKTOP-DC42MTS",
-    "cpu_count":  2,
-    "cargo":  "cargo 1.100.0 (3acc79c0c 2026-11-05)",
-    "rustc":  "rustc 1.100.0 (0ef1bc386 2026-11-09)",
-    "release_build_seconds":  1.7,
-    "release_binary_bytes":  24236071,
-    "test_seconds":  2.9,
-    "test_summary":  "test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s | test result: ok. 59 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s | test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s | test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s | test result: FAILED. 83 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.97s"
+    "measured_at":  "2026-11-15T23:09:28.9498534+07:00",
+    "machine":  "DESKTOP-FCLCS0H",
+    "cpu_count":  8,
+    "cargo":  "cargo 1.99.1 (5f94df478 2026-08-27)",
+    "rustc":  "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "release_build_seconds":  1.4,
+    "release_binary_bytes":  16907264,
+    "test_seconds":  14.6,
+    "test_summary":  "test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s | test result: ok. 95 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s | test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s | test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s | test result: ok. 104 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 3.14s | test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.17s | test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.06s | test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
 }

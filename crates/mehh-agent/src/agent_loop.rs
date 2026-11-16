@@ -15,6 +15,9 @@ use crate::types::{
 /// Default upper bound on assistant turns per `run_agent_loop` invocation.
 pub const DEFAULT_MAX_AGENT_TURNS: usize = 200;
 
+/// Shared thread-safe handle to dynamic tools list.
+pub type DynamicToolsList = Arc<RwLock<Vec<Arc<dyn AgentTool>>>>;
+
 #[derive(Clone)]
 pub struct AgentLoopConfig {
     pub model: Model,
@@ -22,7 +25,7 @@ pub struct AgentLoopConfig {
     pub stream_options: StreamOptions,
     pub system_prompt: Option<String>,
     pub tools: Vec<Arc<dyn AgentTool>>,
-    pub dynamic_tools: Option<Arc<RwLock<Vec<Arc<dyn AgentTool>>>>>,
+    pub dynamic_tools: Option<DynamicToolsList>,
     pub max_turns: Option<usize>,
     pub steering_queue: Arc<Mutex<VecDeque<Message>>>,
     pub follow_up_queue: Arc<Mutex<VecDeque<Message>>>,
@@ -30,6 +33,10 @@ pub struct AgentLoopConfig {
     pub follow_up_mode: QueueMode,
     pub before_tool_call: Option<BeforeToolCallHook>,
     pub after_tool_call: Option<AfterToolCallHook>,
+    pub prepare_request: Option<crate::types::PrepareRequestHook>,
+    pub prepare_next_turn: Option<crate::types::PrepareNextTurnHook>,
+    pub transform_context: Option<crate::types::TransformContextHook>,
+    pub finish_turn: Option<crate::types::FinishTurnHook>,
     pub cancel: CancellationToken,
 }
 
@@ -49,6 +56,10 @@ impl AgentLoopConfig {
             follow_up_mode: QueueMode::OneAtATime,
             before_tool_call: None,
             after_tool_call: None,
+            prepare_request: None,
+            prepare_next_turn: None,
+            transform_context: None,
+            finish_turn: None,
             cancel: CancellationToken::new(),
         }
     }
@@ -93,6 +104,8 @@ pub async fn run_agent_loop(
     let mut current_messages = history;
     let mut new_messages: Vec<Message> = Vec::new();
     let mut turns_completed: usize = 0;
+    let mut current_model = config.model.clone();
+    let mut current_thinking_level = config.stream_options.reasoning;
 
     emit(AgentEvent::AgentStart);
     if config.max_turns == Some(0) || config.cancel.is_cancelled() {
@@ -113,6 +126,7 @@ pub async fn run_agent_loop(
     }
 
     emit(AgentEvent::TurnStart);
+    let mut turn_open = true;
 
     for prompt in prompts {
         emit(AgentEvent::MessageStart {
@@ -126,6 +140,7 @@ pub async fn run_agent_loop(
     }
 
     let mut pending_messages: Vec<Message> = drain_queue(&config.steering_queue, config.steering_mode);
+    let mut last_completed_turn: Option<crate::types::AgentTurnContext> = None;
 
     'outer: loop {
         let mut has_more_tool_calls = true;
@@ -135,6 +150,41 @@ pub async fn run_agent_loop(
                 || config.max_turns.is_some_and(|cap| turns_completed >= cap)
             {
                 break 'outer;
+            }
+
+            if let Some(turn_ctx) = last_completed_turn.take() {
+                if let Some(ref hook) = config.prepare_next_turn {
+                    if let Some(update) = hook(turn_ctx, config.cancel.clone()).await {
+                        if let Some(ctx) = update.context {
+                            current_messages = ctx.messages;
+                        }
+                        if let Some(msgs) = update.messages {
+                            for msg in msgs {
+                                emit(AgentEvent::MessageStart {
+                                    message: msg.clone(),
+                                });
+                                emit(AgentEvent::MessageEnd {
+                                    message: msg.clone(),
+                                });
+                                current_messages.push(msg.clone());
+                                new_messages.push(msg);
+                            }
+                        }
+                        if let Some(m) = update.model {
+                            current_model = m;
+                        }
+                        if let Some(tl) = update.thinking_level {
+                            current_thinking_level = Some(tl);
+                        }
+                    }
+                }
+
+                if pending_messages.is_empty()
+                    || config.steering_mode == crate::types::QueueMode::All
+                {
+                    let extra_steering = drain_queue(&config.steering_queue, config.steering_mode);
+                    pending_messages.extend(extra_steering);
+                }
             }
 
             for msg in pending_messages.drain(..) {
@@ -148,8 +198,34 @@ pub async fn run_agent_loop(
                 new_messages.push(msg);
             }
 
+            if let Some(ref hook) = config.transform_context {
+                current_messages = hook(current_messages, config.cancel.clone()).await;
+            }
+
+            if let Some(ref hook) = config.prepare_request {
+                let req_ctx = crate::types::PrepareRequestContext {
+                    context: crate::types::AgentContext {
+                        messages: current_messages.clone(),
+                        tools: Some(resolve_tools(&config)),
+                    },
+                    model: current_model.clone(),
+                    thinking_level: current_thinking_level,
+                };
+                if let Some(update) = hook(req_ctx, config.cancel.clone()).await {
+                    if let Some(ctx) = update.context {
+                        current_messages = ctx.messages;
+                    }
+                    if let Some(m) = update.model {
+                        current_model = m;
+                    }
+                    if let Some(tl) = update.thinking_level {
+                        current_thinking_level = Some(tl);
+                    }
+                }
+            }
+
             let assistant_message =
-                stream_assistant_response(&current_messages, &config, &on_event).await;
+                stream_assistant_response(&current_messages, &current_model, current_thinking_level, &config, &on_event).await;
             turns_completed += 1;
 
             current_messages.push(Message::Assistant(assistant_message.clone()));
@@ -158,6 +234,15 @@ pub async fn run_agent_loop(
             if assistant_message.stop_reason == StopReason::Error
                 || assistant_message.stop_reason == StopReason::Aborted
             {
+                if let Some(ref hook) = config.finish_turn {
+                    let turn_ctx = crate::types::AgentTurnContext {
+                        turn_index: turns_completed,
+                        messages: current_messages.clone(),
+                        assistant_message: assistant_message.clone(),
+                        tool_results: Vec::new(),
+                    };
+                    let _ = hook(turn_ctx, config.cancel.clone()).await;
+                }
                 emit(AgentEvent::TurnEnd {
                     message: assistant_message,
                     tool_results: Vec::new(),
@@ -185,6 +270,7 @@ pub async fn run_agent_loop(
                     let (batch, terminate) = execute_tool_calls(
                         &assistant_message,
                         &tool_calls,
+                        &current_messages,
                         &config,
                         &on_event,
                     )
@@ -198,10 +284,31 @@ pub async fn run_agent_loop(
                 }
             }
 
+            let mut finish_decision = None;
+            if let Some(ref hook) = config.finish_turn {
+                let turn_ctx = crate::types::AgentTurnContext {
+                    turn_index: turns_completed,
+                    messages: current_messages.clone(),
+                    assistant_message: assistant_message.clone(),
+                    tool_results: tool_results.clone(),
+                };
+                finish_decision = hook(turn_ctx, config.cancel.clone()).await;
+            }
+
             emit(AgentEvent::TurnEnd {
-                message: assistant_message,
-                tool_results,
+                message: assistant_message.clone(),
+                tool_results: tool_results.clone(),
             });
+            turn_open = false;
+
+            if let Some(decision) = finish_decision {
+                match decision.action {
+                    crate::types::TurnAction::End => break 'outer,
+                    crate::types::TurnAction::Continue => {
+                        has_more_tool_calls = true;
+                    }
+                }
+            }
 
             if config.cancel.is_cancelled()
                 || config.max_turns.is_some_and(|cap| turns_completed >= cap)
@@ -209,10 +316,21 @@ pub async fn run_agent_loop(
                 break 'outer;
             }
 
+            last_completed_turn = Some(crate::types::AgentTurnContext {
+                turn_index: turns_completed,
+                messages: current_messages.clone(),
+                assistant_message: assistant_message.clone(),
+                tool_results: tool_results.clone(),
+            });
+
             pending_messages = drain_queue(&config.steering_queue, config.steering_mode);
 
-            if has_more_tool_calls || !pending_messages.is_empty() {
+            if (has_more_tool_calls || !pending_messages.is_empty())
+                && !config.cancel.is_cancelled()
+                && !config.max_turns.is_some_and(|cap| turns_completed >= cap)
+            {
                 emit(AgentEvent::TurnStart);
+                turn_open = true;
             }
         }
 
@@ -220,11 +338,29 @@ pub async fn run_agent_loop(
 
         if !follow_up_messages.is_empty() {
             pending_messages = follow_up_messages;
-            emit(AgentEvent::TurnStart);
+            if !config.cancel.is_cancelled()
+                && !config.max_turns.is_some_and(|cap| turns_completed >= cap)
+            {
+                emit(AgentEvent::TurnStart);
+                turn_open = true;
+            }
             continue 'outer;
         }
 
         break 'outer;
+    }
+
+    if turn_open {
+        let mut empty_msg = AssistantMessage::empty_for_model(&current_model);
+        empty_msg.stop_reason = if config.cancel.is_cancelled() {
+            StopReason::Aborted
+        } else {
+            StopReason::Stop
+        };
+        emit(AgentEvent::TurnEnd {
+            message: empty_msg,
+            tool_results: Vec::new(),
+        });
     }
 
     emit(AgentEvent::AgentEnd {
@@ -236,6 +372,8 @@ pub async fn run_agent_loop(
 
 async fn stream_assistant_response(
     messages: &[Message],
+    model: &Model,
+    thinking_level: Option<mehh_ai::ThinkingLevel>,
     config: &AgentLoopConfig,
     on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
 ) -> AssistantMessage {
@@ -261,10 +399,13 @@ async fn stream_assistant_response(
         },
     };
 
+    let mut stream_opts = config.stream_options.clone();
+    stream_opts.reasoning = thinking_level;
+
     let mut stream = config.provider.stream(
-        &config.model,
+        model,
         &context,
-        &config.stream_options,
+        &stream_opts,
         config.cancel.clone(),
     );
 
@@ -387,6 +528,7 @@ fn emit_synthetic_tool_errors(
             tool_name: tool_call.name.clone(),
             result: result.clone(),
             is_error: true,
+            duration_ms: None,
         });
 
         let msg = ToolResultMessage {
@@ -396,6 +538,8 @@ fn emit_synthetic_tool_errors(
             details: result.details,
             is_error: true,
             timestamp: now_ms(),
+            duration_ms: None,
+            usage: None,
         };
 
         emit(AgentEvent::MessageStart {
@@ -435,6 +579,7 @@ async fn execute_single_tool(
     assistant_message: &AssistantMessage,
     tool_call: &ToolCall,
     tools: &[Arc<dyn AgentTool>],
+    current_messages: &[Message],
     config: &AgentLoopConfig,
     on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
 ) -> SingleToolOutcome {
@@ -442,6 +587,11 @@ async fn execute_single_tool(
         if let Some(ref cb) = on_event {
             cb(event);
         }
+    };
+
+    let agent_ctx = crate::types::AgentContext {
+        messages: current_messages.to_vec(),
+        tools: Some(tools.to_vec()),
     };
 
     let tool_opt = tools.iter().find(|t| t.name() == tool_call.name);
@@ -454,6 +604,7 @@ async fn execute_single_tool(
                 tool_name: tool_call.name.clone(),
                 result: res.clone(),
                 is_error: true,
+                duration_ms: None,
             });
             return SingleToolOutcome {
                 tool_result_message: ToolResultMessage {
@@ -463,6 +614,8 @@ async fn execute_single_tool(
                     details: res.details,
                     is_error: true,
                     timestamp: now_ms(),
+                    duration_ms: None,
+                    usage: None,
                 },
                 terminate: false,
             };
@@ -479,6 +632,7 @@ async fn execute_single_tool(
                 tool_name: tool_call.name.clone(),
                 result: res.clone(),
                 is_error: true,
+                duration_ms: None,
             });
             return SingleToolOutcome {
                 tool_result_message: ToolResultMessage {
@@ -488,6 +642,8 @@ async fn execute_single_tool(
                     details: res.details,
                     is_error: true,
                     timestamp: now_ms(),
+                    duration_ms: None,
+                    usage: None,
                 },
                 terminate: false,
             };
@@ -500,8 +656,9 @@ async fn execute_single_tool(
             assistant_message: assistant_message.clone(),
             tool_call: tool_call.clone(),
             args: validated_args.clone(),
+            context: agent_ctx.clone(),
         };
-        let before_res = hook(&before_ctx);
+        let before_res = hook(before_ctx, config.cancel.clone()).await;
         if before_res.block {
             let reason = before_res
                 .reason
@@ -512,6 +669,7 @@ async fn execute_single_tool(
                 tool_name: tool_call.name.clone(),
                 result: res.clone(),
                 is_error: true,
+                duration_ms: None,
             });
             return SingleToolOutcome {
                 tool_result_message: ToolResultMessage {
@@ -521,6 +679,8 @@ async fn execute_single_tool(
                     details: res.details,
                     is_error: true,
                     timestamp: now_ms(),
+                    duration_ms: None,
+                    usage: None,
                 },
                 terminate: before_res.terminate,
             };
@@ -537,6 +697,7 @@ async fn execute_single_tool(
             tool_name: tool_call.name.clone(),
             result: res.clone(),
             is_error: true,
+            duration_ms: None,
         });
         return SingleToolOutcome {
             tool_result_message: ToolResultMessage {
@@ -546,6 +707,8 @@ async fn execute_single_tool(
                 details: res.details,
                 is_error: true,
                 timestamp: now_ms(),
+                duration_ms: None,
+                usage: None,
             },
             terminate: false,
         };
@@ -570,6 +733,7 @@ async fn execute_single_tool(
         None
     };
 
+    let start = std::time::Instant::now();
     let exec_res = tool
         .execute(
             &tool_call.id,
@@ -578,9 +742,16 @@ async fn execute_single_tool(
             on_update_cb,
         )
         .await;
+    let duration_ms = Some(start.elapsed().as_millis() as u64);
 
     let (mut result, mut is_error) = match exec_res {
-        Ok(res) => (res, false),
+        Ok(res) => {
+            let err = res.is_error.unwrap_or(false);
+            if res.terminate == Some(true) {
+                terminate = true;
+            }
+            (res, err)
+        }
         Err(err_msg) => (AgentToolResult::text(err_msg), true),
     };
 
@@ -591,8 +762,10 @@ async fn execute_single_tool(
             args: validated_args.clone(),
             result: result.clone(),
             is_error,
+            context: agent_ctx,
         };
-        let after_res = hook(&after_ctx);
+        let after_res = hook(after_ctx, config.cancel.clone()).await;
+        let content_replaced = after_res.content.is_some();
         if let Some(c) = after_res.content {
             result.content = c;
         }
@@ -602,8 +775,16 @@ async fn execute_single_tool(
         if let Some(e) = after_res.is_error {
             is_error = e;
         }
-        if after_res.terminate {
-            terminate = true;
+        if let Some(u) = after_res.usage {
+            result.usage = Some(u);
+        }
+        if let Some(t) = after_res.terminate {
+            terminate = t;
+        }
+        if after_res.structured_content.is_some() {
+            result.structured_content = after_res.structured_content;
+        } else if content_replaced {
+            result.structured_content = None;
         }
     }
 
@@ -612,8 +793,10 @@ async fn execute_single_tool(
         tool_name: tool_call.name.clone(),
         result: result.clone(),
         is_error,
+        duration_ms,
     });
 
+    let usage = result.usage.clone();
     SingleToolOutcome {
         tool_result_message: ToolResultMessage {
             tool_call_id: tool_call.id.clone(),
@@ -622,6 +805,8 @@ async fn execute_single_tool(
             details: result.details,
             is_error,
             timestamp: now_ms(),
+            duration_ms,
+            usage,
         },
         terminate,
     }
@@ -631,6 +816,7 @@ async fn execute_tool_calls_sequential(
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
     tools: &[Arc<dyn AgentTool>],
+    current_messages: &[Message],
     config: &AgentLoopConfig,
     on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
 ) -> (Vec<ToolResultMessage>, bool) {
@@ -660,7 +846,7 @@ async fn execute_tool_calls_sequential(
             args: tc.arguments.clone(),
         });
 
-        let outcome = execute_single_tool(assistant_message, tc, tools, config, on_event).await;
+        let outcome = execute_single_tool(assistant_message, tc, tools, current_messages, config, on_event).await;
 
         emit(AgentEvent::MessageStart {
             message: Message::ToolResult(outcome.tool_result_message.clone()),
@@ -693,6 +879,7 @@ async fn execute_tool_calls_parallel(
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
     tools: &[Arc<dyn AgentTool>],
+    current_messages: &[Message],
     config: &AgentLoopConfig,
     on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
 ) -> (Vec<ToolResultMessage>, bool) {
@@ -712,7 +899,7 @@ async fn execute_tool_calls_parallel(
 
     let futures = tool_calls
         .iter()
-        .map(|tc| execute_single_tool(assistant_message, tc, tools, config, on_event));
+        .map(|tc| execute_single_tool(assistant_message, tc, tools, current_messages, config, on_event));
 
     let outcomes = futures::future::join_all(futures).await;
 
@@ -734,6 +921,7 @@ async fn execute_tool_calls_parallel(
 async fn execute_tool_calls(
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
+    current_messages: &[Message],
     config: &AgentLoopConfig,
     on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
 ) -> (Vec<ToolResultMessage>, bool) {
@@ -748,9 +936,9 @@ async fn execute_tool_calls(
     });
 
     if has_sequential {
-        execute_tool_calls_sequential(assistant_message, tool_calls, &tools, config, on_event).await
+        execute_tool_calls_sequential(assistant_message, tool_calls, &tools, current_messages, config, on_event).await
     } else {
-        execute_tool_calls_parallel(assistant_message, tool_calls, &tools, config, on_event).await
+        execute_tool_calls_parallel(assistant_message, tool_calls, &tools, current_messages, config, on_event).await
     }
 }
 
@@ -800,7 +988,7 @@ mod tests {
     async fn test_agent_loop_enforces_max_turns() {
         let provider = Arc::new(FauxProvider::new());
         for i in 0..5 {
-            let call = faux_tool_call(&format!("c{i}"), "ping", serde_json::json!({}));
+            let call = faux_tool_call(format!("c{i}"), "ping", serde_json::json!({}));
             provider.add_response(faux_tool_call_message(vec![call]));
         }
 
@@ -923,5 +1111,510 @@ mod tests {
             ToolResultContentBlock::Text(t) => assert!(t.text.contains("aborted")),
             _ => panic!("expected text"),
         }
+    }
+
+    #[tokio::test]
+    async fn executed_tool_call_records_duration_ms() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_tool_call_message(vec![
+            faux_tool_call("c1", "dummy", serde_json::json!({})),
+        ]));
+
+        let dummy_tool = Arc::new(DummyTool {
+            tool_name: "dummy".to_string(),
+            mode: ToolExecutionMode::Sequential,
+            on_exec: None,
+        });
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let mut config = AgentLoopConfig::new(faux_model(), provider);
+        config.tools = vec![dummy_tool];
+
+        let prompt = Message::User(UserMessage {
+            content: UserContent::Text("run tool".to_string()),
+            timestamp: now_ms(),
+        });
+        let out = run_agent_loop(
+            vec![prompt],
+            vec![],
+            config,
+            Some(Arc::new(move |ev| {
+                events_clone.lock().unwrap().push(ev);
+            })),
+        )
+        .await;
+
+        let results: Vec<&ToolResultMessage> = out
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].duration_ms.is_some(), "persisted ToolResultMessage must have duration_ms");
+
+        let recorded_events = events.lock().unwrap();
+        let end_event = recorded_events.iter().find_map(|ev| match ev {
+            AgentEvent::ToolExecutionEnd { tool_call_id, duration_ms, .. } if tool_call_id == "c1" => {
+                Some(*duration_ms)
+            }
+            _ => None,
+        });
+        assert!(end_event.is_some(), "ToolExecutionEnd must be emitted");
+        assert!(end_event.unwrap().is_some(), "ToolExecutionEnd must record duration_ms");
+    }
+
+    #[tokio::test]
+    async fn blocked_tool_call_omits_duration_ms() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_tool_call_message(vec![
+            faux_tool_call("c1", "dummy", serde_json::json!({})),
+        ]));
+
+        let dummy_tool = Arc::new(DummyTool {
+            tool_name: "dummy".to_string(),
+            mode: ToolExecutionMode::Sequential,
+            on_exec: None,
+        });
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let mut config = AgentLoopConfig::new(faux_model(), provider);
+        config.tools = vec![dummy_tool];
+        config.before_tool_call = Some(Arc::new(|_ctx, _cancel| {
+            Box::pin(async {
+                crate::types::BeforeToolCallResult {
+                    block: true,
+                    reason: Some("blocked by policy".to_string()),
+                    terminate: false,
+                }
+            })
+        }));
+
+        let prompt = Message::User(UserMessage {
+            content: UserContent::Text("run blocked tool".to_string()),
+            timestamp: now_ms(),
+        });
+        let out = run_agent_loop(
+            vec![prompt],
+            vec![],
+            config,
+            Some(Arc::new(move |ev| {
+                events_clone.lock().unwrap().push(ev);
+            })),
+        )
+        .await;
+
+        let results: Vec<&ToolResultMessage> = out
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].duration_ms, None, "blocked tool call must omit duration_ms on message");
+
+        let recorded_events = events.lock().unwrap();
+        let end_event = recorded_events.iter().find_map(|ev| match ev {
+            AgentEvent::ToolExecutionEnd { tool_call_id, duration_ms, .. } if tool_call_id == "c1" => {
+                Some(*duration_ms)
+            }
+            _ => None,
+        });
+        assert!(end_event.is_some(), "ToolExecutionEnd must be emitted");
+        assert_eq!(end_event.unwrap(), None, "blocked tool call must omit duration_ms on event");
+    }
+
+    #[tokio::test]
+    async fn async_tool_hooks_receive_context_and_override_structured_content_usage() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_tool_call_message(vec![
+            faux_tool_call("c1", "structured_tool", serde_json::json!({})),
+        ]));
+
+        struct StructuredTool;
+        #[async_trait::async_trait]
+        impl AgentTool for StructuredTool {
+            fn name(&self) -> &str { "structured_tool" }
+            fn description(&self) -> &str { "tool with structured content" }
+            fn parameters(&self) -> serde_json::Value { serde_json::json!({ "type": "object" }) }
+            async fn execute(
+                &self,
+                _tool_call_id: &str,
+                _params: serde_json::Map<String, serde_json::Value>,
+                _cancel: CancellationToken,
+                _on_update: Option<AgentToolUpdateCallback>,
+            ) -> Result<AgentToolResult, String> {
+                Ok(AgentToolResult {
+                    content: vec![ToolResultContentBlock::Text(mehh_ai::TextContent {
+                        text: "original content".to_string(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    structured_content: Some(serde_json::json!({ "score": 42 })),
+                    usage: Some(mehh_ai::Usage {
+                        input: 10,
+                        output: 20,
+                        ..Default::default()
+                    }),
+                    is_error: None,
+                    terminate: None,
+                })
+            }
+        }
+
+        let context_seen = Arc::new(Mutex::new(Vec::new()));
+        let context_seen_clone = context_seen.clone();
+
+        let mut config = AgentLoopConfig::new(faux_model(), provider);
+        config.tools = vec![Arc::new(StructuredTool)];
+        config.before_tool_call = Some(Arc::new(move |ctx, _cancel| {
+            let seen = context_seen_clone.clone();
+            Box::pin(async move {
+                seen.lock().unwrap().extend(ctx.context.messages.clone());
+                crate::types::BeforeToolCallResult::default()
+            })
+        }));
+        config.after_tool_call = Some(Arc::new(|_ctx, _cancel| {
+            Box::pin(async move {
+                crate::types::AfterToolCallResult {
+                    content: Some(vec![ToolResultContentBlock::Text(mehh_ai::TextContent {
+                        text: "replaced content".to_string(),
+                        text_signature: None,
+                    })]),
+                    structured_content: None,
+                    usage: Some(mehh_ai::Usage {
+                        input: 100,
+                        output: 200,
+                        ..Default::default()
+                    }),
+                    details: None,
+                    is_error: None,
+                    terminate: None,
+                }
+            })
+        }));
+
+        let prompt = Message::User(UserMessage {
+            content: UserContent::Text("run structured".to_string()),
+            timestamp: now_ms(),
+        });
+        let out = run_agent_loop(vec![prompt], vec![], config, None).await;
+
+        let results: Vec<&ToolResultMessage> = out
+            .iter()
+            .filter_map(|m| match m {
+                Message::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].usage, Some(mehh_ai::Usage {
+            input: 100,
+            output: 200,
+            ..Default::default()
+        }));
+        assert_eq!(context_seen.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn turn_lifecycle_hooks_control_request_context_and_finish_decision() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_assistant_message("turn 1 response"));
+        provider.add_response(faux_assistant_message("turn 2 response"));
+
+        let transformed_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let transformed_called_clone = transformed_called.clone();
+
+        let mut config = AgentLoopConfig::new(faux_model(), provider);
+        config.transform_context = Some(Arc::new(move |msgs, _cancel| {
+            transformed_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { msgs })
+        }));
+        config.prepare_request = Some(Arc::new(|req, _cancel| {
+            Box::pin(async move {
+                assert!(!req.context.messages.is_empty());
+                None
+            })
+        }));
+        let finished_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let finished_count_clone = finished_count.clone();
+        config.finish_turn = Some(Arc::new(move |_turn, _cancel| {
+            let count = finished_count_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                if count == 0 {
+                    Some(crate::types::FinishTurnDecision {
+                        action: crate::types::TurnAction::Continue,
+                    })
+                } else {
+                    Some(crate::types::FinishTurnDecision {
+                        action: crate::types::TurnAction::End,
+                    })
+                }
+            })
+        }));
+
+        let prompt = Message::User(UserMessage {
+            content: UserContent::Text("hello lifecycle".to_string()),
+            timestamp: now_ms(),
+        });
+        let out = run_agent_loop(vec![prompt], vec![], config, None).await;
+
+        assert!(transformed_called.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(finished_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn after_tool_call_can_override_terminate_hint_to_false() {
+        struct TermTool;
+        #[async_trait::async_trait]
+        impl AgentTool for TermTool {
+            fn name(&self) -> &str {
+                "term_tool"
+            }
+            fn description(&self) -> &str {
+                "Term tool"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object", "properties": {} })
+            }
+            fn execution_mode(&self) -> ToolExecutionMode {
+                ToolExecutionMode::Sequential
+            }
+            async fn execute(
+                &self,
+                _id: &str,
+                _p: serde_json::Map<String, serde_json::Value>,
+                _c: CancellationToken,
+                _u: Option<AgentToolUpdateCallback>,
+            ) -> Result<AgentToolResult, String> {
+                let mut res = AgentToolResult::text("did work");
+                res.terminate = Some(true);
+                Ok(res)
+            }
+        }
+
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_tool_call_message(vec![
+            faux_tool_call("c1", "term_tool", serde_json::json!({})),
+        ]));
+        provider.add_response(faux_assistant_message("continued turn response"));
+
+        let mut config = AgentLoopConfig::new(faux_model(), provider);
+        config.tools = vec![Arc::new(TermTool)];
+
+        // Hook overrides terminate hint back to false so loop continues
+        config.after_tool_call = Some(Arc::new(|_ctx, _cancel| {
+            Box::pin(async move {
+                crate::types::AfterToolCallResult {
+                    terminate: Some(false),
+                    ..Default::default()
+                }
+            })
+        }));
+
+        let prompt = Message::User(UserMessage {
+            content: UserContent::Text("run".to_string()),
+            timestamp: now_ms(),
+        });
+        let out = run_agent_loop(vec![prompt], vec![], config, None).await;
+        // User + Assistant (tool call) + ToolResult + Assistant (continued turn) = 4
+        assert_eq!(out.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn finish_turn_is_invoked_on_error_or_aborted_turn() {
+        let provider = Arc::new(FauxProvider::new());
+        let mut err_msg = faux_assistant_message("rate limited");
+        err_msg.stop_reason = StopReason::Error;
+        err_msg.error_message = Some("rate limit exceeded".to_string());
+        provider.add_response(err_msg);
+
+        let finish_turn_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let finish_turn_clone = finish_turn_called.clone();
+
+        let mut config = AgentLoopConfig::new(faux_model(), provider);
+        config.finish_turn = Some(Arc::new(move |_turn, _cancel| {
+            finish_turn_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { None })
+        }));
+
+        let prompt = Message::User(UserMessage {
+            content: UserContent::Text("run".to_string()),
+            timestamp: now_ms(),
+        });
+        let _ = run_agent_loop(vec![prompt], vec![], config, None).await;
+        assert!(finish_turn_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn prepare_next_turn_is_only_invoked_when_continuing_to_subsequent_turn() {
+        // Case 1: Terminal single turn without tool calls -> hook must NOT be called
+        let provider1 = Arc::new(FauxProvider::new());
+        provider1.add_response(faux_assistant_message("single turn answer"));
+
+        let called_count1 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called_clone1 = called_count1.clone();
+
+        let mut config1 = AgentLoopConfig::new(faux_model(), provider1);
+        config1.prepare_next_turn = Some(Arc::new(move |_turn, _cancel| {
+            called_clone1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { None })
+        }));
+
+        let prompt1 = Message::User(UserMessage {
+            content: UserContent::Text("hello".to_string()),
+            timestamp: now_ms(),
+        });
+        let _ = run_agent_loop(vec![prompt1], vec![], config1, None).await;
+        assert_eq!(
+            called_count1.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "prepare_next_turn must not run on a terminating turn"
+        );
+
+        // Case 2: Multi-turn with tool calls -> hook must run before subsequent turn
+        struct SimpleEchoTool;
+        #[async_trait::async_trait]
+        impl AgentTool for SimpleEchoTool {
+            fn name(&self) -> &str {
+                "echo"
+            }
+            fn description(&self) -> &str {
+                "Echo"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object", "properties": {} })
+            }
+            fn execution_mode(&self) -> ToolExecutionMode {
+                ToolExecutionMode::Sequential
+            }
+            async fn execute(
+                &self,
+                _id: &str,
+                _p: serde_json::Map<String, serde_json::Value>,
+                _c: CancellationToken,
+                _u: Option<AgentToolUpdateCallback>,
+            ) -> Result<AgentToolResult, String> {
+                Ok(AgentToolResult::text("echoed"))
+            }
+        }
+
+        let provider2 = Arc::new(FauxProvider::new());
+        provider2.add_response(faux_tool_call_message(vec![
+            faux_tool_call("c1", "echo", serde_json::json!({})),
+        ]));
+        provider2.add_response(faux_assistant_message("final response"));
+
+        let called_count2 = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let called_clone2 = called_count2.clone();
+
+        let mut config2 = AgentLoopConfig::new(faux_model(), provider2);
+        config2.tools = vec![Arc::new(SimpleEchoTool)];
+        config2.prepare_next_turn = Some(Arc::new(move |_turn, _cancel| {
+            called_clone2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move { None })
+        }));
+
+        let prompt2 = Message::User(UserMessage {
+            content: UserContent::Text("run echo".to_string()),
+            timestamp: now_ms(),
+        });
+        let _ = run_agent_loop(vec![prompt2], vec![], config2, None).await;
+        assert_eq!(
+            called_count2.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "prepare_next_turn must run exactly once before the continued turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn steering_queue_one_at_a_time_does_not_double_drain_across_turn_prep() {
+        let provider = Arc::new(FauxProvider::new());
+        // Turn 1: model calls tool
+        provider.add_response(faux_tool_call_message(vec![
+            faux_tool_call("call_1", "push_steering", serde_json::json!({})),
+        ]));
+        // Turn 2: response after first steering message
+        provider.add_response(faux_assistant_message("turn 2 reply"));
+        // Turn 3: response after second steering message
+        provider.add_response(faux_assistant_message("turn 3 reply"));
+
+        let mut config = AgentLoopConfig::new(faux_model(), provider);
+        let queue_clone = config.steering_queue.clone();
+        struct PushSteeringTool {
+            queue: Arc<Mutex<VecDeque<Message>>>,
+        }
+        #[async_trait::async_trait]
+        impl AgentTool for PushSteeringTool {
+            fn name(&self) -> &str {
+                "push_steering"
+            }
+            fn description(&self) -> &str {
+                "PushSteering"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object", "properties": {} })
+            }
+            fn execution_mode(&self) -> ToolExecutionMode {
+                ToolExecutionMode::Sequential
+            }
+            async fn execute(
+                &self,
+                _id: &str,
+                _p: serde_json::Map<String, serde_json::Value>,
+                _c: CancellationToken,
+                _u: Option<AgentToolUpdateCallback>,
+            ) -> Result<AgentToolResult, String> {
+                let mut q = self.queue.lock().unwrap();
+                q.push_back(Message::User(UserMessage {
+                    content: UserContent::Text("steer 1".to_string()),
+                    timestamp: now_ms(),
+                }));
+                q.push_back(Message::User(UserMessage {
+                    content: UserContent::Text("steer 2".to_string()),
+                    timestamp: now_ms(),
+                }));
+                Ok(AgentToolResult::text("pushed"))
+            }
+        }
+
+        config.tools = vec![Arc::new(PushSteeringTool { queue: queue_clone })];
+        config.steering_mode = QueueMode::OneAtATime;
+
+        let turn_messages: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let tm_clone = turn_messages.clone();
+
+        let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |event| {
+            if let AgentEvent::TurnStart = event {
+                tm_clone.lock().unwrap().push(Vec::new());
+            } else if let AgentEvent::MessageStart { message: Message::User(u) } = event {
+                let mut turns = tm_clone.lock().unwrap();
+                if let Some(current_turn) = turns.last_mut() {
+                    current_turn.push(u.content.text().to_string());
+                }
+            }
+        });
+
+        let prompt = Message::User(UserMessage {
+            content: UserContent::Text("initial prompt".to_string()),
+            timestamp: now_ms(),
+        });
+
+        let _ = run_agent_loop(vec![prompt], vec![], config.clone(), Some(on_event)).await;
+
+        let turns = turn_messages.lock().unwrap().clone();
+        // Turn 1 had initial prompt.
+        // Turn 2 must have steer 1 only.
+        // Turn 3 must have steer 2 only.
+        assert!(turns.len() >= 3, "Expected at least 3 turns, got {}", turns.len());
+        assert_eq!(turns[1], vec!["steer 1".to_string()], "Turn 2 should only have steer 1");
+        assert_eq!(turns[2], vec!["steer 2".to_string()], "Turn 3 should only have steer 2");
     }
 }

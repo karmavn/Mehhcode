@@ -292,6 +292,10 @@ pub struct ToolResultMessage {
     pub details: Option<serde_json::Value>,
     pub is_error: bool,
     pub timestamp: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "durationMs", alias = "duration_ms")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

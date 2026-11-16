@@ -145,6 +145,9 @@ impl LlmProvider for OpenAiCompletionsProvider {
                                     state.process_chunk_into(&ev.data, &mut batch);
                                 }
                                 sender.send_batch(batch).await;
+                                if state.done {
+                                    break;
+                                }
                             }
                             Ok(Some(Err(e))) => {
                                 state.mark_error(e.to_string());
@@ -498,6 +501,19 @@ impl OpenAiStreamState {
         let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             return;
         };
+
+        if let Some(err_obj) = json.get("error") {
+            self.received_terminal = true;
+            self.output.stop_reason = StopReason::Error;
+            let msg = err_obj
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| err_obj.as_str())
+                .unwrap_or("OpenAI API error");
+            self.output.error_message = Some(msg.to_string());
+            self.finish_into(out);
+            return;
+        }
 
         if self.output.response_id.is_none() {
             if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
@@ -985,6 +1001,8 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 1002,
+                    duration_ms: None,
+                    usage: None,
                 }),
             ],
             tools: Some(vec![ToolDefinition {
@@ -1259,6 +1277,8 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 300,
+                    duration_ms: None,
+                    usage: None,
                 }),
             ],
             tools: None,
@@ -1390,5 +1410,35 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn test_openai_error_chunk() {
+        let model = test_model();
+        let (sender, _stream) = create_event_stream();
+        let chunks = vec![
+            serde_json::json!({
+                "error": {
+                    "message": "Rate limit exceeded: 500 requests per minute",
+                    "type": "requests",
+                    "code": "rate_limit_exceeded"
+                }
+            })
+            .to_string(),
+        ];
+        let sse_events: Vec<SseEvent> = chunks
+            .into_iter()
+            .map(|data| SseEvent {
+                event: None,
+                data,
+            })
+            .collect();
+
+        let result = process_openai_sse_events(&model, &sse_events, &sender);
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("Rate limit exceeded: 500 requests per minute")
+        );
     }
 }

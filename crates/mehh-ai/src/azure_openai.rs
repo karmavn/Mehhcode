@@ -173,6 +173,9 @@ impl LlmProvider for AzureOpenAiResponsesProvider {
                                     state.process_chunk_into(&ev.data, &mut batch);
                                 }
                                 sender.send_batch(batch).await;
+                                if state.done {
+                                    break;
+                                }
                             }
                             Ok(Some(Err(e))) => {
                                 state.mark_error(e.to_string());

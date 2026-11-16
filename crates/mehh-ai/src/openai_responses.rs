@@ -126,6 +126,9 @@ impl LlmProvider for OpenAiResponsesProvider {
                                     state.process_chunk_into(&ev.data, &mut batch);
                                 }
                                 sender.send_batch(batch).await;
+                                if state.done {
+                                    break;
+                                }
                             }
                             Ok(Some(Err(e))) => {
                                 state.mark_error(e.to_string());
@@ -445,7 +448,7 @@ pub struct OpenAiResponsesStreamState {
     model: Model,
     output: AssistantMessage,
     started: bool,
-    done: bool,
+    pub done: bool,
     pub received_terminal: bool,
     slots: HashMap<usize, OutputSlot>,
 }
@@ -498,6 +501,20 @@ impl OpenAiResponsesStreamState {
         let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             return;
         };
+
+        if let Some(err_val) = json.get("error") {
+            self.received_terminal = true;
+            self.output.stop_reason = StopReason::Error;
+            let err_msg = err_val
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| err_val.as_str())
+                .or_else(|| json.get("message").and_then(|m| m.as_str()))
+                .unwrap_or("OpenAI Responses error");
+            self.output.error_message = Some(err_msg.to_string());
+            self.finish_into(events);
+            return;
+        }
 
         let ev_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -895,6 +912,7 @@ impl OpenAiResponsesStreamState {
                 } else {
                     self.output.stop_reason = StopReason::Stop;
                 }
+                self.finish_into(events);
             }
             "response.incomplete" => {
                 self.received_terminal = true;
@@ -922,6 +940,7 @@ impl OpenAiResponsesStreamState {
                     }
                 }
                 self.output.stop_reason = StopReason::Length;
+                self.finish_into(events);
             }
             "response.failed" | "error" => {
                 self.received_terminal = true;
@@ -936,6 +955,7 @@ impl OpenAiResponsesStreamState {
                     .or_else(|| json.get("message").and_then(|m| m.as_str()))
                     .unwrap_or("OpenAI Responses error");
                 self.output.error_message = Some(err_msg.to_string());
+                self.finish_into(events);
             }
             _ => {}
         }
@@ -1144,6 +1164,8 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 1002,
+                    duration_ms: None,
+                    usage: None,
                 }),
             ],
             tools: Some(vec![ToolDefinition {
@@ -1404,6 +1426,8 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 300,
+                    duration_ms: None,
+                    usage: None,
                 }),
             ],
             tools: None,
@@ -1533,5 +1557,30 @@ mod tests {
             }
             _ => panic!("Expected ToolCallDelta event"),
         }
+    }
+
+    #[test]
+    fn test_openai_responses_error_chunk() {
+        let model = test_responses_model();
+        let (sender, _stream) = create_event_stream();
+        let chunks = vec![
+            serde_json::json!({
+                "error": {
+                    "message": "Model is overloaded"
+                }
+            })
+            .to_string(),
+        ];
+        let sse_events: Vec<SseEvent> = chunks
+            .into_iter()
+            .map(|data| SseEvent {
+                event: None,
+                data,
+            })
+            .collect();
+
+        let result = process_openai_responses_sse_events(&model, &sse_events, &sender);
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(result.error_message.as_deref(), Some("Model is overloaded"));
     }
 }

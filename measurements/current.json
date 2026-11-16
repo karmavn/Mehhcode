@@ -1,0 +1,12 @@
+{
+    "label":  "current",
+    "measured_at":  "2026-11-15T23:03:17.9048293+07:00",
+    "machine":  "DESKTOP-FCLCS0H",
+    "cpu_count":  8,
+    "cargo":  "cargo 1.99.1 (5f94df478 2026-08-27)",
+    "rustc":  "rustc 1.99.1 (58cf8f9c3 2026-10-13)",
+    "release_build_seconds":  326.5,
+    "release_binary_bytes":  16907264,
+    "test_seconds":  29.9,
+    "test_summary":  "test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s | test result: ok. 95 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s | test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s | test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s | test result: ok. 104 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 3.22s | test result: ok. 46 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s | test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.94s | test result: ok. 55 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s | test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s"
+}

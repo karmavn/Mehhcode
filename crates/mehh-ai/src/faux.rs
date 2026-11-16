@@ -77,9 +77,23 @@ impl LlmProvider for FauxProvider {
         model: &Model,
         context: &Context,
         options: &StreamOptions,
-        _cancel: tokio_util::sync::CancellationToken,
+        cancel: tokio_util::sync::CancellationToken,
     ) -> AssistantEventStream {
         let (sender, stream) = create_event_stream();
+
+        if cancel.is_cancelled() {
+            let mut message = AssistantMessage::empty_for_model(model);
+            message.stop_reason = StopReason::Aborted;
+            message.error_message = Some("Request was cancelled".to_string());
+            sender.push(AssistantMessageEvent::Start {
+                partial: message.clone(),
+            });
+            sender.push(AssistantMessageEvent::Error {
+                reason: StopReason::Aborted,
+                error: message,
+            });
+            return stream;
+        }
 
         let message = {
             let mut state = self.inner.lock().unwrap();
@@ -333,5 +347,21 @@ mod tests {
         let final_message = stream.collect_final_message().await.unwrap();
 
         assert_eq!(final_message.text_content(), "Answer for model faux-1");
+    }
+
+    #[tokio::test]
+    async fn test_faux_pre_cancelled() {
+        let provider = FauxProvider::new();
+        let model = faux_model();
+        let context = Context::default();
+        let options = StreamOptions::default();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let mut stream = provider.stream(&model, &context, &options, cancel);
+        let final_message = stream.collect_final_message().await.unwrap();
+
+        assert_eq!(final_message.stop_reason, StopReason::Aborted);
+        assert_eq!(final_message.error_message.as_deref(), Some("Request was cancelled"));
     }
 }

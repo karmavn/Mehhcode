@@ -537,7 +537,7 @@ mod tests {
                     hasHostLog: typeof globalThis.__host_log !== "undefined",
                 };
             "#,
-            &[tool_def.clone()],
+            std::slice::from_ref(&tool_def),
             dummy_executor(),
             kv.clone(),
             &config,

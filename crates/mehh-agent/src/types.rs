@@ -23,11 +23,19 @@ pub enum QueueMode {
     All,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct AgentToolResult {
     pub content: Vec<ToolResultContentBlock>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "structuredContent", alias = "structured_content")]
+    pub structured_content: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<mehh_ai::Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "isError", alias = "is_error")]
+    pub is_error: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminate: Option<bool>,
 }
 
 impl AgentToolResult {
@@ -38,6 +46,10 @@ impl AgentToolResult {
                 text_signature: None,
             })],
             details: None,
+            structured_content: None,
+            usage: None,
+            is_error: None,
+            terminate: None,
         }
     }
 }
@@ -72,11 +84,27 @@ pub fn tool_to_definition(tool: &dyn AgentTool) -> ToolDefinition {
     }
 }
 
+#[derive(Clone)]
+pub struct AgentContext {
+    pub messages: Vec<Message>,
+    pub tools: Option<Vec<Arc<dyn AgentTool>>>,
+}
+
+impl std::fmt::Debug for AgentContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentContext")
+            .field("messages", &self.messages)
+            .field("tools_count", &self.tools.as_ref().map(|t| t.len()))
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BeforeToolCallContext {
     pub assistant_message: AssistantMessage,
     pub tool_call: ToolCall,
     pub args: serde_json::Map<String, serde_json::Value>,
+    pub context: AgentContext,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -93,18 +121,94 @@ pub struct AfterToolCallContext {
     pub args: serde_json::Map<String, serde_json::Value>,
     pub result: AgentToolResult,
     pub is_error: bool,
+    pub context: AgentContext,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AfterToolCallResult {
     pub content: Option<Vec<ToolResultContentBlock>>,
     pub details: Option<serde_json::Value>,
+    pub structured_content: Option<serde_json::Value>,
     pub is_error: Option<bool>,
-    pub terminate: bool,
+    pub usage: Option<mehh_ai::Usage>,
+    pub terminate: Option<bool>,
 }
 
-pub type BeforeToolCallHook = Arc<dyn Fn(&BeforeToolCallContext) -> BeforeToolCallResult + Send + Sync>;
-pub type AfterToolCallHook = Arc<dyn Fn(&AfterToolCallContext) -> AfterToolCallResult + Send + Sync>;
+pub type BeforeToolCallHook = Arc<
+    dyn Fn(BeforeToolCallContext, tokio_util::sync::CancellationToken) -> futures::future::BoxFuture<'static, BeforeToolCallResult>
+        + Send
+        + Sync,
+>;
+pub type AfterToolCallHook = Arc<
+    dyn Fn(AfterToolCallContext, tokio_util::sync::CancellationToken) -> futures::future::BoxFuture<'static, AfterToolCallResult>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnAction {
+    Continue,
+    End,
+}
+
+#[derive(Debug, Clone)]
+pub struct FinishTurnDecision {
+    pub action: TurnAction,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentTurnContext {
+    pub turn_index: usize,
+    pub messages: Vec<Message>,
+    pub assistant_message: AssistantMessage,
+    pub tool_results: Vec<ToolResultMessage>,
+}
+
+pub type FinishTurnHook = Arc<
+    dyn Fn(AgentTurnContext, tokio_util::sync::CancellationToken) -> futures::future::BoxFuture<'static, Option<FinishTurnDecision>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone)]
+pub struct PrepareRequestContext {
+    pub context: AgentContext,
+    pub model: mehh_ai::Model,
+    pub thinking_level: Option<mehh_ai::ThinkingLevel>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentRequestUpdate {
+    pub context: Option<AgentContext>,
+    pub model: Option<mehh_ai::Model>,
+    pub thinking_level: Option<mehh_ai::ThinkingLevel>,
+}
+
+pub type PrepareRequestHook = Arc<
+    dyn Fn(PrepareRequestContext, tokio_util::sync::CancellationToken) -> futures::future::BoxFuture<'static, Option<AgentRequestUpdate>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentLoopTurnUpdate {
+    pub context: Option<AgentContext>,
+    pub messages: Option<Vec<Message>>,
+    pub model: Option<mehh_ai::Model>,
+    pub thinking_level: Option<mehh_ai::ThinkingLevel>,
+}
+
+pub type PrepareNextTurnHook = Arc<
+    dyn Fn(AgentTurnContext, tokio_util::sync::CancellationToken) -> futures::future::BoxFuture<'static, Option<AgentLoopTurnUpdate>>
+        + Send
+        + Sync,
+>;
+
+pub type TransformContextHook = Arc<
+    dyn Fn(Vec<Message>, tokio_util::sync::CancellationToken) -> futures::future::BoxFuture<'static, Vec<Message>>
+        + Send
+        + Sync,
+>;
 
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -165,7 +269,38 @@ pub enum AgentEvent {
         result: AgentToolResult,
         #[serde(alias = "is_error")]
         is_error: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none", rename = "durationMs", alias = "duration_ms")]
+        duration_ms: Option<u64>,
     },
+}
+
+#[derive(Clone)]
+pub struct AgentState {
+    pub system_prompt: String,
+    pub model: mehh_ai::Model,
+    pub thinking_level: Option<mehh_ai::ThinkingLevel>,
+    pub tools: Vec<Arc<dyn AgentTool>>,
+    pub messages: Vec<Message>,
+    pub is_streaming: bool,
+    pub streaming_message: Option<Message>,
+    pub pending_tool_calls: std::collections::HashSet<String>,
+    pub error_message: Option<String>,
+}
+
+impl std::fmt::Debug for AgentState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentState")
+            .field("system_prompt", &self.system_prompt)
+            .field("model", &self.model)
+            .field("thinking_level", &self.thinking_level)
+            .field("tools_count", &self.tools.len())
+            .field("messages", &self.messages)
+            .field("is_streaming", &self.is_streaming)
+            .field("streaming_message", &self.streaming_message)
+            .field("pending_tool_calls", &self.pending_tool_calls)
+            .field("error_message", &self.error_message)
+            .finish()
+    }
 }
 
 #[cfg(test)]

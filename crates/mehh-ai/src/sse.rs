@@ -284,7 +284,7 @@ mod tests {
     #[test]
     fn test_feed_bytes_caps_buffer() {
         let mut parser = SseParser::with_max_buffer_bytes(64);
-        let events = parser.feed_bytes(&vec![b'a'; 100]);
+        let events = parser.feed_bytes(&[b'a'; 100]);
         assert!(events.is_empty());
         assert!(parser.has_overflowed());
     }

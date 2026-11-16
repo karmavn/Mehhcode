@@ -4,12 +4,17 @@ use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecut
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-const CHUNK_READ_SIZE: usize = 4096;
-const MAX_STREAMING_PREVIEW_BYTES: usize = 256 * 1024;
-const UPDATE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
-const MAX_OUTPUT_CHARS: usize = 30_000;
+pub(crate) const CHUNK_READ_SIZE: usize = 4096;
+pub(crate) const MAX_STREAMING_PREVIEW_BYTES: usize = 256 * 1024;
+pub(crate) const UPDATE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
+pub(crate) const MAX_OUTPUT_CHARS: usize = 30_000;
 
-fn append_rolling(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) {
+pub(crate) const UTF8_OUTPUT_PREFIX: &str =
+    "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
+pub(crate) const WINDOWS_POWERSHELL_EXIT_SUFFIX: &str =
+    "\n;\nif ($?) { exit 0 }\nif (($LASTEXITCODE -eq 0) -and (\"$($Error[0].FullyQualifiedErrorId)\" -like \"NativeCommandError*\")) { exit 0 }\nif ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
+
+pub(crate) fn append_rolling(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) {
     if chunk.len() >= cap {
         buf.clear();
         buf.extend_from_slice(&chunk[chunk.len() - cap..]);
@@ -22,7 +27,7 @@ fn append_rolling(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) {
     buf.extend_from_slice(chunk);
 }
 
-fn format_bash_output(bytes: &[u8]) -> String {
+pub(crate) fn format_bash_output(bytes: &[u8]) -> String {
     let combined = String::from_utf8_lossy(bytes);
     if combined.len() > MAX_OUTPUT_CHARS {
         let char_count = combined.chars().count();
@@ -54,10 +59,13 @@ fn format_bash_output(bytes: &[u8]) -> String {
     }
 }
 
-async fn kill_process_tree(child: &mut tokio::process::Child) {
+pub(crate) async fn kill_process_tree(child: &mut tokio::process::Child) {
     #[cfg(windows)]
     if let Some(pid) = child.id() {
-        let _ = tokio::process::Command::new("taskkill")
+        let taskkill_bin = std::env::var("SystemRoot")
+            .map(|r| format!("{r}\\System32\\taskkill.exe"))
+            .unwrap_or_else(|_| "taskkill".to_string());
+        let _ = tokio::process::Command::new(taskkill_bin)
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -134,7 +142,12 @@ impl AgentTool for BashTool {
 
         let mut cmd = if cfg!(windows) {
             let mut c = tokio::process::Command::new("powershell");
-            c.args(["-NoProfile", "-NonInteractive", "-Command", command]);
+            let full_command = if !command.ends_with('`') {
+                format!("{}{}{}", UTF8_OUTPUT_PREFIX, command, WINDOWS_POWERSHELL_EXIT_SUFFIX)
+            } else {
+                format!("{}{}", UTF8_OUTPUT_PREFIX, command)
+            };
+            c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &full_command]);
             c
         } else {
             let mut c = tokio::process::Command::new("sh");
@@ -235,8 +248,15 @@ impl AgentTool for BashTool {
         }
 
         if let Some(reason) = aborted_reason {
+            let mut drained_any = false;
             while let Ok(chunk) = rx.try_recv() {
                 append_rolling(&mut captured, &chunk, MAX_STREAMING_PREVIEW_BYTES);
+                drained_any = true;
+            }
+            if drained_any {
+                if let Some(cb) = on_update.as_ref() {
+                    cb(AgentToolResult::text(format_bash_output(&captured)));
+                }
             }
             if let Some(h) = out_handle {
                 h.abort();
@@ -288,13 +308,13 @@ mod tests {
         });
 
         let cmd = if cfg!(windows) {
-            "Write-Output 'partial_marker'; Start-Sleep -Seconds 5"
+            "Write-Output 'partial_marker'; Start-Sleep -Seconds 10"
         } else {
-            "echo partial_marker; sleep 5"
+            "echo partial_marker; sleep 10"
         };
         let params = json!({
             "command": cmd,
-            "timeout": 1200
+            "timeout": 2000
         })
         .as_object()
         .unwrap()

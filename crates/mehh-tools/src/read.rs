@@ -140,6 +140,7 @@ impl AgentTool for ReadTool {
                     mime_type: mime_type.to_string(),
                 })],
                 details: None,
+                ..Default::default()
             });
         }
 
@@ -158,30 +159,31 @@ impl AgentTool for ReadTool {
             return Ok(AgentToolResult::text(""));
         }
 
-        let content_str = String::from_utf8_lossy(&bytes);
+        let content_lossy = String::from_utf8_lossy(&bytes);
+        let content_str = content_lossy.strip_prefix('\u{feff}').unwrap_or(&content_lossy);
+
+        let mut raw_lines: Vec<&str> = content_str.split('\n').collect();
+        if content_str.ends_with('\n') {
+            raw_lines.pop();
+        }
+        let total_lines = raw_lines.len();
 
         let start_line = offset - 1;
-        let mut total_lines = 0usize;
-        let mut formatted_lines = Vec::with_capacity(limit.min(2048));
-        for (idx, raw_line) in content_str.split('\n').enumerate() {
-            total_lines = idx + 1;
-            if idx >= start_line && formatted_lines.len() < limit {
-                let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
-                if line.len() > 2000 {
-                    if let Some((cut, _)) = line.char_indices().nth(2000) {
-                        formatted_lines.push(format!("{}... [truncated]", &line[..cut]));
-                        continue;
-                    }
-                }
-                formatted_lines.push(line.to_string());
-            }
-        }
-
         if start_line >= total_lines {
             return Err(format!(
                 "Offset {} is beyond end of file ({} lines total)",
                 offset, total_lines
             ));
+        }
+
+        let mut formatted_lines = Vec::with_capacity(limit.min(2048));
+        for &raw_line in raw_lines.iter().skip(start_line).take(limit) {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if let Some((cut, _)) = line.char_indices().nth(2000) {
+                formatted_lines.push(format!("{}... [truncated]", &line[..cut]));
+            } else {
+                formatted_lines.push(line.to_string());
+            }
         }
 
         let end_line = start_line + formatted_lines.len();

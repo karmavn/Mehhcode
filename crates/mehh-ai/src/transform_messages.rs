@@ -282,6 +282,8 @@ where
                         details: None,
                         is_error: true,
                         timestamp: now_ms(),
+                        duration_ms: None,
+                        usage: None,
                     }));
                 }
             }
@@ -544,6 +546,8 @@ mod tests {
                 details: None,
                 is_error: false,
                 timestamp: 2,
+                duration_ms: None,
+                usage: None,
             }),
         ];
 
@@ -675,6 +679,8 @@ mod tests {
                 details: None,
                 is_error: false,
                 timestamp: 3,
+                duration_ms: None,
+                usage: None,
             }),
         ];
 
@@ -805,6 +811,8 @@ mod tests {
                 details: None,
                 is_error: false,
                 timestamp: 2,
+                duration_ms: None,
+                usage: None,
             }),
         ];
 
@@ -924,6 +932,8 @@ mod tests {
             details: None,
             is_error: false,
             timestamp: 1,
+            duration_ms: None,
+            usage: None,
         };
         assert!(split_error_tool_result_images(&non_error_msg).is_none());
 
@@ -938,6 +948,8 @@ mod tests {
             details: None,
             is_error: true,
             timestamp: 1,
+            duration_ms: None,
+            usage: None,
         };
         assert!(split_error_tool_result_images(&text_error_msg).is_none());
 
@@ -960,6 +972,8 @@ mod tests {
             details: None,
             is_error: true,
             timestamp: 1,
+            duration_ms: None,
+            usage: None,
         };
 
         let split = split_error_tool_result_images(&error_msg).expect("Expected SplitErrorToolResult");

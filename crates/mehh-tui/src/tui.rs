@@ -174,6 +174,7 @@ pub fn composite_tui_line(
 pub struct TuiRenderer {
     pub previous_lines: Vec<String>,
     pub previous_width: usize,
+    pub cursor_row: usize,
 }
 
 impl TuiRenderer {
@@ -181,12 +182,14 @@ impl TuiRenderer {
         Self {
             previous_lines: Vec::new(),
             previous_width: 0,
+            cursor_row: 0,
         }
     }
 
     pub fn reset(&mut self) {
         self.previous_lines.clear();
         self.previous_width = 0;
+        self.cursor_row = 0;
     }
 
     pub fn render_frame(
@@ -230,6 +233,8 @@ impl TuiRenderer {
         let mut out = String::new();
         out.push_str("\x1b[?2026h"); // Synchronized output begin
 
+        let mut final_cursor_row;
+
         if full_redraw {
             out.push('\r');
             for (i, line) in lines.iter().enumerate() {
@@ -239,6 +244,7 @@ impl TuiRenderer {
                     out.push_str("\r\n");
                 }
             }
+            final_cursor_row = lines.len().saturating_sub(1);
         } else {
             let max_len = lines.len().max(self.previous_lines.len());
             let mut first_changed = None;
@@ -256,52 +262,56 @@ impl TuiRenderer {
             }
 
             if let (Some(first), Some(last)) = (first_changed, last_changed) {
-                let prev_total = self.previous_lines.len();
-                if prev_total > 0 && first < prev_total {
-                    let move_up = prev_total - 1 - first;
-                    if move_up > 0 {
-                        out.push_str(&format!("\x1b[{move_up}A"));
-                    }
+                let diff = first as isize - self.cursor_row as isize;
+                if diff < 0 {
+                    out.push_str(&format!("\x1b[{}A", -diff));
+                } else if diff > 0 {
+                    out.push_str(&format!("\x1b[{}B", diff));
                 }
                 out.push('\r');
 
-                let mut current_row = first;
-                while current_row <= last {
-                    out.push_str("\x1b[2K");
-                    if current_row < lines.len() {
-                        out.push_str(&lines[current_row]);
-                    }
-                    if current_row < last || current_row + 1 < lines.len() {
+                let render_end = last.min(lines.len().saturating_sub(1));
+                for (i, line) in lines.iter().enumerate().take(render_end + 1).skip(first) {
+                    if i > first {
                         out.push_str("\r\n");
                     }
-                    current_row += 1;
+                    out.push_str("\x1b[2K");
+                    out.push_str(line);
                 }
+                final_cursor_row = render_end;
 
                 if self.previous_lines.len() > lines.len() {
+                    if render_end < lines.len().saturating_sub(1) {
+                        let move_down = lines.len() - 1 - render_end;
+                        out.push_str(&format!("\x1b[{move_down}B"));
+                        final_cursor_row = lines.len() - 1;
+                    }
                     let extra = self.previous_lines.len() - lines.len();
                     for _ in 0..extra {
                         out.push_str("\r\n\x1b[2K");
                     }
                     out.push_str(&format!("\x1b[{extra}A"));
                 }
+            } else {
+                final_cursor_row = self.cursor_row;
             }
         }
 
         // Position hardware cursor if tracked
         if show_hardware_cursor {
             if let Some((target_row, target_col)) = cursor_pos {
-                let current_row = lines.len().saturating_sub(1);
-                if target_row < current_row {
-                    let up = current_row - target_row;
-                    out.push_str(&format!("\x1b[{up}A"));
-                } else if target_row > current_row {
-                    let down = target_row - current_row;
-                    out.push_str(&format!("\x1b[{down}B"));
+                let target_row = target_row.min(lines.len().saturating_sub(1));
+                let diff = target_row as isize - final_cursor_row as isize;
+                if diff < 0 {
+                    out.push_str(&format!("\x1b[{}A", -diff));
+                } else if diff > 0 {
+                    out.push_str(&format!("\x1b[{}B", diff));
                 }
                 out.push('\r');
                 if target_col > 0 {
                     out.push_str(&format!("\x1b[{}C", target_col));
                 }
+                final_cursor_row = target_row;
             }
         }
 
@@ -312,7 +322,46 @@ impl TuiRenderer {
 
         self.previous_lines = lines;
         self.previous_width = width;
+        self.cursor_row = final_cursor_row;
 
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_differential_render_cursor_position_when_partial_lines_change() {
+        let mut term = MockTerminal::new(40, 10);
+        let mut renderer = TuiRenderer::new();
+
+        // Initial 4 lines
+        let frame1 = vec![
+            "line0".to_string(),
+            "line1".to_string(),
+            "line2".to_string(),
+            "line3".to_string(),
+        ];
+        renderer.render_frame(&mut term, frame1, false).unwrap();
+        term.clear_output();
+
+        // Frame 2: only line0 changes, with cursor at line0
+        let frame2 = vec![
+            format!("line0_new{CURSOR_MARKER}"),
+            "line1".to_string(),
+            "line2".to_string(),
+            "line3".to_string(),
+        ];
+        renderer.render_frame(&mut term, frame2, true).unwrap();
+        let out = term.full_output();
+
+        // If cursor is at bottom (row 3) after re-rendering line0..line3, moving to line0 takes 3A.
+        // But if renderer stops after line0, it should either advance to row 3 before moving 3A, or move 1A from row 1.
+        // It must NOT emit an overshoot movement (e.g. moving up 3 from row 1).
+        assert!(out.contains("line0_new"));
+        assert!(!out.contains("\x1b[3A\r\x1b[2Kline0_new\r\n\x1b[3A"), "Out contained bad overshoot cursor move: {out:?}");
+    }
+}
+

@@ -121,6 +121,9 @@ impl LlmProvider for GoogleProvider {
                                     state.process_chunk_into(&ev.data, &mut batch);
                                 }
                                 sender.send_batch(batch).await;
+                                if state.done {
+                                    break;
+                                }
                             }
                             Ok(Some(Err(e))) => {
                                 state.mark_error(e.to_string());
@@ -541,6 +544,19 @@ impl GoogleStreamState {
         let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             return;
         };
+
+        if let Some(err_val) = json.get("error") {
+            self.received_terminal = true;
+            self.output.stop_reason = StopReason::Error;
+            let msg = err_val
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| err_val.as_str())
+                .unwrap_or("Google API error");
+            self.output.error_message = Some(msg.to_string());
+            self.finish_into(events);
+            return;
+        }
 
         if self.output.response_id.is_none() {
             if let Some(id) = json.get("responseId").and_then(|v| v.as_str()) {
@@ -980,6 +996,8 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 1002,
+                    duration_ms: None,
+                    usage: None,
                 }),
             ],
             tools: Some(vec![ToolDefinition {
@@ -1262,6 +1280,8 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 300,
+                    duration_ms: None,
+                    usage: None,
                 }),
             ],
             tools: None,
@@ -1285,5 +1305,48 @@ mod tests {
         let fr = &user_msg["parts"][0]["functionResponse"];
         assert_eq!(fr["name"], "calculator");
         assert_eq!(fr["id"], "call_abc123_item_xyz789");
+    }
+
+    #[test]
+    fn test_google_error_chunk() {
+        let model = Model {
+            id: "gemini-2.5-flash".to_string(),
+            name: "Gemini 2.5 Flash".to_string(),
+            api: "google-generative-ai".to_string(),
+            provider: "google".to_string(),
+            base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 1_000_000,
+            max_tokens: 8192,
+            headers: None,
+            ..Default::default()
+        };
+        let (sender, _stream) = create_event_stream();
+        let chunks = vec![
+            serde_json::json!({
+                "error": {
+                    "code": 400,
+                    "message": "User location is not supported for the API use.",
+                    "status": "FAILED_PRECONDITION"
+                }
+            })
+            .to_string(),
+        ];
+        let sse_events: Vec<SseEvent> = chunks
+            .into_iter()
+            .map(|data| SseEvent {
+                event: None,
+                data,
+            })
+            .collect();
+
+        let result = process_google_sse_events(&model, &sse_events, &sender);
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(
+            result.error_message.as_deref(),
+            Some("User location is not supported for the API use.")
+        );
     }
 }

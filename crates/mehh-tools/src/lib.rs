@@ -1,16 +1,20 @@
 pub mod bash;
 pub mod edit;
+pub mod file_mutation_queue;
 pub mod find;
 pub mod grep;
 pub mod ls;
+pub mod powershell;
 pub mod read;
 pub mod write;
 
 pub use bash::BashTool;
 pub use edit::EditTool;
+pub use file_mutation_queue::with_file_mutation_queue;
 pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
+pub use powershell::PowerShellTool;
 pub use read::ReadTool;
 pub use write::WriteTool;
 
@@ -28,6 +32,47 @@ pub fn create_coding_tools(cwd: PathBuf) -> Vec<Arc<dyn AgentTool>> {
         Arc::new(FindTool::new(cwd.clone())),
         Arc::new(LsTool::new(cwd)),
     ]
+}
+
+pub fn create_all_tools(cwd: PathBuf) -> Vec<Arc<dyn AgentTool>> {
+    vec![
+        Arc::new(ReadTool::new(cwd.clone())),
+        Arc::new(WriteTool::new(cwd.clone())),
+        Arc::new(EditTool::new(cwd.clone())),
+        Arc::new(BashTool::new(cwd.clone())),
+        Arc::new(GrepTool::new(cwd.clone())),
+        Arc::new(FindTool::new(cwd.clone())),
+        Arc::new(LsTool::new(cwd.clone())),
+        Arc::new(PowerShellTool::new(cwd)),
+    ]
+}
+
+pub fn select_coding_tools(
+    cwd: PathBuf,
+    include: Option<&[String]>,
+    exclude: &[String],
+) -> anyhow::Result<Vec<Arc<dyn AgentTool>>> {
+    let all = create_all_tools(cwd);
+    let mut selected = Vec::new();
+    let exclude_set: std::collections::HashSet<&str> = exclude.iter().map(|s| s.as_str()).collect();
+
+    for tool in all {
+        let name = tool.name();
+        if exclude_set.contains(name) {
+            continue;
+        }
+        if let Some(inc) = include {
+            if inc.iter().any(|s| s == name) {
+                selected.push(tool);
+            }
+        } else {
+            // Default 7 tools if include is None (powershell is opt-in)
+            if name != "powershell" {
+                selected.push(tool);
+            }
+        }
+    }
+    Ok(selected)
 }
 
 #[cfg(test)]
@@ -435,6 +480,163 @@ mod tests {
         assert_eq!(
             names,
             vec!["read", "write", "edit", "bash", "grep", "find", "ls"]
+        );
+    }
+
+    #[test]
+    fn create_coding_tools_excludes_powershell_while_create_all_tools_includes_it() {
+        let default_tools = create_coding_tools(PathBuf::from("."));
+        assert_eq!(default_tools.len(), 7);
+        assert!(!default_tools.iter().any(|t| t.name() == "powershell"));
+
+        let all_tools = create_all_tools(PathBuf::from("."));
+        assert_eq!(all_tools.len(), 8);
+        assert!(all_tools.iter().any(|t| t.name() == "powershell"));
+
+        // select_coding_tools with include
+        let selected = select_coding_tools(
+            PathBuf::from("."),
+            Some(&["powershell".to_string(), "bash".to_string()]),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(selected.len(), 2);
+
+        // select_coding_tools with exclude
+        let without_bash = select_coding_tools(
+            PathBuf::from("."),
+            None,
+            &["bash".to_string()],
+        )
+        .unwrap();
+        assert_eq!(without_bash.len(), 6);
+        assert!(!without_bash.iter().any(|t| t.name() == "bash"));
+    }
+
+    #[tokio::test]
+    async fn test_read_tool_bom_and_trailing_newline_line_count() {
+        let temp_dir = TempTestDir::new("read_bom_nl");
+        let file_path = temp_dir.path().join("sample_bom.txt");
+        let bom_content = "\u{feff}first line\nsecond line\n";
+        std::fs::write(&file_path, bom_content.as_bytes()).unwrap();
+
+        let read_tool = ReadTool::new(temp_dir.path().to_path_buf());
+        let params = json!({
+            "path": "sample_bom.txt",
+            "offset": 1,
+            "limit": 10
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let res = read_tool
+            .execute("tc_bom", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let text = match &res.content[0] {
+            ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("Expected text"),
+        };
+
+        // File has 2 lines; trailing newline must not inflate line count to 3
+        assert!(!text.contains("3 lines total"), "Trailing newline caused off-by-one line count: {text}");
+        assert!(!text.contains("[Showing lines 1-2 of 3"), "Trailing newline caused off-by-one pagination hint: {text}");
+        assert!(!text.starts_with('\u{feff}'), "BOM was not stripped from read tool output");
+    }
+
+    #[tokio::test]
+    async fn test_edit_tool_preserves_bom_and_matches_first_line() {
+        let temp_dir = TempTestDir::new("edit_bom");
+        let file_path = temp_dir.path().join("bom_code.rs");
+        // Trailing whitespace requires tier-2 fuzzy matching on a file with BOM
+        let bom_code = "\u{feff}fn main() {   \n    let x = 1;  \n}\n";
+        std::fs::write(&file_path, bom_code.as_bytes()).unwrap();
+
+        let edit_tool = EditTool::new(temp_dir.path().to_path_buf());
+        let params = json!({
+            "path": "bom_code.rs",
+            "oldText": "fn main() {\n    let x = 1;\n}",
+            "newText": "fn main() {\n    let x = 42;\n}"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let res = edit_tool
+            .execute("tc_edit_bom", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert!(match &res.content[0] {
+            ToolResultContentBlock::Text(t) => t.text.contains("Successfully edited"),
+            _ => false,
+        });
+
+        let updated_bytes = std::fs::read(&file_path).unwrap();
+        let updated_str = String::from_utf8(updated_bytes).unwrap();
+        assert!(updated_str.starts_with('\u{feff}'), "BOM must be preserved after edit");
+        assert!(updated_str.contains("let x = 42;"));
+    }
+
+    #[tokio::test]
+    async fn test_edit_tool_preserves_mixed_line_endings_without_wholesale_rewrite() {
+        let temp_dir = TempTestDir::new("edit_mixed");
+        let file_path = temp_dir.path().join("mixed.rs");
+        // File is LF throughout, but contains an actual CRLF in one place
+        let initial = "fn test() {\n    let crlf = \"\r\n\";\n    let y = 1;\n}\n";
+        std::fs::write(&file_path, initial.as_bytes()).unwrap();
+
+        let edit_tool = EditTool::new(temp_dir.path().to_path_buf());
+        let params = json!({
+            "path": "mixed.rs",
+            "oldText": "let y = 1;",
+            "newText": "let y = 2;"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        edit_tool
+            .execute("tc_mixed", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+
+        let updated = std::fs::read_to_string(&file_path).unwrap();
+        assert_eq!(updated, "fn test() {\n    let crlf = \"\r\n\";\n    let y = 2;\n}\n");
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_honors_cancellation() {
+        let temp_dir = TempTestDir::new("write_cancel");
+        let write_tool = WriteTool::new(temp_dir.path().to_path_buf());
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let params = json!({
+            "path": "cancelled.txt",
+            "content": "should not be written"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let res = write_tool.execute("tc_cancel", params, cancel, None).await;
+        assert!(res.is_err(), "WriteTool must fail when cancelled");
+        assert!(!temp_dir.path().join("cancelled.txt").exists(), "Cancelled write must not create file");
+    }
+
+    #[test]
+    fn test_mutation_queue_key_resolves_dot_dot_before_file_creation() {
+        let temp_dir = TempTestDir::new("key_dotdot");
+        let direct = temp_dir.path().join("target.txt");
+        let via_dotdot = temp_dir.path().join("subdir").join("..").join("target.txt");
+
+        let key_direct = file_mutation_queue::get_mutation_queue_key(&direct);
+        let key_dotdot = file_mutation_queue::get_mutation_queue_key(&via_dotdot);
+
+        assert_eq!(
+            key_direct, key_dotdot,
+            "Mutation queue keys must resolve '..' components identically before file creation"
         );
     }
 }

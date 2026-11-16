@@ -18,7 +18,7 @@ pub struct DeferredToolMatch {
 
 /// Catalog of deferred tools that can be searched and dynamically activated mid-session.
 pub struct DeferredToolCatalog {
-    deferred: Vec<Arc<dyn AgentTool>>,
+    deferred: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
     active_tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
 }
 
@@ -26,9 +26,15 @@ impl DeferredToolCatalog {
     /// Creates a catalog wrapping `deferred` tools alongside an empty dynamic tool slot.
     pub fn new(deferred: Vec<Arc<dyn AgentTool>>) -> Self {
         Self {
-            deferred,
+            deferred: Arc::new(RwLock::new(deferred)),
             active_tools: Arc::new(RwLock::new(Vec::new())),
         }
+    }
+
+    /// Replaces the registered deferred tools in the catalog.
+    pub fn replace_deferred(&self, deferred: Vec<Arc<dyn AgentTool>>) {
+        let mut guard = self.deferred.write().unwrap();
+        *guard = deferred;
     }
 
     /// Returns the shared handle wired into `AgentLoopConfig.dynamic_tools`.
@@ -38,12 +44,12 @@ impl DeferredToolCatalog {
 
     /// Returns the number of deferred tools registered in the catalog.
     pub fn len(&self) -> usize {
-        self.deferred.len()
+        self.deferred.read().unwrap().len()
     }
 
     /// Returns true if no deferred tools are registered.
     pub fn is_empty(&self) -> bool {
-        self.deferred.is_empty()
+        self.deferred.read().unwrap().is_empty()
     }
 
     /// Searches deferred tools by case-insensitive keyword matching against names and descriptions.
@@ -52,8 +58,8 @@ impl DeferredToolCatalog {
         let q = query.trim().to_ascii_lowercase();
         let terms: Vec<&str> = q.split_whitespace().collect();
 
-        let mut scored: Vec<(usize, &Arc<dyn AgentTool>)> = self
-            .deferred
+        let deferred_guard = self.deferred.read().unwrap();
+        let mut scored: Vec<(usize, &Arc<dyn AgentTool>)> = deferred_guard
             .iter()
             .filter_map(|tool| {
                 if terms.is_empty() {
@@ -104,9 +110,9 @@ impl DeferredToolCatalog {
     pub fn activate_by_names(&self, names: &[String]) -> (Vec<String>, Vec<String>) {
         let mut found = Vec::new();
         let mut missing = Vec::new();
+        let deferred_guard = self.deferred.read().unwrap();
         for name in names {
-            if let Some(tool) = self
-                .deferred
+            if let Some(tool) = deferred_guard
                 .iter()
                 .find(|t| t.name().eq_ignore_ascii_case(name))
             {

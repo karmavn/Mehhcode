@@ -89,6 +89,8 @@ fn format_markdown_table(
                 break;
             }
         }
+    } else {
+        col_widths.fill(1);
     }
 
     let mut lines = Vec::new();
@@ -149,7 +151,8 @@ impl Component for MarkdownView {
         options.insert(Options::ENABLE_TABLES);
         options.insert(Options::ENABLE_TASKLISTS);
 
-        let parser = Parser::new_ext(&self.source, options);
+        let clean_source = crate::ansi::strip_ansi(&self.source);
+        let parser = Parser::new_ext(&clean_source, options);
 
         let mut output_lines: Vec<String> = Vec::new();
         let mut current_line = String::new();
@@ -166,6 +169,7 @@ impl Component for MarkdownView {
         let mut blockquote_depth = 0usize;
         let mut list_stack: Vec<Option<u64>> = Vec::new();
         let mut link_osc8_stack: Vec<bool> = Vec::new();
+        let mut active_heading_style: Option<String> = None;
 
         let quote_color = if !self.theme.md_quote.is_empty() {
             &self.theme.md_quote
@@ -204,14 +208,16 @@ impl Component for MarkdownView {
                         HeadingLevel::H6 => "###### ",
                     };
                     let heading_style = if !self.theme.md_heading.is_empty() {
-                        &self.theme.md_heading
+                        self.theme.md_heading.clone()
                     } else {
-                        "\x1b[1;36m"
+                        "\x1b[1;36m".to_string()
                     };
-                    current_line.push_str(heading_style);
+                    current_line.push_str(&heading_style);
                     current_line.push_str(prefix);
+                    active_heading_style = Some(heading_style);
                 }
                 Event::End(TagEnd::Heading(_)) => {
+                    active_heading_style = None;
                     current_line.push_str("\x1b[0m");
                     flush_current_line(&mut current_line, &mut output_lines, blockquote_depth);
                     output_lines.push(String::new());
@@ -388,18 +394,27 @@ impl Component for MarkdownView {
                 }
                 Event::End(TagEnd::Emphasis) => {
                     current_line.push_str("\x1b[23m");
+                    if let Some(ref h_style) = active_heading_style {
+                        current_line.push_str(h_style);
+                    }
                 }
                 Event::Start(Tag::Strong) => {
                     current_line.push_str("\x1b[1m");
                 }
                 Event::End(TagEnd::Strong) => {
                     current_line.push_str("\x1b[22m");
+                    if let Some(ref h_style) = active_heading_style {
+                        current_line.push_str(h_style);
+                    }
                 }
                 Event::Start(Tag::Strikethrough) => {
                     current_line.push_str("\x1b[9m");
                 }
                 Event::End(TagEnd::Strikethrough) => {
                     current_line.push_str("\x1b[29m");
+                    if let Some(ref h_style) = active_heading_style {
+                        current_line.push_str(h_style);
+                    }
                 }
                 Event::Start(Tag::Link { dest_url, .. }) => {
                     let link_style = if !self.theme.md_link.is_empty() {
@@ -417,10 +432,11 @@ impl Component for MarkdownView {
                 }
                 Event::End(TagEnd::Link) => {
                     let opened = link_osc8_stack.pop().unwrap_or(false);
+                    let restore = active_heading_style.as_deref().unwrap_or("");
                     if opened {
-                        current_line.push_str("\x1b]8;;\x07\x1b[0m");
+                        current_line.push_str(&format!("\x1b]8;;\x07\x1b[0m{restore}"));
                     } else {
-                        current_line.push_str("\x1b[0m");
+                        current_line.push_str(&format!("\x1b[0m{restore}"));
                     }
                 }
                 Event::Code(text) => {
@@ -428,7 +444,11 @@ impl Component for MarkdownView {
                         code_block_buf.push_str(&text);
                     } else {
                         let clean = sanitize_markdown_text(&text, false);
-                        current_line.push_str(&format!("{code_color}{clean}\x1b[0m"));
+                        if let Some(ref h_style) = active_heading_style {
+                            current_line.push_str(&format!("{code_color}{clean}\x1b[0m{h_style}"));
+                        } else {
+                            current_line.push_str(&format!("{code_color}{clean}\x1b[0m"));
+                        }
                     }
                 }
                 Event::Text(text) => {
@@ -444,7 +464,7 @@ impl Component for MarkdownView {
                     output_lines.push(format!("{border_color}{}\x1b[0m", "─".repeat(rule_w)));
                     output_lines.push(String::new());
                 }
-                Event::SoftBreak if !in_code_block && !in_table => {
+                Event::SoftBreak if !in_code_block => {
                     current_line.push(' ');
                 }
                 Event::HardBreak if !in_code_block && !in_table => {
@@ -531,4 +551,48 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn test_markdown_heading_preserves_styling_after_inline_code() {
+        let src = "### Why `sourceInfo` should not be optional";
+        let lines = MarkdownView::new(src).render(80);
+        let joined = lines.join("\n");
+        assert!(joined.contains("\x1b[33m")); // yellow inline code
+        let code_marker = "sourceInfo\x1b[0m";
+        let code_end = joined.find(code_marker).unwrap() + code_marker.len();
+        let after_idx = joined.find("should not be optional").unwrap();
+        let between = &joined[code_end..after_idx];
+        assert!(
+            between.contains("\x1b[1;36m") || between.contains("\x1b[36m"),
+            "Heading style must be re-applied immediately after inline code: {between:?}"
+        );
+    }
+
+    #[test]
+    fn test_markdown_table_narrow_width_does_not_overflow() {
+        let src = "| ColumnOne | ColumnTwo |\n| --- | --- |\n| very_long_value_one | very_long_value_two |";
+        // Narrow width smaller than overhead
+        let lines = MarkdownView::new(src).render(6);
+        for line in &lines {
+            // Should not produce an unconstrained 100-character line
+            assert!(
+                crate::ansi::visible_width(line) <= 12,
+                "Table line exceeded expected bounds: {:?}",
+                line
+            );
+        }
+    }
+
+    #[test]
+    fn test_markdown_softbreak_preserves_space() {
+        let src = "Hello\nworld";
+        let lines = MarkdownView::new(src).render(40);
+        let plain = lines
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(plain.contains("Hello world"), "Paragraph softbreak must have space between lines: {plain}");
+    }
 }
+

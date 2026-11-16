@@ -176,6 +176,28 @@ pub fn resolve_project_trust(
     Ok(trusted)
 }
 
+/// Explicit CLI trust override for the current invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrustOverride {
+    None,
+    Approve,
+    NoApprove,
+}
+
+/// Resolves whether project-local configuration should be trusted taking CLI overrides into account.
+/// Overrides (`Approve` or `NoApprove`) take effect for this invocation without mutating disk.
+pub fn resolve_project_trust_with_override(
+    cwd: &Path,
+    trust_override: TrustOverride,
+    interactive_prompt: bool,
+) -> anyhow::Result<bool> {
+    match trust_override {
+        TrustOverride::Approve => Ok(true),
+        TrustOverride::NoApprove => Ok(false),
+        TrustOverride::None => resolve_project_trust(cwd, false, interactive_prompt),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,5 +248,25 @@ mod tests {
         if TrustStore::default_path().is_ok() {
             assert!(!resolve_project_trust(dir.path(), false, false).unwrap());
         }
+    }
+
+    #[test]
+    fn no_approve_overrides_persisted_trust_without_writing_disk() {
+        let dir = crate::TempTestDir::new("trust_override");
+        let store_dir = crate::TempTestDir::new("trust_override_store");
+        let store_path = store_dir.path().join("trust.json");
+
+        let mut store = TrustStore::default();
+        store.set(dir.path(), TrustLevel::Trusted);
+        store.save_to(&store_path).unwrap();
+
+        let res = resolve_project_trust_with_override(dir.path(), TrustOverride::NoApprove, false).unwrap();
+        assert!(!res);
+
+        let res = resolve_project_trust_with_override(dir.path(), TrustOverride::Approve, false).unwrap();
+        assert!(res);
+
+        let reloaded = TrustStore::load_from(&store_path).unwrap();
+        assert_eq!(reloaded.get(dir.path()), Some(TrustLevel::Trusted));
     }
 }

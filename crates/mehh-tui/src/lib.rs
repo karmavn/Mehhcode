@@ -1,14 +1,18 @@
 pub mod ansi;
 pub mod components;
+pub mod fuzzy;
 pub mod keys;
 pub mod theme;
 pub mod tui;
+pub mod wheel_scroll;
 
 pub use ansi::*;
 pub use components::*;
+pub use fuzzy::*;
 pub use keys::*;
 pub use theme::*;
 pub use tui::*;
+pub use wheel_scroll::*;
 
 #[cfg(test)]
 mod tests {
@@ -195,6 +199,16 @@ mod tests {
         let list_rendered2 = list.render(30);
         assert!(list_rendered2[1].contains('>'));
         assert!(list_rendered2[1].contains("Banana"));
+
+        // Fuzzy filter: "bnn" matches Banana
+        list.set_filter("bnn");
+        assert_eq!(list.filtered_indices(), vec![1]);
+        assert_eq!(list.selected_item().map(|it| it.label.as_str()), Some("Banana"));
+
+        // Out-of-bounds selected should not panic when rendering
+        list.selected = 100;
+        let safe_lines = list.render(30);
+        assert!(!safe_lines.is_empty());
     }
 
     #[test]

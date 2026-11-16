@@ -357,6 +357,9 @@ impl LlmProvider for MistralProvider {
                                     state.process_chunk_into(&ev.data, &mut batch);
                                 }
                                 sender.send_batch(batch).await;
+                                if state.done {
+                                    break;
+                                }
                             }
                             Ok(Some(Err(e))) => {
                                 state.mark_error(e.to_string());
@@ -460,12 +463,36 @@ impl MistralStreamState {
         }
         if trimmed == "[DONE]" {
             self.received_terminal = true;
+            self.finish_into(events);
             return;
         }
 
         let Ok(json) = serde_json::from_str::<serde_json::Value>(trimmed) else {
             return;
         };
+
+        if let Some(err_val) = json.get("error") {
+            self.received_terminal = true;
+            self.output.stop_reason = StopReason::Error;
+            let msg = err_val
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| err_val.as_str())
+                .unwrap_or("Mistral API error");
+            self.output.error_message = Some(msg.to_string());
+            self.finish_into(events);
+            return;
+        }
+
+        if let Some(msg_val) = json.get("message").and_then(|m| m.as_str()) {
+            if json.get("choices").is_none() {
+                self.received_terminal = true;
+                self.output.stop_reason = StopReason::Error;
+                self.output.error_message = Some(msg_val.to_string());
+                self.finish_into(events);
+                return;
+            }
+        }
 
         if self.output.response_id.is_none() {
             if let Some(id) = json.get("id").and_then(|v| v.as_str()) {
@@ -745,18 +772,14 @@ impl MistralStreamState {
         tool_call_indices.sort_by_key(|t| t.0);
 
         for (_, content_index, raw_args) in tool_call_indices {
-            let parsed_args = match serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(&raw_args) {
-                Ok(map) => map,
-                Err(e) => {
-                    if let Some(AssistantContentBlock::ToolCall(tc)) = self.output.content.get_mut(content_index) {
-                        tc.arguments_error = Some(e.to_string());
-                    }
-                    serde_json::Map::new()
-                }
-            };
+            let (parsed_args, err) =
+                crate::streaming_json::parse_tool_call_arguments(Some(&raw_args));
 
-            let tool_call = if let Some(AssistantContentBlock::ToolCall(tc)) = self.output.content.get_mut(content_index) {
+            let tool_call = if let Some(AssistantContentBlock::ToolCall(tc)) =
+                self.output.content.get_mut(content_index)
+            {
                 tc.arguments = parsed_args;
+                tc.arguments_error = err;
                 tc.clone()
             } else {
                 continue;
@@ -890,6 +913,8 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 3,
+                    duration_ms: None,
+                    usage: None,
                 }),
             ],
             tools: None,
@@ -1091,6 +1116,8 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 300,
+                    duration_ms: None,
+                    usage: None,
                 }),
                 Message::ToolResult(ToolResultMessage {
                     tool_call_id: id_b.to_string(),
@@ -1102,6 +1129,8 @@ mod tests {
                     details: None,
                     is_error: false,
                     timestamp: 301,
+                    duration_ms: None,
+                    usage: None,
                 }),
             ],
             tools: None,
@@ -1116,5 +1145,82 @@ mod tests {
         // Tool results adopt the same mapped IDs
         assert_eq!(messages[2]["tool_call_id"], norm_a);
         assert_eq!(messages[3]["tool_call_id"], norm_b);
+    }
+
+    #[test]
+    fn test_mistral_empty_tool_arguments() {
+        let model = Model {
+            id: "mistral-large-latest".to_string(),
+            name: "Mistral Large".to_string(),
+            api: "mistral-conversations".to_string(),
+            provider: "mistral".to_string(),
+            base_url: "https://api.mistral.ai/v1".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 32_768,
+            headers: None,
+            ..Default::default()
+        };
+        let (sender, _stream) = create_event_stream();
+        let chunks = vec![
+            serde_json::json!({
+                "id": "cmpl-1",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_123456789",
+                            "type": "function",
+                            "function": {
+                                "name": "get_time",
+                                "arguments": ""
+                            }
+                        }]
+                    }
+                }]
+            }).to_string(),
+            "[DONE]".to_string(),
+        ];
+        let sse_events: Vec<SseEvent> = chunks.into_iter().map(|data| SseEvent { event: None, data }).collect();
+        let result = process_mistral_sse_events(&model, &sse_events, &sender);
+        assert_eq!(result.content.len(), 1);
+        match &result.content[0] {
+            AssistantContentBlock::ToolCall(tc) => {
+                assert_eq!(tc.name, "get_time");
+                assert_eq!(tc.arguments_error, None);
+            }
+            _ => panic!("Expected ToolCall"),
+        }
+    }
+
+    #[test]
+    fn test_mistral_error_chunk() {
+        let model = Model {
+            id: "mistral-large-latest".to_string(),
+            name: "Mistral Large".to_string(),
+            api: "mistral-conversations".to_string(),
+            provider: "mistral".to_string(),
+            base_url: "https://api.mistral.ai/v1".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 32_768,
+            headers: None,
+            ..Default::default()
+        };
+        let (sender, _stream) = create_event_stream();
+        let chunks = vec![
+            serde_json::json!({
+                "message": "Rate limit exceeded"
+            }).to_string(),
+        ];
+        let sse_events: Vec<SseEvent> = chunks.into_iter().map(|data| SseEvent { event: None, data }).collect();
+        let result = process_mistral_sse_events(&model, &sse_events, &sender);
+        assert_eq!(result.stop_reason, StopReason::Error);
+        assert_eq!(result.error_message.as_deref(), Some("Rate limit exceeded"));
     }
 }

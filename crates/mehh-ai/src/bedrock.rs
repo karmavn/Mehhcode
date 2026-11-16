@@ -772,6 +772,19 @@ impl BedrockStreamState {
             });
         }
 
+        // 0. In-band exceptions or errors
+        if let Some(obj) = json.as_object() {
+            for (k, v) in obj {
+                if (k.ends_with("Exception") || k.ends_with("exception") || k == "error") && v.is_object() {
+                    self.received_terminal = true;
+                    self.output.stop_reason = StopReason::Error;
+                    let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or(k.as_str());
+                    self.output.error_message = Some(format!("{k}: {msg}"));
+                    return;
+                }
+            }
+        }
+
         // 1. contentBlockStart
         if let Some(cbs) = json.get("contentBlockStart") {
             let block_idx = cbs.get("contentBlockIndex").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -1201,15 +1214,19 @@ impl LlmProvider for BedrockProvider {
                                     Ok(events) => {
                                         let mut batch = Vec::new();
                                         for ev in events {
-                                            if ev.headers.get(":message-type").map(|s| s.as_str())
-                                                == Some("exception")
-                                            {
+                                            let msg_type = ev.headers.get(":message-type").map(|s| s.as_str());
+                                            if msg_type == Some("exception") || msg_type == Some("error") {
                                                 let exc = ev
                                                     .headers
                                                     .get(":exception-type")
+                                                    .or_else(|| ev.headers.get(":error-code"))
                                                     .cloned()
                                                     .unwrap_or_else(|| "Bedrock exception".to_string());
-                                                let detail = String::from_utf8_lossy(&ev.payload);
+                                                let detail = if let Some(msg) = ev.headers.get(":error-message") {
+                                                    msg.clone()
+                                                } else {
+                                                    String::from_utf8_lossy(&ev.payload).to_string()
+                                                };
                                                 state.mark_error(format!("{exc}: {detail}"));
                                                 state.finish_into(&mut batch);
                                                 sender.send_batch(batch).await;
@@ -1217,6 +1234,13 @@ impl LlmProvider for BedrockProvider {
                                             }
                                             if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&ev.payload) {
                                                 state.process_event_into(&json, &mut batch);
+                                                if state.output.stop_reason == StopReason::Error
+                                                    || state.output.stop_reason == StopReason::Aborted
+                                                {
+                                                    state.finish_into(&mut batch);
+                                                    sender.send_batch(batch).await;
+                                                    return;
+                                                }
                                             }
                                         }
                                         sender.send_batch(batch).await;
@@ -1514,6 +1538,8 @@ mod tests {
                     details: None,
                     is_error: true,
                     timestamp: 300,
+                    duration_ms: None,
+                    usage: None,
                 }),
             ],
             tools: None,
@@ -1776,5 +1802,40 @@ mod tests {
             }
             _ => panic!("Expected ToolCallDelta event"),
         }
+    }
+
+    #[test]
+    fn test_bedrock_in_band_exception() {
+        let model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            name: "Claude 3.7 Sonnet (Bedrock)".to_string(),
+            api: "bedrock-converse-stream".to_string(),
+            provider: "amazon-bedrock".to_string(),
+            base_url: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 200_000,
+            max_tokens: 64_000,
+            headers: None,
+            ..Default::default()
+        };
+        let (sender, _stream) = create_event_stream();
+        let mut state = BedrockStreamState::new(&model);
+        state.process_event(
+            &serde_json::json!({
+                "modelStreamErrorException": {
+                    "message": "The model encountered an issue during generation"
+                }
+            }),
+            &sender,
+        );
+        let final_msg = state.finish(&sender);
+        assert_eq!(final_msg.stop_reason, StopReason::Error);
+        assert!(final_msg
+            .error_message
+            .as_deref()
+            .unwrap_or("")
+            .contains("The model encountered an issue during generation"));
     }
 }

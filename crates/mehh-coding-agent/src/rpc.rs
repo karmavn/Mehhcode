@@ -1,15 +1,18 @@
 //! Headless RPC protocol for embedding the coding agent over asynchronous stdin/stdout or duplex streams.
 
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::sync::Arc;
 use anyhow::Result;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
-use mehh_agent::AgentEvent;
+use mehh_agent::{AgentEvent, AgentTool};
 use mehh_ai::{Message, StopReason, ThinkingLevel};
 
 use crate::agent_session::AgentSession;
+use crate::session::SessionManager;
 
 /// Serializes and sends JSONL responses and events to the writer.
 struct RpcOutput<W> {
@@ -457,6 +460,202 @@ where
                 session.abort();
                 output.send_success(id, "abort", None).await?;
             }
+            "steer" => {
+                let msg = val
+                    .get("message")
+                    .or_else(|| val.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                session.steer(msg);
+                output.send_success(id, "steer", None).await?;
+            }
+            "follow_up" => {
+                let msg = val
+                    .get("message")
+                    .or_else(|| val.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                session.follow_up(msg);
+                output.send_success(id, "follow_up", None).await?;
+            }
+            "clear_queue" => {
+                session.clear_queues();
+                output.send_success(id, "clear_queue", None).await?;
+            }
+            "cycle_model" => {
+                match session.cycle_model() {
+                    Ok(Some(m)) => {
+                        let _ = session.ensure_api_key(None).await;
+                        output
+                            .send_success(id, "cycle_model", Some(serde_json::to_value(&m)?))
+                            .await?;
+                    }
+                    Ok(None) => {
+                        output.send_success(id, "cycle_model", None).await?;
+                    }
+                    Err(e) => {
+                        output.send_error(id, "cycle_model", &e.to_string()).await?;
+                    }
+                }
+            }
+            "bash" => {
+                let command = val.get("command").and_then(|v| v.as_str()).unwrap_or("");
+                let cancel = CancellationToken::new();
+                *session.active_bash_cancel.lock().unwrap() = Some(cancel.clone());
+
+                let bash_tool = mehh_tools::BashTool::new(session.cwd.clone());
+                let args = [("command".to_string(), serde_json::json!(command))]
+                    .into_iter()
+                    .collect();
+
+                let res = bash_tool.execute("rpc_bash", args, cancel, None).await;
+                *session.active_bash_cancel.lock().unwrap() = None;
+
+                match res {
+                    Ok(tool_res) => {
+                        let text = tool_res
+                            .content
+                            .iter()
+                            .filter_map(|b| match b {
+                                mehh_ai::ToolResultContentBlock::Text(t) => Some(t.text.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        output
+                            .send_success(
+                                id,
+                                "bash",
+                                Some(serde_json::json!({
+                                    "output": text,
+                                    "isError": tool_res.is_error.unwrap_or(false),
+                                })),
+                            )
+                            .await?;
+                    }
+                    Err(e) => {
+                        if e.contains("Command aborted") || e.contains("Missing required parameter") {
+                            output.send_error(id, "bash", &e).await?;
+                        } else {
+                            output
+                                .send_success(
+                                    id,
+                                    "bash",
+                                    Some(serde_json::json!({
+                                        "output": e,
+                                        "isError": true,
+                                    })),
+                                )
+                                .await?;
+                        }
+                    }
+                }
+            }
+            "abort_bash" => {
+                session.abort_bash();
+                output.send_success(id, "abort_bash", None).await?;
+            }
+            "fork" => {
+                let entry_id = val
+                    .get("entryId")
+                    .or_else(|| val.get("entry_id"))
+                    .and_then(|v| v.as_str());
+                match session.session().fork_at(entry_id) {
+                    Ok(forked) => {
+                        let new_id = forked.session_id().to_string();
+                        session.session = forked;
+                        output
+                            .send_success(id, "fork", Some(serde_json::json!({ "sessionId": new_id })))
+                            .await?;
+                    }
+                    Err(e) => {
+                        output.send_error(id, "fork", &e.to_string()).await?;
+                    }
+                }
+            }
+            "clone" => {
+                match session.session().clone_at_leaf() {
+                    Ok(cloned) => {
+                        let new_id = cloned.session_id().to_string();
+                        session.session = cloned;
+                        output
+                            .send_success(id, "clone", Some(serde_json::json!({ "sessionId": new_id })))
+                            .await?;
+                    }
+                    Err(e) => {
+                        output.send_error(id, "clone", &e.to_string()).await?;
+                    }
+                }
+            }
+            "switch_session" => {
+                let session_path = val
+                    .get("sessionPath")
+                    .or_else(|| val.get("session_path"))
+                    .or_else(|| val.get("path"))
+                    .and_then(|v| v.as_str());
+                match session_path {
+                    Some(p) => {
+                        let path = PathBuf::from(p);
+                        match SessionManager::open_file(&path, session.cwd.clone()) {
+                            Ok(opened) => {
+                                let sid = opened.session_id().to_string();
+                                session.session = opened;
+                                output
+                                    .send_success(
+                                        id,
+                                        "switch_session",
+                                        Some(serde_json::json!({ "sessionId": sid })),
+                                    )
+                                    .await?;
+                            }
+                            Err(e) => {
+                                output.send_error(id, "switch_session", &e.to_string()).await?;
+                            }
+                        }
+                    }
+                    None => {
+                        output
+                            .send_error(id, "switch_session", "Missing 'sessionPath' argument")
+                            .await?;
+                    }
+                }
+            }
+            "get_tree" => {
+                let tree = session.session().build_rpc_tree();
+                let leaf_id = session.session().leaf_id();
+                output
+                    .send_success(
+                        id,
+                        "get_tree",
+                        Some(serde_json::json!({
+                            "tree": tree,
+                            "leafId": leaf_id,
+                        })),
+                    )
+                    .await?;
+            }
+            "set_session_name" => {
+                let name = val
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                match name {
+                    Some(n) => match session.session_mut().set_session_name(Some(n.to_string())) {
+                        Ok(()) => {
+                            output.send_success(id, "set_session_name", None).await?;
+                        }
+                        Err(e) => {
+                            output.send_error(id, "set_session_name", &e.to_string()).await?;
+                        }
+                    },
+                    None => {
+                        output
+                            .send_error(id, "set_session_name", "Session name cannot be empty")
+                            .await?;
+                    }
+                }
+            }
             _ => {
                 output
                     .send_error(id, cmd_type, &format!("Unsupported command: {cmd_type}"))
@@ -682,15 +881,16 @@ mod tests {
             crate::settings::Settings::default(),
         );
 
-        let (client_stream, server_stream) = tokio::io::duplex(8192);
-        let (server_read, server_write) = tokio::io::split(server_stream);
-        let (client_read, mut client_write) = tokio::io::split(client_stream);
+        let (client_write, server_read) = tokio::io::duplex(8192);
+        let (server_write, client_read) = tokio::io::duplex(8192);
+
+        let mut client_write = client_write;
+        let mut reader = tokio::io::BufReader::new(client_read);
 
         let rpc_handle = tokio::spawn(async move {
             run_rpc_mode(&mut session, tokio::io::BufReader::new(server_read), server_write).await
         });
 
-        let mut reader = tokio::io::BufReader::new(client_read);
         let mut line = String::new();
 
         // 1. Unknown model fails with success: false
@@ -745,6 +945,166 @@ mod tests {
         assert!(prompt_err_seen);
 
         drop(client_write);
+        assert!(rpc_handle.await.unwrap().is_ok());
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_queue_session_tree_and_bash_commands() {
+        let temp_dir = std::env::temp_dir().join(format!("mehh_rpc_commands_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            mehh_ai::faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+        );
+
+        let (client_write, server_read) = tokio::io::duplex(64 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(64 * 1024);
+
+        let rpc_handle = tokio::spawn(async move {
+            run_rpc_mode(&mut session, BufReader::new(server_read), server_write).await
+        });
+
+        let mut writer = client_write;
+        let mut reader = BufReader::new(client_read);
+
+        async fn send_and_expect(
+            writer: &mut tokio::io::DuplexStream,
+            reader: &mut BufReader<tokio::io::DuplexStream>,
+            cmd: serde_json::Value,
+            expected_cmd: &str,
+        ) -> serde_json::Value {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            writer
+                .write_all(format!("{cmd}\n").as_bytes())
+                .await
+                .unwrap();
+            writer.flush().await.unwrap();
+
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let n = reader.read_line(&mut line).await.unwrap();
+                assert!(n > 0, "EOF before receiving response for {expected_cmd}");
+                let ev: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if ev.get("type").and_then(|v| v.as_str()) == Some("response")
+                    && ev.get("command").and_then(|v| v.as_str()) == Some(expected_cmd)
+                {
+                    assert_eq!(ev["success"], true, "Expected success for {expected_cmd}: {:?}", ev);
+                    return ev;
+                }
+            }
+        }
+
+        // 1. steer
+        send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "1", "type": "steer", "message": "steering msg" }),
+            "steer",
+        ).await;
+
+        // 2. follow_up
+        send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "2", "type": "follow_up", "message": "follow up msg" }),
+            "follow_up",
+        ).await;
+
+        // 3. clear_queue
+        send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "3", "type": "clear_queue" }),
+            "clear_queue",
+        ).await;
+
+        // 4. cycle_model
+        send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "4", "type": "cycle_model" }),
+            "cycle_model",
+        ).await;
+
+        // 5. set_session_name
+        send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "5", "type": "set_session_name", "name": "RPC Named Session" }),
+            "set_session_name",
+        ).await;
+
+        // 6. get_tree
+        let tree_resp = send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "6", "type": "get_tree" }),
+            "get_tree",
+        ).await;
+        assert!(tree_resp["data"]["tree"].is_array());
+
+        // 7. clone
+        send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "7", "type": "clone" }),
+            "clone",
+        ).await;
+
+        // 8. fork
+        send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "8", "type": "fork" }),
+            "fork",
+        ).await;
+
+        // 9. bash
+        let echo_cmd = if cfg!(windows) { "Write-Output 'hello_rpc'" } else { "echo 'hello_rpc'" };
+        let bash_resp = send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "9", "type": "bash", "command": echo_cmd }),
+            "bash",
+        ).await;
+        assert!(bash_resp["data"]["output"].as_str().unwrap().contains("hello_rpc"));
+
+        // 9b. bash non-zero exit code resolves with isError: true instead of RPC error
+        let fail_cmd = "exit 1";
+        let fail_resp = send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "9b", "type": "bash", "command": fail_cmd }),
+            "bash",
+        ).await;
+        assert_eq!(fail_resp["data"]["isError"], true);
+        assert!(fail_resp["data"]["output"].as_str().unwrap().contains("Command exited with code 1"));
+
+        // 10. abort_bash
+        send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "10", "type": "abort_bash" }),
+            "abort_bash",
+        ).await;
+
+        // 11. switch_session
+        let session_file = temp_dir.join("switched_session.jsonl");
+        let sw_mgr = SessionManager::open_file(&session_file, &temp_dir).unwrap();
+        let switch_resp = send_and_expect(
+            &mut writer,
+            &mut reader,
+            serde_json::json!({ "id": "11", "type": "switch_session", "sessionPath": session_file.to_string_lossy() }),
+            "switch_session",
+        ).await;
+        assert_eq!(switch_resp["data"]["sessionId"], sw_mgr.session_id());
+
+        drop(writer);
         assert!(rpc_handle.await.unwrap().is_ok());
         let _ = std::fs::remove_dir_all(temp_dir);
     }

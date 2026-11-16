@@ -45,6 +45,7 @@ pub struct McpManager {
     summaries: Vec<McpConnectionSummary>,
     registry: McpServerRegistry,
     auth_store: Arc<McpAuthStore>,
+    tools_dirty: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for McpManager {
@@ -71,6 +72,7 @@ impl Default for McpManager {
             summaries: Vec::new(),
             registry,
             auth_store,
+            tools_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
@@ -111,6 +113,7 @@ impl McpManager {
             summaries: Vec::new(),
             registry,
             auth_store,
+            tools_dirty: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
 
         let mut sorted_names: Vec<String> = configs.keys().cloned().collect();
@@ -140,6 +143,13 @@ impl McpManager {
         for (name, res) in results {
             match res {
                 Ok((client, tool_infos)) => {
+                    let dirty = mgr.tools_dirty.clone();
+                    client.on_notification(
+                        "notifications/tools/list_changed",
+                        Arc::new(move |_params| {
+                            dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }),
+                    );
                     let adapted = create_mcp_agent_tools(&name, tool_infos, client.clone());
                     let tool_count = adapted.len();
                     mgr.server_tools.insert(name.clone(), adapted);
@@ -273,6 +283,32 @@ impl McpManager {
         self.registry.clone()
     }
 
+    /// Returns true and resets the dirty flag if any server reported `notifications/tools/list_changed`.
+    pub fn take_tools_dirty(&self) -> bool {
+        self.tools_dirty.swap(false, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Explicitly marks the tools dirty flag.
+    pub fn mark_tools_dirty(&self) {
+        self.tools_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Fetches the latest tools from all connected MCP clients and updates active tools.
+    pub async fn refresh_server_tools(&mut self) -> anyhow::Result<bool> {
+        let mut changed = false;
+        for (name, client) in &self.clients {
+            if let Ok(new_tools) = client.list_tools().await {
+                let adapted = create_mcp_agent_tools(name, new_tools, client.clone());
+                self.server_tools.insert(name.clone(), adapted);
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild_tools();
+        }
+        Ok(changed)
+    }
+
     /// Returns the shared persistent authentication store.
     pub fn auth_store(&self) -> Arc<McpAuthStore> {
         self.auth_store.clone()
@@ -314,6 +350,13 @@ impl McpManager {
         } else {
             match Self::connect_server_internal(name, &cfg, &self.cwd, &self.auth_store).await {
                 Ok((client, tool_infos)) => {
+                    let dirty = self.tools_dirty.clone();
+                    client.on_notification(
+                        "notifications/tools/list_changed",
+                        Arc::new(move |_params| {
+                            dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }),
+                    );
                     let adapted = create_mcp_agent_tools(name, tool_infos, client.clone());
                     let tool_count = adapted.len();
                     self.server_tools.insert(name.to_string(), adapted);
@@ -540,5 +583,141 @@ mod tests {
             .expect("trusted corrupt project mcp.json must fail closed");
         let msg = format!("{err:#}");
         assert!(msg.contains("mcp.json"), "unexpected error: {msg}");
+    }
+
+    #[tokio::test]
+    async fn tools_list_changed_refreshes_catalog_and_codemode() {
+        use mehh_mcp::transport::{InMemoryTransport, McpTransport};
+        use mehh_mcp::jsonrpc::{JsonRpcMessage, JsonRpcNotification, JsonRpcResponse};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (client_transport, server_transport) = InMemoryTransport::pair();
+        let client_transport = Arc::new(client_transport);
+        let server_transport = Arc::new(server_transport);
+
+        let tool_query_count = Arc::new(AtomicUsize::new(0));
+        let count_clone = tool_query_count.clone();
+
+        tokio::spawn({
+            let server_transport = server_transport.clone();
+            async move {
+                // Handshake
+                if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                    let resp = JsonRpcResponse::success(
+                        req.id,
+                        serde_json::json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": { "tools": { "listChanged": true } },
+                            "serverInfo": { "name": "mock-server", "version": "1.0.0" }
+                        }),
+                    );
+                    server_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+                }
+                let _ = server_transport.recv().await; // notifications/initialized
+
+                while let Some(Ok(msg)) = server_transport.recv().await {
+                    match msg {
+                        JsonRpcMessage::Request(req) if req.method == "tools/list" => {
+                            let c = count_clone.fetch_add(1, Ordering::SeqCst);
+                            let tools = if c == 0 {
+                                vec![serde_json::json!({
+                                    "name": "initial_tool",
+                                    "description": "Initial tool",
+                                    "inputSchema": { "type": "object" }
+                                })]
+                            } else {
+                                vec![
+                                    serde_json::json!({
+                                        "name": "initial_tool",
+                                        "description": "Initial tool",
+                                        "inputSchema": { "type": "object" }
+                                    }),
+                                    serde_json::json!({
+                                        "name": "new_tool",
+                                        "description": "Newly added dynamic tool",
+                                        "inputSchema": { "type": "object" }
+                                    }),
+                                ]
+                            };
+                            let resp = JsonRpcResponse::success(req.id, serde_json::json!({ "tools": tools }));
+                            server_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        });
+
+        let client = Arc::new(McpClient::connect(client_transport).await.unwrap());
+        let tools = client.list_tools().await.unwrap();
+        let adapted = create_mcp_agent_tools("mock", tools, client.clone());
+
+        let mut mgr = McpManager::default();
+        let dirty = mgr.tools_dirty.clone();
+        client.on_notification(
+            "notifications/tools/list_changed",
+            Arc::new(move |_params| {
+                dirty.store(true, Ordering::SeqCst);
+            }),
+        );
+        mgr.clients.push(("mock".to_string(), client.clone()));
+        mgr.server_tools.insert("mock".to_string(), adapted);
+        mgr.rebuild_tools();
+
+        // Create AgentSession
+        let temp_dir = crate::TempTestDir::new("mcp_sync_test");
+        let model = mehh_ai::Model {
+            id: "faux-1".to_string(),
+            name: "Faux".to_string(),
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            base_url: String::new(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: mehh_ai::ModelCost::default(),
+            context_window: 100_000,
+            max_tokens: 4096,
+            headers: None,
+            compat: None,
+            thinking_level_map: None,
+        };
+        let provider = Arc::new(mehh_ai::FauxProvider::new());
+        let session_mgr = crate::session::SessionManager::in_memory(temp_dir.path().to_path_buf());
+        let settings = crate::settings::Settings::default();
+        let mut session = crate::agent_session::AgentSession::new(
+            temp_dir.path().to_path_buf(),
+            model,
+            provider,
+            session_mgr,
+            settings,
+        );
+
+        session.enable_mcp_and_codemode(mgr.tools().to_vec(), true);
+        assert!(!mgr.take_tools_dirty());
+        let codemode = session.codemode_tool().expect("codemode should be enabled");
+        assert!(codemode.tools().iter().any(|t| t.name() == "mcp__mock__initial_tool"));
+        assert!(!codemode.tools().iter().any(|t| t.name() == "mcp__mock__new_tool"));
+
+        // Now simulate server notifying tools/list_changed
+        server_transport
+            .send(JsonRpcMessage::Notification(JsonRpcNotification::new(
+                "notifications/tools/list_changed",
+                None,
+            )))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(mgr.take_tools_dirty(), "dirty flag must be true after notification");
+
+        let refreshed = mgr.refresh_server_tools().await.unwrap();
+        assert!(refreshed);
+
+        session.sync_mcp_tools(mgr.tools().to_vec(), true);
+        let updated_codemode = session.codemode_tool().expect("codemode should still be present");
+        assert!(updated_codemode.tools().iter().any(|t| t.name() == "mcp__mock__initial_tool"));
+        assert!(updated_codemode.tools().iter().any(|t| t.name() == "mcp__mock__new_tool"));
+
+        mgr.close_all().await;
     }
 }

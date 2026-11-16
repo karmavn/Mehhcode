@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use mehh_agent::{tool_to_definition, AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
@@ -11,7 +11,7 @@ use crate::sandbox::{
 };
 
 pub struct CodemodeTool {
-    tools: Vec<Arc<dyn AgentTool>>,
+    tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
     kv_store: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     config: CodemodeConfig,
 }
@@ -23,10 +23,20 @@ impl CodemodeTool {
             .filter(|t| t.name() != "codemode")
             .collect();
         Self {
-            tools: filtered_tools,
+            tools: Arc::new(RwLock::new(filtered_tools)),
             kv_store: Arc::new(Mutex::new(HashMap::new())),
             config: CodemodeConfig::default(),
         }
+    }
+
+    /// Replaces the active tools exposed inside the sandbox.
+    pub fn replace_tools(&self, tools: Vec<Arc<dyn AgentTool>>) {
+        let filtered_tools = tools
+            .into_iter()
+            .filter(|t| t.name() != "codemode")
+            .collect();
+        let mut guard = self.tools.write().unwrap();
+        *guard = filtered_tools;
     }
 
     pub fn with_config(mut self, config: CodemodeConfig) -> Self {
@@ -46,8 +56,8 @@ impl CodemodeTool {
         self.kv_store.clone()
     }
 
-    pub fn tools(&self) -> &[Arc<dyn AgentTool>] {
-        &self.tools
+    pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        self.tools.read().unwrap().clone()
     }
 }
 
@@ -117,13 +127,13 @@ impl AgentTool for CodemodeTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: code".to_string())?;
 
-        let tool_defs: Vec<ToolDefinition> = self
-            .tools
+        let current_tools = self.tools.read().unwrap().clone();
+        let tool_defs: Vec<ToolDefinition> = current_tools
             .iter()
             .map(|t| tool_to_definition(t.as_ref()))
             .collect();
 
-        let tools = self.tools.clone();
+        let tools = current_tools;
         let tool_call_prefix = tool_call_id.to_string();
         let cancel_executor = cancel.clone();
 
@@ -241,6 +251,7 @@ impl AgentTool for CodemodeTool {
         Ok(AgentToolResult {
             content,
             details: res.value,
+            ..Default::default()
         })
     }
 }

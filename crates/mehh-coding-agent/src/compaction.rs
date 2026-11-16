@@ -417,8 +417,8 @@ pub fn prepare_compaction(
             }
         }
         match turn_start {
-            Some(ts) => ts,
-            None => entries[cut_index + 1..]
+            Some(ts) if ts > boundary_start => ts,
+            _ => entries[cut_index + 1..]
                 .iter()
                 .position(|e| {
                     matches!(
@@ -658,6 +658,8 @@ mod tests {
                     })],
                     details: None,
                     is_error: false,
+                    duration_ms: None,
+                    usage: None,
                     timestamp: now_ms(),
                 }),
             },
@@ -787,12 +789,14 @@ mod tests {
             })],
             details: None,
             is_error: false,
+            duration_ms: None,
+            usage: None,
             timestamp: now_ms(),
         })]);
         assert!(serialized.contains("more characters truncated"));
 
         // Cutting on an assistant entry mid-turn must anchor first_kept_entry_id on that turn's User entry.
-        let long_text = "word ".repeat(3000);
+        let long_text = "word ".repeat(12_000);
         let mk_user = |id: &str, parent: Option<&str>, text: &str| SessionEntry {
             id: id.to_string(),
             parent_id: parent.map(str::to_string),
@@ -825,6 +829,44 @@ mod tests {
         assert_eq!(prep.first_kept_entry_id, "u2");
         assert_eq!(prep.messages_to_summarize.len(), 2);
         assert!(prep.turn_prefix_messages.is_empty());
+    }
+
+    #[test]
+    fn test_compaction_cut_splits_turn_advances_to_next_user_when_turn_start_is_boundary() {
+        let mk_user = |id: &str, parent: Option<&str>, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            timestamp: "2026-11-12T10:00:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: now_ms(),
+                }),
+            },
+        };
+        let mk_ast = |id: &str, parent: &str, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            timestamp: "2026-11-12T10:01:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::Assistant(mehh_ai::faux_assistant_message(text)),
+            },
+        };
+
+        let long_reply = "A".repeat(4000);
+        let entries = vec![
+            mk_user("u1", None, "initial prompt"),
+            mk_ast("a1", "u1", &long_reply),
+            mk_user("u2", Some("a1"), "follow-up prompt"),
+            mk_ast("a2", "u2", "short reply"),
+        ];
+
+        // Budget is small (50 tokens) so walking backwards from a2 reaches a1 and exceeds budget.
+        // a1 is an assistant message whose turn_start is u1 (index 0 == boundary_start).
+        // It must advance to u2 instead of returning None.
+        let prep = prepare_compaction(&entries, 50).expect("Compaction should succeed by advancing to next User turn");
+        assert_eq!(prep.first_kept_entry_id, "u2");
+        assert_eq!(prep.messages_to_summarize.len(), 2);
     }
 
     #[test]

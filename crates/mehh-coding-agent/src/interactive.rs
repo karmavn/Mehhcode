@@ -18,7 +18,8 @@ use mehh_ai::{AssistantContentBlock, AssistantMessageEvent, Message, StopReason,
 use mehh_tui::{
     normalize_crossterm_key, truncate_to_width, wrap_text_with_ansi, BorderStyle, BorderedBox,
     Component, CrosstermTerminal, Editor, EditorOutput, Keybindings, Loader, MarkdownView,
-    SelectItem, SelectList, Terminal, Theme, TuiAction, TuiRenderer,
+    SelectItem, SelectList, SettingItem, SettingsList, Terminal, Theme, TuiAction, TuiRenderer,
+    WheelScrollAccelerator,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -51,6 +52,7 @@ pub enum SelectorKind {
 pub struct Selector {
     pub kind: SelectorKind,
     pub list: SelectList,
+    pub settings_list: Option<SettingsList>,
 }
 
 type MarkdownCache = HashMap<(usize, usize), (String, String, Vec<String>)>;
@@ -67,6 +69,7 @@ pub struct InteractiveState {
     pub selector: Option<Selector>,
     pub mcp_summaries: Vec<McpConnectionSummary>,
     pub theme: Theme,
+    pub keybindings: Keybindings,
     pub scroll_offset: usize,
     pub last_max_scroll: AtomicUsize,
     pub last_prompt_text: Option<String>,
@@ -93,6 +96,7 @@ impl InteractiveState {
             selector: None,
             mcp_summaries,
             theme: Theme::load(settings.theme.as_deref()),
+            keybindings: Keybindings::default_bindings(),
             scroll_offset: 0,
             last_max_scroll: AtomicUsize::new(0),
             last_prompt_text: None,
@@ -159,6 +163,14 @@ pub fn builtin_slash_commands() -> Vec<SelectItem> {
         SelectItem::new("/login", "/login").with_description("Log in to a provider"),
         SelectItem::new("/logout", "/logout").with_description("Remove a stored provider credential"),
         SelectItem::new("/follow-up", "/follow-up").with_description("Queue a follow-up message"),
+        SelectItem::new("/copy", "/copy").with_description("Copy last agent message to clipboard"),
+        SelectItem::new("/name", "/name").with_description("Set session display name"),
+        SelectItem::new("/session", "/session").with_description("Show session info and stats"),
+        SelectItem::new("/hotkeys", "/hotkeys").with_description("Show all keyboard shortcuts"),
+        SelectItem::new("/reload", "/reload").with_description("Reload keybindings, skills, prompts, themes, and context files"),
+        SelectItem::new("/scoped-models", "/scoped-models").with_description("Enable/disable models for cycling"),
+        SelectItem::new("/export", "/export").with_description("Export session to a JSONL file"),
+        SelectItem::new("/import", "/import").with_description("Import a JSONL session"),
         SelectItem::new("/clear", "/clear").with_description("Clear terminal transcript"),
         SelectItem::new("/exit", "/exit").with_description("Exit interactive mode"),
         SelectItem::new("/quit", "/quit").with_description("Quit interactive mode"),
@@ -476,6 +488,79 @@ fn settings_selector_items(settings: &Settings) -> Vec<SelectItem> {
     ]
 }
 
+/// Builds the two-column settings list component for the settings screen.
+fn build_settings_list(settings: &Settings) -> SettingsList {
+    let items = vec![
+        SettingItem::new(
+            "theme",
+            "theme",
+            settings.theme.clone().unwrap_or_else(|| "dark".to_string()),
+        )
+        .with_values(vec!["dark".to_string(), "light".to_string()])
+        .with_description("Active color theme for the TUI"),
+        SettingItem::new(
+            "steering_mode",
+            "steering mode",
+            queue_mode_label(settings.steering_mode.unwrap_or_default()),
+        )
+        .with_values(vec![
+            "none".to_string(),
+            "all".to_string(),
+            "one_at_a_time".to_string(),
+        ])
+        .with_description("Steering mode for tool execution and prompts"),
+        SettingItem::new(
+            "follow_up_mode",
+            "follow-up mode",
+            queue_mode_label(settings.follow_up_mode.unwrap_or_default()),
+        )
+        .with_values(vec![
+            "none".to_string(),
+            "all".to_string(),
+            "one_at_a_time".to_string(),
+        ])
+        .with_description("Follow-up queue mode"),
+        SettingItem::new(
+            "default_thinking_level",
+            "default thinking level",
+            settings
+                .default_thinking_level
+                .map(|t| format!("{t:?}").to_lowercase())
+                .unwrap_or_else(|| "off".to_string()),
+        )
+        .with_values(vec![
+            "off".to_string(),
+            "low".to_string(),
+            "medium".to_string(),
+            "high".to_string(),
+        ])
+        .with_description("Default thinking budget level"),
+        SettingItem::new(
+            "hide_thinking_block",
+            "hide thinking block",
+            if settings.hide_thinking_block.unwrap_or(false) {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .with_values(vec!["false".to_string(), "true".to_string()])
+        .with_description("Collapse or hide thinking blocks in output"),
+        SettingItem::new(
+            "auto_compact",
+            "auto compact",
+            if settings.auto_compact.unwrap_or(true) {
+                "true"
+            } else {
+                "false"
+            },
+        )
+        .with_values(vec!["true".to_string(), "false".to_string()])
+        .with_description("Automatically compact context when nearing limit"),
+    ];
+    SettingsList::new(items, 8)
+}
+
 /// Cycles a single setting value and applies it to the running session.
 fn apply_setting_cycle(
     key: &str,
@@ -664,6 +749,33 @@ async fn apply_interactive_model_switch(
     )));
 }
 
+/// Formats active keyboard shortcuts from Keybindings for display.
+pub fn format_hotkeys(keybindings: &Keybindings) -> String {
+    let mut out = String::from("Keyboard Shortcuts:\n");
+    let actions = [
+        (TuiAction::Submit, "Submit prompt"),
+        (TuiAction::Newline, "Insert newline"),
+        (TuiAction::Interrupt, "Cancel turn / Interrupt"),
+        (TuiAction::ClearOrExit, "Exit interactive session"),
+        (TuiAction::TabComplete, "Autocomplete slash commands / files"),
+        (TuiAction::ScrollUp, "Scroll up"),
+        (TuiAction::ScrollDown, "Scroll down"),
+        (TuiAction::HistoryPrev, "Previous history item"),
+        (TuiAction::HistoryNext, "Next history item"),
+        (TuiAction::Undo, "Undo"),
+    ];
+
+    for (action, desc) in actions {
+        if let Some(keys) = keybindings.get_bindings(action) {
+            if !keys.is_empty() {
+                let keys_str = keys.join(", ");
+                out.push_str(&format!("  {:<24} {}\n", keys_str, desc));
+            }
+        }
+    }
+    out.trim_end().to_string()
+}
+
 /// Dispatches interactive slash commands.
 pub async fn handle_slash_command(
     input: &str,
@@ -681,6 +793,7 @@ pub async fn handle_slash_command(
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next();
     let rest = parts.collect::<Vec<_>>().join(" ");
+    let full_arg = trimmed.strip_prefix(cmd).map(str::trim).filter(|s| !s.is_empty());
 
     match cmd {
         "/exit" | "/quit" => SlashCommandOutcome::Quit,
@@ -774,6 +887,7 @@ Keybindings:
                         state.selector = Some(Selector {
                             kind: SelectorKind::Model,
                             list: SelectList::new(items, 8),
+                            settings_list: None,
                         });
                     }
                     Err(e) => {
@@ -858,9 +972,11 @@ Keybindings:
         }
         "/settings" => {
             let items = settings_selector_items(&session.settings);
+            let sl = build_settings_list(&session.settings);
             state.selector = Some(Selector {
                 kind: SelectorKind::Settings,
                 list: SelectList::new(items, 8),
+                settings_list: Some(sl),
             });
             SlashCommandOutcome::Handled
         }
@@ -1007,18 +1123,33 @@ Keybindings:
         }
         "/tree" => {
             match arg {
-                Some(entry_id) => {
-                    match session.session_mut().branch_from(entry_id) {
-                        Ok(()) => {
-                            state.items = rebuild_transcript_items(session);
-                            state.scroll_offset = 0;
-                            state.items.push(TranscriptItem::System(format!(
-                                "Switched to branch at {entry_id}"
-                            )));
+                Some(arg_str) => {
+                    let parts = arg_str.split_whitespace();
+                    let mut entry_id = None;
+                    let mut summarize = false;
+                    for p in parts {
+                        if p == "--summarize" || p == "-s" {
+                            summarize = true;
+                        } else if entry_id.is_none() {
+                            entry_id = Some(p);
                         }
-                        Err(e) => state.items.push(TranscriptItem::System(format!(
-                            "Failed to switch branch: {e}"
-                        ))),
+                    }
+                    if let Some(id) = entry_id {
+                        match session.navigate_tree(id, summarize, None).await {
+                            Ok(summary_opt) => {
+                                state.items = rebuild_transcript_items(session);
+                                state.scroll_offset = 0;
+                                let msg = if let Some(s) = summary_opt {
+                                    format!("Switched to branch at {id} with branch summary ({})", s.len())
+                                } else {
+                                    format!("Switched to branch at {id}")
+                                };
+                                state.items.push(TranscriptItem::System(msg));
+                            }
+                            Err(e) => state.items.push(TranscriptItem::System(format!(
+                                "Failed to switch branch: {e}"
+                            ))),
+                        }
                     }
                 }
                 None => {
@@ -1043,6 +1174,7 @@ Keybindings:
                         state.selector = Some(Selector {
                             kind: SelectorKind::Tree,
                             list: SelectList::new(items, 10),
+                            settings_list: None,
                         });
                     }
                 }
@@ -1112,6 +1244,7 @@ Keybindings:
                         state.selector = Some(Selector {
                             kind: SelectorKind::Resume,
                             list: SelectList::new(items, 10),
+                            settings_list: None,
                         });
                     }
                 }
@@ -1159,6 +1292,7 @@ Keybindings:
                     state.selector = Some(Selector {
                         kind: SelectorKind::Login,
                         list: SelectList::new(items, 8),
+                        settings_list: None,
                     });
                 }
             }
@@ -1194,6 +1328,157 @@ Keybindings:
                 state.items.push(TranscriptItem::System(format!(
                     "Queued follow-up: {text}"
                 )));
+            }
+            SlashCommandOutcome::Handled
+        }
+        "/copy" => {
+            let messages = session.session().build_context_messages();
+            let last_assistant = messages.iter().rev().find_map(|m| match m {
+                Message::Assistant(a) => Some(a.text_content()),
+                _ => None,
+            });
+            match last_assistant {
+                Some(text) if !text.trim().is_empty() => {
+                    match crate::clipboard::copy_to_clipboard(&text) {
+                        Ok(()) => {
+                            state.items.push(TranscriptItem::System("Copied message to clipboard.".to_string()));
+                        }
+                        Err(err) => {
+                            state.items.push(TranscriptItem::System(format!("Failed to copy to clipboard: {err}")));
+                        }
+                    }
+                }
+                _ => {
+                    state.items.push(TranscriptItem::System("No assistant message to copy.".to_string()));
+                }
+            }
+            SlashCommandOutcome::Handled
+        }
+        "/name" => {
+            match full_arg {
+                Some(name) => {
+                    let trimmed = name.trim().to_string();
+                    match session.session_mut().set_session_name(Some(trimmed.clone())) {
+                        Ok(()) => {
+                            state.items.push(TranscriptItem::System(format!("Set session name to '{trimmed}'")));
+                        }
+                        Err(e) => {
+                            state.items.push(TranscriptItem::System(format!("Failed to set session name: {e}")));
+                        }
+                    }
+                }
+                None => {
+                    let current_name = session.session().entries().iter().rev().find_map(|e| {
+                        if let SessionEntryKind::SessionInfo { name: Some(n) } = &e.kind {
+                            Some(n.as_str())
+                        } else {
+                            None
+                        }
+                    });
+                    if let Some(n) = current_name {
+                        state.items.push(TranscriptItem::System(format!("Session name: '{n}'")));
+                    } else {
+                        state.items.push(TranscriptItem::System("Session has no name set.".to_string()));
+                    }
+                }
+            }
+            SlashCommandOutcome::Handled
+        }
+        "/session" => {
+            let s = session.session();
+            let entries_count = s.entries().len();
+            let messages = s.build_context_messages();
+            let msg_count = messages.len();
+            let tokens = crate::compaction::estimate_context_tokens(&messages);
+            let s_id = s.session_id();
+            let s_file = s.file_path().map(|p| p.display().to_string()).unwrap_or_else(|| "in-memory".to_string());
+            let m_id = &session.model().id;
+            let m_prov = &session.model().provider;
+            let thinking = session.thinking_level();
+            state.items.push(TranscriptItem::System(format!(
+                "Session: {s_id}\nPath: {s_file}\nEntries: {entries_count} ({msg_count} active messages)\nEstimated Context Tokens: {tokens}\nModel: {m_prov}/{m_id}\nThinking Level: {thinking:?}"
+            )));
+            SlashCommandOutcome::Handled
+        }
+        "/hotkeys" => {
+            state.items.push(TranscriptItem::System(format_hotkeys(&state.keybindings)));
+            SlashCommandOutcome::Handled
+        }
+        "/reload" => {
+            session.reload();
+            state.theme = Theme::load(session.settings.theme.as_deref());
+            state.keybindings = Keybindings::default_bindings();
+            state.items.push(TranscriptItem::System("Reloaded settings, skills, and prompt templates.".to_string()));
+            SlashCommandOutcome::Handled
+        }
+        "/scoped-models" => {
+            match full_arg {
+                Some(arg_str) => {
+                    if let Ok(reg) = crate::models_config::ModelRegistry::load_default() {
+                        let mut resolved = Vec::new();
+                        for token in arg_str.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
+                            let parts: Vec<&str> = token.split('/').collect();
+                            let model_opt = if parts.len() == 2 {
+                                reg.resolve_exact(parts[0], parts[1])
+                            } else {
+                                reg.resolve(token, None)
+                            };
+                            if let Some(m) = model_opt {
+                                resolved.push(m);
+                            }
+                        }
+                        let count = resolved.len();
+                        session.set_scoped_models(resolved);
+                        state.items.push(TranscriptItem::System(format!("Configured {count} scoped models for cycling.")));
+                    } else {
+                        state.items.push(TranscriptItem::System("Failed to load models registry.".to_string()));
+                    }
+                }
+                None => {
+                    let current = session.scoped_models();
+                    if current.is_empty() {
+                        state.items.push(TranscriptItem::System("No scoped models configured (cycles through all models).".to_string()));
+                    } else {
+                        let names: Vec<String> = current.iter().map(|m| format!("{}/{}", m.provider, m.id)).collect();
+                        state.items.push(TranscriptItem::System(format!("Scoped models:\n  {}", names.join("\n  "))));
+                    }
+                }
+            }
+            SlashCommandOutcome::Handled
+        }
+        "/export" => {
+            let default_path = PathBuf::from(format!("session_{}.jsonl", session.session().session_id()));
+            let out_path = full_arg.map(PathBuf::from).unwrap_or(default_path);
+            match session.session().export_jsonl(&out_path) {
+                Ok(()) => {
+                    state.items.push(TranscriptItem::System(format!("Exported session to {}", out_path.display())));
+                }
+                Err(e) => {
+                    state.items.push(TranscriptItem::System(format!("Failed to export session: {e}")));
+                }
+            }
+            SlashCommandOutcome::Handled
+        }
+        "/import" => {
+            match full_arg {
+                Some(file_path_str) => {
+                    let path = PathBuf::from(file_path_str.trim());
+                    match SessionManager::open_file(&path, session.cwd.clone()) {
+                        Ok(new_session) => {
+                            let id = new_session.session_id().to_string();
+                            session.session = new_session;
+                            state.items = rebuild_transcript_items(session);
+                            state.scroll_offset = 0;
+                            state.items.push(TranscriptItem::System(format!("Imported session {id} from {}", path.display())));
+                        }
+                        Err(e) => {
+                            state.items.push(TranscriptItem::System(format!("Failed to import session: {e}")));
+                        }
+                    }
+                }
+                None => {
+                    state.items.push(TranscriptItem::System("Usage: /import <session_file.jsonl>".to_string()));
+                }
             }
             SlashCommandOutcome::Handled
         }
@@ -1424,7 +1709,16 @@ pub fn render_interactive_frame(
             SelectorKind::Settings => "Settings (Enter to cycle value, Esc to close)",
             SelectorKind::Login => "Select Provider (Enter to confirm, Esc to cancel)",
         };
-        let boxed = BorderedBox::new(Box::new(selector.list.clone()))
+        let component: Box<dyn Component> = if selector.kind == SelectorKind::Settings {
+            if let Some(ref sl) = selector.settings_list {
+                Box::new(sl.clone())
+            } else {
+                Box::new(selector.list.clone())
+            }
+        } else {
+            Box::new(selector.list.clone())
+        };
+        let boxed = BorderedBox::new(component)
             .with_title(title)
             .with_style(BorderStyle::Rounded);
         bottom_lines.extend(boxed.render(width));
@@ -2103,7 +2397,7 @@ pub async fn run_interactive_mode(
     let mut editor = Editor::new()
         .with_prefix("> ")
         .with_placeholder("Type a message or /help...");
-    let keybindings = Keybindings::default_bindings();
+    let keybindings = state.keybindings.clone();
 
     // Background input reader thread
     let (event_tx, mut event_rx) = tokio::sync::mpsc::channel::<crossterm::event::Event>(128);
@@ -2121,6 +2415,7 @@ pub async fn run_interactive_mode(
 
     let mut tick_interval = tokio::time::interval(Duration::from_millis(80));
     let mut turn_running = false;
+    let mut wheel_accelerator = WheelScrollAccelerator::default();
 
     // Render initial screen
     render_now(&state, &editor, session, &mut terminal, &mut renderer);
@@ -2135,15 +2430,25 @@ pub async fn run_interactive_mode(
                     }
                     Event::Mouse(mouse) => match mouse.kind {
                         MouseEventKind::ScrollUp => {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs_f64() * 1000.0)
+                                .unwrap_or(0.0);
+                            let lines = wheel_accelerator.next(-1, now_ms);
                             let max_scroll = state.last_max_scroll.load(Ordering::Relaxed);
                             state.scroll_offset =
-                                state.scroll_offset.saturating_add(3).min(max_scroll);
+                                state.scroll_offset.saturating_add(lines).min(max_scroll);
                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
                         }
                         MouseEventKind::ScrollDown => {
+                            let now_ms = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs_f64() * 1000.0)
+                                .unwrap_or(0.0);
+                            let lines = wheel_accelerator.next(1, now_ms);
                             let max_scroll = state.last_max_scroll.load(Ordering::Relaxed);
                             state.scroll_offset =
-                                state.scroll_offset.min(max_scroll).saturating_sub(3);
+                                state.scroll_offset.min(max_scroll).saturating_sub(lines);
                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
                         }
                         _ => {}
@@ -2171,7 +2476,11 @@ pub async fn run_interactive_mode(
                             // 1. Selector overlay handling
                             if state.selector.is_some() {
                                 match key_str.as_str() {
-                                    "enter" => {
+                                    "enter" | " " | "space"
+                                        if key_str == "enter"
+                                            || state.selector.as_ref().map(|s| s.kind)
+                                                == Some(SelectorKind::Settings) =>
+                                    {
                                         let kind = state.selector.as_ref().map(|s| s.kind);
                                         let selected = state
                                             .selector
@@ -2193,8 +2502,8 @@ pub async fn run_interactive_mode(
                                                 .await;
                                             }
                                             (Some(SelectorKind::Tree), Some(item)) => {
-                                                match session.session_mut().branch_from(&item.id) {
-                                                    Ok(()) => {
+                                                match session.navigate_tree(&item.id, false, None).await {
+                                                    Ok(_) => {
                                                         state.items = rebuild_transcript_items(session);
                                                         state.scroll_offset = 0;
                                                         state.items.push(TranscriptItem::System(format!(
@@ -2202,7 +2511,7 @@ pub async fn run_interactive_mode(
                                                         )));
                                                     }
                                                     Err(e) => state.items.push(TranscriptItem::System(format!(
-                                                        "Failed to switch branch: {e}"
+                                                         "Failed to switch branch: {e}"
                                                     ))),
                                                 }
                                             }
@@ -2248,6 +2557,9 @@ pub async fn run_interactive_mode(
                                                 // Refresh the labels so they show the new value.
                                                 if let Some(sel) = state.selector.as_mut() {
                                                     sel.list.set_items(settings_selector_items(&session.settings));
+                                                    let mut sl = build_settings_list(&session.settings);
+                                                    sl.selected = sel.list.selected;
+                                                    sel.settings_list = Some(sl);
                                                 }
                                             }
                                             (Some(SelectorKind::Login), Some(item)) => {
@@ -2282,11 +2594,17 @@ pub async fn run_interactive_mode(
                                     "up" => {
                                         if let Some(sel) = state.selector.as_mut() {
                                             sel.list.move_up();
+                                            if let Some(ref mut sl) = sel.settings_list {
+                                                sl.move_up();
+                                            }
                                         }
                                     }
                                     "down" => {
                                         if let Some(sel) = state.selector.as_mut() {
                                             sel.list.move_down();
+                                            if let Some(ref mut sl) = sel.settings_list {
+                                                sl.move_down();
+                                            }
                                         }
                                     }
                                     _ => {}
@@ -2420,6 +2738,16 @@ pub async fn run_interactive_mode(
                                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
                                         }
                                         SlashCommandOutcome::NotACommand => {
+                                            if let Some(ref mut mgr) = mcp_manager {
+                                                if mgr.take_tools_dirty() {
+                                                    if let Ok(true) = mgr.refresh_server_tools().await {
+                                                        sync_mcp_tools(session, mgr.tools().to_vec(), codemode_enabled);
+                                                        state.items.push(TranscriptItem::System(
+                                                            "MCP tools updated via tools/list_changed.".to_string(),
+                                                        ));
+                                                    }
+                                                }
+                                            }
                                             state.scroll_offset = 0;
                                             state.items.push(TranscriptItem::User(trimmed.to_string()));
                                             state.last_prompt_text = Some(trimmed.to_string());
@@ -2687,6 +3015,7 @@ mod tests {
                 tool_name: "read_file".to_string(),
                 result: mehh_agent::AgentToolResult::text("file content"),
                 is_error: false,
+                duration_ms: None,
             },
         );
         assert_eq!(state.status, None);
@@ -3678,7 +4007,7 @@ mod tests {
                 timestamp: mehh_ai::now_ms(),
             }))
             .unwrap();
-            sm.append_message(Message::Assistant(mehh_ai::faux_assistant_message(&format!(
+            sm.append_message(Message::Assistant(mehh_ai::faux_assistant_message(format!(
                 "prior reply {i}: {}",
                 "reply ".repeat(800)
             ))))
@@ -3758,5 +4087,85 @@ mod tests {
             it,
             TranscriptItem::Assistant { text, .. } if text.contains("Recovered in interactive!")
         )));
+    }
+
+    #[tokio::test]
+    async fn slash_name_session_hotkeys_scoped_models_export_import() {
+        let temp_dir = std::env::temp_dir().join(format!("interactive_slash_{}", uuid::Uuid::now_v7()));
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            mehh_ai::faux_model(),
+            Arc::new(mehh_ai::FauxProvider::default()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+        );
+        let mut state = InteractiveState::new(vec![], &session.settings);
+
+        // Test /name Demo
+        handle_slash_command("/name Demo Session", &mut session, &mut state, None, false).await;
+        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Demo Session"))));
+        assert!(session.session().entries().iter().any(|e| matches!(&e.kind, SessionEntryKind::SessionInfo { name: Some(n) } if n == "Demo Session")));
+
+        // Test /name without args reads current name
+        handle_slash_command("/name", &mut session, &mut state, None, false).await;
+        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Session name: 'Demo Session'"))));
+
+        // Test /session
+        handle_slash_command("/session", &mut session, &mut state, None, false).await;
+        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Estimated Context Tokens:"))));
+
+        // Test /hotkeys
+        handle_slash_command("/hotkeys", &mut session, &mut state, None, false).await;
+        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Keyboard Shortcuts"))));
+
+        // Test /scoped-models
+        handle_slash_command("/scoped-models", &mut session, &mut state, None, false).await;
+        handle_slash_command("/scoped-models faux/faux-model", &mut session, &mut state, None, false).await;
+
+        // Test /copy with assistant message
+        session.session_mut().append_message(Message::Assistant(mehh_ai::faux_assistant_message("Hello from assistant"))).unwrap();
+        handle_slash_command("/copy", &mut session, &mut state, None, false).await;
+        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Copied message to clipboard"))));
+
+        // Test /reload
+        handle_slash_command("/reload", &mut session, &mut state, None, false).await;
+        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Reloaded settings"))));
+
+        // Test /export and /import
+        let export_file = temp_dir.join("exported_session.jsonl");
+        let export_arg = export_file.to_string_lossy().to_string();
+        handle_slash_command(&format!("/export {export_arg}"), &mut session, &mut state, None, false).await;
+        assert!(export_file.exists());
+
+        // Create a new session and import the exported file
+        session.session_mut().new_session().unwrap();
+        assert_eq!(session.session().entries().len(), 0);
+
+        handle_slash_command(&format!("/import {export_arg}"), &mut session, &mut state, None, false).await;
+        assert!(!session.session().entries().is_empty());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_slash_command_hotkeys_reflects_configured_keybindings() {
+        let mut session = make_test_session();
+        let mut state = make_test_state();
+        state.keybindings.set_bindings(TuiAction::Submit, vec!["ctrl+enter".to_string()]);
+
+        handle_slash_command("/hotkeys", &mut session, &mut state, None, false).await;
+
+        let last_system_msg = state
+            .items
+            .iter()
+            .rev()
+            .find_map(|it| match it {
+                TranscriptItem::System(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .expect("must have system message from /hotkeys");
+
+        assert!(last_system_msg.contains("ctrl+enter"), "hotkeys must reflect configured bindings: {last_system_msg}");
+        assert!(last_system_msg.contains("Submit prompt"));
     }
 }

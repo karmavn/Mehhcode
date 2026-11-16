@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use tokio_util::sync::CancellationToken;
 
 use mehh_agent::{run_agent_loop, AgentEvent, AgentLoopConfig, AgentTool, DEFAULT_MAX_AGENT_TURNS};
@@ -46,8 +46,12 @@ pub struct AgentSession {
     pub steering_queue: Arc<Mutex<VecDeque<Message>>>,
     pub follow_up_queue: Arc<Mutex<VecDeque<Message>>>,
     pub active_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    pub active_bash_cancel: Arc<Mutex<Option<CancellationToken>>>,
+    pub scoped_models: Vec<Model>,
+    pub trusted: bool,
     dynamic_tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
     deferred_catalog: Option<Arc<DeferredToolCatalog>>,
+    codemode_tool: Option<Arc<mehh_codemode::CodemodeTool>>,
 }
 
 impl AgentSession {
@@ -108,8 +112,12 @@ impl AgentSession {
             steering_queue: Arc::new(Mutex::new(VecDeque::new())),
             follow_up_queue: Arc::new(Mutex::new(VecDeque::new())),
             active_cancel: Arc::new(Mutex::new(None)),
+            active_bash_cancel: Arc::new(Mutex::new(None)),
+            scoped_models: Vec::new(),
+            trusted,
             dynamic_tools: Arc::new(RwLock::new(Vec::new())),
             deferred_catalog: None,
+            codemode_tool: None,
         }
     }
 
@@ -168,6 +176,51 @@ impl AgentSession {
             .unwrap_or(false)
     }
 
+    /// Sets the list of scoped models available for cycling.
+    pub fn set_scoped_models(&mut self, models: Vec<Model>) {
+        self.scoped_models = models;
+    }
+
+    /// Returns a reference to the scoped models list.
+    pub fn scoped_models(&self) -> &[Model] {
+        &self.scoped_models
+    }
+
+    /// Cycles to the next model in `scoped_models` (or registry if scoped_models is empty).
+    pub fn cycle_model(&mut self) -> Result<Option<Model>> {
+        let models_list: Vec<Model> = if !self.scoped_models.is_empty() {
+            self.scoped_models.clone()
+        } else if let Ok(reg) = crate::models_config::ModelRegistry::load_default() {
+            reg.models().to_vec()
+        } else {
+            Vec::new()
+        };
+
+        if models_list.is_empty() {
+            return Ok(None);
+        }
+
+        let curr_idx = models_list.iter().position(|m| {
+            m.id.eq_ignore_ascii_case(&self.model.id)
+                && m.provider.eq_ignore_ascii_case(&self.model.provider)
+        });
+        let next_idx = match curr_idx {
+            Some(i) => (i + 1) % models_list.len(),
+            None => 0,
+        };
+        let next_model = models_list[next_idx].clone();
+        let prov = Self::default_provider_for_model(&next_model);
+        self.set_model(next_model.clone(), prov);
+        Ok(Some(next_model))
+    }
+
+    /// Aborts any currently running bash tool command.
+    pub fn abort_bash(&self) {
+        if let Some(tok) = self.active_bash_cancel.lock().unwrap().take() {
+            tok.cancel();
+        }
+    }
+
     /// Returns the shared steering queue.
     pub fn steering_queue(&self) -> Arc<Mutex<VecDeque<Message>>> {
         self.steering_queue.clone()
@@ -186,6 +239,11 @@ impl AgentSession {
     /// Overrides active tools for the session.
     pub fn set_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) {
         self.tools = tools;
+        self.refresh_subagent_tool();
+        if let Some(ref codemode) = self.codemode_tool {
+            codemode.replace_tools(self.tools.clone());
+        }
+        self.rebuild_system_prompt();
     }
 
     /// Returns a slice of the active tools.
@@ -212,6 +270,19 @@ impl AgentSession {
         );
     }
 
+    /// Reloads settings, skills, and prompt templates from disk, then rebuilds system prompt.
+    pub fn reload(&mut self) {
+        if let Ok(settings) =
+            crate::settings::SettingsManager::try_load_with_trust(&self.cwd, self.trusted)
+        {
+            self.settings = settings;
+        }
+        self.skills = crate::skills::load_skills_with_trust(&self.cwd, self.trusted);
+        self.prompt_templates =
+            crate::prompt_templates::load_prompt_templates_with_trust(&self.cwd, self.trusted);
+        self.rebuild_system_prompt();
+    }
+
     /// Injects MCP tools (deferring large MCP toolsets behind `tool_search` when codemode is off)
     /// and optionally wraps all tools in CodemodeTool, rebuilding the system prompt.
     pub fn enable_mcp_and_codemode(
@@ -224,6 +295,7 @@ impl AgentSession {
             .filter(|t| t.name().starts_with("mcp__"))
             .count();
         if !enable_codemode && mcp_server_tool_count > DEFERRED_MCP_TOOL_THRESHOLD {
+            self.codemode_tool = None;
             let mut eager = Vec::new();
             let mut deferred = Vec::new();
             for tool in mcp_tools {
@@ -239,10 +311,73 @@ impl AgentSession {
             self.tools.extend(mcp_tools);
             if enable_codemode {
                 let codemode_tool = Arc::new(mehh_codemode::CodemodeTool::new(self.tools.clone()));
+                self.codemode_tool = Some(codemode_tool.clone());
                 self.tools.push(codemode_tool);
+            } else {
+                self.codemode_tool = None;
             }
             self.rebuild_system_prompt();
         }
+    }
+
+    /// Synchronizes updated MCP tools into the session, updating deferred catalog and codemode bindings in-place.
+    pub fn sync_mcp_tools(&mut self, mcp_tools: Vec<Arc<dyn AgentTool>>, enable_codemode: bool) {
+        self.tools.retain(|t| {
+            !t.name().starts_with("mcp__")
+                && t.name() != "list_mcp_resources"
+                && t.name() != "list_mcp_resource_templates"
+                && t.name() != "read_mcp_resource"
+                && t.name() != "tool_search"
+                && t.name() != "codemode"
+        });
+
+        let mcp_server_tool_count = mcp_tools
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count();
+
+        if !enable_codemode && mcp_server_tool_count > DEFERRED_MCP_TOOL_THRESHOLD {
+            self.codemode_tool = None;
+            let mut eager = Vec::new();
+            let mut deferred = Vec::new();
+            for tool in mcp_tools {
+                if tool.name().starts_with("mcp__") {
+                    deferred.push(tool);
+                } else {
+                    eager.push(tool);
+                }
+            }
+            self.tools.extend(eager);
+            self.enable_deferred_mcp_tools(deferred);
+        } else {
+            if self.deferred_catalog.is_some() {
+                self.clear_deferred_mcp_tools();
+            }
+            self.tools.extend(mcp_tools);
+            if enable_codemode {
+                if let Some(ref codemode) = self.codemode_tool {
+                    codemode.replace_tools(self.tools.clone());
+                    self.tools.push(codemode.clone());
+                } else {
+                    let codemode_tool = Arc::new(mehh_codemode::CodemodeTool::new(self.tools.clone()));
+                    self.codemode_tool = Some(codemode_tool.clone());
+                    self.tools.push(codemode_tool);
+                }
+            } else {
+                self.codemode_tool = None;
+            }
+            self.rebuild_system_prompt();
+        }
+    }
+
+    /// Returns the active CodemodeTool handle, if enabled.
+    pub fn codemode_tool(&self) -> Option<Arc<mehh_codemode::CodemodeTool>> {
+        self.codemode_tool.clone()
+    }
+
+    /// Returns the deferred tool catalog handle, if active.
+    pub fn deferred_catalog(&self) -> Option<Arc<DeferredToolCatalog>> {
+        self.deferred_catalog.clone()
     }
 
     /// Clears deferred `tool_search` tools prior to resynchronizing MCP tools.
@@ -257,11 +392,18 @@ impl AgentSession {
         if deferred.is_empty() {
             return;
         }
-        let catalog = Arc::new(DeferredToolCatalog::new(deferred));
-        self.dynamic_tools = catalog.dynamic_tools_handle();
-        self.deferred_catalog = Some(Arc::clone(&catalog));
-        self.tools.retain(|t| t.name() != "tool_search");
-        self.tools.push(Arc::new(ToolSearchTool::new(catalog)));
+        if let Some(ref catalog) = self.deferred_catalog {
+            catalog.replace_deferred(deferred);
+            if !self.tools.iter().any(|t| t.name() == "tool_search") {
+                self.tools.push(Arc::new(ToolSearchTool::new(catalog.clone())));
+            }
+        } else {
+            let catalog = Arc::new(DeferredToolCatalog::new(deferred));
+            self.dynamic_tools = catalog.dynamic_tools_handle();
+            self.deferred_catalog = Some(Arc::clone(&catalog));
+            self.tools.retain(|t| t.name() != "tool_search");
+            self.tools.push(Arc::new(ToolSearchTool::new(catalog)));
+        }
         self.rebuild_system_prompt();
     }
 
@@ -282,6 +424,9 @@ impl AgentSession {
         ));
         if let Some(slot) = self.tools.iter_mut().find(|t| t.name() == "subagent") {
             *slot = updated;
+        }
+        if let Some(ref codemode) = self.codemode_tool {
+            codemode.replace_tools(self.tools.clone());
         }
     }
 
@@ -399,11 +544,32 @@ impl AgentSession {
         input.to_string()
     }
 
-    /// Prepares input, history, and agent loop configuration for a prompt turn.
-    pub fn prepare_prompt(&self, text: &str) -> (Message, Vec<Message>, AgentLoopConfig) {
-        let expanded = self.expand_input(text);
+    /// Prepares input, history, and agent loop configuration for a prompt turn with arbitrary user content.
+    pub fn prepare_prompt_content(
+        &self,
+        content: UserContent,
+    ) -> (Message, Vec<Message>, AgentLoopConfig) {
+        let expanded_content = match content {
+            UserContent::Text(text) => UserContent::Text(self.expand_input(&text)),
+            UserContent::Blocks(blocks) => {
+                let expanded_blocks = blocks
+                    .into_iter()
+                    .map(|b| match b {
+                        mehh_ai::UserContentBlock::Text(t) => {
+                            mehh_ai::UserContentBlock::Text(mehh_ai::TextContent {
+                                text: self.expand_input(&t.text),
+                                text_signature: t.text_signature,
+                            })
+                        }
+                        image => image,
+                    })
+                    .collect();
+                UserContent::Blocks(expanded_blocks)
+            }
+        };
+
         let user_msg = Message::User(UserMessage {
-            content: UserContent::Text(expanded),
+            content: expanded_content,
             timestamp: now_ms(),
         });
 
@@ -432,6 +598,11 @@ impl AgentSession {
         }
 
         (user_msg, history, config)
+    }
+
+    /// Prepares input, history, and agent loop configuration for a prompt turn.
+    pub fn prepare_prompt(&self, text: &str) -> (Message, Vec<Message>, AgentLoopConfig) {
+        self.prepare_prompt_content(UserContent::Text(text.to_string()))
     }
 
     /// Appends new messages from an agent turn to the session manager.
@@ -583,12 +754,12 @@ impl AgentSession {
         Ok(true)
     }
 
-    /// Sends a user prompt through the agent loop, expanding skills or prompt templates,
+    /// Sends user content through the agent loop, expanding skills or prompt templates,
     /// performing proactive and reactive overflow auto-compaction (when enabled, default true),
     /// and persisting messages to the session.
-    pub async fn prompt(
+    pub async fn prompt_content(
         &mut self,
-        text: &str,
+        content: UserContent,
         on_event: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
     ) -> Result<Vec<Message>> {
         let pre_cancel = CancellationToken::new();
@@ -616,14 +787,15 @@ impl AgentSession {
             anyhow::bail!("Operation aborted");
         }
 
-        let (user_msg, history, config) = self.prepare_prompt(text);
+        let (user_msg, history, config) = self.prepare_prompt_content(content.clone());
         let new_messages = run_agent_loop(vec![user_msg], history, config, on_event.clone()).await;
         *self.active_cancel.lock().unwrap() = None;
 
         if self.is_overflow_turn(&new_messages) {
             match self.try_overflow_compaction().await {
                 Ok(true) => {
-                    let (retry_user, retry_history, retry_config) = self.prepare_prompt(text);
+                    let (retry_user, retry_history, retry_config) =
+                        self.prepare_prompt_content(content);
                     let retry_messages =
                         run_agent_loop(vec![retry_user], retry_history, retry_config, on_event)
                             .await;
@@ -640,6 +812,18 @@ impl AgentSession {
 
         self.finish_prompt(&new_messages)?;
         Ok(new_messages)
+    }
+
+    /// Sends a user prompt through the agent loop, expanding skills or prompt templates,
+    /// performing proactive and reactive overflow auto-compaction (when enabled, default true),
+    /// and persisting messages to the session.
+    pub async fn prompt(
+        &mut self,
+        text: &str,
+        on_event: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
+    ) -> Result<Vec<Message>> {
+        self.prompt_content(UserContent::Text(text.to_string()), on_event)
+            .await
     }
 
     /// Manually triggers compaction on the active branch history, saving the summary entry.
@@ -704,11 +888,65 @@ impl AgentSession {
         )?;
         Ok(summary)
     }
+
+    /// Navigates to a target entry in the session tree, optionally summarizing the abandoned branch.
+    pub async fn navigate_tree(
+        &mut self,
+        target_id: &str,
+        summarize: bool,
+        custom_instructions: Option<&str>,
+    ) -> Result<Option<String>> {
+        let old_leaf_id = self.session.leaf_id().map(str::to_string);
+
+        if self.session.get_entry(target_id).is_none() {
+            return Err(anyhow!("Target entry ID not found: {target_id}"));
+        }
+
+        let summary = if summarize {
+            let collected = crate::branch_summarization::collect_entries_for_branch_summary(
+                &self.session,
+                old_leaf_id.as_deref(),
+                target_id,
+            );
+            if !collected.entries.is_empty() {
+                let cancel = CancellationToken::new();
+                let sum = crate::branch_summarization::generate_branch_summary(
+                    &collected.entries,
+                    &self.model,
+                    self.provider.as_ref(),
+                    self.api_key.as_deref(),
+                    custom_instructions,
+                    None,
+                    cancel,
+                )
+                .await?;
+
+                // Switch branch to target_id first
+                self.session.branch_from(target_id)?;
+                // Append BranchSummary on top of target branch
+                let from_id = old_leaf_id.unwrap_or_else(|| "root".to_string());
+                self.session.append_entry(crate::session::SessionEntryKind::BranchSummary {
+                    from_id,
+                    summary: sum.clone(),
+                })?;
+                Some(sum)
+            } else {
+                self.session.branch_from(target_id)?;
+                None
+            }
+        } else {
+            self.session.branch_from(target_id)?;
+            None
+        };
+
+        Ok(summary)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::SessionEntryKind;
     use mehh_ai::{faux_model, StopReason};
 
     #[test]
@@ -835,7 +1073,7 @@ mod tests {
                 timestamp: now_ms(),
             }))
             .unwrap();
-            sm.append_message(Message::Assistant(mehh_ai::faux_assistant_message(&format!(
+            sm.append_message(Message::Assistant(mehh_ai::faux_assistant_message(format!(
                 "prior reply {i}: {}",
                 "reply ".repeat(800)
             ))))
@@ -892,5 +1130,232 @@ mod tests {
         }));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn navigate_tree_with_summarize_generates_and_appends_branch_summary() {
+        let temp_dir = std::env::temp_dir().join(format!("agent_session_tree_{}", uuid::Uuid::now_v7()));
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            faux_model(),
+            Arc::new(mehh_ai::FauxProvider::default()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+        );
+
+        // Root entry m0
+        let m0 = session
+            .session_mut()
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("Initial prompt".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        // Branch A entries: m1, m2
+        let _m1 = session
+            .session_mut()
+            .append_message(Message::Assistant(mehh_ai::faux_assistant_message("Working on branch A")))
+            .unwrap();
+        let m2 = session
+            .session_mut()
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("Follow up on branch A".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        // Switch to m0 without summary (creating branch B)
+        session.navigate_tree(&m0, false, None).await.unwrap();
+        let m3 = session
+            .session_mut()
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("Branch B work".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        // Now from m3, navigate to m2 with summarize = true!
+        let summary_opt = session.navigate_tree(&m2, true, None).await.unwrap();
+        assert!(summary_opt.is_some());
+
+        // Check active branch entries: leaf should now have branch summary
+        let active = session.session().active_path_entries();
+        let last_entry = active.last().unwrap();
+        match &last_entry.kind {
+            SessionEntryKind::BranchSummary { from_id, summary } => {
+                assert_eq!(from_id, &m3);
+                assert!(!summary.is_empty());
+            }
+            _ => panic!("Expected BranchSummary as newest entry on active branch"),
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn prompt_content_forwards_user_blocks_with_image_to_agent_loop() {
+        let temp_dir = std::env::temp_dir().join(format!("agent_session_blocks_{}", uuid::Uuid::now_v7()));
+        let faux = Arc::new(mehh_ai::FauxProvider::with_responses(vec![
+            mehh_ai::faux_assistant_message("I see the diagram."),
+        ]));
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            faux_model(),
+            faux.clone(),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+        );
+
+        let blocks = vec![
+            mehh_ai::UserContentBlock::Text(mehh_ai::TextContent {
+                text: "describe this:".to_string(),
+                text_signature: None,
+            }),
+            mehh_ai::UserContentBlock::Image(mehh_ai::ImageContent {
+                mime_type: "image/png".to_string(),
+                data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==".to_string(),
+            }),
+        ];
+
+        let res = session
+            .prompt_content(mehh_ai::UserContent::Blocks(blocks), None)
+            .await
+            .unwrap();
+
+        assert_eq!(res.len(), 2);
+        let active = session.session().active_path_entries();
+        let first_msg_entry = active.first().unwrap();
+        match &first_msg_entry.kind {
+            SessionEntryKind::Message { message: Message::User(u) } => {
+                match &u.content {
+                    UserContent::Blocks(b) => {
+                        assert_eq!(b.len(), 2);
+                        assert!(matches!(b[1], mehh_ai::UserContentBlock::Image(_)));
+                    }
+                    _ => panic!("Expected UserContent::Blocks"),
+                }
+            }
+            _ => panic!("Expected user message entry"),
+        }
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_agent_session_reload_picks_up_new_skill_and_prompt_template_from_disk() {
+        let temp_dir = std::env::temp_dir().join(format!("agent_session_reload_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut session = AgentSession::new_with_trust(
+            temp_dir.clone(),
+            faux_model(),
+            Arc::new(mehh_ai::FauxProvider::default()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+            true,
+        );
+
+        assert!(session.skills.is_empty());
+        assert!(session.prompt_templates.is_empty());
+
+        // Create a new skill on disk
+        let skill_dir = temp_dir.join(".agents").join("skills").join("calc");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: calc\ndescription: Calculates math\n---\nCalc instructions\n",
+        )
+        .unwrap();
+
+        // Create a prompt template on disk
+        let template_dir = temp_dir.join(".mehh").join("prompts");
+        std::fs::create_dir_all(&template_dir).unwrap();
+        std::fs::write(template_dir.join("review.md"), "Please review this code.").unwrap();
+
+        session.reload();
+
+        assert_eq!(session.skills.len(), 1);
+        assert_eq!(session.skills[0].name, "calc");
+        assert_eq!(session.prompt_templates.len(), 1);
+        assert_eq!(session.prompt_templates[0].name, "review");
+        assert!(session.system_prompt.contains("calc"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[derive(Debug)]
+    struct MockTool {
+        name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentTool for MockTool {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "mock"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(
+            &self,
+            _call_id: &str,
+            _params: serde_json::Map<String, serde_json::Value>,
+            _cancel: CancellationToken,
+            _on_update: Option<mehh_agent::AgentToolUpdateCallback>,
+        ) -> Result<mehh_agent::AgentToolResult, String> {
+            Ok(mehh_agent::AgentToolResult::text("ok"))
+        }
+    }
+
+    #[test]
+    fn test_sync_mcp_tools_preserves_codemode_and_catalog_handles() {
+        let temp_dir = std::env::temp_dir().join(format!("agent_session_sync_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let mut session = AgentSession::new_with_trust(
+            temp_dir.clone(),
+            faux_model(),
+            Arc::new(mehh_ai::FauxProvider::default()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+            true,
+        );
+
+        // 1. Codemode preservation
+        session.enable_mcp_and_codemode(vec![], true);
+        let orig_codemode = session.codemode_tool().expect("codemode must be set");
+
+        // Sync with new mcp tools preserves existing CodemodeTool instance
+        session.sync_mcp_tools(vec![], true);
+        let synced_codemode = session.codemode_tool().expect("codemode still set");
+        assert!(Arc::ptr_eq(&orig_codemode, &synced_codemode));
+
+        // 2. Deferred catalog preservation (> 20 tools)
+        let dummy_tools: Vec<Arc<dyn AgentTool>> = (0..25)
+            .map(|i| {
+                Arc::new(MockTool {
+                    name: format!("mcp__srv__tool_{i}"),
+                }) as Arc<dyn AgentTool>
+            })
+            .collect();
+        session.sync_mcp_tools(dummy_tools, false);
+        let orig_catalog = session.deferred_catalog().expect("catalog must be set");
+
+        let updated_tools: Vec<Arc<dyn AgentTool>> = (0..22)
+            .map(|i| {
+                Arc::new(MockTool {
+                    name: format!("mcp__srv__tool_{i}"),
+                }) as Arc<dyn AgentTool>
+            })
+            .collect();
+        session.sync_mcp_tools(updated_tools, false);
+        let synced_catalog = session.deferred_catalog().expect("catalog still set");
+        assert!(Arc::ptr_eq(&orig_catalog, &synced_catalog));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
