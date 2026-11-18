@@ -469,6 +469,48 @@ where
                 session.steer(msg);
                 output.send_success(id, "steer", None).await?;
             }
+            "subagent_list" => {
+                let agents: Vec<serde_json::Value> = session
+                    .subagent_control()
+                    .list()
+                    .into_iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "agent_id": s.agent_id,
+                            "mode": s.mode,
+                            "elapsed_ms": s.elapsed_ms,
+                        })
+                    })
+                    .collect();
+                output
+                    .send_success(id, "subagent_list", Some(serde_json::json!({ "agents": agents })))
+                    .await?;
+            }
+            "subagent_steer" => {
+                let agent_id = val.get("agent_id").and_then(|v| v.as_str());
+                let message = val
+                    .get("message")
+                    .or_else(|| val.get("text"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let ok = match agent_id {
+                    Some(id) => session.subagent_control().steer(id, message),
+                    None => false,
+                };
+                output
+                    .send_success(id, "subagent_steer", Some(serde_json::json!({ "ok": ok })))
+                    .await?;
+            }
+            "subagent_kill" => {
+                let agent_id = val.get("agent_id").and_then(|v| v.as_str());
+                let ok = match agent_id {
+                    Some(id) => session.subagent_control().kill(id),
+                    None => false,
+                };
+                output
+                    .send_success(id, "subagent_kill", Some(serde_json::json!({ "ok": ok })))
+                    .await?;
+            }
             "follow_up" => {
                 let msg = val
                     .get("message")
