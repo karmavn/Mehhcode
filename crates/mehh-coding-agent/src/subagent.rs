@@ -1,7 +1,8 @@
 //! Depth-bounded, multi-mode subagent tool for delegated tasks and parallel execution.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -11,10 +12,14 @@ use tokio_util::sync::CancellationToken;
 
 use mehh_agent::{
     run_agent_loop, AgentEvent, AgentLoopConfig, AgentTool, AgentToolResult,
-    AgentToolUpdateCallback,
+    AgentToolUpdateCallback, QueueMode,
 };
 use mehh_ai::{now_ms, LlmProvider, Message, Model, StopReason, UserContent, UserMessage};
 
+use crate::subagent_lifecycle::{
+    agent_store_dir, classify_failure, derive_state, new_agent_id, new_manifest, write_manifest,
+    SubagentEvent, SubagentEventKind, SubagentFailureClass, SubagentManifest, SubagentStatus,
+};
 use crate::tool_inspection::ToolInspectionManager;
 
 /// Maximum nested subagent recursion depth.
@@ -100,6 +105,12 @@ impl SubagentTool {
                     "minimum": 1,
                     "maximum": 20,
                     "description": "Optional turn budget override (capped at 20)."
+                },
+                "timeout_secs": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 180,
+                    "description": "Optional wall-clock timeout override in seconds (default 180)."
                 }
             }
         })
@@ -125,6 +136,106 @@ impl SubagentTool {
         }
     }
 
+    /// Builds the structured subagent update result for a lifecycle event.
+    pub fn subagent_update(child_id: &str, mode: &str, event: &SubagentEvent) -> AgentToolResult {
+        let event_kind = serde_json::to_value(&event.kind).unwrap_or_else(|_| json!("unknown"));
+        let details = json!({
+            "subagent": {
+                "child_id": child_id,
+                "mode": mode,
+                "event_kind": event_kind,
+                "detail": event.detail,
+            }
+        });
+        let text = match event.kind {
+            SubagentEventKind::Started => format!("[subagent:{mode}] started"),
+            SubagentEventKind::ToolStarted => format!("[subagent:{mode}] Executing tool {}", event.detail.as_deref().unwrap_or("")),
+            SubagentEventKind::ToolFinished => format!("[subagent:{mode}] Tool {}", event.detail.as_deref().unwrap_or("completed")),
+            SubagentEventKind::Blocked => format!("[subagent:{mode}] blocked"),
+            SubagentEventKind::Finished => format!("[subagent:{mode}] finished"),
+            SubagentEventKind::Aborted => format!("[subagent:{mode}] aborted"),
+            SubagentEventKind::TimedOut => format!("[subagent:{mode}] timed out"),
+        };
+        let mut result = AgentToolResult::text(text);
+        result.details = Some(details);
+        result
+    }
+
+    /// Single finalization step: applies the terminal status, pushes the
+    /// terminal lifecycle event, forwards it as a structured update, and
+    /// persists the manifest. Always runs exactly once per child.
+    fn finalize_subagent_run(
+        cwd: &Path,
+        manifest: &mut SubagentManifest,
+        events: &Mutex<Vec<SubagentEvent>>,
+        outcome: Result<String, String>,
+        cancel: &CancellationToken,
+        on_update: Option<AgentToolUpdateCallback>,
+    ) -> Result<String, String> {
+        let (status, failure_class, error, result, terminal_kind, terminal_detail) = match &outcome {
+            Ok(out) => (
+                SubagentStatus::Completed,
+                None,
+                None,
+                Some(out.clone()),
+                SubagentEventKind::Finished,
+                Some(out.clone()),
+            ),
+            Err(e) => {
+                let cancelled = cancel.is_cancelled();
+                let failure_class = if cancelled {
+                    SubagentFailureClass::Aborted
+                } else if e.contains("timed out") {
+                    SubagentFailureClass::Timeout
+                } else if e.contains("aborted") || e.contains("panicked") {
+                    SubagentFailureClass::Aborted
+                } else {
+                    classify_failure(e)
+                };
+                let terminal_kind = if cancelled || failure_class == SubagentFailureClass::Aborted {
+                    SubagentEventKind::Aborted
+                } else if failure_class == SubagentFailureClass::Timeout {
+                    SubagentEventKind::TimedOut
+                } else {
+                    SubagentEventKind::Blocked
+                };
+                (
+                    SubagentStatus::Failed,
+                    Some(failure_class),
+                    Some(e.clone()),
+                    None,
+                    terminal_kind,
+                    Some(e.clone()),
+                )
+            }
+        };
+
+        let derived_state = derive_state(&status, failure_class.as_ref()).to_string();
+        manifest.status = status;
+        manifest.failure_class = failure_class;
+        manifest.derived_state = derived_state;
+        manifest.completed_at_ms = Some(now_ms());
+        manifest.result = result;
+        manifest.error = error;
+
+        let terminal_event = SubagentEvent {
+            kind: terminal_kind,
+            at_ms: now_ms(),
+            detail: terminal_detail,
+        };
+        events.lock().unwrap().push(terminal_event.clone());
+        manifest.events = events.lock().unwrap().clone();
+
+        if let Some(ref cb) = on_update {
+            cb(Self::subagent_update(&manifest.agent_id, &manifest.mode, &terminal_event));
+        }
+
+        if let Err(e) = write_manifest(&agent_store_dir(cwd), manifest) {
+            return Err(e);
+        }
+        outcome
+    }
+
     async fn run_child_prompt(
         &self,
         task_prompt: &str,
@@ -133,6 +244,9 @@ impl SubagentTool {
         max_turns: usize,
         cancel: CancellationToken,
         on_update: Option<AgentToolUpdateCallback>,
+        manifest: &mut SubagentManifest,
+        timeout_secs: u64,
+        steering_queue: Option<Arc<Mutex<VecDeque<Message>>>>,
     ) -> Result<String, String> {
         let child_tools = self.filter_tools_for_mode(mode);
         let default_sys = match mode {
@@ -149,6 +263,53 @@ impl SubagentTool {
                 self.cwd.display()
             ),
         };
+
+        let events = Arc::new(Mutex::new(manifest.events.clone()));
+        let child_agent_id = manifest.agent_id.clone();
+        let started_event = SubagentEvent {
+            kind: SubagentEventKind::Started,
+            at_ms: now_ms(),
+            detail: None,
+        };
+        if let Some(ref cb) = on_update {
+            cb(Self::subagent_update(&child_agent_id, mode, &started_event));
+        }
+
+        let mode_owned = mode.to_string();
+        let listener_events = events.clone();
+        let listener_on_update = on_update.clone();
+        let listener: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |event| {
+            let mode_str = mode_owned.clone();
+            let agent_id = child_agent_id.clone();
+            let events = listener_events.clone();
+            let on_update = listener_on_update.clone();
+            match event {
+                AgentEvent::ToolExecutionStart { tool_name, .. } => {
+                    let ev = SubagentEvent {
+                        kind: SubagentEventKind::ToolStarted,
+                        at_ms: now_ms(),
+                        detail: Some(tool_name),
+                    };
+                    events.lock().unwrap().push(ev.clone());
+                    if let Some(ref cb) = on_update {
+                        cb(Self::subagent_update(&agent_id, &mode_str, &ev));
+                    }
+                }
+                AgentEvent::ToolExecutionEnd { is_error, .. } => {
+                    let status = if is_error { "failed" } else { "completed" };
+                    let ev = SubagentEvent {
+                        kind: SubagentEventKind::ToolFinished,
+                        at_ms: now_ms(),
+                        detail: Some(status.to_string()),
+                    };
+                    events.lock().unwrap().push(ev.clone());
+                    if let Some(ref cb) = on_update {
+                        cb(Self::subagent_update(&agent_id, &mode_str, &ev));
+                    }
+                }
+                _ => {}
+            }
+        });
 
         let mut config = AgentLoopConfig::new(self.model.clone(), Arc::clone(&self.provider));
         config.cancel = cancel.child_token();
@@ -196,57 +357,57 @@ impl SubagentTool {
             }
         }
 
+        if let Some(ref queue) = steering_queue {
+            config.steering_queue = Arc::clone(queue);
+            config.steering_mode = QueueMode::OneAtATime;
+        }
+
         let user_msg = Message::User(UserMessage {
             content: UserContent::Text(task_prompt.to_string()),
             timestamp: now_ms(),
         });
 
-        let event_listener = on_update.map(|cb| {
-            let mode_str = mode.to_string();
-            let listener: Arc<dyn Fn(AgentEvent) + Send + Sync> = Arc::new(move |event| {
-                match event {
-                    AgentEvent::ToolExecutionStart { tool_name, .. } => {
-                        cb(AgentToolResult::text(format!(
-                            "[subagent:{mode_str}] Executing tool {}",
-                            tool_name
-                        )));
+        let outcome: Result<String, String> = async {
+            let messages: Result<Vec<Message>, String> = tokio::select! {
+                res = tokio::time::timeout(
+                    Duration::from_secs(timeout_secs),
+                    run_agent_loop(vec![user_msg], Vec::new(), config, Some(listener)),
+                ) => res.map_err(|_| format!("Subagent timed out after {timeout_secs}s")),
+                _ = cancel.cancelled() => Err("Subagent execution was aborted".to_string()),
+            };
+
+            match messages {
+                Ok(msgs) => {
+                    let final_ast = msgs.iter().rev().find_map(|m| match m {
+                        Message::Assistant(a) => Some(a),
+                        _ => None,
+                    });
+
+                    match final_ast {
+                        Some(a) if a.stop_reason == StopReason::Error => Err(a
+                            .error_message
+                            .clone()
+                            .unwrap_or_else(|| "Subagent model call failed".to_string())),
+                        Some(a) if a.stop_reason == StopReason::Aborted => {
+                            Err("Subagent execution was aborted".to_string())
+                        }
+                        Some(a) => Ok(a.text_content()),
+                        None => Err("Subagent produced no assistant response".to_string()),
                     }
-                    AgentEvent::ToolExecutionEnd { is_error, .. } => {
-                        let status = if is_error { "failed" } else { "completed" };
-                        cb(AgentToolResult::text(format!(
-                            "[subagent:{mode_str}] Tool {}",
-                            status
-                        )));
-                    }
-                    _ => {}
                 }
-            });
-            listener
-        });
-
-        let messages = tokio::time::timeout(
-            Duration::from_secs(SUBAGENT_TIMEOUT_SECS),
-            run_agent_loop(vec![user_msg], Vec::new(), config, event_listener),
-        )
-        .await
-        .map_err(|_| format!("Subagent timed out after {SUBAGENT_TIMEOUT_SECS}s"))?;
-
-        let final_ast = messages.iter().rev().find_map(|m| match m {
-            Message::Assistant(a) => Some(a),
-            _ => None,
-        });
-
-        match final_ast {
-            Some(a) if a.stop_reason == StopReason::Error => Err(a
-                .error_message
-                .clone()
-                .unwrap_or_else(|| "Subagent model call failed".to_string())),
-            Some(a) if a.stop_reason == StopReason::Aborted => {
-                Err("Subagent execution was aborted".to_string())
+                Err(e) => Err(e),
             }
-            Some(a) => Ok(a.text_content()),
-            None => Err("Subagent produced no assistant response".to_string()),
         }
+        .await;
+
+        Ok(Self::finalize_subagent_run(
+            &self.cwd,
+            manifest,
+            &events,
+            outcome,
+            &cancel,
+            on_update,
+        )?)
     }
 }
 
@@ -290,6 +451,11 @@ impl AgentTool for SubagentTool {
             .map(|n| (n as usize).clamp(1, SUBAGENT_MAX_TURNS))
             .unwrap_or(SUBAGENT_MAX_TURNS);
 
+        let timeout_secs = params
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(SUBAGENT_TIMEOUT_SECS);
+
         // Check if parallel batch of tasks was provided
         if let Some(tasks_arr) = params.get("tasks").and_then(|v| v.as_array()) {
             let task_prompts: Vec<String> = tasks_arr
@@ -300,6 +466,7 @@ impl AgentTool for SubagentTool {
             if !task_prompts.is_empty() {
                 let semaphore = Arc::new(Semaphore::new(4));
                 let mut handles = Vec::new();
+                let mut child_manifests: Vec<SubagentManifest> = Vec::new();
 
                 for (idx, task_p) in task_prompts.iter().enumerate() {
                     let sem = semaphore.clone();
@@ -318,6 +485,9 @@ impl AgentTool for SubagentTool {
                         inspection_manager: self.inspection_manager.clone(),
                         approval_handler: self.approval_handler.clone(),
                     };
+                    let task_manifest = new_manifest(new_agent_id(), mode_str.clone(), self.model.id.clone(), now_ms());
+                    let mut task_manifest_for_task = task_manifest.clone();
+                    child_manifests.push(task_manifest);
 
                     handles.push(tokio::spawn(async move {
                         let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
@@ -334,6 +504,9 @@ impl AgentTool for SubagentTool {
                             max_turns,
                             cancel_token,
                             on_update_child,
+                            &mut task_manifest_for_task,
+                            timeout_secs,
+                            None,
                         )
                         .await
                     }));
@@ -346,12 +519,35 @@ impl AgentTool for SubagentTool {
                     match h.await {
                         Ok(Ok(out)) => report.push_str(&out),
                         Ok(Err(e)) => report.push_str(&format!("Error: {}", e)),
-                        Err(join_err) => report.push_str(&format!("Join error: {}", join_err)),
+                        Err(join_err) => {
+                            let mut child_manifest = child_manifests[idx].clone();
+                            let events = std::sync::Mutex::new(Vec::new());
+                            let _ = SubagentTool::finalize_subagent_run(
+                                &self.cwd,
+                                &mut child_manifest,
+                                &events,
+                                Err(format!("subagent task panicked: {join_err}")),
+                                &cancel,
+                                None,
+                            );
+                        }
                     }
                     report.push_str("\n\n");
                 }
 
-                return Ok(AgentToolResult::text(report.trim().to_string()));
+                let mut result = AgentToolResult::text(report.trim().to_string());
+                if let Some(child_manifest) = child_manifests.last() {
+                    let path = agent_store_dir(&self.cwd).join(format!("{}.json", child_manifest.agent_id));
+                    result.details = Some(json!({
+                        "subagent": {
+                            "child_id": child_manifest.agent_id,
+                            "mode": mode,
+                            "status": child_manifest.status,
+                            "manifest": path,
+                        }
+                    }));
+                }
+                return Ok(result);
             }
         }
 
@@ -373,11 +569,32 @@ impl AgentTool for SubagentTool {
             approval_handler: self.approval_handler.clone(),
         };
 
+        let mut manifest = new_manifest(new_agent_id(), mode.to_string(), self.model.id.clone(), now_ms());
         let result_text = child_sub
-            .run_child_prompt(prompt, mode, custom_sys, max_turns, cancel, on_update)
+            .run_child_prompt(
+                prompt,
+                mode,
+                custom_sys,
+                max_turns,
+                cancel,
+                on_update,
+                &mut manifest,
+                timeout_secs,
+                None,
+            )
             .await?;
 
-        Ok(AgentToolResult::text(result_text))
+        let path = agent_store_dir(&self.cwd).join(format!("{}.json", manifest.agent_id));
+        let mut result = AgentToolResult::text(result_text);
+        result.details = Some(json!({
+            "subagent": {
+                "child_id": manifest.agent_id,
+                "mode": mode,
+                "status": manifest.status,
+                "manifest": path,
+            }
+        }));
+        Ok(result)
     }
 }
 
