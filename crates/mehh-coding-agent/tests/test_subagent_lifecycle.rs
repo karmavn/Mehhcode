@@ -4,7 +4,7 @@ use mehh_ai::{
     faux_assistant_message, faux_model, AssistantMessage, FauxProvider, StopReason, Usage,
 };
 use mehh_coding_agent::subagent::SubagentTool;
-use mehh_coding_agent::subagent_lifecycle::agent_store_dir;
+use mehh_coding_agent::subagent_lifecycle::{agent_store_dir, new_manifest, write_manifest};
 
 struct HangingProvider;
 
@@ -215,4 +215,22 @@ async fn manifest_write_failure_is_surfaced() {
         .await;
     let _ = std::fs::remove_file(&bad_cwd);
     assert!(res.is_err(), "manifest write failure must surface as execute error");
+}
+
+// The brief's MEHH_AGENT_STORE env-var variant is unsafe here: tests in this
+// binary run on parallel threads and sibling tests resolve the store dir through
+// the same process-global env var. Per the brief's fallback, call write_manifest
+// directly with a store path whose parent is a regular file.
+#[test]
+fn write_manifest_with_invalid_store_dir_errors_naming_the_path() {
+    let base = std::env::temp_dir().join(format!("mehh_sub_store_file_{}", uuid::Uuid::now_v7()));
+    std::fs::write(&base, "not a directory").unwrap();
+    let store = base.join("agents");
+    let m = new_manifest("sub-invalid".into(), "research".into(), "m".into(), 1000);
+    let err = write_manifest(&store, &m).unwrap_err();
+    let _ = std::fs::remove_file(&base);
+    assert!(
+        err.contains(&store.display().to_string()),
+        "error must name the store path, got: {err}"
+    );
 }

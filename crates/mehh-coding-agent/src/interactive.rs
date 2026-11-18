@@ -28,6 +28,15 @@ use crate::mcp_manager::{McpConnectionSummary, McpManager};
 use crate::session::{SessionEntryKind, SessionManager, SessionSummary};
 use crate::settings::{Settings, SettingsManager};
 
+/// One child row inside a nested subagent group, keyed by `child_id`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentChildRow {
+    pub child_id: String,
+    pub label: String,
+    pub status: String,
+    pub detail: String,
+}
+
 /// Transcript display entry in the interactive session.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptItem {
@@ -41,6 +50,14 @@ pub enum TranscriptItem {
         args_summary: String,
         output_preview: Vec<String>,
         diff: Option<String>,
+    },
+    /// Nested subagent tool call with its per-child progress rows.
+    Subagent {
+        id: String,
+        mode: String,
+        status: String,
+        is_error: bool,
+        children: Vec<SubagentChildRow>,
     },
     System(String),
 }
@@ -1696,6 +1713,21 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
         }
         AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
             state.status = Some(format!("Executing {tool_name}..."));
+            if tool_name == "subagent" {
+                let mode = args
+                    .get("mode")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("research")
+                    .to_string();
+                state.items.push(TranscriptItem::Subagent {
+                    id: tool_call_id.clone(),
+                    mode,
+                    status: "running".to_string(),
+                    is_error: false,
+                    children: Vec::new(),
+                });
+                return;
+            }
             let args_summary = if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
                 p.to_string()
             } else if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
@@ -1716,6 +1748,79 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
             });
         }
         AgentEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } => {
+            // Structured subagent updates: upsert a child row keyed by child_id,
+            // or move the group's status on terminal events.
+            if let Some(sub) = partial_result
+                .details
+                .as_ref()
+                .and_then(|d| d.get("subagent"))
+            {
+                if let (Some(child_id), Some(event_kind)) = (
+                    sub.get("child_id").and_then(|v| v.as_str()),
+                    sub.get("event_kind").and_then(|v| v.as_str()),
+                ) {
+                    let detail = sub
+                        .get("detail")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    for item in state.items.iter_mut().rev() {
+                        if let TranscriptItem::Subagent {
+                            id,
+                            status,
+                            is_error,
+                            children,
+                            ..
+                        } = item
+                        {
+                            if id != tool_call_id {
+                                continue;
+                            }
+                            match event_kind {
+                                "tool_started" => {
+                                    match children.iter_mut().find(|r| r.child_id == child_id) {
+                                        Some(row) => {
+                                            row.label = detail.clone();
+                                            row.status = "running".to_string();
+                                        }
+                                        None => children.push(SubagentChildRow {
+                                            child_id: child_id.to_string(),
+                                            label: detail.clone(),
+                                            status: "running".to_string(),
+                                            detail: String::new(),
+                                        }),
+                                    }
+                                }
+                                "tool_finished" => {
+                                    match children.iter_mut().find(|r| r.child_id == child_id) {
+                                        Some(row) => row.status = "completed".to_string(),
+                                        None => children.push(SubagentChildRow {
+                                            child_id: child_id.to_string(),
+                                            label: detail.clone(),
+                                            status: "completed".to_string(),
+                                            detail: String::new(),
+                                        }),
+                                    }
+                                }
+                                "finished" => {
+                                    *status = "completed".to_string();
+                                    *is_error = false;
+                                }
+                                "aborted" | "timed_out" => {
+                                    *status = "failed".to_string();
+                                    *is_error = true;
+                                }
+                                _ => {}
+                            }
+                            // Same cap as the generic tool card's output preview.
+                            while children.len() > 8 {
+                                children.remove(0);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
             for item in state.items.iter_mut().rev() {
                 if let TranscriptItem::ToolCall { id, status, output_preview, .. } = item {
                     if id == tool_call_id {
@@ -1735,8 +1840,20 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 }
             }
         }
-        AgentEvent::ToolExecutionEnd { tool_call_id, is_error, result, .. } => {
+        AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, is_error, result, .. } => {
             state.status = None;
+            if tool_name == "subagent" {
+                for item in state.items.iter_mut().rev() {
+                    if let TranscriptItem::Subagent { id, status, is_error: err, .. } = item {
+                        if id == tool_call_id {
+                            *status = if *is_error { "failed".to_string() } else { "completed".to_string() };
+                            *err = *is_error;
+                            break;
+                        }
+                    }
+                }
+                return;
+            }
             for item in state.items.iter_mut().rev() {
                 if let TranscriptItem::ToolCall { id, status, is_error: err, diff, output_preview, .. } = item {
                     if id == tool_call_id {
@@ -1961,6 +2078,38 @@ pub fn render_interactive_frame(
                         };
                         transcript_lines.extend(wrap_text_with_ansi(&format!("    {colorized}"), width));
                     }
+                }
+            }
+            TranscriptItem::Subagent {
+                id,
+                mode,
+                status,
+                is_error,
+                children,
+            } => {
+                let sym = if *is_error || status == "failed" {
+                    theme.fg(&theme.tool_error, "✗")
+                } else if status == "completed" {
+                    theme.fg(&theme.tool_success, "✓")
+                } else {
+                    theme.fg(&theme.tool_pending, "⚙")
+                };
+                let formatted = format!(
+                    "  {sym} subagent [{}] {}: {}",
+                    theme.fg(&theme.accent, mode),
+                    theme.fg(&theme.dim, &format!("({id})")),
+                    theme.fg(&theme.dim, status)
+                );
+                transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
+
+                for row in children {
+                    let row_line = format!(
+                        "    - {}: {} {}",
+                        theme.fg(&theme.text, &row.label),
+                        theme.fg(&theme.dim, &row.status),
+                        theme.fg(&theme.dim, &row.detail)
+                    );
+                    transcript_lines.extend(wrap_text_with_ansi(&row_line, width));
                 }
             }
             TranscriptItem::System(text) => {
@@ -3338,6 +3487,65 @@ mod tests {
         // AgentEnd
         apply_agent_event(&mut state, &AgentEvent::AgentEnd { messages: vec![] });
         assert!(!state.is_busy);
+    }
+
+    #[test]
+    fn test_subagent_group_renders_nested_child_rows_keyed_by_tool_call_id() {
+        let mut state = make_test_state();
+        let tool_id = "tc_sub_1".to_string();
+
+        apply_agent_event(&mut state, &AgentEvent::ToolExecutionStart {
+            tool_call_id: tool_id.clone(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::json!({"mode": "coding"}).as_object().unwrap().clone(),
+        });
+        assert!(matches!(state.items.last().unwrap(), TranscriptItem::Subagent { mode, .. } if mode == "coding"));
+
+        let child_update = |id: &str, kind: &str, detail: &str| AgentEvent::ToolExecutionUpdate {
+            tool_call_id: tool_id.clone(), tool_name: "subagent".to_string(), args: serde_json::Map::new(),
+            partial_result: mehh_agent::AgentToolResult {
+                details: Some(serde_json::json!({"subagent": {
+                    "child_id": id, "mode": "coding", "event_kind": kind, "detail": detail
+                }})),
+                ..Default::default()
+            },
+        };
+        apply_agent_event(&mut state, &child_update("sub-a", "tool_started", "read"));
+        apply_agent_event(&mut state, &child_update("sub-b", "tool_started", "read"));
+        apply_agent_event(&mut state, &child_update("sub-b", "tool_finished", "read"));
+
+        match state.items.last().unwrap() {
+            TranscriptItem::Subagent { children, .. } => {
+                assert_eq!(children.len(), 2);
+                let a = children.iter().find(|r| r.child_id == "sub-a").unwrap();
+                let b = children.iter().find(|r| r.child_id == "sub-b").unwrap();
+                assert_eq!(a.status, "running");
+                assert_eq!(b.status, "completed");
+            }
+            _ => panic!("expected subagent group"),
+        }
+
+        apply_agent_event(&mut state, &AgentEvent::ToolExecutionStart {
+            tool_call_id: "tc_sub_2".to_string(), tool_name: "subagent".to_string(), args: serde_json::Map::new(),
+        });
+        assert_eq!(state.items.iter().filter(|i| matches!(i, TranscriptItem::Subagent { .. })).count(), 2);
+    }
+
+    #[test]
+    fn test_subagent_group_render_shows_child_rows() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        state.items.push(TranscriptItem::Subagent {
+            id: "tc_x".into(), mode: "coding".into(), status: "running".into(), is_error: false,
+            children: vec![SubagentChildRow {
+                child_id: "sub-a".into(), label: "read".into(),
+                status: "running".into(), detail: "src/main.rs".into(),
+            }],
+        });
+        let editor = Editor::new().with_prefix("> ");
+        let frame = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
+        assert!(frame.contains("subagent"), "header must name the tool");
+        assert!(frame.contains("sub-a") || frame.contains("read"), "child row must be rendered");
     }
 
     #[test]
