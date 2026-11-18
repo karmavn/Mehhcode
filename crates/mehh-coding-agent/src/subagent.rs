@@ -7,7 +7,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
-use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use mehh_agent::{
@@ -20,6 +19,7 @@ use crate::subagent_lifecycle::{
     agent_store_dir, classify_failure, derive_state, new_agent_id, new_manifest, write_manifest,
     SubagentEvent, SubagentEventKind, SubagentFailureClass, SubagentManifest, SubagentStatus,
 };
+use crate::subagent_control::{SubagentControl, DEFAULT_MAX_CONCURRENT_SUBAGENTS};
 use crate::tool_inspection::ToolInspectionManager;
 
 /// Maximum nested subagent recursion depth.
@@ -41,6 +41,7 @@ pub struct SubagentTool {
     pub depth: usize,
     pub inspection_manager: Option<Arc<ToolInspectionManager>>,
     pub approval_handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
+    pub control: Option<Arc<SubagentControl>>,
 }
 
 impl SubagentTool {
@@ -61,6 +62,7 @@ impl SubagentTool {
             depth,
             inspection_manager: None,
             approval_handler: None,
+            control: None,
         }
     }
 
@@ -74,6 +76,11 @@ impl SubagentTool {
         handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
     ) -> Self {
         self.approval_handler = handler;
+        self
+    }
+
+    pub fn with_control(mut self, control: Arc<SubagentControl>) -> Self {
+        self.control = Some(control);
         self
     }
 
@@ -463,13 +470,15 @@ impl AgentTool for SubagentTool {
                 .collect();
 
             if !task_prompts.is_empty() {
-                let semaphore = Arc::new(Semaphore::new(4));
+                let control: Arc<SubagentControl> = self.control.clone().unwrap_or_else(|| {
+                    Arc::new(SubagentControl::new(DEFAULT_MAX_CONCURRENT_SUBAGENTS))
+                });
                 let mut handles = Vec::new();
                 let mut child_manifests: Vec<SubagentManifest> = Vec::new();
+                let mut task_ids: Vec<String> = Vec::new();
                 let mut batch_status: Option<SubagentStatus> = None;
 
                 for (idx, task_p) in task_prompts.iter().enumerate() {
-                    let sem = semaphore.clone();
                     let task_p = task_p.clone();
                     let cancel_token = cancel.clone();
                     let on_update_child = on_update.clone();
@@ -484,31 +493,43 @@ impl AgentTool for SubagentTool {
                         depth: self.depth + 1,
                         inspection_manager: self.inspection_manager.clone(),
                         approval_handler: self.approval_handler.clone(),
+                        control: self.control.clone(),
                     };
-                    let task_manifest = new_manifest(new_agent_id(), mode_str.clone(), self.model.id.clone(), now_ms());
-                    let mut task_manifest_for_task = task_manifest.clone();
-                    child_manifests.push(task_manifest);
+                    let task_agent_id = new_agent_id();
+                    task_ids.push(task_agent_id.clone());
+                    let mut task_manifest_for_task =
+                        new_manifest(task_agent_id.clone(), mode_str.clone(), self.model.id.clone(), now_ms());
+                    child_manifests.push(task_manifest_for_task.clone());
 
+                    let task_control = control.clone();
                     handles.push(tokio::spawn(async move {
-                        let _permit = sem.acquire().await.map_err(|e| e.to_string())?;
+                        let _permit = task_control.acquire().await;
+                        let handle = task_control.register(
+                            task_agent_id,
+                            mode_str.clone(),
+                            cancel_token.child_token(),
+                        );
                         if let Some(ref cb) = on_update_child {
                             cb(AgentToolResult::text(format!(
                                 "[subagent:{mode_str}] Starting task #{}",
                                 idx + 1
                             )));
                         }
-                        sub.run_child_prompt(
-                            &task_p,
-                            &mode_str,
-                            custom_sys_owned.as_deref(),
-                            max_turns,
-                            cancel_token,
-                            on_update_child,
-                            &mut task_manifest_for_task,
-                            timeout_secs,
-                            None,
-                        )
-                        .await
+                        let res = sub
+                            .run_child_prompt(
+                                &task_p,
+                                &mode_str,
+                                custom_sys_owned.as_deref(),
+                                max_turns,
+                                handle.cancel.clone(),
+                                on_update_child,
+                                &mut task_manifest_for_task,
+                                timeout_secs,
+                                Some(handle.steering_queue.clone()),
+                            )
+                            .await;
+                        task_control.unregister(&handle.agent_id);
+                        res
                     }));
                 }
 
@@ -527,6 +548,7 @@ impl AgentTool for SubagentTool {
                         }
                         Err(join_err) => {
                             report.push_str(&format!("Join error: {}", join_err));
+                            control.unregister(&task_ids[idx]);
                             let mut child_manifest = child_manifests[idx].clone();
                             let events = std::sync::Mutex::new(child_manifest.events.clone());
                             if let Err(e) = SubagentTool::finalize_subagent_run(
@@ -577,22 +599,31 @@ impl AgentTool for SubagentTool {
             depth: self.depth + 1,
             inspection_manager: self.inspection_manager.clone(),
             approval_handler: self.approval_handler.clone(),
+            control: self.control.clone(),
         };
 
-        let mut manifest = new_manifest(new_agent_id(), mode.to_string(), self.model.id.clone(), now_ms());
-        let result_text = child_sub
+        let control: Arc<SubagentControl> = child_sub
+            .control
+            .clone()
+            .unwrap_or_else(|| Arc::new(SubagentControl::new(DEFAULT_MAX_CONCURRENT_SUBAGENTS)));
+        let _permit = control.acquire().await;
+        let handle = control.register(new_agent_id(), mode.to_string(), cancel.child_token());
+        let mut manifest = new_manifest(handle.agent_id.clone(), mode.to_string(), self.model.id.clone(), now_ms());
+        let outcome = child_sub
             .run_child_prompt(
                 prompt,
                 mode,
                 custom_sys,
                 max_turns,
-                cancel,
+                handle.cancel.clone(),
                 on_update,
                 &mut manifest,
                 timeout_secs,
-                None,
+                Some(handle.steering_queue.clone()),
             )
-            .await?;
+            .await;
+        control.unregister(&handle.agent_id);
+        let result_text = outcome?;
 
         let path = agent_store_dir(&self.cwd).join(format!("{}.json", manifest.agent_id));
         let mut result = AgentToolResult::text(result_text);

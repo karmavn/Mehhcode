@@ -20,6 +20,7 @@ use crate::session::SessionManager;
 use crate::settings::Settings;
 use crate::skills::Skill;
 use crate::subagent::SubagentTool;
+use crate::subagent_control::{SubagentControl, DEFAULT_MAX_CONCURRENT_SUBAGENTS};
 use crate::system_prompt::build_system_prompt_with_skills;
 use crate::tool_search::{DeferredToolCatalog, ToolSearchTool};
 
@@ -56,6 +57,7 @@ pub struct AgentSession {
     pub approval_handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
     pub todo_state: Arc<tokio::sync::RwLock<crate::todo::TodoState>>,
     pub lead_worker: Arc<Mutex<crate::lead_worker::LeadWorkerManager>>,
+    pub subagent_control: Arc<SubagentControl>,
 }
 
 impl AgentSession {
@@ -142,6 +144,7 @@ impl AgentSession {
             worker_api_key
         };
 
+        let subagent_control = Arc::new(SubagentControl::new(DEFAULT_MAX_CONCURRENT_SUBAGENTS));
         let subagent = Arc::new(
             SubagentTool::new(
                 cwd.clone(),
@@ -151,7 +154,8 @@ impl AgentSession {
                 tools.clone(),
                 0,
             )
-            .with_inspection_manager(inspection_manager.clone()),
+            .with_inspection_manager(inspection_manager.clone())
+            .with_control(subagent_control.clone()),
         );
         tools.push(subagent);
         let todo_state = Arc::new(tokio::sync::RwLock::new(crate::todo::TodoState::default()));
@@ -189,6 +193,7 @@ impl AgentSession {
             approval_handler: None,
             todo_state,
             lead_worker,
+            subagent_control,
         }
     }
 
@@ -300,6 +305,11 @@ impl AgentSession {
     /// Returns the shared follow-up queue.
     pub fn follow_up_queue(&self) -> Arc<Mutex<VecDeque<Message>>> {
         self.follow_up_queue.clone()
+    }
+
+    /// Returns the shared subagent control (registry + global budget).
+    pub fn subagent_control(&self) -> Arc<SubagentControl> {
+        self.subagent_control.clone()
     }
 
     /// Returns the slot holding the active cancellation token.
@@ -555,7 +565,8 @@ impl AgentSession {
                 0,
             )
             .with_inspection_manager(self.inspection_manager.clone())
-            .with_approval_handler(self.approval_handler.clone()),
+            .with_approval_handler(self.approval_handler.clone())
+            .with_control(self.subagent_control.clone()),
         );
         if let Some(slot) = self.tools.iter_mut().find(|t| t.name() == "subagent") {
             *slot = updated;
