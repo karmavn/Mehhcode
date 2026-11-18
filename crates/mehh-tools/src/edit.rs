@@ -1,18 +1,30 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use mehh_ai::{TextContent, ToolResultContentBlock};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use crate::undo_edit::{EditUndoStore, FileSnapshot};
+
 #[derive(Debug, Clone)]
 pub struct EditTool {
     pub cwd: PathBuf,
+    pub undo_store: Option<Arc<EditUndoStore>>,
 }
 
 impl EditTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            undo_store: None,
+        }
+    }
+
+    pub fn with_undo_store(mut self, undo_store: Arc<EditUndoStore>) -> Self {
+        self.undo_store = Some(undo_store);
+        self
     }
 
     fn resolve_path(&self, p: &str) -> PathBuf {
@@ -138,11 +150,13 @@ fn parse_edits(params: &serde_json::Map<String, serde_json::Value>) -> Result<Ve
         let old_text = params
             .get("oldText")
             .or_else(|| params.get("old_text"))
+            .or_else(|| params.get("old_string"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
         let new_text = params
             .get("newText")
             .or_else(|| params.get("new_text"))
+            .or_else(|| params.get("new_string"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
@@ -260,7 +274,20 @@ fn find_fuzzy_matches(content: &str, old_norm: &str) -> Vec<(usize, usize)> {
     matches
 }
 
-fn line_similarity(a: &str, b: &str) -> f64 {
+fn char_bigrams(s: &str) -> std::collections::HashSet<(char, char)> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() < 2 {
+        std::collections::HashSet::new()
+    } else {
+        chars.windows(2).map(|w| (w[0], w[1])).collect()
+    }
+}
+
+fn line_similarity(
+    a: &str,
+    b: &str,
+    a_bigrams: &std::collections::HashSet<(char, char)>,
+) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
     }
@@ -274,15 +301,13 @@ fn line_similarity(a: &str, b: &str) -> f64 {
         let max_len = a_len.max(b_len) as f64;
         return (min_len / max_len).max(0.6);
     }
-    let a_chars: Vec<char> = a.chars().collect();
-    let b_chars: Vec<char> = b.chars().collect();
-    if a_chars.len() < 2 || b_chars.len() < 2 {
+    if a_bigrams.is_empty() {
         return 0.0;
     }
-    let a_bigrams: std::collections::HashSet<(char, char)> =
-        a_chars.windows(2).map(|w| (w[0], w[1])).collect();
-    let b_bigrams: std::collections::HashSet<(char, char)> =
-        b_chars.windows(2).map(|w| (w[0], w[1])).collect();
+    let b_bigrams = char_bigrams(b);
+    if b_bigrams.is_empty() {
+        return 0.0;
+    }
     let shared = a_bigrams.intersection(&b_bigrams).count() as f64;
     (2.0 * shared) / ((a_bigrams.len() + b_bigrams.len()) as f64)
 }
@@ -292,13 +317,14 @@ fn closest_line_hint(content: &str, old_norm: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())?;
+    let target_bigrams = char_bigrams(target);
     let mut best: Option<(usize, f64, &str)> = None;
     for (idx, line) in content.lines().enumerate() {
         let candidate = line.trim();
         if candidate.is_empty() {
             continue;
         }
-        let score = line_similarity(target, candidate);
+        let score = line_similarity(target, candidate, &target_bigrams);
         if score >= CLOSEST_HINT_MIN_SCORE
             && best.is_none_or(|(_, best_s, _)| score > best_s)
         {
@@ -364,6 +390,10 @@ impl AgentTool for EditTool {
         ToolExecutionMode::Sequential
     }
 
+    fn is_read_only(&self) -> Option<bool> {
+        Some(false)
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -383,6 +413,7 @@ impl AgentTool for EditTool {
         let edits = parse_edits(&params)?;
 
         let full_path = self.resolve_path(path_str);
+        let undo_store = self.undo_store.clone();
         with_file_mutation_queue(&full_path, async {
             if !full_path.exists() {
                 return Err(format!("File not found: {}", path_str));
@@ -392,7 +423,7 @@ impl AgentTool for EditTool {
                 .await
                 .map_err(|e| format!("Failed to read {}: {}", path_str, e))?;
 
-            let raw_content = String::from_utf8(raw_bytes)
+            let raw_content = String::from_utf8(raw_bytes.clone())
                 .map_err(|e| format!("File {} is not valid UTF-8: {}", path_str, e))?;
 
             let (bom, content) = split_bom(&raw_content);
@@ -478,6 +509,20 @@ impl AgentTool for EditTool {
                 apply_replacements_to_original(content, &matched_edits)
             };
             let final_content = format!("{bom}{final_body}");
+
+            if let Some(ref store) = undo_store {
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                store.push_snapshot(
+                    &full_path,
+                    FileSnapshot::Existed {
+                        bytes: raw_bytes,
+                        timestamp_ms,
+                    },
+                );
+            }
 
             tokio::fs::write(&full_path, final_content.as_bytes())
                 .await

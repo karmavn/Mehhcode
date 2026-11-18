@@ -33,7 +33,15 @@ use crate::settings::{Settings, SettingsManager};
 pub enum TranscriptItem {
     User(String),
     Assistant { thinking: String, text: String },
-    ToolCall { id: String, name: String, status: String, is_error: bool },
+    ToolCall {
+        id: String,
+        name: String,
+        status: String,
+        is_error: bool,
+        args_summary: String,
+        output_preview: Vec<String>,
+        diff: Option<String>,
+    },
     System(String),
 }
 
@@ -45,6 +53,7 @@ pub enum SelectorKind {
     Resume,
     Settings,
     Login,
+    ToolApproval,
 }
 
 /// A picker overlay: the list of choices plus the context needed to apply one.
@@ -57,6 +66,54 @@ pub struct Selector {
 
 type MarkdownCache = HashMap<(usize, usize), (String, String, Vec<String>)>;
 
+/// Context for an active tool approval request awaiting user decision.
+pub struct PendingApproval {
+    pub tool_name: String,
+    pub args: serde_json::Map<String, serde_json::Value>,
+    pub reason: String,
+    pub preview: Option<String>,
+    pub reply_tx: tokio::sync::oneshot::Sender<bool>,
+}
+
+/// Interactive broker dispatching tool approval requests to the TUI event loop.
+pub struct InteractiveApprovalBroker {
+    tx: tokio::sync::mpsc::UnboundedSender<AgentSignal>,
+    approval_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+impl InteractiveApprovalBroker {
+    pub(crate) fn new(tx: tokio::sync::mpsc::UnboundedSender<AgentSignal>) -> Self {
+        Self {
+            tx,
+            approval_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::tool_inspection::ApprovalHandler for InteractiveApprovalBroker {
+    async fn request_approval(
+        &self,
+        ctx: &crate::tool_inspection::ToolInspectionContext,
+        reason: &str,
+        preview: Option<&str>,
+    ) -> bool {
+        let _guard = self.approval_lock.lock().await;
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        let pending = PendingApproval {
+            tool_name: ctx.tool_name.clone(),
+            args: ctx.args.clone(),
+            reason: reason.to_string(),
+            preview: preview.map(str::to_string),
+            reply_tx,
+        };
+        if self.tx.send(AgentSignal::ToolApprovalRequest(pending)).is_err() {
+            return false;
+        }
+        reply_rx.await.unwrap_or(false)
+    }
+}
+
 /// State managed by the interactive mode session.
 pub struct InteractiveState {
     pub items: Vec<TranscriptItem>,
@@ -67,6 +124,7 @@ pub struct InteractiveState {
     pub total_output_tokens: u64,
     pub total_cost: f64,
     pub selector: Option<Selector>,
+    pub pending_approval: Option<PendingApproval>,
     pub mcp_summaries: Vec<McpConnectionSummary>,
     pub theme: Theme,
     pub keybindings: Keybindings,
@@ -94,6 +152,7 @@ impl InteractiveState {
             total_output_tokens: 0,
             total_cost: 0.0,
             selector: None,
+            pending_approval: None,
             mcp_summaries,
             theme: Theme::load(settings.theme.as_deref()),
             keybindings: Keybindings::default_bindings(),
@@ -148,6 +207,7 @@ pub fn route_busy_input(input: &str) -> BusyInput {
 pub fn builtin_slash_commands() -> Vec<SelectItem> {
     vec![
         SelectItem::new("/help", "/help").with_description("Show help and available commands"),
+        SelectItem::new("/mode", "/mode").with_description("Set permission mode (auto/smart_approve/approve/chat)"),
         SelectItem::new("/new", "/new").with_description("Start a fresh session"),
         SelectItem::new("/compact", "/compact").with_description("Compact session history"),
         SelectItem::new("/model", "/model").with_description("Switch active model"),
@@ -389,6 +449,9 @@ fn message_to_transcript_item(message: &Message) -> TranscriptItem {
                 "completed".to_string()
             },
             is_error: tr.is_error,
+            args_summary: String::new(),
+            output_preview: Vec::new(),
+            diff: tr.details.as_ref().and_then(|d| d.get("diff")).and_then(|v| v.as_str()).map(str::to_string),
         },
         Message::System(s) => TranscriptItem::System(s.content.clone()),
     }
@@ -834,6 +897,27 @@ Keybindings:
   Esc          Interrupt the turn, clear the input, or exit on an empty prompt
   Up / Down    Navigate history or autocomplete";
             state.items.push(TranscriptItem::System(help_text.to_string()));
+            SlashCommandOutcome::Handled
+        }
+        "/mode" => {
+            if let Some(mode_str) = full_arg {
+                match mode_str.parse::<crate::tool_inspection::PermissionMode>() {
+                    Ok(new_mode) => {
+                        session.inspection_manager.set_mode(new_mode).await;
+                        session.settings.permission_mode = Some(new_mode);
+                        state.items.push(TranscriptItem::System(format!("Permission mode set to: {:?}", new_mode)));
+                    }
+                    Err(e) => {
+                        state.items.push(TranscriptItem::System(e));
+                    }
+                }
+            } else {
+                let current = session.inspection_manager.mode().await;
+                state.items.push(TranscriptItem::System(format!(
+                    "Current permission mode: {:?} (options: auto, smart_approve, approve, chat)",
+                    current
+                )));
+            }
             SlashCommandOutcome::Handled
         }
         "/new" => {
@@ -1610,32 +1694,66 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 }
             }
         }
-        AgentEvent::ToolExecutionStart { tool_call_id, tool_name, .. } => {
+        AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
             state.status = Some(format!("Executing {tool_name}..."));
+            let args_summary = if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+                p.to_string()
+            } else if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
+                cmd.chars().take(40).collect::<String>()
+            } else if let Some(q) = args.get("query").or_else(|| args.get("pattern")).and_then(|v| v.as_str()) {
+                q.to_string()
+            } else {
+                String::new()
+            };
             state.items.push(TranscriptItem::ToolCall {
                 id: tool_call_id.clone(),
                 name: tool_name.clone(),
                 status: "running".to_string(),
                 is_error: false,
+                args_summary,
+                output_preview: Vec::new(),
+                diff: None,
             });
         }
-        AgentEvent::ToolExecutionUpdate { tool_call_id, .. } => {
+        AgentEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } => {
             for item in state.items.iter_mut().rev() {
-                if let TranscriptItem::ToolCall { id, status, .. } = item {
+                if let TranscriptItem::ToolCall { id, status, output_preview, .. } = item {
                     if id == tool_call_id {
                         *status = "running".to_string();
+                        for block in &partial_result.content {
+                            if let mehh_ai::ToolResultContentBlock::Text(ref tc) = block {
+                                for line in tc.text.lines().filter(|l| !l.trim().is_empty()) {
+                                    output_preview.push(line.to_string());
+                                    if output_preview.len() > 8 {
+                                        output_preview.remove(0);
+                                    }
+                                }
+                            }
+                        }
                         break;
                     }
                 }
             }
         }
-        AgentEvent::ToolExecutionEnd { tool_call_id, is_error, .. } => {
+        AgentEvent::ToolExecutionEnd { tool_call_id, is_error, result, .. } => {
             state.status = None;
             for item in state.items.iter_mut().rev() {
-                if let TranscriptItem::ToolCall { id, status, is_error: err, .. } = item {
+                if let TranscriptItem::ToolCall { id, status, is_error: err, diff, output_preview, .. } = item {
                     if id == tool_call_id {
                         *status = if *is_error { "failed".to_string() } else { "completed".to_string() };
                         *err = *is_error;
+                        if let Some(d) = result.details.as_ref().and_then(|m| m.get("diff")).and_then(|v| v.as_str()) {
+                            *diff = Some(d.to_string());
+                        }
+                        if *is_error && output_preview.is_empty() {
+                            for block in &result.content {
+                                if let mehh_ai::ToolResultContentBlock::Text(ref tc) = block {
+                                    for line in tc.text.lines().filter(|l| !l.trim().is_empty()).take(8) {
+                                        output_preview.push(line.to_string());
+                                    }
+                                }
+                            }
+                        }
                         break;
                     }
                 }
@@ -1708,6 +1826,7 @@ pub fn render_interactive_frame(
             SelectorKind::Resume => "Select Session (Enter to confirm, Esc to cancel)",
             SelectorKind::Settings => "Settings (Enter to cycle value, Esc to close)",
             SelectorKind::Login => "Select Provider (Enter to confirm, Esc to cancel)",
+            SelectorKind::ToolApproval => "Tool Approval Required (y/Enter: allow once, a: allow session, A: always allow, n/Esc: deny)",
         };
         let component: Box<dyn Component> = if selector.kind == SelectorKind::Settings {
             if let Some(ref sl) = selector.settings_list {
@@ -1762,7 +1881,7 @@ pub fn render_interactive_frame(
 
     // 4. Transcript
     let hide_thinking = session.settings.hide_thinking_block.unwrap_or(false);
-    let mut transcript_lines = Vec::new();
+    let mut transcript_lines = Vec::with_capacity(state.items.len().saturating_mul(4).max(64));
     let mut md_cache = state.markdown_cache.lock().unwrap_or_else(|e| e.into_inner());
     if md_cache.len() > state.items.len().saturating_mul(2).saturating_add(16) {
         md_cache.clear();
@@ -1795,7 +1914,15 @@ pub fn render_interactive_frame(
                     md_cache.insert(key, (theme.name.clone(), text.clone(), rendered));
                 }
             }
-            TranscriptItem::ToolCall { id, name, status, is_error } => {
+            TranscriptItem::ToolCall {
+                id,
+                name,
+                status,
+                is_error,
+                args_summary,
+                output_preview,
+                diff,
+            } => {
                 let sym = if *is_error || status == "failed" {
                     theme.fg(&theme.tool_error, "✗")
                 } else if status == "completed" {
@@ -1803,13 +1930,38 @@ pub fn render_interactive_frame(
                 } else {
                     theme.fg(&theme.tool_pending, "⚙")
                 };
+                let summary_part = if !args_summary.is_empty() {
+                    format!(" {}", theme.fg(&theme.accent, args_summary))
+                } else {
+                    String::new()
+                };
                 let formatted = format!(
-                    "  {sym} {} {}: {}",
+                    "  {sym} {}{summary_part} {}: {}",
                     theme.fg(&theme.text, name),
                     theme.fg(&theme.dim, &format!("({id})")),
                     theme.fg(&theme.dim, status)
                 );
                 transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
+
+                for line in output_preview {
+                    let preview_line = format!("    {}", theme.fg(&theme.dim, line));
+                    transcript_lines.extend(wrap_text_with_ansi(&preview_line, width));
+                }
+
+                if let Some(diff_str) = diff {
+                    for line in diff_str.lines().take(24) {
+                        let colorized = if line.starts_with('+') && !line.starts_with("+++") {
+                            theme.fg(&theme.tool_success, line)
+                        } else if line.starts_with('-') && !line.starts_with("---") {
+                            theme.fg(&theme.tool_error, line)
+                        } else if line.starts_with("@@") {
+                            theme.fg(&theme.accent, line)
+                        } else {
+                            theme.fg(&theme.dim, line)
+                        };
+                        transcript_lines.extend(wrap_text_with_ansi(&format!("    {colorized}"), width));
+                    }
+                }
             }
             TranscriptItem::System(text) => {
                 for sub in text.split('\n') {
@@ -1849,7 +2001,7 @@ pub fn render_interactive_frame(
 }
 
 /// Signal delivered from a running agent turn or background prep/compaction task to the UI loop.
-enum AgentSignal {
+pub(crate) enum AgentSignal {
     ReadyForTurn {
         prompt_text: String,
         new_api_key: Option<String>,
@@ -1866,6 +2018,7 @@ enum AgentSignal {
         cancelled: bool,
     },
     Event(Box<AgentEvent>),
+    ToolApprovalRequest(PendingApproval),
     Finished(Vec<Message>),
     Failed(String),
 }
@@ -1880,6 +2033,30 @@ fn apply_agent_signal(
     state: &mut InteractiveState,
 ) -> bool {
     match signal {
+        AgentSignal::ToolApprovalRequest(pending) => {
+            let desc = if let Some(ref p) = pending.preview {
+                format!("{}: {}", pending.reason, p)
+            } else {
+                pending.reason.clone()
+            };
+            let items = vec![
+                SelectItem::new("allow_once", "Allow once (y/Enter)")
+                    .with_description(desc),
+                SelectItem::new("allow_session", "Allow for session (a)")
+                    .with_description("Auto-approve this tool until session ends"),
+                SelectItem::new("always_allow", "Always allow (A)")
+                    .with_description("Persist always-allow rule to ~/.mehh/agent/permissions.json"),
+                SelectItem::new("deny", "Deny (n/Esc)")
+                    .with_description("Block this tool call"),
+            ];
+            state.pending_approval = Some(pending);
+            state.selector = Some(Selector {
+                kind: SelectorKind::ToolApproval,
+                list: SelectList::new(items, 6),
+                settings_list: None,
+            });
+            false
+        }
         AgentSignal::Event(ev) => {
             apply_agent_event(state, &ev);
             if matches!(&*ev, AgentEvent::AgentEnd { .. }) {
@@ -1890,6 +2067,12 @@ fn apply_agent_signal(
             false
         }
         AgentSignal::Finished(messages) => {
+            if let Some(pending) = state.pending_approval.take() {
+                let _ = pending.reply_tx.send(false);
+            }
+            if state.selector.as_ref().map(|s| s.kind) == Some(SelectorKind::ToolApproval) {
+                state.selector = None;
+            }
             state.is_busy = false;
             state.status = None;
             *session.active_cancel_slot().lock().unwrap() = None;
@@ -1909,6 +2092,12 @@ fn apply_agent_signal(
             true
         }
         AgentSignal::Failed(message) => {
+            if let Some(pending) = state.pending_approval.take() {
+                let _ = pending.reply_tx.send(false);
+            }
+            if state.selector.as_ref().map(|s| s.kind) == Some(SelectorKind::ToolApproval) {
+                state.selector = None;
+            }
             state.is_busy = false;
             state.status = None;
             *session.active_cancel_slot().lock().unwrap() = None;
@@ -1918,6 +2107,12 @@ fn apply_agent_signal(
             true
         }
         AgentSignal::PrepFailed(message) => {
+            if let Some(pending) = state.pending_approval.take() {
+                let _ = pending.reply_tx.send(false);
+            }
+            if state.selector.as_ref().map(|s| s.kind) == Some(SelectorKind::ToolApproval) {
+                state.selector = None;
+            }
             state.is_busy = false;
             state.status = None;
             *session.active_cancel_slot().lock().unwrap() = None;
@@ -1925,6 +2120,12 @@ fn apply_agent_signal(
             true
         }
         AgentSignal::PrepAborted => {
+            if let Some(pending) = state.pending_approval.take() {
+                let _ = pending.reply_tx.send(false);
+            }
+            if state.selector.as_ref().map(|s| s.kind) == Some(SelectorKind::ToolApproval) {
+                state.selector = None;
+            }
             state.is_busy = false;
             state.status = None;
             *session.active_cancel_slot().lock().unwrap() = None;
@@ -2413,6 +2614,9 @@ pub async fn run_interactive_mode(
     let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
     let _agent_keepalive = agent_tx.clone();
 
+    let approval_broker = Arc::new(InteractiveApprovalBroker::new(agent_tx.clone()));
+    session.set_approval_handler(Some(approval_broker));
+
     let mut tick_interval = tokio::time::interval(Duration::from_millis(80));
     let mut turn_running = false;
     let mut wheel_accelerator = WheelScrollAccelerator::default();
@@ -2475,6 +2679,72 @@ pub async fn run_interactive_mode(
                         if let Some(key_str) = normalize_crossterm_key(key_event) {
                             // 1. Selector overlay handling
                             if state.selector.is_some() {
+                                if state.selector.as_ref().map(|s| s.kind) == Some(SelectorKind::ToolApproval) {
+                                    let mut decision: Option<bool> = None;
+                                    let mut persist_rule = false;
+                                    match key_str.as_str() {
+                                        "y" => decision = Some(true),
+                                        "a" => decision = Some(true),
+                                        "A" => {
+                                            decision = Some(true);
+                                            persist_rule = true;
+                                        }
+                                        "n" | "escape" => decision = Some(false),
+                                        "enter" => {
+                                            let selected_id = state
+                                                .selector
+                                                .as_ref()
+                                                .and_then(|s| s.list.selected_item())
+                                                .map(|i| i.id.as_str())
+                                                .unwrap_or("allow_once");
+                                            match selected_id {
+                                                "allow_once" | "allow_session" => decision = Some(true),
+                                                "always_allow" => {
+                                                    decision = Some(true);
+                                                    persist_rule = true;
+                                                }
+                                                _ => decision = Some(false),
+                                            }
+                                        }
+                                        "up" => {
+                                            if let Some(sel) = state.selector.as_mut() {
+                                                sel.list.move_up();
+                                            }
+                                        }
+                                        "down" => {
+                                            if let Some(sel) = state.selector.as_mut() {
+                                                sel.list.move_down();
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+
+                                    if let Some(allowed) = decision {
+                                        state.selector = None;
+                                        if let Some(pending) = state.pending_approval.take() {
+                                            if persist_rule {
+                                                let arg_prefix = pending.args.get("command").and_then(|v| v.as_str()).map(|cmd| {
+                                                    cmd.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
+                                                });
+                                                let rule = crate::permissions::PermissionRule {
+                                                    tool_name: pending.tool_name.clone(),
+                                                    arg_prefix,
+                                                    path_glob: None,
+                                                    action: crate::permissions::PermissionAction::AlwaysAllow,
+                                                };
+                                                let _ = session.inspection_manager.add_permission_rule(rule).await;
+                                                state.items.push(TranscriptItem::System(format!(
+                                                    "Rule added: always allow tool '{}'",
+                                                    pending.tool_name
+                                                )));
+                                            }
+                                            let _ = pending.reply_tx.send(allowed);
+                                        }
+                                    }
+                                    render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                                    continue 'outer;
+                                }
+
                                 match key_str.as_str() {
                                     "enter" | " " | "space"
                                         if key_str == "enter"
@@ -2788,7 +3058,11 @@ pub async fn run_interactive_mode(
                         turn_running = true;
                         render_now(&state, &editor, session, &mut terminal, &mut renderer);
                     }
-                    SignalOutcome::Continuing => {}
+                    SignalOutcome::Continuing => {
+                        if state.selector.is_some() {
+                            render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                        }
+                    }
                 }
                 // Streaming updates are painted by the 80 ms tick, so a burst of
                 // token deltas does not rebuild the frame for every delta.
@@ -3004,6 +3278,9 @@ mod tests {
                 name: "read_file".to_string(),
                 status: "running".to_string(),
                 is_error: false,
+                args_summary: String::new(),
+                output_preview: Vec::new(),
+                diff: None,
             }
         );
 
@@ -3026,6 +3303,9 @@ mod tests {
                 name: "read_file".to_string(),
                 status: "completed".to_string(),
                 is_error: false,
+                args_summary: String::new(),
+                output_preview: Vec::new(),
+                diff: None,
             }
         );
 
@@ -3074,6 +3354,9 @@ mod tests {
             name: "list_dir".to_string(),
             status: "completed".to_string(),
             is_error: false,
+            args_summary: String::new(),
+            output_preview: Vec::new(),
+            diff: None,
         });
         state.items.push(TranscriptItem::System("System notice: ready".to_string()));
 
@@ -3139,6 +3422,9 @@ mod tests {
             name: "read".to_string(),
             status: "completed".to_string(),
             is_error: false,
+            args_summary: String::new(),
+            output_preview: Vec::new(),
+            diff: None,
         });
         state.items.push(TranscriptItem::System("note".to_string()));
 

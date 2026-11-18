@@ -67,6 +67,12 @@ pub trait AgentTool: Send + Sync {
     fn execution_mode(&self) -> ToolExecutionMode {
         ToolExecutionMode::Parallel
     }
+    fn is_read_only(&self) -> Option<bool> {
+        None
+    }
+    fn is_safe_for_auto_approve(&self, _args: &serde_json::Map<String, serde_json::Value>) -> Option<bool> {
+        self.is_read_only()
+    }
     async fn execute(
         &self,
         tool_call_id: &str,
@@ -177,11 +183,25 @@ pub struct PrepareRequestContext {
     pub thinking_level: Option<mehh_ai::ThinkingLevel>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AgentRequestUpdate {
     pub context: Option<AgentContext>,
     pub model: Option<mehh_ai::Model>,
+    pub provider: Option<Arc<dyn mehh_ai::LlmProvider>>,
+    pub api_key: Option<Option<String>>,
     pub thinking_level: Option<mehh_ai::ThinkingLevel>,
+}
+
+impl std::fmt::Debug for AgentRequestUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentRequestUpdate")
+            .field("context", &self.context)
+            .field("model", &self.model)
+            .field("provider", &self.provider.as_ref().map(|_| "<LlmProvider>"))
+            .field("api_key", &self.api_key)
+            .field("thinking_level", &self.thinking_level)
+            .finish()
+    }
 }
 
 pub type PrepareRequestHook = Arc<
@@ -190,12 +210,27 @@ pub type PrepareRequestHook = Arc<
         + Sync,
 >;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct AgentLoopTurnUpdate {
     pub context: Option<AgentContext>,
     pub messages: Option<Vec<Message>>,
     pub model: Option<mehh_ai::Model>,
+    pub provider: Option<Arc<dyn mehh_ai::LlmProvider>>,
+    pub api_key: Option<Option<String>>,
     pub thinking_level: Option<mehh_ai::ThinkingLevel>,
+}
+
+impl std::fmt::Debug for AgentLoopTurnUpdate {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentLoopTurnUpdate")
+            .field("context", &self.context)
+            .field("messages", &self.messages)
+            .field("model", &self.model)
+            .field("provider", &self.provider.as_ref().map(|_| "<LlmProvider>"))
+            .field("api_key", &self.api_key)
+            .field("thinking_level", &self.thinking_level)
+            .finish()
+    }
 }
 
 pub type PrepareNextTurnHook = Arc<

@@ -41,6 +41,24 @@ fn search_in_file(
     context: usize,
     remaining_limit: usize,
 ) -> (Vec<String>, usize) {
+    if context == 0 {
+        let mut output_lines = Vec::new();
+        let mut match_count = 0usize;
+        for (idx, raw_line) in content.split('\n').enumerate() {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if re.is_match(line) {
+                match_count += 1;
+                let line_num = idx + 1;
+                let line_text = truncate_line(line, 500);
+                output_lines.push(format!("{}:{}:{}", path_display, line_num, line_text));
+                if match_count >= remaining_limit {
+                    break;
+                }
+            }
+        }
+        return (output_lines, match_count);
+    }
+
     let lines: Vec<&str> = content
         .split('\n')
         .map(|l| l.strip_suffix('\r').unwrap_or(l))
@@ -63,38 +81,30 @@ fn search_in_file(
     let match_count = match_indices.len();
     let mut output_lines = Vec::new();
 
-    if context == 0 {
-        for &idx in &match_indices {
-            let line_num = idx + 1;
-            let line_text = truncate_line(lines[idx], 500);
-            output_lines.push(format!("{}:{}:{}", path_display, line_num, line_text));
-        }
-    } else {
-        let mut ranges: Vec<(usize, usize)> = Vec::new();
-        for &idx in &match_indices {
-            let start = idx.saturating_sub(context);
-            let end = idx.saturating_add(context).saturating_add(1).min(lines.len());
-            if let Some(last) = ranges.last_mut() {
-                if start <= last.1 {
-                    last.1 = last.1.max(end);
-                    continue;
-                }
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for &idx in &match_indices {
+        let start = idx.saturating_sub(context);
+        let end = idx.saturating_add(context).saturating_add(1).min(lines.len());
+        if let Some(last) = ranges.last_mut() {
+            if start <= last.1 {
+                last.1 = last.1.max(end);
+                continue;
             }
-            ranges.push((start, end));
         }
+        ranges.push((start, end));
+    }
 
-        let match_set: std::collections::HashSet<usize> = match_indices.iter().copied().collect();
+    let match_set: std::collections::HashSet<usize> = match_indices.iter().copied().collect();
 
-        for (start, end) in ranges {
-            for (offset, line) in lines[start..end].iter().enumerate() {
-                let idx = start + offset;
-                let line_num = idx + 1;
-                let line_text = truncate_line(line, 500);
-                if match_set.contains(&idx) {
-                    output_lines.push(format!("{}:{}:{}", path_display, line_num, line_text));
-                } else {
-                    output_lines.push(format!("{}-{}-{}", path_display, line_num, line_text));
-                }
+    for (start, end) in ranges {
+        for (offset, line) in lines[start..end].iter().enumerate() {
+            let idx = start + offset;
+            let line_num = idx + 1;
+            let line_text = truncate_line(line, 500);
+            if match_set.contains(&idx) {
+                output_lines.push(format!("{}:{}:{}", path_display, line_num, line_text));
+            } else {
+                output_lines.push(format!("{}-{}-{}", path_display, line_num, line_text));
             }
         }
     }
@@ -154,6 +164,10 @@ impl AgentTool for GrepTool {
 
     fn execution_mode(&self) -> ToolExecutionMode {
         ToolExecutionMode::Parallel
+    }
+
+    fn is_read_only(&self) -> Option<bool> {
+        Some(true)
     }
 
     async fn execute(

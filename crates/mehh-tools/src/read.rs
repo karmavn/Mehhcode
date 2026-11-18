@@ -64,6 +64,10 @@ impl AgentTool for ReadTool {
         ToolExecutionMode::Parallel
     }
 
+    fn is_read_only(&self) -> Option<bool> {
+        Some(true)
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -162,11 +166,10 @@ impl AgentTool for ReadTool {
         let content_lossy = String::from_utf8_lossy(&bytes);
         let content_str = content_lossy.strip_prefix('\u{feff}').unwrap_or(&content_lossy);
 
-        let mut raw_lines: Vec<&str> = content_str.split('\n').collect();
+        let mut total_lines = content_str.split('\n').count();
         if content_str.ends_with('\n') {
-            raw_lines.pop();
+            total_lines = total_lines.saturating_sub(1);
         }
-        let total_lines = raw_lines.len();
 
         let start_line = offset - 1;
         if start_line >= total_lines {
@@ -176,8 +179,9 @@ impl AgentTool for ReadTool {
             ));
         }
 
-        let mut formatted_lines = Vec::with_capacity(limit.min(2048));
-        for &raw_line in raw_lines.iter().skip(start_line).take(limit) {
+        let take_count = limit.min(total_lines.saturating_sub(start_line));
+        let mut formatted_lines = Vec::with_capacity(take_count.min(2048));
+        for raw_line in content_str.split('\n').skip(start_line).take(take_count) {
             let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
             if let Some((cut, _)) = line.char_indices().nth(2000) {
                 formatted_lines.push(format!("{}... [truncated]", &line[..cut]));

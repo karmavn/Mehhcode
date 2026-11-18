@@ -1,18 +1,29 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use crate::file_mutation_queue::with_file_mutation_queue;
+use crate::undo_edit::{EditUndoStore, FileSnapshot};
 
 #[derive(Debug, Clone)]
 pub struct WriteTool {
     pub cwd: PathBuf,
+    pub undo_store: Option<Arc<EditUndoStore>>,
 }
 
 impl WriteTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            undo_store: None,
+        }
+    }
+
+    pub fn with_undo_store(mut self, undo_store: Arc<EditUndoStore>) -> Self {
+        self.undo_store = Some(undo_store);
+        self
     }
 
     fn resolve_path(&self, p: &str) -> PathBuf {
@@ -56,6 +67,10 @@ impl AgentTool for WriteTool {
         ToolExecutionMode::Sequential
     }
 
+    fn is_read_only(&self) -> Option<bool> {
+        Some(false)
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -78,6 +93,7 @@ impl AgentTool for WriteTool {
             .ok_or_else(|| "Missing required parameter 'content'".to_string())?;
 
         let full_path = self.resolve_path(path_str);
+        let undo_store = self.undo_store.clone();
         let cancel_inner = cancel.clone();
 
         with_file_mutation_queue(&full_path, async {
@@ -93,6 +109,20 @@ impl AgentTool for WriteTool {
 
             if cancel_inner.is_cancelled() {
                 return Err("Tool execution cancelled".to_string());
+            }
+
+            if let Some(ref store) = undo_store {
+                let timestamp_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as i64)
+                    .unwrap_or(0);
+                if full_path.exists() {
+                    if let Ok(bytes) = tokio::fs::read(&full_path).await {
+                        store.push_snapshot(&full_path, FileSnapshot::Existed { bytes, timestamp_ms });
+                    }
+                } else {
+                    store.push_snapshot(&full_path, FileSnapshot::DidNotExist);
+                }
             }
 
             tokio::fs::write(&full_path, content.as_bytes())

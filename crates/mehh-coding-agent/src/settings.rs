@@ -122,6 +122,12 @@ pub struct Settings {
     pub tree_filter_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hide_thinking_block: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<crate::tool_inspection::PermissionMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lead_turns: Option<usize>,
 }
 
 /// Settings loader and merger.
@@ -201,6 +207,9 @@ impl SettingsManager {
             follow_up_mode: overlay.follow_up_mode.or(base.follow_up_mode),
             tree_filter_mode: overlay.tree_filter_mode.or(base.tree_filter_mode),
             hide_thinking_block: overlay.hide_thinking_block.or(base.hide_thinking_block),
+            permission_mode: overlay.permission_mode.or(base.permission_mode),
+            worker_model: overlay.worker_model.or(base.worker_model),
+            lead_turns: overlay.lead_turns.or(base.lead_turns),
         }
     }
 
@@ -217,7 +226,7 @@ impl SettingsManager {
         Self::try_load_from_paths(&global_path, &project_path, trusted)
     }
 
-    pub(crate) fn try_load_from_paths(
+    pub fn try_load_from_paths(
         global_path: &Path,
         project_path: &Path,
         trusted: bool,
@@ -226,7 +235,12 @@ impl SettingsManager {
         if !trusted {
             return Ok(global);
         }
-        let local = Self::load_file(project_path)?;
+        let mut local = Self::load_file(project_path)?;
+        // Escalation guard: Workspace .mehh/settings.json cannot elevate to Auto.
+        // Neutralized to None so that it does not override user's global preference.
+        if local.permission_mode == Some(crate::tool_inspection::PermissionMode::Auto) {
+            local.permission_mode = None;
+        }
         Ok(Self::merge(global, local))
     }
 }
@@ -253,6 +267,9 @@ mod tests {
             follow_up_mode: Some(QueueMode::OneAtATime),
             tree_filter_mode: Some("user".to_string()),
             hide_thinking_block: Some(true),
+            permission_mode: Some(crate::tool_inspection::PermissionMode::SmartApprove),
+            worker_model: None,
+            lead_turns: None,
         };
 
         SettingsManager::save_file(&file_path, &settings).unwrap();
@@ -278,6 +295,9 @@ mod tests {
             follow_up_mode: Some(QueueMode::OneAtATime),
             tree_filter_mode: Some("all".to_string()),
             hide_thinking_block: Some(false),
+            permission_mode: Some(crate::tool_inspection::PermissionMode::SmartApprove),
+            worker_model: Some("gemini-2.5-flash".to_string()),
+            lead_turns: Some(2),
         };
 
         let overlay = Settings {
@@ -292,6 +312,9 @@ mod tests {
             follow_up_mode: None,
             tree_filter_mode: None,
             hide_thinking_block: Some(true),
+            permission_mode: Some(crate::tool_inspection::PermissionMode::Auto),
+            worker_model: None,
+            lead_turns: None,
         };
 
         let merged = SettingsManager::merge(base, overlay);
@@ -306,6 +329,9 @@ mod tests {
         assert_eq!(merged.follow_up_mode, Some(QueueMode::OneAtATime));
         assert_eq!(merged.tree_filter_mode.as_deref(), Some("all"));
         assert_eq!(merged.hide_thinking_block, Some(true));
+        assert_eq!(merged.permission_mode, Some(crate::tool_inspection::PermissionMode::Auto));
+        assert_eq!(merged.worker_model.as_deref(), Some("gemini-2.5-flash"));
+        assert_eq!(merged.lead_turns, Some(2));
     }
 
     #[test]
@@ -351,5 +377,25 @@ mod tests {
         // Corrupt global JSON always fails closed
         std::fs::write(&global_path, b"{corrupt").unwrap();
         assert!(SettingsManager::try_load_from_paths(&global_path, &project_path, false).is_err());
+    }
+
+    #[test]
+    fn test_project_settings_auto_permission_escalation_guard() {
+        let dir = crate::TempTestDir::new("settings_escalation");
+        let global_path = dir.path().join("global-settings.json");
+        let project_path = dir.path().join("project-settings.json");
+
+        // Global has Auto, project also has Auto
+        std::fs::write(&global_path, r#"{"permissionMode":"auto"}"#).unwrap();
+        std::fs::write(&project_path, r#"{"permissionMode":"auto"}"#).unwrap();
+        let loaded = SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
+        // Since local Auto was neutralized to None, global Auto is preserved!
+        assert_eq!(loaded.permission_mode, Some(crate::tool_inspection::PermissionMode::Auto));
+
+        // Global has SmartApprove, project has Auto (trying to escalate)
+        std::fs::write(&global_path, r#"{"permissionMode":"smart_approve"}"#).unwrap();
+        let loaded2 = SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
+        // Global SmartApprove is preserved, project Auto is neutralized!
+        assert_eq!(loaded2.permission_mode, Some(crate::tool_inspection::PermissionMode::SmartApprove));
     }
 }

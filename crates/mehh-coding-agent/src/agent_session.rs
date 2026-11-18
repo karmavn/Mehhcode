@@ -52,6 +52,10 @@ pub struct AgentSession {
     dynamic_tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
     deferred_catalog: Option<Arc<DeferredToolCatalog>>,
     codemode_tool: Option<Arc<mehh_codemode::CodemodeTool>>,
+    pub inspection_manager: Arc<crate::tool_inspection::ToolInspectionManager>,
+    pub approval_handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
+    pub todo_state: Arc<tokio::sync::RwLock<crate::todo::TodoState>>,
+    pub lead_worker: Arc<Mutex<crate::lead_worker::LeadWorkerManager>>,
 }
 
 impl AgentSession {
@@ -80,19 +84,82 @@ impl AgentSession {
         let prompt_templates =
             crate::prompt_templates::load_prompt_templates_with_trust(&cwd, trusted);
         let mut tools = mehh_tools::create_coding_tools(cwd.clone());
-        let subagent = Arc::new(SubagentTool::new(
+
+        let thinking_level = settings.default_thinking_level;
+        let default_mode = if model.provider == "faux" || model.api == "faux" {
+            crate::tool_inspection::PermissionMode::Auto
+        } else {
+            crate::tool_inspection::PermissionMode::SmartApprove
+        };
+        let permission_mode = settings.permission_mode.unwrap_or(default_mode);
+        let perm_store = crate::permissions::PermissionStore::load(&cwd, trusted).unwrap_or_default();
+        let inspection_manager = Arc::new(crate::tool_inspection::ToolInspectionManager::new_with_store(
+            permission_mode,
             cwd.clone(),
+            perm_store,
+        ));
+
+        let (worker_model, worker_provider) = if let Some(ref wm) = settings.worker_model {
+            if let Ok(reg) = crate::models_config::ModelRegistry::load_default() {
+                if let Some(m) = reg.resolve(wm, None) {
+                    let p = Self::default_provider_for_model(&m);
+                    (Some(m), Some(p))
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+
+        let worker_api_key = if let Some(ref wm) = worker_model {
+            if wm.provider == "faux" || wm.api == "faux" {
+                None
+            } else {
+                crate::auth::resolve_api_key(&wm.provider, None, None)
+            }
+        } else {
+            None
+        };
+
+        let mut lw_mgr = crate::lead_worker::LeadWorkerManager::new(
             model.clone(),
             provider.clone(),
-            None,
-            tools.clone(),
-            0,
-        ));
+            worker_model,
+            worker_provider,
+            settings.lead_turns.unwrap_or(1),
+        );
+        lw_mgr.set_worker_api_key(worker_api_key.clone());
+        let lead_worker = Arc::new(Mutex::new(lw_mgr));
+
+        let subagent_model = lead_worker.lock().unwrap().worker_model().cloned().unwrap_or_else(|| model.clone());
+        let subagent_provider = lead_worker.lock().unwrap().worker_provider().cloned().unwrap_or_else(|| provider.clone());
+        let subagent_key = if subagent_model.provider == model.provider {
+            None
+        } else {
+            worker_api_key
+        };
+
+        let subagent = Arc::new(
+            SubagentTool::new(
+                cwd.clone(),
+                subagent_model,
+                subagent_provider,
+                subagent_key,
+                tools.clone(),
+                0,
+            )
+            .with_inspection_manager(inspection_manager.clone()),
+        );
         tools.push(subagent);
+        let todo_state = Arc::new(tokio::sync::RwLock::new(crate::todo::TodoState::default()));
+        let todo_tool = Arc::new(crate::todo::TodoTool::new(todo_state.clone()));
+        tools.push(todo_tool);
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         let system_prompt =
             build_system_prompt_with_skills(&cwd, None, None, &tool_names, &skills);
-        let thinking_level = settings.default_thinking_level;
 
         Self {
             cwd,
@@ -118,6 +185,10 @@ impl AgentSession {
             dynamic_tools: Arc::new(RwLock::new(Vec::new())),
             deferred_catalog: None,
             codemode_tool: None,
+            inspection_manager,
+            approval_handler: None,
+            todo_state,
+            lead_worker,
         }
     }
 
@@ -236,6 +307,15 @@ impl AgentSession {
         self.active_cancel.clone()
     }
 
+    /// Sets or clears the interactive approval handler for tool inspection.
+    pub fn set_approval_handler(
+        &mut self,
+        handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
+    ) {
+        self.approval_handler = handler;
+        self.refresh_subagent_tool();
+    }
+
     /// Overrides active tools for the session.
     pub fn set_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) {
         self.tools = tools;
@@ -310,7 +390,7 @@ impl AgentSession {
         } else {
             self.tools.extend(mcp_tools);
             if enable_codemode {
-                let codemode_tool = Arc::new(mehh_codemode::CodemodeTool::new(self.tools.clone()));
+                let codemode_tool = self.create_codemode_tool(self.tools.clone());
                 self.codemode_tool = Some(codemode_tool.clone());
                 self.tools.push(codemode_tool);
             } else {
@@ -318,6 +398,46 @@ impl AgentSession {
             }
             self.rebuild_system_prompt();
         }
+    }
+
+    fn create_codemode_tool(&self, tools: Vec<Arc<dyn AgentTool>>) -> Arc<mehh_codemode::CodemodeTool> {
+        let inspection_mgr = self.inspection_manager.clone();
+        let approval_h = self.approval_handler.clone();
+        let session_cwd = self.cwd.clone();
+        let tools_clone = tools.clone();
+        let interceptor: mehh_codemode::ToolCallInterceptor = Arc::new(move |name, args| {
+            let inspection_mgr = inspection_mgr.clone();
+            let approval_h = approval_h.clone();
+            let session_cwd = session_cwd.clone();
+            let name_str = name.to_string();
+            let args_map = args.clone();
+            let is_read_only = tools_clone
+                .iter()
+                .find(|t| t.name() == name_str)
+                .and_then(|t| t.is_read_only());
+            Box::pin(async move {
+                let inspect_ctx = crate::tool_inspection::ToolInspectionContext {
+                    tool_call_id: format!("codemode/{}", name_str),
+                    tool_name: name_str,
+                    args: args_map,
+                    is_read_only,
+                    cwd: session_cwd,
+                };
+                let res = inspection_mgr
+                    .inspect_and_authorize(&inspect_ctx, approval_h.as_deref())
+                    .await;
+                if res.block {
+                    Err(res.reason.unwrap_or_else(|| "Tool call blocked by inspection policy".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+        });
+
+        Arc::new(
+            mehh_codemode::CodemodeTool::new(tools)
+                .with_interceptor(interceptor)
+        )
     }
 
     /// Synchronizes updated MCP tools into the session, updating deferred catalog and codemode bindings in-place.
@@ -359,7 +479,7 @@ impl AgentSession {
                     codemode.replace_tools(self.tools.clone());
                     self.tools.push(codemode.clone());
                 } else {
-                    let codemode_tool = Arc::new(mehh_codemode::CodemodeTool::new(self.tools.clone()));
+                    let codemode_tool = self.create_codemode_tool(self.tools.clone());
                     self.codemode_tool = Some(codemode_tool.clone());
                     self.tools.push(codemode_tool);
                 }
@@ -414,14 +534,29 @@ impl AgentSession {
             .filter(|t| t.name() != "subagent" && t.name() != "codemode")
             .cloned()
             .collect();
-        let updated = Arc::new(SubagentTool::new(
-            self.cwd.clone(),
-            self.model.clone(),
-            self.provider.clone(),
-            self.api_key.clone(),
-            base_tools,
-            0,
-        ));
+        let (subagent_model, subagent_provider, subagent_api_key) = {
+            let lw = self.lead_worker.lock().unwrap();
+            let wm = lw.worker_model().cloned().unwrap_or_else(|| self.model.clone());
+            let wp = lw.worker_provider().cloned().unwrap_or_else(|| self.provider.clone());
+            let ak = if wm.provider == self.model.provider {
+                self.api_key.clone()
+            } else {
+                lw.active_api_key()
+            };
+            (wm, wp, ak)
+        };
+        let updated = Arc::new(
+            SubagentTool::new(
+                self.cwd.clone(),
+                subagent_model,
+                subagent_provider,
+                subagent_api_key,
+                base_tools,
+                0,
+            )
+            .with_inspection_manager(self.inspection_manager.clone())
+            .with_approval_handler(self.approval_handler.clone()),
+        );
         if let Some(slot) = self.tools.iter_mut().find(|t| t.name() == "subagent") {
             *slot = updated;
         }
@@ -438,7 +573,8 @@ impl AgentSession {
     /// Sets or updates the provider API key (clearing any explicit CLI override marker).
     pub fn set_api_key(&mut self, api_key: Option<String>) {
         self.has_explicit_api_key = false;
-        self.api_key = api_key;
+        self.api_key = api_key.clone();
+        self.lead_worker.lock().unwrap().set_lead_api_key(api_key);
         self.refresh_subagent_tool();
     }
 
@@ -447,7 +583,8 @@ impl AgentSession {
         self.has_explicit_api_key = api_key
             .as_deref()
             .is_some_and(|k| !k.trim().is_empty());
-        self.api_key = api_key;
+        self.api_key = api_key.clone();
+        self.lead_worker.lock().unwrap().set_lead_api_key(api_key);
         self.refresh_subagent_tool();
     }
 
@@ -596,6 +733,137 @@ impl AgentSession {
         if let Some(m) = self.settings.max_tokens {
             config.stream_options.max_tokens = Some(m);
         }
+
+        let inspection_mgr = self.inspection_manager.clone();
+        let approval_h = self.approval_handler.clone();
+        let session_cwd = self.cwd.clone();
+
+        config.before_tool_call = Some(Arc::new(move |before_ctx, _cancel| {
+            let inspection_mgr = inspection_mgr.clone();
+            let approval_h = approval_h.clone();
+            let session_cwd = session_cwd.clone();
+
+            Box::pin(async move {
+                let tool_name = before_ctx.tool_call.name.clone();
+                let tool_call_id = before_ctx.tool_call.id.clone();
+                let is_read_only = before_ctx
+                    .context
+                    .tools
+                    .as_ref()
+                    .and_then(|tools| tools.iter().find(|t| t.name() == tool_name))
+                    .and_then(|t| t.is_read_only());
+
+                let inspect_ctx = crate::tool_inspection::ToolInspectionContext {
+                    tool_call_id,
+                    tool_name,
+                    args: before_ctx.args,
+                    is_read_only,
+                    cwd: session_cwd,
+                };
+
+                inspection_mgr
+                    .inspect_and_authorize(&inspect_ctx, approval_h.as_deref())
+                    .await
+            })
+        }));
+
+        let todo_state = self.todo_state.clone();
+        let session_cwd_moim = self.cwd.clone();
+        let session_trusted = self.trusted;
+
+        config.prepare_request = Some(Arc::new(move |req_ctx, _cancel| {
+            let todo_state = todo_state.clone();
+            let session_cwd = session_cwd_moim.clone();
+
+            Box::pin(async move {
+                let block_opt = {
+                    let read = todo_state.read().await;
+                    read.format_moim_block(&session_cwd, session_trusted)
+                };
+
+                if let Some(moim_block) = block_opt {
+                    let mut ctx = req_ctx.context.clone();
+                    if let Some(Message::User(ref mut u)) = ctx
+                        .messages
+                        .iter_mut()
+                        .rev()
+                        .find(|m| matches!(m, Message::User(_)))
+                    {
+                        match u.content {
+                            UserContent::Text(ref mut t) => {
+                                t.push_str("\n\n");
+                                t.push_str(&moim_block);
+                            }
+                            UserContent::Blocks(ref mut blocks) => {
+                                blocks.push(mehh_ai::UserContentBlock::Text(mehh_ai::TextContent {
+                                    text: format!("\n\n{}", moim_block),
+                                    text_signature: None,
+                                }));
+                            }
+                        }
+                    } else {
+                        // Fallback: If no User message exists in history, insert at the beginning.
+                        ctx.messages.insert(
+                            0,
+                            Message::User(UserMessage {
+                                content: UserContent::Text(moim_block),
+                                timestamp: crate::agent_session::now_ms(),
+                            }),
+                        );
+                    }
+
+                    Some(mehh_agent::AgentRequestUpdate {
+                        context: Some(ctx),
+                        ..Default::default()
+                    })
+                } else {
+                    None
+                }
+            })
+        }));
+
+        self.lead_worker.lock().unwrap().reset_for_new_prompt();
+        let lead_worker_turn = self.lead_worker.clone();
+        config.prepare_next_turn = Some(Arc::new(move |turn_ctx, _cancel| {
+            let lead_worker = lead_worker_turn.clone();
+            Box::pin(async move {
+                let mut mgr = lead_worker.lock().unwrap();
+                let stop_reason = turn_ctx.assistant_message.stop_reason;
+                let is_empty_assistant = turn_ctx.assistant_message.content.is_empty();
+                let repetition_detected = turn_ctx.tool_results.iter().any(|tr| {
+                    tr.is_error
+                        && tr.content.iter().any(|b| match b {
+                            mehh_ai::ToolResultContentBlock::Text(t) => {
+                                t.text.contains("Repeated identical tool call")
+                            }
+                            _ => false,
+                        })
+                });
+                let is_repetition_break = is_empty_assistant || repetition_detected;
+                mgr.record_turn_outcome(stop_reason, is_repetition_break);
+
+                if mgr.is_active() {
+                    let next_model = mgr.active_model();
+                    let next_provider = mgr.active_provider();
+
+                    if next_model.id != turn_ctx.assistant_message.model
+                        || next_model.provider != turn_ctx.assistant_message.provider
+                    {
+                        let next_api_key = mgr.active_api_key();
+                        Some(mehh_agent::AgentLoopTurnUpdate {
+                            model: Some(next_model),
+                            provider: Some(next_provider),
+                            api_key: Some(next_api_key),
+                            ..Default::default()
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+        }));
 
         (user_msg, history, config)
     }

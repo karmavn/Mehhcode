@@ -16,6 +16,50 @@ pub struct DeferredToolMatch {
     pub parameters: Value,
 }
 
+fn tokenize_terms(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for chunk in text.split(|c: char| c.is_whitespace() || c == '_' || c == '-' || c == ':' || c == '.') {
+        if chunk.is_empty() {
+            continue;
+        }
+        let mut curr = String::new();
+        for ch in chunk.chars() {
+            if ch.is_uppercase() && !curr.is_empty() {
+                tokens.push(curr);
+                curr = String::new();
+            }
+            curr.push(ch.to_ascii_lowercase());
+        }
+        if !curr.is_empty() {
+            tokens.push(curr);
+        }
+    }
+    tokens
+}
+
+fn extract_schema_terms(val: &Value, out: &mut Vec<String>) {
+    match val {
+        Value::Object(map) => {
+            for (k, v) in map {
+                out.push(k.clone());
+                if k == "description" {
+                    if let Some(desc_str) = v.as_str() {
+                        out.push(desc_str.to_string());
+                    }
+                } else {
+                    extract_schema_terms(v, out);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                extract_schema_terms(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Catalog of deferred tools that can be searched and dynamically activated mid-session.
 pub struct DeferredToolCatalog {
     deferred: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
@@ -52,38 +96,166 @@ impl DeferredToolCatalog {
         self.deferred.read().unwrap().is_empty()
     }
 
-    /// Searches deferred tools by case-insensitive keyword matching against names and descriptions.
+    /// Helper to register a test tool into the deferred catalog.
+    pub fn register_test_tool(
+        &mut self,
+        name: &'static str,
+        desc: &'static str,
+        parameters: Value,
+    ) {
+        struct TestDeferredTool {
+            name: &'static str,
+            desc: &'static str,
+            params: Value,
+        }
+        #[async_trait]
+        impl AgentTool for TestDeferredTool {
+            fn name(&self) -> &str {
+                self.name
+            }
+            fn description(&self) -> &str {
+                self.desc
+            }
+            fn parameters(&self) -> Value {
+                self.params.clone()
+            }
+            async fn execute(
+                &self,
+                _id: &str,
+                _params: Map<String, Value>,
+                _cancel: CancellationToken,
+                _on_update: Option<AgentToolUpdateCallback>,
+            ) -> Result<AgentToolResult, String> {
+                Ok(AgentToolResult::text("ok"))
+            }
+        }
+
+        let mut guard = self.deferred.write().unwrap();
+        guard.push(Arc::new(TestDeferredTool {
+            name,
+            desc,
+            params: parameters,
+        }));
+    }
+
+    /// Searches deferred tools using Okapi BM25 (k1=1.2, b=0.75) across names, descriptions,
+    /// and JSON schema parameters, with exact name and substring boosts.
     pub fn search(&self, query: &str, max_results: usize) -> Vec<Arc<dyn AgentTool>> {
         let max_results = max_results.clamp(1, 25);
-        let q = query.trim().to_ascii_lowercase();
-        let terms: Vec<&str> = q.split_whitespace().collect();
+        let q = query.trim();
+        let query_norm = q.to_ascii_lowercase();
+        let query_tokens = tokenize_terms(&query_norm);
 
         let deferred_guard = self.deferred.read().unwrap();
-        let mut scored: Vec<(usize, &Arc<dyn AgentTool>)> = deferred_guard
+        if deferred_guard.is_empty() {
+            return Vec::new();
+        }
+        if query_tokens.is_empty() {
+            return deferred_guard.iter().take(max_results).map(Arc::clone).collect();
+        }
+
+        let num_docs = deferred_guard.len() as f64;
+        const K1: f64 = 1.2;
+        const B: f64 = 0.75;
+
+        // Build document representations
+        struct DocRep<'a> {
+            tool: &'a Arc<dyn AgentTool>,
+            tf_map: std::collections::HashMap<String, f64>,
+            doc_len: f64,
+        }
+
+        let mut docs = Vec::with_capacity(deferred_guard.len());
+        let mut total_len = 0.0;
+
+        for tool in deferred_guard.iter() {
+            let mut tf_map = std::collections::HashMap::new();
+            let mut doc_len = 0.0;
+
+            // Name tokens weighted 3.0
+            for tok in tokenize_terms(tool.name()) {
+                *tf_map.entry(tok).or_insert(0.0) += 3.0;
+                doc_len += 3.0;
+            }
+
+            // Description tokens weighted 1.0
+            for tok in tokenize_terms(tool.description()) {
+                *tf_map.entry(tok).or_insert(0.0) += 1.0;
+                doc_len += 1.0;
+            }
+
+            // Parameter schema tokens weighted 1.0
+            let mut schema_raw = Vec::new();
+            extract_schema_terms(&tool.parameters(), &mut schema_raw);
+            for s in schema_raw {
+                for tok in tokenize_terms(&s) {
+                    *tf_map.entry(tok).or_insert(0.0) += 1.0;
+                    doc_len += 1.0;
+                }
+            }
+
+            total_len += doc_len;
+            docs.push(DocRep {
+                tool,
+                tf_map,
+                doc_len,
+            });
+        }
+
+        let avgdl = if num_docs > 0.0 {
+            total_len / num_docs
+        } else {
+            1.0
+        };
+
+        // Precompute IDF for each query token across docs (reduces complexity from O(D^2 * T) to O(D * T))
+        let idfs: Vec<(&String, f64)> = query_tokens
             .iter()
-            .filter_map(|tool| {
-                if terms.is_empty() {
-                    return Some((1, tool));
+            .filter_map(|q_term| {
+                let df = docs
+                    .iter()
+                    .filter(|d| d.tf_map.contains_key(q_term))
+                    .count() as f64;
+                if df > 0.0 {
+                    let idf = ((num_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
+                    Some((q_term, idf))
+                } else {
+                    None
                 }
-                let name_lower = tool.name().to_ascii_lowercase();
-                let desc_lower = tool.description().to_ascii_lowercase();
-                let mut score = 0usize;
-                for term in &terms {
-                    if name_lower == *term {
-                        score += 100;
-                    } else if name_lower.contains(term) {
-                        score += 40;
-                    } else if desc_lower.contains(term) {
-                        score += 10;
-                    } else {
-                        return None;
-                    }
-                }
-                Some((score, tool))
             })
             .collect();
 
-        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.name().cmp(b.1.name())));
+        let mut scored: Vec<(f64, &Arc<dyn AgentTool>)> = Vec::with_capacity(docs.len());
+
+        for doc in &docs {
+            let mut score = 0.0f64;
+
+            for &(q_term, idf) in &idfs {
+                if let Some(&tf) = doc.tf_map.get(q_term) {
+                    let numerator = tf * (K1 + 1.0);
+                    let denominator = tf + K1 * (1.0 - B + B * (doc.doc_len / avgdl));
+                    score += idf * (numerator / denominator);
+                }
+            }
+
+            let tool_name_lower = doc.tool.name().to_ascii_lowercase();
+            if tool_name_lower == query_norm {
+                score += 50.0;
+            } else if tool_name_lower.contains(&query_norm) {
+                score += 15.0;
+            }
+
+            if score > 0.001 {
+                scored.push((score, doc.tool));
+            }
+        }
+
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.1.name().cmp(b.1.name()))
+        });
+
         scored
             .into_iter()
             .take(max_results)

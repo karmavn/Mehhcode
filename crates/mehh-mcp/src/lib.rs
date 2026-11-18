@@ -242,6 +242,7 @@ mod tests {
             name: "echo_action".to_string(),
             description: Some("Echoes actions back".to_string()),
             input_schema: json!({ "type": "object" }),
+            annotations: None,
         };
 
         let agent_tool = McpAgentTool::new("my_server", tool_info, client.clone());

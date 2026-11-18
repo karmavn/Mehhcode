@@ -10,10 +10,20 @@ use crate::sandbox::{
     run_codemode, to_identifier, CodemodeConfig, CodemodeOutputItem, SandboxToolExecutor,
 };
 
+pub type ToolCallInterceptor = Arc<
+    dyn Fn(
+            &str,
+            &serde_json::Map<String, serde_json::Value>,
+        ) -> futures::future::BoxFuture<'static, Result<(), String>>
+        + Send
+        + Sync,
+>;
+
 pub struct CodemodeTool {
     tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
     kv_store: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     config: CodemodeConfig,
+    interceptor: Option<ToolCallInterceptor>,
 }
 
 impl CodemodeTool {
@@ -26,6 +36,7 @@ impl CodemodeTool {
             tools: Arc::new(RwLock::new(filtered_tools)),
             kv_store: Arc::new(Mutex::new(HashMap::new())),
             config: CodemodeConfig::default(),
+            interceptor: None,
         }
     }
 
@@ -50,6 +61,15 @@ impl CodemodeTool {
     ) -> Self {
         self.kv_store = kv_store;
         self
+    }
+
+    pub fn with_interceptor(mut self, interceptor: ToolCallInterceptor) -> Self {
+        self.interceptor = Some(interceptor);
+        self
+    }
+
+    pub fn set_interceptor(&mut self, interceptor: Option<ToolCallInterceptor>) {
+        self.interceptor = interceptor;
     }
 
     pub fn kv_store(&self) -> Arc<Mutex<HashMap<String, serde_json::Value>>> {
@@ -136,12 +156,14 @@ impl AgentTool for CodemodeTool {
         let tools = current_tools;
         let tool_call_prefix = tool_call_id.to_string();
         let cancel_executor = cancel.clone();
+        let interceptor = self.interceptor.clone();
 
         let executor: SandboxToolExecutor = Arc::new(move |tool_name: &str, args: serde_json::Value| {
             let tools = tools.clone();
             let name_str = tool_name.to_string();
             let prefix = tool_call_prefix.clone();
             let cancel = cancel_executor.clone();
+            let interceptor = interceptor.clone();
 
             Box::pin(async move {
                 let matching = tools.iter().find(|t| {
@@ -156,6 +178,10 @@ impl AgentTool for CodemodeTool {
                     serde_json::Value::Object(m) => m,
                     _ => serde_json::Map::new(),
                 };
+
+                if let Some(ref intercept) = interceptor {
+                    intercept(&name_str, &params_map).await?;
+                }
 
                 let nested_call_id = format!("{prefix}/{name_str}");
                 let tool_res = tool.execute(&nested_call_id, params_map, cancel, None).await?;

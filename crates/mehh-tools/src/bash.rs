@@ -118,6 +118,10 @@ impl AgentTool for BashTool {
         ToolExecutionMode::Sequential
     }
 
+    fn is_read_only(&self) -> Option<bool> {
+        Some(false)
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,

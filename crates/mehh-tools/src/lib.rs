@@ -1,3 +1,4 @@
+pub mod analyze;
 pub mod bash;
 pub mod edit;
 pub mod file_mutation_queue;
@@ -6,8 +7,10 @@ pub mod grep;
 pub mod ls;
 pub mod powershell;
 pub mod read;
+pub mod undo_edit;
 pub mod write;
 
+pub use analyze::AnalyzeTool;
 pub use bash::BashTool;
 pub use edit::EditTool;
 pub use file_mutation_queue::with_file_mutation_queue;
@@ -16,6 +19,7 @@ pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
+pub use undo_edit::{EditUndoStore, FileSnapshot, UndoEditTool};
 pub use write::WriteTool;
 
 use std::path::PathBuf;
@@ -23,27 +27,33 @@ use std::sync::Arc;
 use mehh_agent::AgentTool;
 
 pub fn create_coding_tools(cwd: PathBuf) -> Vec<Arc<dyn AgentTool>> {
+    let undo_store = Arc::new(EditUndoStore::new());
     vec![
         Arc::new(ReadTool::new(cwd.clone())),
-        Arc::new(WriteTool::new(cwd.clone())),
-        Arc::new(EditTool::new(cwd.clone())),
-        Arc::new(BashTool::new(cwd.clone())),
-        Arc::new(GrepTool::new(cwd.clone())),
-        Arc::new(FindTool::new(cwd.clone())),
-        Arc::new(LsTool::new(cwd)),
-    ]
-}
-
-pub fn create_all_tools(cwd: PathBuf) -> Vec<Arc<dyn AgentTool>> {
-    vec![
-        Arc::new(ReadTool::new(cwd.clone())),
-        Arc::new(WriteTool::new(cwd.clone())),
-        Arc::new(EditTool::new(cwd.clone())),
+        Arc::new(WriteTool::new(cwd.clone()).with_undo_store(undo_store.clone())),
+        Arc::new(EditTool::new(cwd.clone()).with_undo_store(undo_store.clone())),
+        Arc::new(UndoEditTool::new(cwd.clone(), undo_store)),
         Arc::new(BashTool::new(cwd.clone())),
         Arc::new(GrepTool::new(cwd.clone())),
         Arc::new(FindTool::new(cwd.clone())),
         Arc::new(LsTool::new(cwd.clone())),
-        Arc::new(PowerShellTool::new(cwd)),
+        Arc::new(AnalyzeTool::new(cwd)),
+    ]
+}
+
+pub fn create_all_tools(cwd: PathBuf) -> Vec<Arc<dyn AgentTool>> {
+    let undo_store = Arc::new(EditUndoStore::new());
+    vec![
+        Arc::new(ReadTool::new(cwd.clone())),
+        Arc::new(WriteTool::new(cwd.clone()).with_undo_store(undo_store.clone())),
+        Arc::new(EditTool::new(cwd.clone()).with_undo_store(undo_store.clone())),
+        Arc::new(UndoEditTool::new(cwd.clone(), undo_store)),
+        Arc::new(BashTool::new(cwd.clone())),
+        Arc::new(GrepTool::new(cwd.clone())),
+        Arc::new(FindTool::new(cwd.clone())),
+        Arc::new(LsTool::new(cwd.clone())),
+        Arc::new(PowerShellTool::new(cwd.clone())),
+        Arc::new(AnalyzeTool::new(cwd)),
     ]
 }
 
@@ -475,22 +485,24 @@ mod tests {
     #[test]
     fn test_create_coding_tools() {
         let tools = create_coding_tools(PathBuf::from("."));
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 9);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
-            vec!["read", "write", "edit", "bash", "grep", "find", "ls"]
+            vec![
+                "read", "write", "edit", "undo_edit", "bash", "grep", "find", "ls", "analyze"
+            ]
         );
     }
 
     #[test]
     fn create_coding_tools_excludes_powershell_while_create_all_tools_includes_it() {
         let default_tools = create_coding_tools(PathBuf::from("."));
-        assert_eq!(default_tools.len(), 7);
+        assert_eq!(default_tools.len(), 9);
         assert!(!default_tools.iter().any(|t| t.name() == "powershell"));
 
         let all_tools = create_all_tools(PathBuf::from("."));
-        assert_eq!(all_tools.len(), 8);
+        assert_eq!(all_tools.len(), 10);
         assert!(all_tools.iter().any(|t| t.name() == "powershell"));
 
         // select_coding_tools with include
@@ -509,7 +521,7 @@ mod tests {
             &["bash".to_string()],
         )
         .unwrap();
-        assert_eq!(without_bash.len(), 6);
+        assert_eq!(without_bash.len(), 8);
         assert!(!without_bash.iter().any(|t| t.name() == "bash"));
     }
 

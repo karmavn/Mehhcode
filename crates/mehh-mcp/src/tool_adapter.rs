@@ -456,7 +456,18 @@ impl AgentTool for McpAgentTool {
     }
 
     fn execution_mode(&self) -> ToolExecutionMode {
-        ToolExecutionMode::Parallel
+        if self.is_read_only() == Some(true) {
+            ToolExecutionMode::Parallel
+        } else {
+            ToolExecutionMode::Sequential
+        }
+    }
+
+    fn is_read_only(&self) -> Option<bool> {
+        self.tool_info
+            .annotations
+            .as_ref()
+            .and_then(|a| a.read_only_hint)
     }
 
     async fn execute(
@@ -569,6 +580,10 @@ impl AgentTool for ListMcpResourcesTool {
 
     fn execution_mode(&self) -> ToolExecutionMode {
         ToolExecutionMode::Parallel
+    }
+
+    fn is_read_only(&self) -> Option<bool> {
+        Some(true)
     }
 
     async fn execute(
@@ -717,6 +732,10 @@ impl AgentTool for ListMcpResourceTemplatesTool {
         ToolExecutionMode::Parallel
     }
 
+    fn is_read_only(&self) -> Option<bool> {
+        Some(true)
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,
@@ -841,6 +860,10 @@ impl AgentTool for ReadMcpResourceTool {
 
     fn execution_mode(&self) -> ToolExecutionMode {
         ToolExecutionMode::Parallel
+    }
+
+    fn is_read_only(&self) -> Option<bool> {
+        Some(true)
     }
 
     async fn execute(
@@ -1160,6 +1183,7 @@ mod tests {
             name: "test_tool".to_string(),
             description: Some("desc".to_string()),
             input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
         };
         let agent_tool = McpAgentTool::new("mock_server", tool_info, client);
 

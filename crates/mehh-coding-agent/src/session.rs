@@ -462,7 +462,8 @@ pub fn list_sessions(cwd: &Path) -> Result<Vec<SessionSummary>> {
                     id: Option<&'a str>,
                     #[serde(rename = "type")]
                     kind: Option<&'a str>,
-                    name: Option<String>,
+                    #[serde(borrow)]
+                    name: Option<&'a str>,
                 }
 
                 if let Ok(fast) = serde_json::from_str::<FastSessionLine>(trimmed) {
@@ -471,7 +472,6 @@ pub fn list_sessions(cwd: &Path) -> Result<Vec<SessionSummary>> {
                         if fast.kind == Some("session_info") {
                             session_name = fast
                                 .name
-                                .as_deref()
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
                                 .map(String::from);

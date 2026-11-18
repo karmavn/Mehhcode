@@ -61,6 +61,10 @@ impl AgentTool for FindTool {
         ToolExecutionMode::Parallel
     }
 
+    fn is_read_only(&self) -> Option<bool> {
+        Some(true)
+    }
+
     async fn execute(
         &self,
         _tool_call_id: &str,

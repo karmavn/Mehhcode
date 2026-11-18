@@ -105,6 +105,8 @@ pub async fn run_agent_loop(
     let mut new_messages: Vec<Message> = Vec::new();
     let mut turns_completed: usize = 0;
     let mut current_model = config.model.clone();
+    let mut current_provider = config.provider.clone();
+    let mut current_api_key = config.stream_options.api_key.clone();
     let mut current_thinking_level = config.stream_options.reasoning;
 
     emit(AgentEvent::AgentStart);
@@ -173,6 +175,12 @@ pub async fn run_agent_loop(
                         if let Some(m) = update.model {
                             current_model = m;
                         }
+                        if let Some(p) = update.provider {
+                            current_provider = p;
+                        }
+                        if let Some(ak) = update.api_key {
+                            current_api_key = ak;
+                        }
                         if let Some(tl) = update.thinking_level {
                             current_thinking_level = Some(tl);
                         }
@@ -218,14 +226,28 @@ pub async fn run_agent_loop(
                     if let Some(m) = update.model {
                         current_model = m;
                     }
+                    if let Some(p) = update.provider {
+                        current_provider = p;
+                    }
+                    if let Some(ak) = update.api_key {
+                        current_api_key = ak;
+                    }
                     if let Some(tl) = update.thinking_level {
                         current_thinking_level = Some(tl);
                     }
                 }
             }
 
-            let assistant_message =
-                stream_assistant_response(&current_messages, &current_model, current_thinking_level, &config, &on_event).await;
+            let assistant_message = stream_assistant_response(
+                &current_messages,
+                &current_model,
+                &current_provider,
+                current_api_key.as_deref(),
+                current_thinking_level,
+                &config,
+                &on_event,
+            )
+            .await;
             turns_completed += 1;
 
             current_messages.push(Message::Assistant(assistant_message.clone()));
@@ -373,6 +395,8 @@ pub async fn run_agent_loop(
 async fn stream_assistant_response(
     messages: &[Message],
     model: &Model,
+    provider: &Arc<dyn mehh_ai::LlmProvider>,
+    api_key: Option<&str>,
     thinking_level: Option<mehh_ai::ThinkingLevel>,
     config: &AgentLoopConfig,
     on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
@@ -401,8 +425,9 @@ async fn stream_assistant_response(
 
     let mut stream_opts = config.stream_options.clone();
     stream_opts.reasoning = thinking_level;
+    stream_opts.api_key = api_key.map(str::to_string);
 
-    let mut stream = config.provider.stream(
+    let mut stream = provider.stream(
         model,
         &context,
         &stream_opts,

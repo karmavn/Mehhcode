@@ -45,6 +45,15 @@ pub struct CliArgs {
     #[arg(long = "mode", default_value = "text")]
     pub mode: String,
 
+    #[arg(long = "permission-mode", value_name = "MODE")]
+    pub permission_mode: Option<String>,
+
+    #[arg(long = "worker-model", value_name = "MODEL")]
+    pub worker_model: Option<String>,
+
+    #[arg(long = "lead-turns", value_name = "TURNS")]
+    pub lead_turns: Option<usize>,
+
     #[arg(short = 'm', long = "model")]
     pub model: Option<String>,
 
@@ -720,7 +729,19 @@ async fn main() -> anyhow::Result<()> {
 
     let is_interactive = should_run_interactive(&args, cli_mode, io::stdin().is_terminal());
     let trusted = resolve_project_trust_with_override(&cwd, args.trust_override(), is_interactive)?;
-    let settings = SettingsManager::try_load_with_trust(&cwd, trusted)?;
+    let mut settings = SettingsManager::try_load_with_trust(&cwd, trusted)?;
+    if let Some(ref m) = args.permission_mode {
+        let mode = m
+            .parse::<mehh_coding_agent::PermissionMode>()
+            .map_err(|e| anyhow::anyhow!(e))?;
+        settings.permission_mode = Some(mode);
+    }
+    if let Some(ref wm) = args.worker_model {
+        settings.worker_model = Some(wm.clone());
+    }
+    if let Some(lt) = args.lead_turns {
+        settings.lead_turns = Some(lt);
+    }
 
     let (model, provider): (Model, Arc<dyn LlmProvider>) = {
         let is_faux = args
@@ -778,34 +799,61 @@ async fn main() -> anyhow::Result<()> {
         trusted,
     );
 
-    let mut cli_tools = resolve_cli_tools(&args, cwd.clone())?;
-    let should_include_subagent = if args.no_tools || args.no_builtin_tools {
-        false
-    } else if let Some(ref inc) = args.tools {
-        inc.split(',').any(|s| s.trim() == "subagent")
-    } else {
-        !args
-            .exclude_tools
-            .as_deref()
-            .unwrap_or("")
-            .split(',')
-            .any(|s| s.trim() == "subagent")
-    };
+    if args.no_tools || args.no_builtin_tools || args.tools.is_some() || args.exclude_tools.is_some() {
+        let mut cli_tools = resolve_cli_tools(&args, cwd.clone())?;
+        let should_include_todo = if args.no_tools || args.no_builtin_tools {
+            false
+        } else if let Some(ref inc) = args.tools {
+            inc.split(',').any(|s| s.trim() == "todo")
+        } else {
+            !args
+                .exclude_tools
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .any(|s| s.trim() == "todo")
+        };
+        if should_include_todo {
+            cli_tools.push(Arc::new(mehh_coding_agent::todo::TodoTool::new(agent_session.todo_state.clone())));
+        }
 
-    if should_include_subagent {
-        let base_tools = cli_tools.clone();
-        let subagent = Arc::new(mehh_coding_agent::subagent::SubagentTool::new(
-            cwd.clone(),
-            model.clone(),
-            provider.clone(),
-            None,
-            base_tools,
-            0,
-        ));
-        cli_tools.push(subagent);
+        let should_include_subagent = if args.no_tools || args.no_builtin_tools {
+            false
+        } else if let Some(ref inc) = args.tools {
+            inc.split(',').any(|s| s.trim() == "subagent")
+        } else {
+            !args
+                .exclude_tools
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .any(|s| s.trim() == "subagent")
+        };
+
+        if should_include_subagent {
+            let (sub_model, sub_provider) = {
+                let lw = agent_session.lead_worker.lock().unwrap();
+                let wm = lw.worker_model().cloned().unwrap_or_else(|| model.clone());
+                let wp = lw.worker_provider().cloned().unwrap_or_else(|| provider.clone());
+                (wm, wp)
+            };
+            let subagent = Arc::new(
+                mehh_coding_agent::subagent::SubagentTool::new(
+                    cwd.clone(),
+                    sub_model,
+                    sub_provider,
+                    None,
+                    cli_tools.clone(),
+                    0,
+                )
+                .with_inspection_manager(agent_session.inspection_manager.clone())
+                .with_approval_handler(agent_session.approval_handler.clone()),
+            );
+            cli_tools.push(subagent);
+        }
+
+        agent_session.set_tools(cli_tools);
     }
-
-    agent_session.set_tools(cli_tools);
 
     if let Some(ref models_str) = args.models {
         let mut resolved = Vec::new();
@@ -1727,10 +1775,10 @@ mod tests {
     fn tool_selection_flags_respect_tools_exclude_tools_and_no_builtin_tools() {
         let temp_dir = make_temp_dir("mehh_tools_test");
 
-        // 1. Default tools (7 tools, powershell is opt-in)
+        // 1. Default tools (9 tools with analyze and undo_edit, powershell is opt-in)
         let args_def = CliArgs::try_parse_from(["mehh"]).unwrap();
         let tools_def = resolve_cli_tools(&args_def, temp_dir.clone()).unwrap();
-        assert_eq!(tools_def.len(), 7);
+        assert_eq!(tools_def.len(), 9);
         assert!(!tools_def.iter().any(|t| t.name() == "powershell"));
 
         // 2. Opt-in powershell via --tools
@@ -1742,7 +1790,7 @@ mod tests {
         // 3. Exclude tools
         let args_ex = CliArgs::try_parse_from(["mehh", "--exclude-tools", "bash,edit"]).unwrap();
         let tools_ex = resolve_cli_tools(&args_ex, temp_dir.clone()).unwrap();
-        assert_eq!(tools_ex.len(), 5);
+        assert_eq!(tools_ex.len(), 7);
         assert!(!tools_ex.iter().any(|t| t.name() == "bash" || t.name() == "edit"));
 
         // 4. --no-builtin-tools
