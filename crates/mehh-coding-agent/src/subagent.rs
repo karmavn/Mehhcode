@@ -609,6 +609,7 @@ impl AgentTool for SubagentTool {
         let _permit = control.acquire().await;
         let handle = control.register(new_agent_id(), mode.to_string(), cancel.child_token());
         let mut manifest = new_manifest(handle.agent_id.clone(), mode.to_string(), self.model.id.clone(), now_ms());
+        let on_update_error = on_update.clone();
         let outcome = child_sub
             .run_child_prompt(
                 prompt,
@@ -623,18 +624,36 @@ impl AgentTool for SubagentTool {
             )
             .await;
         control.unregister(&handle.agent_id);
-        let result_text = outcome?;
 
         let path = agent_store_dir(&self.cwd).join(format!("{}.json", manifest.agent_id));
-        let mut result = AgentToolResult::text(result_text);
-        result.details = Some(json!({
+        let details = json!({
             "subagent": {
                 "child_id": manifest.agent_id,
                 "mode": mode,
                 "status": manifest.status,
                 "manifest": path,
             }
-        }));
+        });
+
+        let result_text = match outcome {
+            Ok(text) => text,
+            Err(err) => {
+                // The manifest is already finalized on disk, but this tool reports
+                // failures through `Err(String)`. Deliver the structured payload as
+                // a final update first so post-error inspection keeps the manifest
+                // pointer and terminal status.
+                if let Some(ref cb) = on_update_error {
+                    let mut failure = AgentToolResult::text(err.clone());
+                    failure.is_error = Some(true);
+                    failure.details = Some(details);
+                    cb(failure);
+                }
+                return Err(err);
+            }
+        };
+
+        let mut result = AgentToolResult::text(result_text);
+        result.details = Some(details);
         Ok(result)
     }
 }

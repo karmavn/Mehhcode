@@ -1820,6 +1820,9 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                         }
                     }
                 }
+                // Subagent updates never target a generic tool card; stop here
+                // instead of falling through into the ToolCall scan below.
+                return;
             }
             for item in state.items.iter_mut().rev() {
                 if let TranscriptItem::ToolCall { id, status, output_preview, .. } = item {

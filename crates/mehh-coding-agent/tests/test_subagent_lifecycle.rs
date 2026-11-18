@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use mehh_agent::AgentTool; // required: execute() is a trait method
+use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback}; // AgentTool: execute() is a trait method
 use mehh_ai::{
     faux_assistant_message, faux_model, AssistantMessage, FauxProvider, StopReason, Usage,
 };
@@ -28,6 +28,40 @@ fn manifest_files(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
         .map(|e| e.unwrap().path()).collect()
 }
 
+/// Collects every structured update the tool emits through `on_update`.
+fn update_collector() -> (Arc<std::sync::Mutex<Vec<AgentToolResult>>>, AgentToolUpdateCallback) {
+    let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cb: AgentToolUpdateCallback = {
+        let updates = updates.clone();
+        Arc::new(move |res| updates.lock().unwrap().push(res))
+    };
+    (updates, cb)
+}
+
+/// After a failed/aborted/timed-out single-task child, the final structured
+/// update must carry `details.subagent` with the manifest path and the
+/// terminal status of that child.
+fn assert_error_payload_carries_manifest(
+    updates: &Arc<std::sync::Mutex<Vec<AgentToolResult>>>,
+    store_files: &[std::path::PathBuf],
+) {
+    let updates = updates.lock().unwrap();
+    let last = updates
+        .last()
+        .expect("error path must deliver a final structured update");
+    let details = last.details.as_ref().expect("final update must carry details");
+    let payload = &details["subagent"];
+    let manifest_path = &store_files[0];
+    assert_eq!(
+        payload["manifest"].as_str(),
+        Some(manifest_path.to_string_lossy().as_ref()),
+        "payload must name the manifest on disk"
+    );
+    assert_eq!(payload["status"], "failed", "payload must carry the terminal status");
+    let agent_id = manifest_path.file_stem().unwrap().to_str().unwrap();
+    assert_eq!(payload["child_id"].as_str(), Some(agent_id));
+}
+
 #[tokio::test]
 async fn successful_child_writes_completed_manifest() {
     let dir = std::env::temp_dir().join(format!("mehh_sub_ok_{}", uuid::Uuid::now_v7()));
@@ -37,10 +71,16 @@ async fn successful_child_writes_completed_manifest() {
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
     let res = sub.execute("tc1", params, tokio_util::sync::CancellationToken::new(), None).await.unwrap();
-    assert!(res.details.is_some(), "result must carry structured subagent details");
+    let details = res.details.expect("result must carry structured subagent details");
+    assert_eq!(details["subagent"]["status"], "completed", "success payload must carry terminal status");
 
     let files = manifest_files(&dir);
     assert_eq!(files.len(), 1);
+    assert_eq!(
+        details["subagent"]["manifest"].as_str(),
+        Some(files[0].to_string_lossy().as_ref()),
+        "success payload must name the manifest on disk"
+    );
     let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
     assert_eq!(m["status"], "completed");
     assert!(m["completed_at_ms"].is_number());
@@ -56,7 +96,8 @@ async fn timeout_writes_terminal_timed_out_manifest() {
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
     params.insert("timeout_secs".into(), serde_json::json!(1));
-    let err = sub.execute("tc2", params, tokio_util::sync::CancellationToken::new(), None).await.unwrap_err();
+    let (updates, cb) = update_collector();
+    let err = sub.execute("tc2", params, tokio_util::sync::CancellationToken::new(), Some(cb)).await.unwrap_err();
     assert!(err.contains("timed out"));
 
     let files = manifest_files(&dir);
@@ -65,6 +106,7 @@ async fn timeout_writes_terminal_timed_out_manifest() {
     assert_eq!(m["failure_class"], "timeout");
     assert!(m["completed_at_ms"].is_number());
     assert!(m["events"].as_array().unwrap().iter().any(|e| e["kind"] == "timed_out"));
+    assert_error_payload_carries_manifest(&updates, &files);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -77,7 +119,8 @@ async fn abort_writes_aborted_manifest_with_completed_at_ms() {
     params.insert("timeout_secs".into(), serde_json::json!(30));
     let cancel = tokio_util::sync::CancellationToken::new();
     let task_cancel = cancel.clone();
-    let task = tokio::spawn(async move { sub.execute("tc3", params, task_cancel, None).await });
+    let (updates, cb) = update_collector();
+    let task = tokio::spawn(async move { sub.execute("tc3", params, task_cancel, Some(cb)).await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     cancel.cancel();
     let err = tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap_err();
@@ -89,6 +132,7 @@ async fn abort_writes_aborted_manifest_with_completed_at_ms() {
     assert_eq!(m["failure_class"], "aborted");
     assert!(m["completed_at_ms"].is_number());
     assert!(m["events"].as_array().unwrap().iter().any(|e| e["kind"] == "aborted"));
+    assert_error_payload_carries_manifest(&updates, &files);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
@@ -140,8 +184,9 @@ async fn generic_failure_finalizes_with_aborted_terminal_event() {
     let sub = SubagentTool::new(dir.clone(), faux_model(), provider, None, vec![], 0);
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
+    let (updates, cb) = update_collector();
     let err = sub
-        .execute("tc_gen", params, tokio_util::sync::CancellationToken::new(), None)
+        .execute("tc_gen", params, tokio_util::sync::CancellationToken::new(), Some(cb))
         .await
         .unwrap_err();
     assert!(err.contains("boom"));
@@ -153,6 +198,7 @@ async fn generic_failure_finalizes_with_aborted_terminal_event() {
         m["events"].as_array().unwrap().iter().last().unwrap()["kind"],
         "aborted"
     );
+    assert_error_payload_carries_manifest(&updates, &files);
     std::fs::remove_dir_all(dir).unwrap();
 }
 
