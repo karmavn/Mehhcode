@@ -1777,29 +1777,67 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                                 continue;
                             }
                             match event_kind {
-                                "tool_started" => {
+                                "started" => {
+                                    if !children.iter().any(|r| r.child_id == child_id) {
+                                        children.push(SubagentChildRow {
+                                            child_id: child_id.to_string(),
+                                            label: "started".to_string(),
+                                            status: "running".to_string(),
+                                            detail: detail.clone(),
+                                        });
+                                    }
+                                }
+                                "blocked" => {
+                                    let blocker = detail.clone();
                                     match children.iter_mut().find(|r| r.child_id == child_id) {
                                         Some(row) => {
-                                            row.label = detail.clone();
-                                            row.status = "running".to_string();
+                                            row.label = "blocked".to_string();
+                                            row.status = "blocked".to_string();
+                                            row.detail = blocker;
                                         }
                                         None => children.push(SubagentChildRow {
                                             child_id: child_id.to_string(),
-                                            label: detail.clone(),
+                                            label: "blocked".to_string(),
+                                            status: "blocked".to_string(),
+                                            detail: blocker,
+                                        }),
+                                    }
+                                }
+                                "tool_started" => {
+                                    match children.iter_mut().find(|r| r.child_id == child_id) {
+                                        Some(row) => {
+                                            // Replace a placeholder (started) row in place
+                                            // rather than appending a duplicate.
+                                            row.label = "tool".to_string();
+                                            row.status = "running".to_string();
+                                            row.detail = detail.clone();
+                                        }
+                                        None => children.push(SubagentChildRow {
+                                            child_id: child_id.to_string(),
+                                            label: "tool".to_string(),
                                             status: "running".to_string(),
-                                            detail: String::new(),
+                                            detail: detail.clone(),
                                         }),
                                     }
                                 }
                                 "tool_finished" => {
-                                    match children.iter_mut().find(|r| r.child_id == child_id) {
-                                        Some(row) => row.status = "completed".to_string(),
-                                        None => children.push(SubagentChildRow {
-                                            child_id: child_id.to_string(),
-                                            label: detail.clone(),
-                                            status: "completed".to_string(),
-                                            detail: String::new(),
-                                        }),
+                                    // Never insert on tool_finished; update the most recent
+                                    // running row for this child_id, if any.
+                                    let status_value = if detail.is_empty() {
+                                        "completed".to_string()
+                                    } else {
+                                        detail.clone()
+                                    };
+                                    // Find the last running row for this child.
+                                    let mut target_idx: Option<usize> = None;
+                                    for (i, r) in children.iter().enumerate() {
+                                        if r.child_id == child_id && r.status == "running" {
+                                            target_idx = Some(i);
+                                        }
+                                    }
+                                    if let Some(i) = target_idx {
+                                        children[i].status = status_value.clone();
+                                        children[i].detail = status_value;
                                     }
                                 }
                                 "finished" => {
@@ -3515,14 +3553,18 @@ mod tests {
         };
         apply_agent_event(&mut state, &child_update("sub-a", "tool_started", "read"));
         apply_agent_event(&mut state, &child_update("sub-b", "tool_started", "read"));
-        apply_agent_event(&mut state, &child_update("sub-b", "tool_finished", "read"));
+        apply_agent_event(&mut state, &child_update("sub-b", "tool_finished", "completed"));
 
         match state.items.last().unwrap() {
             TranscriptItem::Subagent { children, .. } => {
                 assert_eq!(children.len(), 2);
                 let a = children.iter().find(|r| r.child_id == "sub-a").unwrap();
                 let b = children.iter().find(|r| r.child_id == "sub-b").unwrap();
+                assert_eq!(a.label, "tool");
+                assert_eq!(a.detail, "read");
                 assert_eq!(a.status, "running");
+                assert_eq!(b.label, "tool");
+                assert_eq!(b.detail, "completed");
                 assert_eq!(b.status, "completed");
             }
             _ => panic!("expected subagent group"),
@@ -3541,14 +3583,61 @@ mod tests {
         state.items.push(TranscriptItem::Subagent {
             id: "tc_x".into(), mode: "coding".into(), status: "running".into(), is_error: false,
             children: vec![SubagentChildRow {
-                child_id: "sub-a".into(), label: "read".into(),
-                status: "running".into(), detail: "src/main.rs".into(),
+                child_id: "sub-a".into(), label: "tool".into(),
+                status: "running".into(), detail: "read".into(),
             }],
         });
         let editor = Editor::new().with_prefix("> ");
         let frame = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
         assert!(frame.contains("subagent"), "header must name the tool");
         assert!(frame.contains("sub-a") || frame.contains("read"), "child row must be rendered");
+    }
+
+    #[test]
+    fn test_subagent_child_lifecycle_events_populate_rows() {
+        let mut state = make_test_state();
+        let tool_id = "tc_sub_lc".to_string();
+        apply_agent_event(&mut state, &AgentEvent::ToolExecutionStart {
+            tool_call_id: tool_id.clone(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::json!({"mode": "coding"}).as_object().unwrap().clone(),
+        });
+
+        let child_update = |id: &str, kind: &str, detail: &str| AgentEvent::ToolExecutionUpdate {
+            tool_call_id: tool_id.clone(), tool_name: "subagent".to_string(), args: serde_json::Map::new(),
+            partial_result: mehh_agent::AgentToolResult {
+                details: Some(serde_json::json!({"subagent": {
+                    "child_id": id, "mode": "coding", "event_kind": kind, "detail": detail
+                }})),
+                ..Default::default()
+            },
+        };
+        // started inserts placeholder
+        apply_agent_event(&mut state, &child_update("c1", "started", ""));
+        // blocked inserts/updates
+        apply_agent_event(&mut state, &child_update("c2", "blocked", "needs approval"));
+        // tool_finished without prior tool_started is ignored
+        apply_agent_event(&mut state, &child_update("ghost", "tool_finished", "completed"));
+        // tool_started replaces placeholder
+        apply_agent_event(&mut state, &child_update("c1", "tool_started", "read"));
+        // tool_finished updates running row
+        apply_agent_event(&mut state, &child_update("c1", "tool_finished", "completed"));
+
+        match state.items.last().unwrap() {
+            TranscriptItem::Subagent { children, .. } => {
+                assert_eq!(children.len(), 2);
+                let c1 = children.iter().find(|r| r.child_id == "c1").unwrap();
+                assert_eq!(c1.label, "tool");
+                assert_eq!(c1.detail, "completed");
+                assert_eq!(c1.status, "completed");
+                let c2 = children.iter().find(|r| r.child_id == "c2").unwrap();
+                assert_eq!(c2.label, "blocked");
+                assert_eq!(c2.status, "blocked");
+                assert_eq!(c2.detail, "needs approval");
+                assert!(children.iter().all(|r| r.child_id != "ghost"));
+            }
+            _ => panic!("expected subagent group"),
+        }
     }
 
     #[test]
