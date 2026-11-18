@@ -1,6 +1,8 @@
 use std::sync::Arc;
 use mehh_agent::AgentTool; // required: execute() is a trait method
-use mehh_ai::{faux_assistant_message, faux_model, FauxProvider};
+use mehh_ai::{
+    faux_assistant_message, faux_model, AssistantMessage, FauxProvider, StopReason, Usage,
+};
 use mehh_coding_agent::subagent::SubagentTool;
 use mehh_coding_agent::subagent_lifecycle::agent_store_dir;
 
@@ -88,4 +90,129 @@ async fn abort_writes_aborted_manifest_with_completed_at_ms() {
     assert!(m["completed_at_ms"].is_number());
     assert!(m["events"].as_array().unwrap().iter().any(|e| e["kind"] == "aborted"));
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+struct PanickingProvider;
+
+#[async_trait::async_trait]
+impl mehh_ai::LlmProvider for PanickingProvider {
+    fn stream(
+        &self,
+        _model: &mehh_ai::Model,
+        _context: &mehh_ai::Context,
+        _options: &mehh_ai::StreamOptions,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> mehh_ai::AssistantEventStream {
+        panic!("boom");
+    }
+}
+
+#[tokio::test]
+async fn timeout_secs_is_clamped_to_schema_minimum() {
+    let dir = std::env::temp_dir().join(format!("mehh_sub_clamp_{}", uuid::Uuid::now_v7()));
+    let sub = SubagentTool::new(dir.clone(), faux_model(), Arc::new(HangingProvider), None, vec![], 0);
+    let mut params = serde_json::Map::new();
+    params.insert("prompt".into(), serde_json::json!("hi"));
+    params.insert("timeout_secs".into(), serde_json::json!(0));
+    let err = sub
+        .execute("tc_clamp", params, tokio_util::sync::CancellationToken::new(), None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("timed out after 1s"), "unexpected: {err}");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn generic_failure_finalizes_with_aborted_terminal_event() {
+    let dir = std::env::temp_dir().join(format!("mehh_sub_gen_{}", uuid::Uuid::now_v7()));
+    let provider = Arc::new(FauxProvider::new());
+    provider.add_response(AssistantMessage {
+        content: Vec::new(),
+        api: "faux".to_string(),
+        provider: "faux".to_string(),
+        model: "faux-1".to_string(),
+        response_id: None,
+        usage: Usage::default(),
+        stop_reason: StopReason::Error,
+        error_message: Some("boom".to_string()),
+        timestamp: mehh_ai::now_ms(),
+    });
+    let sub = SubagentTool::new(dir.clone(), faux_model(), provider, None, vec![], 0);
+    let mut params = serde_json::Map::new();
+    params.insert("prompt".into(), serde_json::json!("hi"));
+    let err = sub
+        .execute("tc_gen", params, tokio_util::sync::CancellationToken::new(), None)
+        .await
+        .unwrap_err();
+    assert!(err.contains("boom"));
+
+    let files = manifest_files(&dir);
+    let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+    assert_eq!(m["status"], "failed");
+    assert_eq!(
+        m["events"].as_array().unwrap().iter().last().unwrap()["kind"],
+        "aborted"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn batch_join_error_manifest_retains_started_event() {
+    let dir = std::env::temp_dir().join(format!("mehh_sub_join_{}", uuid::Uuid::now_v7()));
+    let sub = SubagentTool::new(dir.clone(), faux_model(), Arc::new(PanickingProvider), None, vec![], 0);
+    let mut params = serde_json::Map::new();
+    params.insert("tasks".into(), serde_json::json!(["do work"]));
+    let res = sub
+        .execute("tc_join", params, tokio_util::sync::CancellationToken::new(), None)
+        .await
+        .unwrap();
+    assert!(res.details.is_some());
+    let files = manifest_files(&dir);
+    assert_eq!(files.len(), 1);
+    let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+    assert_eq!(m["status"], "failed");
+    assert_eq!(m["events"][0]["kind"], "started");
+    assert_eq!(
+        m["events"].as_array().unwrap().iter().last().unwrap()["kind"],
+        "aborted"
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn batch_result_details_status_is_terminal() {
+    let dir = std::env::temp_dir().join(format!("mehh_sub_bstat_{}", uuid::Uuid::now_v7()));
+    let faux = Arc::new(FauxProvider::new());
+    faux.add_response(faux_assistant_message("done"));
+    let sub = SubagentTool::new(dir.clone(), faux_model(), faux, None, vec![], 0);
+    let mut params = serde_json::Map::new();
+    params.insert("tasks".into(), serde_json::json!(["do work"]));
+    let res = sub
+        .execute("tc_bstat", params, tokio_util::sync::CancellationToken::new(), None)
+        .await
+        .unwrap();
+    let details = res.details.expect("batch details must be set");
+    assert_eq!(details["subagent"]["status"], "completed");
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn manifest_write_failure_is_surfaced() {
+    let bad_cwd = std::env::temp_dir().join(format!("mehh_sub_bad_cwd_{}", uuid::Uuid::now_v7()));
+    std::fs::write(&bad_cwd, "not a directory").unwrap();
+    let sub = SubagentTool::new(
+        bad_cwd.clone(),
+        faux_model(),
+        Arc::new(FauxProvider::new()),
+        None,
+        vec![],
+        0,
+    );
+    let mut params = serde_json::Map::new();
+    params.insert("prompt".into(), serde_json::json!("hi"));
+    let res = sub
+        .execute("tc_wfail", params, tokio_util::sync::CancellationToken::new(), None)
+        .await;
+    let _ = std::fs::remove_file(&bad_cwd);
+    assert!(res.is_err(), "manifest write failure must surface as execute error");
 }

@@ -192,12 +192,10 @@ impl SubagentTool {
                 } else {
                     classify_failure(e)
                 };
-                let terminal_kind = if cancelled || failure_class == SubagentFailureClass::Aborted {
-                    SubagentEventKind::Aborted
-                } else if failure_class == SubagentFailureClass::Timeout {
+                let terminal_kind = if failure_class == SubagentFailureClass::Timeout {
                     SubagentEventKind::TimedOut
                 } else {
-                    SubagentEventKind::Blocked
+                    SubagentEventKind::Aborted
                 };
                 (
                     SubagentStatus::Failed,
@@ -454,6 +452,7 @@ impl AgentTool for SubagentTool {
         let timeout_secs = params
             .get("timeout_secs")
             .and_then(|v| v.as_u64())
+            .map(|n| n.clamp(1, 180))
             .unwrap_or(SUBAGENT_TIMEOUT_SECS);
 
         // Check if parallel batch of tasks was provided
@@ -467,6 +466,7 @@ impl AgentTool for SubagentTool {
                 let semaphore = Arc::new(Semaphore::new(4));
                 let mut handles = Vec::new();
                 let mut child_manifests: Vec<SubagentManifest> = Vec::new();
+                let mut batch_status: Option<SubagentStatus> = None;
 
                 for (idx, task_p) in task_prompts.iter().enumerate() {
                     let sem = semaphore.clone();
@@ -517,19 +517,29 @@ impl AgentTool for SubagentTool {
                     let task_name = &task_prompts[idx];
                     report.push_str(&format!("=== Task #{}: {} ===\n", idx + 1, task_name));
                     match h.await {
-                        Ok(Ok(out)) => report.push_str(&out),
-                        Ok(Err(e)) => report.push_str(&format!("Error: {}", e)),
+                        Ok(Ok(out)) => {
+                            report.push_str(&out);
+                            batch_status = Some(SubagentStatus::Completed);
+                        }
+                        Ok(Err(e)) => {
+                            report.push_str(&format!("Error: {}", e));
+                            batch_status = Some(SubagentStatus::Failed);
+                        }
                         Err(join_err) => {
+                            report.push_str(&format!("Join error: {}", join_err));
                             let mut child_manifest = child_manifests[idx].clone();
-                            let events = std::sync::Mutex::new(Vec::new());
-                            let _ = SubagentTool::finalize_subagent_run(
+                            let events = std::sync::Mutex::new(child_manifest.events.clone());
+                            if let Err(e) = SubagentTool::finalize_subagent_run(
                                 &self.cwd,
                                 &mut child_manifest,
                                 &events,
                                 Err(format!("subagent task panicked: {join_err}")),
                                 &cancel,
                                 None,
-                            );
+                            ) {
+                                report.push_str(&format!("Error: {}", e));
+                            }
+                            batch_status = Some(SubagentStatus::Failed);
                         }
                     }
                     report.push_str("\n\n");
@@ -542,7 +552,7 @@ impl AgentTool for SubagentTool {
                         "subagent": {
                             "child_id": child_manifest.agent_id,
                             "mode": mode,
-                            "status": child_manifest.status,
+                            "status": batch_status.clone().unwrap_or(child_manifest.status),
                             "manifest": path,
                         }
                     }));
