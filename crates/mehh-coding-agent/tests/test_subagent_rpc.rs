@@ -1,6 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use mehh_ai::{Message, UserContent};
 use mehh_coding_agent::agent_session::AgentSession;
 use mehh_coding_agent::rpc::run_rpc_mode;
 use mehh_coding_agent::session::SessionManager;
@@ -19,10 +20,6 @@ impl TempDir {
         std::fs::create_dir_all(&path).unwrap();
         Self { path }
     }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
 }
 
 impl Drop for TempDir {
@@ -33,10 +30,10 @@ impl Drop for TempDir {
 
 fn new_session(dir: &TempDir) -> AgentSession {
     AgentSession::new(
-        dir.path().to_path_buf(),
+        dir.path.clone(),
         mehh_ai::faux_model(),
         Arc::new(mehh_ai::FauxProvider::new()),
-        SessionManager::in_memory(dir.path().to_path_buf()),
+        SessionManager::in_memory(dir.path.clone()),
         Settings::default(),
     )
 }
@@ -61,7 +58,24 @@ fn assert_response(resp: &serde_json::Value, id: &str, command: &str) {
     assert_eq!(resp["id"], id, "unexpected response id: {resp}");
     assert_eq!(resp["type"], "response", "unexpected response type: {resp}");
     assert_eq!(resp["command"], command, "unexpected command: {resp}");
+    assert!(
+        resp.get("error").is_none(),
+        "unexpected error response: {resp}"
+    );
     assert_eq!(resp["success"], true, "expected success response: {resp}");
+}
+
+/// Asserts a successful RPC response whose only data field is `ok: false`.
+fn assert_ok_false(resp: &serde_json::Value) {
+    let data = resp["data"]
+        .as_object()
+        .unwrap_or_else(|| panic!("response must contain a data object: {resp}"));
+    assert_eq!(data.len(), 1, "data must contain only 'ok': {resp}");
+    assert_eq!(
+        data.get("ok"),
+        Some(&serde_json::Value::Bool(false)),
+        "expected ok:false: {resp}"
+    );
 }
 
 #[tokio::test]
@@ -77,7 +91,7 @@ async fn rpc_can_list_steer_and_kill_a_child() {
     let input = concat!(
         "{\"id\":\"1\",\"type\":\"subagent_list\"}\n",
         "{\"id\":\"2\",\"type\":\"subagent_steer\",",
-        "\"agent_id\":\"sub-x\",\"message\":\"focus\"}\n",
+        "\"agent_id\":\"sub-x\",\"message\":\"  focus  \"}\n",
         "{\"id\":\"3\",\"type\":\"subagent_kill\",\"agent_id\":\"sub-x\"}\n",
     );
     let responses = run_commands(&mut session, input).await;
@@ -101,7 +115,16 @@ async fn rpc_can_list_steer_and_kill_a_child() {
     assert_response(&responses[2], "3", "subagent_kill");
     assert_eq!(responses[2]["data"]["ok"], true, "kill must report success");
 
-    assert_eq!(child.steering_queue.lock().unwrap().len(), 1);
+    let queued = child.steering_queue.lock().unwrap();
+    assert_eq!(queued.len(), 1, "steer must queue exactly one message");
+    match &queued[0] {
+        Message::User(user) => assert_eq!(
+            user.content,
+            UserContent::Text("  focus  ".to_string()),
+            "queued message must retain surrounding whitespace"
+        ),
+        other => panic!("expected a user message, got {other:?}"),
+    }
     assert!(child.cancel.is_cancelled());
 }
 
@@ -119,13 +142,15 @@ async fn rpc_steer_rejects_absent_or_blank_message() {
         "{\"id\":\"1\",\"type\":\"subagent_steer\",\"agent_id\":\"sub-x\"}\n",
         "{\"id\":\"2\",\"type\":\"subagent_steer\",",
         "\"agent_id\":\"sub-x\",\"message\":\"   \"}\n",
+        "{\"id\":\"3\",\"type\":\"subagent_steer\",",
+        "\"agent_id\":\"sub-x\",\"message\":\"\"}\n",
     );
     let responses = run_commands(&mut session, input).await;
-    assert_eq!(responses.len(), 2, "expected one response per command");
+    assert_eq!(responses.len(), 3, "expected one response per command");
 
-    for (resp, id) in responses.iter().zip(["1", "2"]) {
+    for (resp, id) in responses.iter().zip(["1", "2", "3"]) {
         assert_response(resp, id, "subagent_steer");
-        assert_eq!(resp["data"]["ok"], false, "blank message must fail: {resp}");
+        assert_ok_false(resp);
     }
     assert_eq!(
         child.steering_queue.lock().unwrap().len(),
@@ -157,10 +182,6 @@ async fn rpc_steer_and_kill_reject_missing_or_unknown_agent_id() {
     ];
     for (resp, (id, command)) in responses.iter().zip(expected) {
         assert_response(resp, id, command);
-        assert_eq!(resp["data"]["ok"], false, "unknown id must fail: {resp}");
-        assert!(
-            resp.get("error").is_none(),
-            "must not be an error response: {resp}"
-        );
+        assert_ok_false(resp);
     }
 }
