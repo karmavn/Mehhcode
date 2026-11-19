@@ -488,6 +488,9 @@ impl AgentTool for SubagentTool {
                 let control = self.control();
                 let mut handles = Vec::new();
                 let mut child_manifests: Vec<SubagentManifest> = Vec::new();
+                // Each child's own terminal status, tracked independently of
+                // the aggregate so `details.subagent.children` can report it.
+                let mut child_statuses: Vec<SubagentStatus> = Vec::new();
                 let mut child_events: Vec<Arc<Mutex<Vec<SubagentEvent>>>> = Vec::new();
                 let mut task_ids: Vec<String> = Vec::new();
                 let mut any_failed = false;
@@ -515,6 +518,7 @@ impl AgentTool for SubagentTool {
                     let mut task_manifest_for_task =
                         new_manifest(task_agent_id.clone(), mode_str.clone(), self.model.id.clone(), now_ms());
                     child_manifests.push(task_manifest_for_task.clone());
+                    child_statuses.push(SubagentStatus::Running);
                     // Shared with the spawned task so the parent can finalize
                     // the manifest from the child's live event log even when
                     // the child panics before finalizing it itself.
@@ -561,14 +565,17 @@ impl AgentTool for SubagentTool {
                     report.push_str(&format!("=== Task #{}: {} ===\n", idx + 1, task_name));
                     match h.await {
                         Ok(Ok(out)) => {
+                            child_statuses[idx] = SubagentStatus::Completed;
                             report.push_str(&out);
                         }
                         Ok(Err(e)) => {
+                            child_statuses[idx] = SubagentStatus::Failed;
                             report.push_str(&format!("Error: {}", e));
                             any_failed = true;
                             all_completed = false;
                         }
                         Err(join_err) => {
+                            child_statuses[idx] = SubagentStatus::Failed;
                             report.push_str(&format!("Join error: {}", join_err));
                             control.unregister(&task_ids[idx]);
                             let mut child_manifest = child_manifests[idx].clone();
@@ -611,12 +618,29 @@ impl AgentTool for SubagentTool {
                 }
                 if let Some(child_manifest) = child_manifests.last() {
                     let path = agent_store_dir(&self.cwd).join(format!("{}.json", child_manifest.agent_id));
+                    // `child_id`/`manifest` above keep pointing at the last
+                    // child for compatibility; `children` carries every child
+                    // with its own terminal status and manifest path.
+                    let children: Vec<Value> = child_manifests
+                        .iter()
+                        .zip(child_statuses.iter())
+                        .map(|(m, status)| {
+                            let manifest =
+                                agent_store_dir(&self.cwd).join(format!("{}.json", m.agent_id));
+                            json!({
+                                "child_id": m.agent_id,
+                                "status": status,
+                                "manifest": manifest,
+                            })
+                        })
+                        .collect();
                     result.details = Some(json!({
                         "subagent": {
                             "child_id": child_manifest.agent_id,
                             "mode": mode,
                             "status": aggregate_status,
                             "manifest": path,
+                            "children": children,
                         }
                     }));
                 }
@@ -783,5 +807,108 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("Maximum subagent nesting depth"));
+    }
+
+    #[tokio::test]
+    async fn batch_details_lists_every_child_with_its_own_terminal_status() {
+        // Route by task text so each child's outcome is deterministic even
+        // though batch children are spawned concurrently.
+        fn route(
+            _model: &mehh_ai::Model,
+            context: &mehh_ai::Context,
+            _options: &mehh_ai::StreamOptions,
+        ) -> mehh_ai::AssistantMessage {
+            let is_fail = context
+                .messages
+                .iter()
+                .rev()
+                .find_map(|m| match m {
+                    Message::User(u) => match &u.content {
+                        UserContent::Text(t) => Some(t.contains("FAIL")),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or(false);
+            if is_fail {
+                let mut msg = faux_assistant_message("child failed");
+                msg.stop_reason = StopReason::Error;
+                msg.error_message = Some("simulated failure".to_string());
+                msg
+            } else {
+                faux_assistant_message("child ok")
+            }
+        }
+
+        let faux = Arc::new(FauxProvider::new());
+        faux.add_handler(route);
+        faux.add_handler(route);
+        faux.add_handler(route);
+
+        let cwd = std::env::temp_dir();
+        let tools = mehh_tools::create_coding_tools(cwd.clone());
+        let sub = SubagentTool::new(cwd, faux_model(), faux, None, tools, 0);
+
+        let mut params = Map::new();
+        params.insert(
+            "tasks".to_string(),
+            Value::Array(vec![
+                Value::String("OK one".into()),
+                Value::String("FAIL two".into()),
+                Value::String("OK three".into()),
+            ]),
+        );
+        let res = sub
+            .execute("tc_batch", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+
+        let details = res.details.expect("batch result must carry details");
+        let sub_details = details.get("subagent").expect("subagent details");
+        assert_eq!(
+            sub_details.get("status").and_then(|v| v.as_str()),
+            Some("failed"),
+            "aggregate status reflects any failure"
+        );
+        // Legacy keys still point at the last child.
+        assert_eq!(
+            sub_details.get("child_id").and_then(|v| v.as_str()),
+            sub_details
+                .get("children")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.last())
+                .and_then(|c| c.get("child_id"))
+                .and_then(|v| v.as_str()),
+            "legacy child_id stays the last child"
+        );
+
+        let children = sub_details
+            .get("children")
+            .and_then(|v| v.as_array())
+            .expect("children array");
+        assert_eq!(children.len(), 3, "one entry per task");
+
+        let mut statuses = std::collections::HashMap::new();
+        for child in children {
+            let id = child
+                .get("child_id")
+                .and_then(|v| v.as_str())
+                .expect("child_id")
+                .to_string();
+            let status = child
+                .get("status")
+                .and_then(|v| v.as_str())
+                .expect("status")
+                .to_string();
+            assert!(
+                child.get("manifest").and_then(|v| v.as_str()).is_some(),
+                "each child carries its own manifest path"
+            );
+            assert!(statuses.insert(id, status).is_none(), "child ids are unique");
+        }
+        let failed = statuses.iter().filter(|(_, s)| s.as_str() == "failed").count();
+        let completed = statuses.iter().filter(|(_, s)| s.as_str() == "completed").count();
+        assert_eq!(failed, 1, "the FAIL task is failed: {statuses:?}");
+        assert_eq!(completed, 2, "both OK tasks are completed: {statuses:?}");
     }
 }

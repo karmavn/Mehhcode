@@ -7,8 +7,13 @@ use mehh_ai::{now_ms, Message, UserContent, UserMessage};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-/// Default cap on concurrently running subagents.
+/// Default cap on concurrently running subagents (kept at 4 for `AgentSession`).
 pub const DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 4;
+
+/// Cap for the process-wide [`global_control`]. Higher than the per-session
+/// default so parallel callers sharing this single budget (across tests or
+/// sessions) do not serialize behind a small limit.
+pub const GLOBAL_DEFAULT_MAX_CONCURRENT_SUBAGENTS: usize = 16;
 
 /// Handle for one registered subagent child.
 pub struct SubagentHandle {
@@ -126,9 +131,10 @@ static GLOBAL_CONTROL: OnceLock<Arc<SubagentControl>> = OnceLock::new();
 /// Named `global_control` rather than `global` because `lib.rs` glob-re-exports
 /// this module at the crate root.
 ///
-/// The cap is [`DEFAULT_MAX_CONCURRENT_SUBAGENTS`]; raise it (e.g. to 16) if
-/// parallel callers sharing this single budget ever serialize behind it.
+/// The cap is [`GLOBAL_DEFAULT_MAX_CONCURRENT_SUBAGENTS`] (16), deliberately
+/// above [`DEFAULT_MAX_CONCURRENT_SUBAGENTS`] to avoid cross-test/cross-session
+/// serialization when many callers share this one budget.
 pub fn global_control() -> &'static Arc<SubagentControl> {
     GLOBAL_CONTROL
-        .get_or_init(|| Arc::new(SubagentControl::new(DEFAULT_MAX_CONCURRENT_SUBAGENTS)))
+        .get_or_init(|| Arc::new(SubagentControl::new(GLOBAL_DEFAULT_MAX_CONCURRENT_SUBAGENTS)))
 }

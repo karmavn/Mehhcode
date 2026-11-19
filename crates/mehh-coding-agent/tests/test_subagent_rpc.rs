@@ -65,7 +65,8 @@ fn assert_response(resp: &serde_json::Value, id: &str, command: &str) {
     assert_eq!(resp["success"], true, "expected success response: {resp}");
 }
 
-/// Asserts a successful RPC response whose only data field is `ok: false`.
+/// Asserts the data object contains only `ok: false`; RPC success is checked
+/// by the caller, not here.
 fn assert_ok_false(resp: &serde_json::Value) {
     let data = resp["data"]
         .as_object()

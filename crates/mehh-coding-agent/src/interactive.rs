@@ -2155,7 +2155,9 @@ pub fn render_interactive_frame(
                     if row.label != row.status && !row.status.is_empty() {
                         row_line.push_str(&format!(": {}", theme.fg(&theme.dim, &row.status)));
                     }
-                    if !row.detail.is_empty() {
+                    // A finished tool row has detail == status ("completed");
+                    // omit the redundant suffix instead of printing it twice.
+                    if !row.detail.is_empty() && row.detail != row.status {
                         row_line.push_str(&format!(" {}", theme.fg(&theme.dim, &row.detail)));
                     }
                     transcript_lines.extend(wrap_text_with_ansi(&row_line, width));
@@ -3602,6 +3604,32 @@ mod tests {
         assert!(
             plain.contains("⚙ tool: running read"),
             "child row must render label, status and detail: {plain}"
+        );
+    }
+
+    #[test]
+    fn test_subagent_finished_tool_row_does_not_repeat_status() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        state.items.push(TranscriptItem::Subagent {
+            id: "tc_done".into(), mode: "coding".into(), status: "completed".into(), is_error: false,
+            // A finished tool row carries detail == status.
+            children: vec![SubagentChildRow {
+                child_id: "sub-done".into(), label: "tool".into(),
+                status: "completed".into(), detail: "completed".into(),
+            }],
+        });
+        let editor = Editor::new().with_prefix("> ");
+        let frame = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
+        let plain = mehh_tui::strip_ansi(&frame);
+        let row = plain
+            .lines()
+            .find(|line| line.contains("tool"))
+            .expect("child row must render");
+        assert!(row.contains("✓ tool: completed"), "expected completed row: {row}");
+        assert!(
+            !row.contains("completed completed"),
+            "status must not be duplicated as detail: {row}"
         );
     }
 
