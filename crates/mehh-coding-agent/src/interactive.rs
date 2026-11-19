@@ -1826,7 +1826,7 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                                     let status_value = if detail.is_empty() {
                                         "completed".to_string()
                                     } else {
-                                        detail.clone()
+                                        detail
                                     };
                                     // Find the last running row for this child.
                                     let mut target_idx: Option<usize> = None;
@@ -1836,8 +1836,8 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                                         }
                                     }
                                     if let Some(i) = target_idx {
-                                        children[i].status = status_value.clone();
-                                        children[i].detail = status_value;
+                                        children[i].status = status_value;
+                                        children[i].detail = children[i].status.clone();
                                     }
                                 }
                                 "finished" => {
@@ -2144,12 +2144,20 @@ pub fn render_interactive_frame(
                 transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
 
                 for row in children {
-                    let row_line = format!(
-                        "    - {}: {} {}",
-                        theme.fg(&theme.text, &row.label),
-                        theme.fg(&theme.dim, &row.status),
-                        theme.fg(&theme.dim, &row.detail)
-                    );
+                    let row_sym = if row.status == "failed" {
+                        theme.fg(&theme.tool_error, "✗")
+                    } else if row.status == "completed" {
+                        theme.fg(&theme.tool_success, "✓")
+                    } else {
+                        theme.fg(&theme.tool_pending, "⚙")
+                    };
+                    let mut row_line = format!("    {row_sym} {}", theme.fg(&theme.text, &row.label));
+                    if row.label != row.status && !row.status.is_empty() {
+                        row_line.push_str(&format!(": {}", theme.fg(&theme.dim, &row.status)));
+                    }
+                    if !row.detail.is_empty() {
+                        row_line.push_str(&format!(" {}", theme.fg(&theme.dim, &row.detail)));
+                    }
                     transcript_lines.extend(wrap_text_with_ansi(&row_line, width));
                 }
             }
@@ -3589,8 +3597,12 @@ mod tests {
         });
         let editor = Editor::new().with_prefix("> ");
         let frame = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
-        assert!(frame.contains("subagent"), "header must name the tool");
-        assert!(frame.contains("sub-a") || frame.contains("read"), "child row must be rendered");
+        let plain = mehh_tui::strip_ansi(&frame);
+        assert!(plain.contains("subagent"), "header must name the tool");
+        assert!(
+            plain.contains("⚙ tool: running read"),
+            "child row must render label, status and detail: {plain}"
+        );
     }
 
     #[test]
@@ -3612,20 +3624,31 @@ mod tests {
                 ..Default::default()
             },
         };
-        // started inserts placeholder
+        // started inserts a placeholder row before any tool runs.
         apply_agent_event(&mut state, &child_update("c1", "started", ""));
-        // blocked inserts/updates
+        match state.items.last().unwrap() {
+            TranscriptItem::Subagent { children, .. } => {
+                let c1 = children.iter().find(|r| r.child_id == "c1").expect("started row");
+                assert_eq!(c1.label, "started");
+                assert_eq!(c1.status, "running");
+            }
+            _ => panic!("expected subagent group"),
+        }
+        // blocked inserts a row when the child has no placeholder yet.
         apply_agent_event(&mut state, &child_update("c2", "blocked", "needs approval"));
-        // tool_finished without prior tool_started is ignored
+        // started -> blocked must update the existing row, not add a duplicate.
+        apply_agent_event(&mut state, &child_update("c3", "started", ""));
+        apply_agent_event(&mut state, &child_update("c3", "blocked", "needs review"));
+        // tool_finished without prior tool_started is ignored.
         apply_agent_event(&mut state, &child_update("ghost", "tool_finished", "completed"));
-        // tool_started replaces placeholder
+        // tool_started replaces the placeholder row.
         apply_agent_event(&mut state, &child_update("c1", "tool_started", "read"));
-        // tool_finished updates running row
+        // tool_finished updates the running row.
         apply_agent_event(&mut state, &child_update("c1", "tool_finished", "completed"));
 
         match state.items.last().unwrap() {
             TranscriptItem::Subagent { children, .. } => {
-                assert_eq!(children.len(), 2);
+                assert_eq!(children.len(), 3);
                 let c1 = children.iter().find(|r| r.child_id == "c1").unwrap();
                 assert_eq!(c1.label, "tool");
                 assert_eq!(c1.detail, "completed");
@@ -3634,6 +3657,11 @@ mod tests {
                 assert_eq!(c2.label, "blocked");
                 assert_eq!(c2.status, "blocked");
                 assert_eq!(c2.detail, "needs approval");
+                let c3_rows: Vec<_> = children.iter().filter(|r| r.child_id == "c3").collect();
+                assert_eq!(c3_rows.len(), 1, "blocked must update the started row in place");
+                assert_eq!(c3_rows[0].label, "blocked");
+                assert_eq!(c3_rows[0].status, "blocked");
+                assert_eq!(c3_rows[0].detail, "needs review");
                 assert!(children.iter().all(|r| r.child_id != "ghost"));
             }
             _ => panic!("expected subagent group"),
