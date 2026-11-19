@@ -491,11 +491,12 @@ where
                 let message = val
                     .get("message")
                     .or_else(|| val.get("text"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let ok = match agent_id {
-                    Some(id) => session.subagent_control().steer(id, message),
-                    None => false,
+                    .and_then(|v| v.as_str());
+                let ok = match (agent_id, message) {
+                    (Some(id), Some(text)) if !text.trim().is_empty() => {
+                        session.subagent_control().steer(id, text)
+                    }
+                    _ => false,
                 };
                 output
                     .send_success(id, "subagent_steer", Some(serde_json::json!({ "ok": ok })))
