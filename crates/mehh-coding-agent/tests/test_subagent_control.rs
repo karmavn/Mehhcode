@@ -182,8 +182,40 @@ async fn kill_stops_a_real_child_loop() {
     let id = (*rx.borrow_and_update()).clone();
     assert!(control.kill(&id), "registered child must be killable");
     let result = tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
-    assert!(result.is_err(), "killed child must terminate with error");
+    let res = result.expect("killed child must not surface as a transport error");
+    assert_eq!(res.is_error, Some(true), "killed child must be an is_error result");
+    let details = res
+        .details
+        .expect("killed child result must carry details.subagent");
+    assert_eq!(details["subagent"]["status"], "failed");
     std::fs::remove_dir_all(&cwd).unwrap();
+}
+
+// Standalone tools (built without `with_control`) must share the one
+// process-wide budget instead of each getting a fresh per-call registry.
+#[test]
+fn standalone_tools_share_the_process_wide_control() {
+    let cwd = std::env::temp_dir().join(format!("mehh_global_ctl_{}", uuid::Uuid::now_v7()));
+    let mk = || {
+        SubagentTool::new(
+            cwd.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            None,
+            vec![],
+            0,
+        )
+    };
+    let a = mk();
+    let b = mk();
+    assert!(
+        Arc::ptr_eq(&a.control(), &b.control()),
+        "standalone tools must share one control"
+    );
+    assert!(
+        Arc::ptr_eq(&a.control(), mehh_coding_agent::subagent_control::global_control()),
+        "standalone tools must fall back to the process-wide default"
+    );
 }
 
 #[tokio::test]

@@ -1,7 +1,7 @@
 //! Shared child registry, global concurrency budget, and per-child control.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use mehh_ai::{now_ms, Message, UserContent, UserMessage};
 use tokio::sync::Semaphore;
@@ -115,4 +115,20 @@ impl SubagentControl {
             false
         }
     }
+}
+
+static GLOBAL_CONTROL: OnceLock<Arc<SubagentControl>> = OnceLock::new();
+
+/// Process-wide default control used when a `SubagentTool` was built without
+/// an explicit control (`SubagentTool::new`), so standalone tools share one
+/// budget instead of each getting a fresh per-call registry.
+///
+/// Named `global_control` rather than `global` because `lib.rs` glob-re-exports
+/// this module at the crate root.
+///
+/// The cap is [`DEFAULT_MAX_CONCURRENT_SUBAGENTS`]; raise it (e.g. to 16) if
+/// parallel callers sharing this single budget ever serialize behind it.
+pub fn global_control() -> &'static Arc<SubagentControl> {
+    GLOBAL_CONTROL
+        .get_or_init(|| Arc::new(SubagentControl::new(DEFAULT_MAX_CONCURRENT_SUBAGENTS)))
 }

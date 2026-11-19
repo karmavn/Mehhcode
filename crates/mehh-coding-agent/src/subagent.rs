@@ -19,7 +19,7 @@ use crate::subagent_lifecycle::{
     agent_store_dir, classify_failure, derive_state, new_agent_id, new_manifest, write_manifest,
     SubagentEvent, SubagentEventKind, SubagentFailureClass, SubagentManifest, SubagentStatus,
 };
-use crate::subagent_control::{SubagentControl, DEFAULT_MAX_CONCURRENT_SUBAGENTS};
+use crate::subagent_control::{global_control, SubagentControl};
 use crate::tool_inspection::ToolInspectionManager;
 
 /// Maximum nested subagent recursion depth.
@@ -82,6 +82,14 @@ impl SubagentTool {
     pub fn with_control(mut self, control: Arc<SubagentControl>) -> Self {
         self.control = Some(control);
         self
+    }
+
+    /// Effective control for this tool: the explicit one when set, otherwise
+    /// the process-wide default, so standalone tools share one global budget.
+    pub fn control(&self) -> Arc<SubagentControl> {
+        self.control
+            .clone()
+            .unwrap_or_else(|| Arc::clone(global_control()))
     }
 
     /// Parameter schema defining modes and parallel batch tasks.
@@ -235,10 +243,15 @@ impl SubagentTool {
             cb(Self::subagent_update(&manifest.agent_id, &manifest.mode, &terminal_event));
         }
 
-        if let Err(e) = write_manifest(&agent_store_dir(cwd), manifest) {
-            return Err(e);
+        // Never discard the run's own outcome: a write failure is appended to
+        // it so the caller sees both the real result and the persistence gap.
+        match write_manifest(&agent_store_dir(cwd), manifest) {
+            Ok(_) => outcome,
+            Err(write_err) => Err(match outcome {
+                Ok(_) => format!("subagent run completed but manifest write failed: {write_err}"),
+                Err(original) => format!("{original}; manifest write failed: {write_err}"),
+            }),
         }
-        outcome
     }
 
     async fn run_child_prompt(
@@ -250,6 +263,7 @@ impl SubagentTool {
         cancel: CancellationToken,
         on_update: Option<AgentToolUpdateCallback>,
         manifest: &mut SubagentManifest,
+        events: Arc<Mutex<Vec<SubagentEvent>>>,
         timeout_secs: u64,
         steering_queue: Option<Arc<Mutex<VecDeque<Message>>>>,
     ) -> Result<String, String> {
@@ -269,7 +283,8 @@ impl SubagentTool {
             ),
         };
 
-        let events = Arc::new(Mutex::new(manifest.events.clone()));
+        // The caller owns the shared event log so it can still finalize the
+        // manifest (including in-flight tool events) if this task panics.
         let child_agent_id = manifest.agent_id.clone();
         let started_event = SubagentEvent {
             kind: SubagentEventKind::Started,
@@ -470,13 +485,13 @@ impl AgentTool for SubagentTool {
                 .collect();
 
             if !task_prompts.is_empty() {
-                let control: Arc<SubagentControl> = self.control.clone().unwrap_or_else(|| {
-                    Arc::new(SubagentControl::new(DEFAULT_MAX_CONCURRENT_SUBAGENTS))
-                });
+                let control = self.control();
                 let mut handles = Vec::new();
                 let mut child_manifests: Vec<SubagentManifest> = Vec::new();
+                let mut child_events: Vec<Arc<Mutex<Vec<SubagentEvent>>>> = Vec::new();
                 let mut task_ids: Vec<String> = Vec::new();
-                let mut batch_status: Option<SubagentStatus> = None;
+                let mut any_failed = false;
+                let mut all_completed = true;
 
                 for (idx, task_p) in task_prompts.iter().enumerate() {
                     let task_p = task_p.clone();
@@ -500,6 +515,12 @@ impl AgentTool for SubagentTool {
                     let mut task_manifest_for_task =
                         new_manifest(task_agent_id.clone(), mode_str.clone(), self.model.id.clone(), now_ms());
                     child_manifests.push(task_manifest_for_task.clone());
+                    // Shared with the spawned task so the parent can finalize
+                    // the manifest from the child's live event log even when
+                    // the child panics before finalizing it itself.
+                    let task_events =
+                        Arc::new(Mutex::new(task_manifest_for_task.events.clone()));
+                    child_events.push(task_events.clone());
 
                     let task_control = control.clone();
                     handles.push(tokio::spawn(async move {
@@ -524,6 +545,7 @@ impl AgentTool for SubagentTool {
                                 handle.cancel.clone(),
                                 on_update_child,
                                 &mut task_manifest_for_task,
+                                task_events,
                                 timeout_secs,
                                 Some(handle.steering_queue.clone()),
                             )
@@ -540,41 +562,60 @@ impl AgentTool for SubagentTool {
                     match h.await {
                         Ok(Ok(out)) => {
                             report.push_str(&out);
-                            batch_status = Some(SubagentStatus::Completed);
                         }
                         Ok(Err(e)) => {
                             report.push_str(&format!("Error: {}", e));
-                            batch_status = Some(SubagentStatus::Failed);
+                            any_failed = true;
+                            all_completed = false;
                         }
                         Err(join_err) => {
                             report.push_str(&format!("Join error: {}", join_err));
                             control.unregister(&task_ids[idx]);
                             let mut child_manifest = child_manifests[idx].clone();
-                            let events = std::sync::Mutex::new(child_manifest.events.clone());
+                            // Finalize from the shared event log, not the
+                            // initial snapshot: the panicked task's in-flight
+                            // events (started/tool_started) live there.
+                            let shared_events = child_events[idx].clone();
                             if let Err(e) = SubagentTool::finalize_subagent_run(
                                 &self.cwd,
                                 &mut child_manifest,
-                                &events,
+                                &shared_events,
                                 Err(format!("subagent task panicked: {join_err}")),
                                 &cancel,
                                 None,
                             ) {
                                 report.push_str(&format!("Error: {}", e));
                             }
-                            batch_status = Some(SubagentStatus::Failed);
+                            any_failed = true;
+                            all_completed = false;
                         }
                     }
                     report.push_str("\n\n");
                 }
 
+                // Aggregate over every child instead of the last-writer value:
+                // failed if any child failed, completed only when all
+                // completed, running while any child is still in flight
+                // (defensive: all handles are awaited above).
+                let aggregate_status = if any_failed {
+                    "failed"
+                } else if all_completed {
+                    "completed"
+                } else {
+                    "running"
+                };
+
                 let mut result = AgentToolResult::text(report.trim().to_string());
+                if any_failed {
+                    result.is_error = Some(true);
+                }
                 if let Some(child_manifest) = child_manifests.last() {
                     let path = agent_store_dir(&self.cwd).join(format!("{}.json", child_manifest.agent_id));
                     result.details = Some(json!({
                         "subagent": {
                             "child_id": child_manifest.agent_id,
                             "mode": mode,
-                            "status": batch_status.clone().unwrap_or(child_manifest.status),
+                            "status": aggregate_status,
                             "manifest": path,
                         }
                     }));
@@ -602,14 +643,13 @@ impl AgentTool for SubagentTool {
             control: self.control.clone(),
         };
 
-        let control: Arc<SubagentControl> = child_sub
-            .control
-            .clone()
-            .unwrap_or_else(|| Arc::new(SubagentControl::new(DEFAULT_MAX_CONCURRENT_SUBAGENTS)));
+        let control = self.control();
         let _permit = control.acquire().await;
         let handle = control.register(new_agent_id(), mode.to_string(), cancel.child_token());
         let mut manifest = new_manifest(handle.agent_id.clone(), mode.to_string(), self.model.id.clone(), now_ms());
-        let on_update_error = on_update.clone();
+        // Shared event log: finalize copies it back into the manifest, and the
+        // parent can read it even if the child task dies unexpectedly.
+        let events = Arc::new(Mutex::new(manifest.events.clone()));
         let outcome = child_sub
             .run_child_prompt(
                 prompt,
@@ -619,6 +659,7 @@ impl AgentTool for SubagentTool {
                 handle.cancel.clone(),
                 on_update,
                 &mut manifest,
+                events,
                 timeout_secs,
                 Some(handle.steering_queue.clone()),
             )
@@ -635,24 +676,20 @@ impl AgentTool for SubagentTool {
             }
         });
 
-        let result_text = match outcome {
-            Ok(text) => text,
-            Err(err) => {
-                // The manifest is already finalized on disk, but this tool reports
-                // failures through `Err(String)`. Deliver the structured payload as
-                // a final update first so post-error inspection keeps the manifest
-                // pointer and terminal status.
-                if let Some(ref cb) = on_update_error {
-                    let mut failure = AgentToolResult::text(err.clone());
-                    failure.is_error = Some(true);
-                    failure.details = Some(details);
-                    cb(failure);
-                }
-                return Err(err);
-            }
+        // Domain failures (timeout, abort, model error, manifest write
+        // failure) are results, not transport errors: return them as an
+        // `is_error` result so `details.subagent` (manifest pointer and
+        // terminal status) survives on the returned and persisted
+        // ToolResult. `Err(String)` is reserved for preconditions that can
+        // never produce a manifest (depth limit, missing prompt).
+        let (result_text, is_error) = match outcome {
+            Ok(text) => (text, false),
+            Err(err) => (err, true),
         };
-
         let mut result = AgentToolResult::text(result_text);
+        if is_error {
+            result.is_error = Some(true);
+        }
         result.details = Some(details);
         Ok(result)
     }
@@ -662,6 +699,60 @@ impl AgentTool for SubagentTool {
 mod tests {
     use super::*;
     use mehh_ai::{faux_assistant_message, faux_model, FauxProvider};
+
+    #[test]
+    fn finalize_subagent_run_keeps_original_error_when_manifest_write_fails() {
+        let bad_cwd = std::env::temp_dir().join(format!("mehh_fin_bad_{}", uuid::Uuid::now_v7()));
+        std::fs::write(&bad_cwd, "not a directory").unwrap();
+        let mut manifest = new_manifest("sub-fin-err".into(), "research".into(), "m".into(), 1000);
+        let events = Mutex::new(manifest.events.clone());
+        let cancel = CancellationToken::new();
+        let err = SubagentTool::finalize_subagent_run(
+            &bad_cwd,
+            &mut manifest,
+            &events,
+            Err("child exploded".to_string()),
+            &cancel,
+            None,
+        )
+        .unwrap_err();
+        let _ = std::fs::remove_file(&bad_cwd);
+        assert!(
+            err.contains("child exploded"),
+            "the original outcome error must survive a write failure, got: {err}"
+        );
+        assert!(
+            err.contains("manifest write failed"),
+            "the write failure must also be reported, got: {err}"
+        );
+    }
+
+    #[test]
+    fn finalize_subagent_run_reports_manifest_write_failure_after_success() {
+        let bad_cwd = std::env::temp_dir().join(format!("mehh_fin_ok_{}", uuid::Uuid::now_v7()));
+        std::fs::write(&bad_cwd, "not a directory").unwrap();
+        let mut manifest = new_manifest("sub-fin-ok".into(), "research".into(), "m".into(), 1000);
+        let events = Mutex::new(manifest.events.clone());
+        let cancel = CancellationToken::new();
+        let err = SubagentTool::finalize_subagent_run(
+            &bad_cwd,
+            &mut manifest,
+            &events,
+            Ok("done".to_string()),
+            &cancel,
+            None,
+        )
+        .unwrap_err();
+        let _ = std::fs::remove_file(&bad_cwd);
+        assert!(
+            err.contains("manifest write failed"),
+            "a write failure after success must be an error, got: {err}"
+        );
+        assert!(
+            err.contains("completed"),
+            "the error must state the run itself completed, got: {err}"
+        );
+    }
 
     #[tokio::test]
     async fn test_subagent_runs_isolated_prompt_and_respects_max_depth() {

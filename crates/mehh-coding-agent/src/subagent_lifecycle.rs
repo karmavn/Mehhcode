@@ -150,16 +150,21 @@ pub fn derive_state(
     match status {
         SubagentStatus::Running => "working",
         SubagentStatus::Completed => "finished_cleanable",
+        // Without a failure_class there is no bucket to name; report the real
+        // status instead of masking it behind a guessed "infra".
         SubagentStatus::Failed => failure_class
             .map(|class| class.as_str())
-            .unwrap_or_else(|| SubagentFailureClass::Infra.as_str()),
+            .unwrap_or("failed"),
     }
 }
 
 /// Directory where manifests are stored: `MEHH_AGENT_STORE` or `<cwd>/.mehh-agents`.
+///
+/// Reads the override as an `OsString` so non-UTF8 paths (legal on Windows)
+/// are honored instead of silently falling back to the default directory.
 pub fn agent_store_dir(cwd: &Path) -> PathBuf {
-    match std::env::var("MEHH_AGENT_STORE") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir),
+    match std::env::var_os("MEHH_AGENT_STORE") {
+        Some(dir) if !dir.is_empty() => PathBuf::from(dir),
         _ => cwd.join(".mehh-agents"),
     }
 }
@@ -210,6 +215,84 @@ mod tests {
             SubagentFailureClass::Timeout
         );
         assert_eq!(classify_failure("no idea"), SubagentFailureClass::Infra);
+    }
+
+    #[test]
+    fn derive_state_failed_without_failure_class_reports_failed() {
+        // A Failed status with no failure_class must not be relabeled "infra":
+        // that hid the real status from consumers reading derived_state.
+        assert_eq!(derive_state(&SubagentStatus::Failed, None), "failed");
+        assert_eq!(
+            derive_state(&SubagentStatus::Failed, Some(&SubagentFailureClass::Timeout)),
+            "timeout"
+        );
+        assert_eq!(derive_state(&SubagentStatus::Running, None), "working");
+        assert_eq!(
+            derive_state(&SubagentStatus::Completed, None),
+            "finished_cleanable"
+        );
+    }
+
+    /// Sets `MEHH_AGENT_STORE` and restores the previous value on drop so
+    /// sibling tests in this binary never observe a poisoned store path.
+    struct StoreEnvGuard {
+        prev: Option<std::ffi::OsString>,
+        store: std::path::PathBuf,
+    }
+
+    impl StoreEnvGuard {
+        fn set(store: std::path::PathBuf) -> Self {
+            let prev = std::env::var_os("MEHH_AGENT_STORE");
+            unsafe { std::env::set_var("MEHH_AGENT_STORE", &store) };
+            Self { prev, store }
+        }
+    }
+
+    impl Drop for StoreEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("MEHH_AGENT_STORE", v),
+                    None => std::env::remove_var("MEHH_AGENT_STORE"),
+                }
+            }
+            // A concurrent sibling may have written a manifest through the
+            // override while this test held it; clean that up too.
+            let _ = std::fs::remove_dir_all(&self.store);
+        }
+    }
+
+    /// Absolute temp path whose file name is not valid UTF-8 on this platform.
+    fn non_utf8_store_path() -> std::path::PathBuf {
+        #[cfg(windows)]
+        let component = {
+            use std::os::windows::ffi::OsStringExt;
+            // Unpaired surrogate: a valid OsString on Windows that is not
+            // valid UTF-8, the case `std::env::var` rejects with NotUnicode.
+            std::ffi::OsString::from_wide(&[0x006D, 0xD800, 0x0065])
+        };
+        #[cfg(not(windows))]
+        let component = {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(b"mehh-\xFF-store".to_vec())
+        };
+        std::env::temp_dir().join(format!("mehh_store_{}", uuid::Uuid::now_v7())).join(component)
+    }
+
+    #[test]
+    fn agent_store_dir_honors_non_utf8_env_override() {
+        // Only `test_subagent_runs_isolated_prompt_and_respects_max_depth`
+        // in this binary resolves the store dir concurrently, and it makes no
+        // assertion about where its manifest lands, so the brief override
+        // window is safe.
+        let cwd = std::path::Path::new("/proj/work");
+        let store = non_utf8_store_path();
+        let _guard = StoreEnvGuard::set(store.clone());
+        assert_eq!(agent_store_dir(cwd), store);
+
+        // An empty override falls back to `<cwd>/.mehh-agents`.
+        unsafe { std::env::set_var("MEHH_AGENT_STORE", "") };
+        assert_eq!(agent_store_dir(cwd), cwd.join(".mehh-agents"));
     }
 
     #[test]
