@@ -155,7 +155,8 @@ impl AgentSession {
                 0,
             )
             .with_inspection_manager(inspection_manager.clone())
-            .with_control(subagent_control.clone()),
+            .with_control(subagent_control.clone())
+            .with_lead_worker(lead_worker.clone()),
         );
         tools.push(subagent);
         let todo_state = Arc::new(tokio::sync::RwLock::new(crate::todo::TodoState::default()));
@@ -432,6 +433,7 @@ impl AgentSession {
                     args: args_map,
                     is_read_only,
                     cwd: session_cwd,
+                origin: None,
                 };
                 let res = inspection_mgr
                     .inspect_and_authorize(&inspect_ctx, approval_h.as_deref())
@@ -566,7 +568,8 @@ impl AgentSession {
             )
             .with_inspection_manager(self.inspection_manager.clone())
             .with_approval_handler(self.approval_handler.clone())
-            .with_control(self.subagent_control.clone()),
+            .with_control(self.subagent_control.clone())
+            .with_lead_worker(self.lead_worker.clone()),
         );
         if let Some(slot) = self.tools.iter_mut().find(|t| t.name() == "subagent") {
             *slot = updated;
@@ -770,6 +773,7 @@ impl AgentSession {
                     args: before_ctx.args,
                     is_read_only,
                     cwd: session_cwd,
+                origin: None,
                 };
 
                 inspection_mgr

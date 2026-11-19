@@ -233,6 +233,7 @@ mod tests {
             args,
             is_read_only: None,
             cwd: PathBuf::from("."),
+            origin: None,
         }
     }
 

@@ -62,6 +62,8 @@ pub struct ToolInspectionContext {
     pub args: serde_json::Map<String, serde_json::Value>,
     pub is_read_only: Option<bool>,
     pub cwd: PathBuf,
+    /// Identifies the requesting agent (e.g. "subagent:#2:coding"); None = main session.
+    pub origin: Option<String>,
 }
 
 /// Pluggable tool inspection component in the chain of responsibility.
@@ -316,11 +318,16 @@ impl ToolInspector for PermissionInspector {
     }
 }
 
-/// State tracking consecutive identical tool calls to prevent runaway loops.
+/// State tracking consecutive identical tool calls per requesting origin.
 #[derive(Debug, Default)]
-struct RepetitionState {
+struct RepetitionEntry {
     last_key: Option<String>,
     count: usize,
+}
+
+#[derive(Debug, Default)]
+struct RepetitionState {
+    per_origin: std::collections::HashMap<Option<String>, RepetitionEntry>,
 }
 
 /// Priority 3 Inspector: Halts identical repeated tool calls after `max_repetitions`.
@@ -353,20 +360,22 @@ impl ToolInspector for RepetitionInspector {
     async fn inspect(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
         let key = format!("{}:{}", ctx.tool_name, serde_json::to_string(&ctx.args).unwrap_or_default());
         let mut st = self.state.lock().await;
-
-        if st.last_key.as_deref() == Some(&key) {
-            st.count += 1;
-            if st.count > self.max_repetitions {
+        // Scope repetition tracking per origin so parallel subagents doing
+        // legitimate identical reads do not trip each other's breaker.
+        let entry = st.per_origin.entry(ctx.origin.clone()).or_default();
+        if entry.last_key.as_deref() == Some(&key) {
+            entry.count += 1;
+            if entry.count > self.max_repetitions {
                 return InspectionVerdict::Deny {
                     reason: format!(
                         "Repeated identical tool call '{}' detected ({} times). Change strategy or inspect prior output instead of repeating the exact same call.",
-                        ctx.tool_name, st.count
+                        ctx.tool_name, entry.count
                     ),
                 };
             }
         } else {
-            st.last_key = Some(key);
-            st.count = 1;
+            entry.last_key = Some(key);
+            entry.count = 1;
         }
 
         InspectionVerdict::Allow
@@ -380,6 +389,8 @@ pub struct ToolInspectionManager {
     permission: Mutex<PermissionInspector>,
     repetition: RepetitionInspector,
     cwd: PathBuf,
+    /// Serializes user approval prompts across the session and all subagents.
+    approval_lock: Mutex<()>,
 }
 
 impl ToolInspectionManager {
@@ -402,6 +413,7 @@ impl ToolInspectionManager {
             permission: Mutex::new(PermissionInspector::new_with_store(mode, store)),
             repetition: RepetitionInspector::default(),
             cwd,
+            approval_lock: Mutex::new(()),
         }
     }
 
@@ -468,7 +480,14 @@ impl ToolInspectionManager {
             },
             InspectionVerdict::RequireApproval { reason, preview } => {
                 if let Some(h) = handler {
-                    if h.request_approval(ctx, &reason, preview.as_deref()).await {
+                    // One prompt at a time across session + subagents; label
+                    // the request with its origin so the user knows who asks.
+                    let _gate = self.approval_lock.lock().await;
+                    let labeled = match &ctx.origin {
+                        Some(o) => format!("[{o}] {reason}"),
+                        None => reason.clone(),
+                    };
+                    if h.request_approval(ctx, &labeled, preview.as_deref()).await {
                         return mehh_agent::BeforeToolCallResult::default();
                     }
                 }

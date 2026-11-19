@@ -36,6 +36,7 @@ fn test_permission_store_evaluates_exact_and_prefix_rules() {
         args: args1,
         is_read_only: Some(false),
         cwd: PathBuf::from("."),
+    origin: None,
     };
     assert_eq!(store.evaluate(&ctx1), Some(InspectionVerdict::Allow));
 
@@ -48,6 +49,7 @@ fn test_permission_store_evaluates_exact_and_prefix_rules() {
         args: args2,
         is_read_only: Some(false),
         cwd: PathBuf::from("."),
+    origin: None,
     };
     assert!(matches!(store.evaluate(&ctx2), Some(InspectionVerdict::Deny { .. })));
 
@@ -60,6 +62,7 @@ fn test_permission_store_evaluates_exact_and_prefix_rules() {
         args: args3,
         is_read_only: Some(false),
         cwd: PathBuf::from("."),
+    origin: None,
     };
     assert!(matches!(store.evaluate(&ctx3), Some(InspectionVerdict::RequireApproval { .. })));
 
@@ -70,6 +73,7 @@ fn test_permission_store_evaluates_exact_and_prefix_rules() {
         args: serde_json::Map::new(),
         is_read_only: Some(true),
         cwd: PathBuf::from("."),
+    origin: None,
     };
     assert_eq!(store.evaluate(&ctx4), None);
 }

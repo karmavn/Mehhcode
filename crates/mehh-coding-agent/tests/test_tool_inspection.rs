@@ -16,6 +16,7 @@ async fn test_security_inspector_blocks_mehh_metadata_edits() {
         args,
         is_read_only: Some(false),
         cwd,
+    origin: None,
     };
 
     let verdict = mgr.inspect(&ctx).await;
@@ -36,6 +37,7 @@ async fn test_security_inspector_blocks_dangerous_bash_commands() {
         args,
         is_read_only: Some(false),
         cwd,
+    origin: None,
     };
 
     let verdict = mgr.inspect(&ctx).await;
@@ -56,6 +58,7 @@ async fn test_permission_inspector_smart_approve_allows_safe_and_requires_approv
         args: read_args,
         is_read_only: Some(true),
         cwd: cwd.clone(),
+    origin: None,
     };
     assert!(matches!(mgr.inspect(&read_ctx).await, InspectionVerdict::Allow));
 
@@ -68,6 +71,7 @@ async fn test_permission_inspector_smart_approve_allows_safe_and_requires_approv
         args: edit_args,
         is_read_only: Some(false),
         cwd: cwd.clone(),
+    origin: None,
     };
     assert!(matches!(mgr.inspect(&edit_ctx).await, InspectionVerdict::RequireApproval { .. }));
 
@@ -80,6 +84,7 @@ async fn test_permission_inspector_smart_approve_allows_safe_and_requires_approv
         args: safe_bash,
         is_read_only: Some(false),
         cwd,
+    origin: None,
     };
     assert!(matches!(mgr.inspect(&bash_ctx).await, InspectionVerdict::Allow));
 }
@@ -98,6 +103,7 @@ async fn test_repetition_inspector_triggers_after_three_repeats() {
         args,
         is_read_only: Some(false),
         cwd,
+    origin: None,
     };
 
     assert!(matches!(mgr.inspect(&ctx).await, InspectionVerdict::Allow));
@@ -120,6 +126,7 @@ async fn test_security_inspector_outside_cwd_requires_approval_even_in_auto_mode
         args: inside_args,
         is_read_only: Some(false),
         cwd: cwd.clone(),
+    origin: None,
     };
     assert!(matches!(mgr.inspect(&inside_ctx).await, InspectionVerdict::Allow));
 
@@ -132,6 +139,7 @@ async fn test_security_inspector_outside_cwd_requires_approval_even_in_auto_mode
         args: outside_args,
         is_read_only: Some(false),
         cwd,
+    origin: None,
     };
     assert!(matches!(mgr.inspect(&outside_ctx).await, InspectionVerdict::RequireApproval { .. }));
 }
