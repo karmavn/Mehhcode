@@ -11,8 +11,9 @@ use anyhow::Context;
 pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
+    /// `None` means "not declared"; `Some(vec![])` explicitly overrides with an empty list.
     #[serde(default)]
-    pub args: Vec<String>,
+    pub args: Option<Vec<String>>,
     #[serde(default)]
     pub env: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -21,8 +22,13 @@ pub struct McpServerConfig {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: HashMap<String, String>,
-    #[serde(default, alias = "timeout", alias = "timeoutMs", alias = "timeout_ms", skip_serializing_if = "Option::is_none")]
+    /// Timeout in milliseconds. Serialized as `timeoutMs`; the legacy snake_case alias is accepted.
+    #[serde(default, alias = "timeout_ms", skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// `timeout` is expressed in *seconds*; kept separate from `timeout_ms` to avoid a 1000x error.
+    /// Note: older configs relied on `timeout` aliasing `timeout_ms`; those values need migration.
+    #[serde(default, rename = "timeout", alias = "timeoutSecs", alias = "timeout_secs", skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -37,6 +43,17 @@ impl McpServerConfig {
     /// Returns whether this server is enabled (defaults to true if unspecified).
     pub fn is_enabled(&self) -> bool {
         self.enabled.unwrap_or(true)
+    }
+
+    /// Command-line arguments, empty when not declared.
+    pub fn args(&self) -> &[String] {
+        self.args.as_deref().unwrap_or(&[])
+    }
+
+    /// Effective request timeout in milliseconds.
+    pub fn effective_timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
+            .or_else(|| self.timeout_secs.map(|secs| secs.saturating_mul(1000)))
     }
 
     /// Whether this entry is an override (has no command or url specified).
@@ -65,6 +82,11 @@ pub fn merge_server_config(base: &mut McpServerConfig, override_cfg: McpServerCo
     }
     if let Some(timeout) = override_cfg.timeout_ms {
         base.timeout_ms = Some(timeout);
+        base.timeout_secs = None;
+    }
+    if let Some(timeout) = override_cfg.timeout_secs {
+        base.timeout_secs = Some(timeout);
+        base.timeout_ms = None;
     }
     if let Some(desc) = override_cfg.description {
         base.description = Some(desc);
@@ -75,8 +97,8 @@ pub fn merge_server_config(base: &mut McpServerConfig, override_cfg: McpServerCo
     if let Some(endpoint) = override_cfg.oauth_token_endpoint {
         base.oauth_token_endpoint = Some(endpoint);
     }
-    if !override_cfg.args.is_empty() {
-        base.args = override_cfg.args;
+    if let Some(args) = override_cfg.args {
+        base.args = Some(args);
     }
     if override_cfg.cwd.is_some() {
         base.cwd = override_cfg.cwd;
@@ -108,9 +130,11 @@ fn read_mcp_config_file(path: &Path) -> anyhow::Result<Option<McpConfigFile>> {
 
 /// Returns the path to the global user MCP configuration: `~/.mehh/agent/mcp.json`.
 pub fn global_mcp_config_path() -> Option<PathBuf> {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .map(PathBuf::from)?;
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
+    let home = home.filter(|h| !h.is_empty()).map(PathBuf::from)?;
     Some(home.join(".mehh").join("agent").join("mcp.json"))
 }
 
@@ -133,10 +157,13 @@ pub(crate) fn load_mcp_configs_from_paths(
         let local_path = cwd.join(".mehh").join("mcp.json");
         if let Some(local_file) = read_mcp_config_file(&local_path)? {
             for (name, local_cfg) in local_file.mcp_servers {
-                servers
-                    .entry(name)
-                    .and_modify(|base| merge_server_config(base, local_cfg.clone()))
-                    .or_insert(local_cfg);
+                if servers.contains_key(&name) {
+                    let base = servers.get_mut(&name).expect("checked contains_key");
+                    merge_server_config(base, local_cfg);
+                } else if !local_cfg.is_override() {
+                    // An override for a server that does not exist is not a server.
+                    servers.insert(name, local_cfg);
+                }
             }
         }
     }
@@ -191,7 +218,7 @@ mod tests {
     fn test_merge_override() {
         let mut base = McpServerConfig {
             command: Some("npx".to_string()),
-            args: vec!["-y".to_string(), "server".to_string()],
+            args: Some(vec!["-y".to_string(), "server".to_string()]),
             env: HashMap::from([("KEY1".to_string(), "val1".to_string())]),
             enabled: Some(true),
             timeout_ms: Some(5000),
@@ -207,9 +234,43 @@ mod tests {
 
         merge_server_config(&mut base, override_cfg);
         assert_eq!(base.command.as_deref(), Some("npx"));
+        assert_eq!(base.args(), ["-y".to_string(), "server".to_string()]);
         assert_eq!(base.enabled, Some(false));
         assert_eq!(base.timeout_ms, Some(10000));
         assert_eq!(base.env.get("KEY1").map(|s| s.as_str()), Some("val1"));
         assert_eq!(base.env.get("KEY2").map(|s| s.as_str()), Some("val2"));
     }
+
+    #[test]
+    fn test_timeout_seconds_and_empty_args_override() {
+        let base: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "npx",
+            "args": ["server"],
+            "timeout": 30
+        }))
+        .unwrap();
+        assert_eq!(base.effective_timeout_ms(), Some(30_000));
+
+        let mut merged = base;
+        merge_server_config(
+            &mut merged,
+            serde_json::from_value(serde_json::json!({ "args": [] })).unwrap(),
+        );
+        assert!(merged.args().is_empty(), "empty args array must be a real override");
+
+        let legacy: McpServerConfig =
+            serde_json::from_value(serde_json::json!({ "timeoutMs": 250 })).unwrap();
+        assert_eq!(legacy.effective_timeout_ms(), Some(250));
+
+        let mut mixed = McpServerConfig {
+            timeout_ms: Some(5000),
+            ..Default::default()
+        };
+        merge_server_config(
+            &mut mixed,
+            serde_json::from_value(serde_json::json!({ "timeout": 12 })).unwrap(),
+        );
+        assert_eq!(mixed.effective_timeout_ms(), Some(12_000));
+    }
+
 }

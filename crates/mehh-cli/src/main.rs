@@ -1,20 +1,19 @@
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use clap::Parser;
 use mehh_ai::{
-    catalog, faux, ImageContent, LlmProvider, Model, ModelCost, TextContent, ThinkingLevel,
-    UserContentBlock,
+    catalog, faux, LlmProvider, Model, ModelCost, ThinkingLevel,
 };
 use mehh_coding_agent::auth::resolve_api_key_async;
-use mehh_coding_agent::base64_encode;
 use mehh_coding_agent::models_config::ModelRegistry;
 use mehh_coding_agent::trust::{resolve_project_trust_with_override, TrustOverride};
 use mehh_coding_agent::{
-    list_sessions, perform_login, perform_logout, rpc, run_interactive_mode, run_print_mode_content,
+    process_file_arguments, ProcessedPromptArgs, list_sessions, perform_login, perform_logout, rpc, run_interactive_mode, run_print_mode_content,
     AgentSession, McpManager, OutputMode, SessionManager, SessionSummary, Settings,
     SettingsManager,
 };
+use tokio::io::AsyncReadExt;
 
 #[derive(clap::Parser, Debug, Clone, PartialEq, Eq)]
 #[command(name = "mehh", version, about = "mehh coding agent CLI")]
@@ -166,6 +165,19 @@ impl CliArgs {
         if self.continue_session && self.session.is_some() {
             anyhow::bail!("Cannot specify both -c/--continue and --session");
         }
+        if self.continue_session && self.resume.is_some() {
+            anyhow::bail!("Cannot specify both -c/--continue and -r/--resume");
+        }
+        if self.session_dir.is_some()
+            && (self.no_session
+                || self.session.is_some()
+                || self.continue_session
+                || self.resume.is_some())
+        {
+            anyhow::bail!(
+                "--session-dir cannot be combined with --no-session, --session, -c/--continue, or -r/--resume"
+            );
+        }
         if self.skills && self.no_skills {
             anyhow::bail!("Cannot specify both --skills and --no-skills");
         }
@@ -215,73 +227,6 @@ pub fn resolve_cli_tools(
     mehh_tools::select_coding_tools(cwd, include.as_deref(), &exclude)
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ProcessedPromptArgs {
-    pub text: String,
-    pub blocks: Vec<UserContentBlock>,
-}
-
-pub fn process_file_arguments(cwd: &Path, args: &[String]) -> anyhow::Result<ProcessedPromptArgs> {
-    let mut text_parts = Vec::new();
-    let mut blocks = Vec::new();
-
-    for arg in args {
-        if let Some(path_str) = arg.strip_prefix('@') {
-            let p = Path::new(path_str);
-            let full_path = if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                cwd.join(p)
-            };
-
-            if full_path.is_file() {
-                let ext = full_path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-
-                if matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
-                    let bytes = std::fs::read(&full_path)?;
-                    let mime_type = match ext.as_str() {
-                        "png" => "image/png",
-                        "jpg" | "jpeg" => "image/jpeg",
-                        "gif" => "image/gif",
-                        "webp" => "image/webp",
-                        _ => "application/octet-stream",
-                    };
-                    let b64 = base64_encode(&bytes);
-                    blocks.push(UserContentBlock::Image(ImageContent {
-                        data: b64,
-                        mime_type: mime_type.to_string(),
-                    }));
-                    continue;
-                } else {
-                    let bytes = std::fs::read(&full_path)?;
-                    let raw = String::from_utf8_lossy(&bytes);
-                    let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-                    let tag = format!("<file name=\"{path_str}\">\n{clean}\n</file>");
-                    text_parts.push(tag);
-                    continue;
-                }
-            }
-        }
-        text_parts.push(arg.clone());
-    }
-
-    let text = text_parts.join(" ");
-    if !text.is_empty() {
-        blocks.insert(
-            0,
-            UserContentBlock::Text(TextContent {
-                text: text.clone(),
-                text_signature: None,
-            }),
-        );
-    }
-
-    Ok(ProcessedPromptArgs { text, blocks })
-}
 
 pub fn handle_export(
     input_file: &Path,
@@ -363,6 +308,8 @@ pub fn base_url_for_provider(provider: &str) -> String {
     match provider.as_str() {
         "gemini" => "https://generativelanguage.googleapis.com/v1beta".to_string(),
         "bedrock" => "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+        "azure" | "azure-openai-responses" => std::env::var("AZURE_OPENAI_ENDPOINT")
+            .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
         _ => "https://api.openai.com/v1".to_string(),
     }
 }
@@ -479,7 +426,13 @@ pub fn resolve_or_custom_model_with_registry(
             || lower_id.starts_with("o3")
             || lower_id.starts_with("o4")
             || lower_id.contains("claude")
-            || lower_id.contains("gemini-2.5");
+            || lower_id.contains("gemini-2.5")
+            || lower_id.contains("gemini-3")
+            || lower_id.starts_with("gpt-5")
+            || lower_id.starts_with("deepseek-r1")
+            || lower_id.starts_with("deepseek-reasoner")
+            || lower_id.starts_with("grok-3")
+            || lower_id.contains("magistral");
 
         Some(Model {
             id: id.clone(),
@@ -662,10 +615,20 @@ pub fn resolve_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<Ses
             None => prompt_session_selection(&sessions)?,
         };
         create_session_manager(false, Some(&path), cwd)?
+    } else if let Some(id) = args.session_id.as_deref() {
+        // --session-id works on its own, not only together with --session-dir.
+        if let Some(dir) = args.session_dir.as_deref() {
+            let ts = mehh_ai::now_ms();
+            let path = dir.join(format!("{ts}_{id}.jsonl"));
+            SessionManager::open_file(path, cwd)?
+        } else {
+            let mut mgr = create_session_manager(false, None, cwd)?;
+            mgr.set_session_name(Some(id.to_string()))?;
+            mgr
+        }
     } else if let Some(dir) = args.session_dir.as_deref() {
         let ts = mehh_ai::now_ms();
-        let sid = args.session_id.as_deref().unwrap_or("default");
-        let path = dir.join(format!("{ts}_{sid}.jsonl"));
+        let path = dir.join(format!("{ts}_default.jsonl"));
         SessionManager::open_file(path, cwd)?
     } else {
         create_session_manager(false, None, cwd)?
@@ -799,6 +762,45 @@ async fn main() -> anyhow::Result<()> {
         trusted,
     );
 
+    if args.no_context_files {
+        agent_session.set_no_context_files(true);
+    }
+    if args.verbose {
+        eprintln!(
+            "model={} provider={} api={} base_url={}",
+            model.id, model.provider, model.api, model.base_url
+        );
+    }
+    if args.skills && agent_session.skills.is_empty() {
+        eprintln!("note: --skills is enabled by default; no project skills were found");
+    }
+    if args.prompt_templates && agent_session.prompt_templates.is_empty() {
+        eprintln!("note: --prompt-templates is enabled by default; no templates were found");
+    }
+
+    // Subagent tools are built after MCP connection so child agents see MCP tools.
+    let subagent_models = if args.no_tools || args.no_builtin_tools {
+        None
+    } else {
+        let enabled = match args.tools.as_deref() {
+            Some(inc) => inc.split(',').any(|s| s.trim() == "subagent"),
+            None => !args
+                .exclude_tools
+                .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .any(|s| s.trim() == "subagent"),
+        };
+        if enabled {
+            let lw = agent_session.lead_worker.lock().unwrap();
+            Some((
+                lw.worker_model().cloned().unwrap_or_else(|| model.clone()),
+                lw.worker_provider().cloned().unwrap_or_else(|| provider.clone()),
+            ))
+        } else {
+            None
+        }
+    };
     if args.no_tools || args.no_builtin_tools || args.tools.is_some() || args.exclude_tools.is_some() {
         let mut cli_tools = resolve_cli_tools(&args, cwd.clone())?;
         let should_include_todo = if args.no_tools || args.no_builtin_tools {
@@ -817,55 +819,23 @@ async fn main() -> anyhow::Result<()> {
             cli_tools.push(Arc::new(mehh_coding_agent::todo::TodoTool::new(agent_session.todo_state.clone())));
         }
 
-        let should_include_subagent = if args.no_tools || args.no_builtin_tools {
-            false
-        } else if let Some(ref inc) = args.tools {
-            inc.split(',').any(|s| s.trim() == "subagent")
-        } else {
-            !args
-                .exclude_tools
-                .as_deref()
-                .unwrap_or("")
-                .split(',')
-                .any(|s| s.trim() == "subagent")
-        };
-
-        if should_include_subagent {
-            let (sub_model, sub_provider) = {
-                let lw = agent_session.lead_worker.lock().unwrap();
-                let wm = lw.worker_model().cloned().unwrap_or_else(|| model.clone());
-                let wp = lw.worker_provider().cloned().unwrap_or_else(|| provider.clone());
-                (wm, wp)
-            };
-            let subagent = Arc::new(
-                mehh_coding_agent::subagent::SubagentTool::new(
-                    cwd.clone(),
-                    sub_model,
-                    sub_provider,
-                    None,
-                    cli_tools.clone(),
-                    0,
-                )
-                .with_inspection_manager(agent_session.inspection_manager.clone())
-                .with_approval_handler(agent_session.approval_handler.clone()),
-            );
-            cli_tools.push(subagent);
-        }
-
         agent_session.set_tools(cli_tools);
     }
 
     if let Some(ref models_str) = args.models {
         let mut resolved = Vec::new();
         for token in models_str.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
-            let parts: Vec<&str> = token.split('/').collect();
-            let model_opt = if parts.len() == 2 {
-                model_registry.resolve_exact(parts[0], parts[1])
+            // IDs may contain multiple slashes (e.g. openrouter/anthropic/claude-sonnet-4.5).
+            let model_opt = if let Some((provider, id)) = token.split_once('/') {
+                model_registry
+                    .resolve_exact(provider, id)
+                    .or_else(|| model_registry.resolve(token, None))
             } else {
                 model_registry.resolve(token, None)
             };
-            if let Some(m) = model_opt {
-                resolved.push(m);
+            match model_opt {
+                Some(m) => resolved.push(m),
+                None => eprintln!("warning: unknown model '{token}' in --models; skipped"),
             }
         }
         agent_session.set_scoped_models(resolved);
@@ -890,13 +860,38 @@ async fn main() -> anyhow::Result<()> {
         .api_key
         .as_deref()
         .is_some_and(|k| !k.trim().is_empty());
-    let api_key = resolve_api_key_async(&model.provider, args.api_key.as_deref(), None::<&Path>)
-        .await?
-        .or_else(|| {
-            model_registry
-                .provider_api_key(&model.provider)
-                .map(str::to_string)
-        });
+    // Key refresh (which may perform HTTP) and MCP startup are independent.
+    // join! (not try_join!) so a failing key refresh cannot drop an MCP
+    // connect future that may already have spawned child processes.
+    let (api_key_resolved, mcp_resolved) = tokio::join!(
+        resolve_api_key_async(&model.provider, args.api_key.as_deref(), None::<&Path>),
+        async {
+            if !args.no_tools && !args.no_mcp {
+                McpManager::connect_from_configs_with_trust(&cwd, trusted)
+                    .await
+                    .map(Some)
+            } else {
+                Ok(None)
+            }
+        }
+    );
+    let mcp_manager = mcp_resolved?;
+    let api_key_base = match api_key_resolved {
+        Ok(key) => key,
+        Err(err) => {
+            // join! already let MCP finish connecting; close its child processes
+            // before propagating the credential error.
+            if let Some(ref mgr) = mcp_manager {
+                mgr.close_all().await;
+            }
+            return Err(err);
+        }
+    };
+    let api_key = api_key_base.or_else(|| {
+        model_registry
+            .provider_api_key(&model.provider)
+            .map(str::to_string)
+    });
     if has_explicit_api_key {
         agent_session.set_explicit_api_key(api_key);
     } else {
@@ -904,8 +899,8 @@ async fn main() -> anyhow::Result<()> {
     }
     apply_cli_thinking_override(&mut agent_session, cli_thinking);
 
-    let (mut mcp_manager, mcp_tools) = if !args.no_tools && !args.no_mcp {
-        let mgr = McpManager::connect_from_configs_with_trust(&cwd, trusted).await?;
+    let mut mcp_manager = mcp_manager;
+    let mcp_tools = if let Some(ref mgr) = mcp_manager {
         if !is_interactive {
             for summary in mgr.summaries() {
                 if let Some(ref err) = summary.error {
@@ -916,14 +911,37 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        let tools = mgr.tools().to_vec();
-        (Some(mgr), tools)
+        mgr.tools().to_vec()
     } else {
-        (None, Vec::new())
+        Vec::new()
     };
 
     if !args.no_tools {
         agent_session.enable_mcp_and_codemode(mcp_tools, args.codemode);
+    }
+
+    if let Some((sub_model, sub_provider)) = subagent_models {
+        // Rebuild the subagent tool with the final tool set (including MCP).
+        let mut tools: Vec<Arc<dyn mehh_agent::AgentTool>> = agent_session
+            .tools
+            .iter()
+            .filter(|t| t.name() != "subagent")
+            .cloned()
+            .collect();
+        let subagent = Arc::new(
+            mehh_coding_agent::subagent::SubagentTool::new(
+                cwd.clone(),
+                sub_model,
+                sub_provider,
+                None,
+                tools.clone(),
+                0,
+            )
+            .with_inspection_manager(agent_session.inspection_manager.clone())
+            .with_approval_handler(agent_session.approval_handler.clone()),
+        );
+        tools.push(subagent);
+        agent_session.set_tools(tools);
     }
 
     agent_session.set_custom_system_prompt(
@@ -988,10 +1006,18 @@ async fn run_print_flow(
     };
     let mut prompt_text = processed.text;
     let mut blocks = processed.blocks;
-    if prompt_text.trim().is_empty() && blocks.is_empty() && !io::stdin().is_terminal() {
+    // Piped stdin is added to the prompt argument, never discarded. For
+    // example `git diff | mehh -p "review"` must include both pieces.
+    if !io::stdin().is_terminal() {
         let mut stdin_input = String::new();
-        io::stdin().read_to_string(&mut stdin_input)?;
-        prompt_text = stdin_input.trim_start_matches('\u{feff}').to_string();
+        tokio::io::stdin().read_to_string(&mut stdin_input).await?;
+        let piped = stdin_input.trim_start_matches('\u{feff}');
+        if !piped.trim().is_empty() {
+            if !prompt_text.trim().is_empty() {
+                prompt_text.push_str("\n\n");
+            }
+            prompt_text.push_str(piped);
+        }
     }
 
     if prompt_text.trim().is_empty() && blocks.is_empty() {
@@ -1352,7 +1378,7 @@ mod tests {
         assert_eq!(m.name, "my-custom-model");
         assert_eq!(m.provider, "anthropic");
         assert_eq!(m.api, "anthropic-messages");
-        assert_eq!(m.base_url, "https://api.anthropic.com");
+        assert_eq!(m.base_url, "https://api.anthropic.com/v1");
         assert_eq!(m.context_window, 128_000);
         assert_eq!(m.max_tokens, 16_384);
         assert!(!m.reasoning);
@@ -1373,7 +1399,7 @@ mod tests {
         let m_claude = resolve_or_custom_model(Some("claude-future-v1"), None, None).unwrap();
         assert_eq!(m_claude.provider, "anthropic");
         assert_eq!(m_claude.api, "anthropic-messages");
-        assert_eq!(m_claude.base_url, "https://api.anthropic.com");
+        assert_eq!(m_claude.base_url, "https://api.anthropic.com/v1");
         assert!(m_claude.reasoning);
 
         // Gemini prefix
@@ -1381,7 +1407,7 @@ mod tests {
         assert_eq!(m_gemini.provider, "google");
         assert_eq!(m_gemini.api, "google-generative-ai");
         assert_eq!(m_gemini.base_url, "https://generativelanguage.googleapis.com/v1beta");
-        assert!(!m_gemini.reasoning);
+        assert!(m_gemini.reasoning);
 
         let m_gemini_25 = resolve_or_custom_model(Some("gemini-2.5-custom"), None, None).unwrap();
         assert!(m_gemini_25.reasoning);
@@ -1457,7 +1483,7 @@ mod tests {
             (
                 "anthropic",
                 "anthropic-messages",
-                "https://api.anthropic.com",
+                "https://api.anthropic.com/v1",
             ),
             ("openai", "openai-completions", "https://api.openai.com/v1"),
             (
@@ -1531,7 +1557,7 @@ mod tests {
         let m = resolve_or_custom_model(Some("my-model"), Some("Anthropic"), None).unwrap();
         assert_eq!(m.provider, "anthropic");
         assert_eq!(m.api, "anthropic-messages");
-        assert_eq!(m.base_url, "https://api.anthropic.com");
+        assert_eq!(m.base_url, "https://api.anthropic.com/v1");
     }
 
     #[test]

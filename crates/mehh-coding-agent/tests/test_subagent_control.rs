@@ -4,8 +4,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
 use mehh_ai::{
-    create_event_stream, faux_assistant_message, faux_model, faux_tool_call, faux_tool_call_message,
-    Context, FauxProvider, LlmProvider, Message, Model, StreamOptions,
+    create_event_stream, faux_assistant_message, faux_model, faux_tool_call,
+    faux_tool_call_message, Context, FauxProvider, LlmProvider, Message, Model, StreamOptions,
 };
 use mehh_coding_agent::subagent::SubagentTool;
 use mehh_coding_agent::subagent_control::{SubagentControl, DEFAULT_MAX_CONCURRENT_SUBAGENTS};
@@ -71,7 +71,10 @@ async fn global_budget_is_shared_and_limited() {
     let _a = control.acquire().await;
     let _b = control.acquire().await;
     let blocked = tokio::time::timeout(Duration::from_millis(50), control.clone().acquire()).await;
-    assert!(blocked.is_err(), "third acquire must block while both permits are held");
+    assert!(
+        blocked.is_err(),
+        "third acquire must block while both permits are held"
+    );
     assert_eq!(DEFAULT_MAX_CONCURRENT_SUBAGENTS, 4);
 }
 
@@ -80,8 +83,15 @@ async fn two_overlapping_subagent_calls_share_one_budget() {
     let control = Arc::new(SubagentControl::new(2));
     let cwd = std::env::temp_dir().join(format!("mehh_budget_{}", uuid::Uuid::now_v7()));
     let mk = || {
-        SubagentTool::new(cwd.clone(), faux_model(), Arc::new(HangingProvider), None, vec![], 0)
-            .with_control(control.clone())
+        SubagentTool::new(
+            cwd.clone(),
+            faux_model(),
+            Arc::new(HangingProvider),
+            None,
+            vec![],
+            0,
+        )
+        .with_control(control.clone())
     };
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
@@ -102,7 +112,11 @@ async fn two_overlapping_subagent_calls_share_one_budget() {
         tokio::spawn(async move { sub.execute("b", p, cancel, None).await })
     };
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert_eq!(control.list().len(), 2, "two children from two separate calls");
+    assert_eq!(
+        control.list().len(),
+        2,
+        "two children from two separate calls"
+    );
     let t3 = {
         let sub = mk();
         let p = params;
@@ -140,8 +154,14 @@ async fn kill_targets_one_child_and_steer_reaches_only_that_child() {
     assert!(control.kill("sub-a"));
     assert!(a.cancel.is_cancelled());
     assert!(!b.cancel.is_cancelled());
-    assert!(!parent.is_cancelled(), "parent turn must survive child kill");
-    assert!(!control.kill("sub-a"), "already-unregistered id returns false");
+    assert!(
+        !parent.is_cancelled(),
+        "parent turn must survive child kill"
+    );
+    assert!(
+        !control.kill("sub-a"),
+        "already-unregistered id returns false"
+    );
     control.unregister("sub-a");
     assert_eq!(control.list().len(), 1);
 }
@@ -167,23 +187,40 @@ async fn kill_stops_a_real_child_loop() {
             }
         }
     });
-    let sub = SubagentTool::new(cwd.clone(), faux_model(), Arc::new(HangingProvider), None, vec![], 0)
-        .with_control(control.clone());
+    let sub = SubagentTool::new(
+        cwd.clone(),
+        faux_model(),
+        Arc::new(HangingProvider),
+        None,
+        vec![],
+        0,
+    )
+    .with_control(control.clone());
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
     params.insert("timeout_secs".into(), serde_json::json!(30));
     let token = tokio_util::sync::CancellationToken::new();
     let task_cancel = token.clone();
-    let task = tokio::spawn(async move { sub.execute("tc", params, task_cancel, Some(on_update)).await });
+    let task = tokio::spawn(async move {
+        sub.execute("tc", params, task_cancel, Some(on_update))
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(2), rx.changed())
         .await
         .expect("timed out waiting for child id")
         .expect("child id channel closed");
     let id = (*rx.borrow_and_update()).clone();
     assert!(control.kill(&id), "registered child must be killable");
-    let result = tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
     let res = result.expect("killed child must not surface as a transport error");
-    assert_eq!(res.is_error, Some(true), "killed child must be an is_error result");
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "killed child must be an is_error result"
+    );
     let details = res
         .details
         .expect("killed child result must carry details.subagent");
@@ -213,7 +250,10 @@ fn standalone_tools_share_the_process_wide_control() {
         "standalone tools must share one control"
     );
     assert!(
-        Arc::ptr_eq(&a.control(), mehh_coding_agent::subagent_control::global_control()),
+        Arc::ptr_eq(
+            &a.control(),
+            mehh_coding_agent::subagent_control::global_control()
+        ),
         "standalone tools must fall back to the process-wide default"
     );
 }
@@ -223,7 +263,11 @@ async fn steer_message_reaches_child_context() {
     let control = Arc::new(SubagentControl::new(4));
     let cwd = std::env::temp_dir().join(format!("mehh_steer_{}", uuid::Uuid::now_v7()));
     let provider = Arc::new(FauxProvider::new());
-    provider.add_response(faux_tool_call_message(vec![faux_tool_call("c1", "hang", serde_json::json!({}))]));
+    provider.add_response(faux_tool_call_message(vec![faux_tool_call(
+        "c1",
+        "hang",
+        serde_json::json!({}),
+    )]));
     provider.add_response(faux_assistant_message("done"));
 
     let hang_tool = Arc::new(HangTool {
@@ -261,7 +305,10 @@ async fn steer_message_reaches_child_context() {
             }
         }
     });
-    let task = tokio::spawn(async move { sub.execute("ts", params, task_cancel, Some(on_update)).await });
+    let task = tokio::spawn(async move {
+        sub.execute("ts", params, task_cancel, Some(on_update))
+            .await
+    });
     tokio::time::timeout(Duration::from_secs(2), rx.changed())
         .await
         .expect("timed out waiting for child id")
@@ -269,7 +316,10 @@ async fn steer_message_reaches_child_context() {
     let id = (*rx.borrow_and_update()).clone();
     assert!(control.steer(&id, "ROUTE_ME"));
     hang_tool.release.notify_one();
-    let _result = tokio::time::timeout(Duration::from_secs(10), task).await.unwrap().unwrap();
+    let _result = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .unwrap()
+        .unwrap();
 
     let mut observed = false;
     for _ in 0..100 {

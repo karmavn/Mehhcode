@@ -1,7 +1,7 @@
+use mehh_agent::AgentTool;
+use mehh_coding_agent::todo::{TodoState, TodoTool};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use mehh_coding_agent::todo::{TodoState, TodoTool};
-use mehh_agent::AgentTool;
 
 #[tokio::test]
 async fn test_todo_tool_updates_shared_state() {
@@ -10,11 +10,19 @@ async fn test_todo_tool_updates_shared_state() {
 
     let mut args = serde_json::Map::new();
     args.insert("action".to_string(), serde_json::json!("add"));
-    args.insert("content".to_string(), serde_json::json!("Verify test suite"));
+    args.insert(
+        "content".to_string(),
+        serde_json::json!("Verify test suite"),
+    );
 
-    tool.execute("call_1", args, tokio_util::sync::CancellationToken::new(), None)
-        .await
-        .expect("execute todo add");
+    tool.execute(
+        "call_1",
+        args,
+        tokio_util::sync::CancellationToken::new(),
+        None,
+    )
+    .await
+    .expect("execute todo add");
 
     let read = state.read().await;
     assert_eq!(read.items.len(), 1);
@@ -25,7 +33,11 @@ async fn test_todo_tool_updates_shared_state() {
 async fn test_todo_moim_block_generation() {
     let mut state = TodoState::default();
     state.add("Run regression tests".to_string());
-    state.update(1, Some(mehh_coding_agent::todo::TodoStatus::InProgress), None);
+    state.update(
+        1,
+        Some(mehh_coding_agent::todo::TodoStatus::InProgress),
+        None,
+    );
 
     let temp = std::env::temp_dir();
     let block = state.format_moim_block(&temp, true).expect("moim block");
@@ -54,7 +66,9 @@ async fn test_moim_untrusted_ignores_file() {
     assert!(block.is_none());
 
     // In trusted mode, it reads the file
-    let block_trusted = state.format_moim_block(&temp_dir, true).expect("trusted read");
+    let block_trusted = state
+        .format_moim_block(&temp_dir, true)
+        .expect("trusted read");
     assert!(block_trusted.contains("malicious prompt injection"));
 
     let _ = std::fs::remove_dir_all(&temp_dir);

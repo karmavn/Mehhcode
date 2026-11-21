@@ -1,5 +1,5 @@
-use mehh_coding_agent::lead_worker::LeadWorkerManager;
 use mehh_ai::StopReason;
+use mehh_coding_agent::lead_worker::LeadWorkerManager;
 
 #[test]
 fn test_lead_worker_escalates_on_provider_error() {

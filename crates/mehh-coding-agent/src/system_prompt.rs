@@ -56,6 +56,16 @@ pub fn build_system_prompt(
     append_prompt: Option<&str>,
     tool_names: &[&str],
 ) -> String {
+    build_system_prompt_inner(cwd, custom_prompt, append_prompt, tool_names, true)
+}
+
+fn build_system_prompt_inner(
+    cwd: &Path,
+    custom_prompt: Option<&str>,
+    append_prompt: Option<&str>,
+    tool_names: &[&str],
+    include_context_files: bool,
+) -> String {
     let mut sections = Vec::new();
 
     let preamble = match custom_prompt {
@@ -93,7 +103,11 @@ pub fn build_system_prompt(
     rules_sec.push_str("</rules>");
     sections.push(rules_sec);
 
-    let context_files = discover_context_files(cwd);
+    let context_files = if include_context_files {
+        discover_context_files(cwd)
+    } else {
+        Vec::new()
+    };
     if !context_files.is_empty() {
         let mut proj_sec =
             String::from("<project_context>\nProject-specific instructions and guidelines:\n\n");
@@ -129,7 +143,32 @@ pub fn build_system_prompt_with_skills(
     tool_names: &[&str],
     skills: &[Skill],
 ) -> String {
-    let mut prompt = build_system_prompt(cwd, custom_prompt, append_prompt, tool_names);
+    build_system_prompt_with_skills_and_context(
+        cwd,
+        custom_prompt,
+        append_prompt,
+        tool_names,
+        skills,
+        true,
+    )
+}
+
+/// Variant that can omit project context files (AGENTS.md / CLAUDE.md).
+pub fn build_system_prompt_with_skills_and_context(
+    cwd: &Path,
+    custom_prompt: Option<&str>,
+    append_prompt: Option<&str>,
+    tool_names: &[&str],
+    skills: &[Skill],
+    include_context_files: bool,
+) -> String {
+    let mut prompt = build_system_prompt_inner(
+        cwd,
+        custom_prompt,
+        append_prompt,
+        tool_names,
+        include_context_files,
+    );
     let skills_sec = format_skills_for_prompt(skills);
     if !skills_sec.is_empty() {
         prompt.push_str("\n\n");

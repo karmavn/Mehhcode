@@ -48,7 +48,10 @@ fn edit_ctx(cwd: &std::path::Path, id: &str, origin: Option<String>) -> ToolInsp
 #[tokio::test]
 async fn test_concurrent_approvals_are_serialized() {
     let cwd = std::env::current_dir().unwrap();
-    let mgr = Arc::new(ToolInspectionManager::new(PermissionMode::Approve, cwd.clone()));
+    let mgr = Arc::new(ToolInspectionManager::new(
+        PermissionMode::Approve,
+        cwd.clone(),
+    ));
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
     let reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -106,7 +109,11 @@ async fn test_repetition_breaker_is_scoped_per_origin() {
     // Two parallel subagents legitimately read the same file in alternation.
     // Each origin repeats only 3 times (the breaker threshold), so none may deny.
     for i in 0..6 {
-        let origin = if i % 2 == 0 { "subagent:#1:research" } else { "subagent:#2:research" };
+        let origin = if i % 2 == 0 {
+            "subagent:#1:research"
+        } else {
+            "subagent:#2:research"
+        };
         let ctx = ToolInspectionContext {
             tool_call_id: format!("r{i}"),
             tool_name: "read".to_string(),

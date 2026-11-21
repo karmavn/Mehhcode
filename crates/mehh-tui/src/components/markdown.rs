@@ -299,8 +299,7 @@ impl Component for MarkdownView {
                             }
                         }
 
-                        let bottom =
-                            format!("{border_color}└{}┘\x1b[0m", "─".repeat(middle_w));
+                        let bottom = format!("{border_color}└{}┘\x1b[0m", "─".repeat(middle_w));
                         block_lines.push(bottom);
                     }
 
@@ -533,7 +532,11 @@ mod tests {
         assert!(!joined.contains("\x1b[31m"));
         assert!(!joined.contains("\x1b]2;pwned"));
         assert!(!joined.contains("\x1b[2J"));
-        let plain: String = lines.iter().map(|l| strip_ansi(l)).collect::<Vec<_>>().join("\n");
+        let plain: String = lines
+            .iter()
+            .map(|l| strip_ansi(l))
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(plain.contains("Hello RED and world"));
     }
 
@@ -555,15 +558,19 @@ mod tests {
     #[test]
     fn test_markdown_heading_preserves_styling_after_inline_code() {
         let src = "### Why `sourceInfo` should not be optional";
+        let theme = Theme::dark();
         let lines = MarkdownView::new(src).render(80);
         let joined = lines.join("\n");
-        assert!(joined.contains("\x1b[33m")); // yellow inline code
+        assert!(
+            joined.contains(&theme.md_code),
+            "inline code must use theme token"
+        );
         let code_marker = "sourceInfo\x1b[0m";
         let code_end = joined.find(code_marker).unwrap() + code_marker.len();
         let after_idx = joined.find("should not be optional").unwrap();
         let between = &joined[code_end..after_idx];
         assert!(
-            between.contains("\x1b[1;36m") || between.contains("\x1b[36m"),
+            between.contains(&theme.md_heading) || between.contains(&theme.accent),
             "Heading style must be re-applied immediately after inline code: {between:?}"
         );
     }
@@ -592,7 +599,9 @@ mod tests {
             .map(|l| strip_ansi(l))
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(plain.contains("Hello world"), "Paragraph softbreak must have space between lines: {plain}");
+        assert!(
+            plain.contains("Hello world"),
+            "Paragraph softbreak must have space between lines: {plain}"
+        );
     }
 }
-

@@ -189,7 +189,7 @@ pub struct AgentRequestUpdate {
     pub model: Option<mehh_ai::Model>,
     pub provider: Option<Arc<dyn mehh_ai::LlmProvider>>,
     pub api_key: Option<Option<String>>,
-    pub thinking_level: Option<mehh_ai::ThinkingLevel>,
+    pub thinking_level: Option<Option<mehh_ai::ThinkingLevel>>,
 }
 
 impl std::fmt::Debug for AgentRequestUpdate {
@@ -217,7 +217,7 @@ pub struct AgentLoopTurnUpdate {
     pub model: Option<mehh_ai::Model>,
     pub provider: Option<Arc<dyn mehh_ai::LlmProvider>>,
     pub api_key: Option<Option<String>>,
-    pub thinking_level: Option<mehh_ai::ThinkingLevel>,
+    pub thinking_level: Option<Option<mehh_ai::ThinkingLevel>>,
 }
 
 impl std::fmt::Debug for AgentLoopTurnUpdate {

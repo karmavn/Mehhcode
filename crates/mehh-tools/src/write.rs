@@ -1,15 +1,18 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
+use crate::core::context::{self, PathPolicy};
+use crate::core::fs::atomic_write;
 use crate::file_mutation_queue::with_file_mutation_queue;
 use crate::undo_edit::{EditUndoStore, FileSnapshot};
 
 #[derive(Debug, Clone)]
 pub struct WriteTool {
     pub cwd: PathBuf,
+    pub path_policy: PathPolicy,
     pub undo_store: Option<Arc<EditUndoStore>>,
 }
 
@@ -17,6 +20,7 @@ impl WriteTool {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
             cwd,
+            path_policy: PathPolicy::Unrestricted,
             undo_store: None,
         }
     }
@@ -26,13 +30,13 @@ impl WriteTool {
         self
     }
 
-    fn resolve_path(&self, p: &str) -> PathBuf {
-        let path = Path::new(p);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.cwd.join(path)
-        }
+    pub fn with_path_policy(mut self, policy: PathPolicy) -> Self {
+        self.path_policy = policy;
+        self
+    }
+
+    fn resolve_path(&self, p: &str) -> Result<PathBuf, String> {
+        context::resolve_path(&self.cwd, &self.path_policy, p)
     }
 }
 
@@ -92,7 +96,7 @@ impl AgentTool for WriteTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter 'content'".to_string())?;
 
-        let full_path = self.resolve_path(path_str);
+        let full_path = self.resolve_path(path_str)?;
         let undo_store = self.undo_store.clone();
         let cancel_inner = cancel.clone();
 
@@ -111,23 +115,30 @@ impl AgentTool for WriteTool {
                 return Err("Tool execution cancelled".to_string());
             }
 
-            if let Some(ref store) = undo_store {
+            // Snapshot must be captured before the replacement, but only
+            // recorded after the atomic write succeeds.
+            let snapshot = if undo_store.is_some() {
                 let timestamp_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
                 if full_path.exists() {
-                    if let Ok(bytes) = tokio::fs::read(&full_path).await {
-                        store.push_snapshot(&full_path, FileSnapshot::Existed { bytes, timestamp_ms });
-                    }
+                    tokio::fs::read(&full_path)
+                        .await
+                        .ok()
+                        .map(|bytes| FileSnapshot::Existed { bytes, timestamp_ms })
                 } else {
-                    store.push_snapshot(&full_path, FileSnapshot::DidNotExist);
+                    Some(FileSnapshot::DidNotExist)
                 }
-            }
+            } else {
+                None
+            };
 
-            tokio::fs::write(&full_path, content.as_bytes())
-                .await
-                .map_err(|e| format!("Failed to write to {}: {}", path_str, e))?;
+            atomic_write(&full_path, content.as_bytes()).await?;
+
+            if let (Some(store), Some(snapshot)) = (undo_store.as_ref(), snapshot) {
+                store.push_snapshot(&full_path, snapshot);
+            }
 
             let byte_count = content.len();
             let line_count = content.lines().count();

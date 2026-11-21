@@ -9,7 +9,7 @@ pub fn builtin_models() -> Vec<Model> {
             name: "Claude Sonnet 4.5".to_string(),
             api: "anthropic-messages".to_string(),
             provider: "anthropic".to_string(),
-            base_url: "https://api.anthropic.com".to_string(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
             reasoning: true,
             input: vec!["text".to_string(), "image".to_string()],
             cost: ModelCost {
@@ -28,7 +28,7 @@ pub fn builtin_models() -> Vec<Model> {
             name: "Claude Opus 4.5".to_string(),
             api: "anthropic-messages".to_string(),
             provider: "anthropic".to_string(),
-            base_url: "https://api.anthropic.com".to_string(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
             reasoning: true,
             input: vec!["text".to_string(), "image".to_string()],
             cost: ModelCost {
@@ -47,7 +47,7 @@ pub fn builtin_models() -> Vec<Model> {
             name: "Claude 3.7 Sonnet Latest".to_string(),
             api: "anthropic-messages".to_string(),
             provider: "anthropic".to_string(),
-            base_url: "https://api.anthropic.com".to_string(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
             reasoning: true,
             input: vec!["text".to_string(), "image".to_string()],
             cost: ModelCost {
@@ -66,7 +66,7 @@ pub fn builtin_models() -> Vec<Model> {
             name: "Claude 3.5 Haiku Latest".to_string(),
             api: "anthropic-messages".to_string(),
             provider: "anthropic".to_string(),
-            base_url: "https://api.anthropic.com".to_string(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
             reasoning: false,
             input: vec!["text".to_string(), "image".to_string()],
             cost: ModelCost {
@@ -812,7 +812,7 @@ pub fn env_api_key_name(provider: &str) -> &'static str {
 /// Returns the default base URL for a provider if standard/applicable.
 pub fn default_base_url(provider: &str) -> Option<&'static str> {
     match provider {
-        "anthropic" => Some("https://api.anthropic.com"),
+        "anthropic" => Some("https://api.anthropic.com/v1"),
         "openai" | "openai-responses" => Some("https://api.openai.com/v1"),
         "google" => Some("https://generativelanguage.googleapis.com/v1beta"),
         "google-vertex" => Some("https://us-central1-aiplatform.googleapis.com/v1"),
@@ -945,7 +945,7 @@ mod tests {
 
     #[test]
     fn test_default_base_url() {
-        assert_eq!(default_base_url("anthropic"), Some("https://api.anthropic.com"));
+        assert_eq!(default_base_url("anthropic"), Some("https://api.anthropic.com/v1"));
         assert_eq!(default_base_url("openai"), Some("https://api.openai.com/v1"));
         assert_eq!(default_base_url("mistral"), Some("https://api.mistral.ai/v1"));
         assert_eq!(default_base_url("groq"), Some("https://api.groq.com/openai/v1"));

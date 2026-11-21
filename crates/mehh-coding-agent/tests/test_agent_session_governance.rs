@@ -1,9 +1,9 @@
-use std::sync::Arc;
+use mehh_agent::{AgentContext, BeforeToolCallContext};
 use mehh_ai::{faux_model, AssistantMessage, FauxProvider, ToolCall};
 use mehh_coding_agent::agent_session::AgentSession;
 use mehh_coding_agent::session::SessionManager;
 use mehh_coding_agent::settings::Settings;
-use mehh_agent::{AgentContext, BeforeToolCallContext};
+use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 #[tokio::test]
@@ -19,7 +19,10 @@ async fn test_agent_session_wires_before_tool_call() {
     );
 
     let (_msg, _hist, config) = session.prepare_prompt("test prompt");
-    assert!(config.before_tool_call.is_some(), "before_tool_call hook must be wired");
+    assert!(
+        config.before_tool_call.is_some(),
+        "before_tool_call hook must be wired"
+    );
 
     let before_hook = config.before_tool_call.unwrap();
 
@@ -58,7 +61,8 @@ async fn test_agent_session_wires_before_tool_call() {
 
 #[tokio::test]
 async fn test_headless_deny_handler_fails_closed() {
-    let temp_dir = std::env::temp_dir().join(format!("agent_session_gov_h_{}", uuid::Uuid::now_v7()));
+    let temp_dir =
+        std::env::temp_dir().join(format!("agent_session_gov_h_{}", uuid::Uuid::now_v7()));
     let session_mgr = SessionManager::in_memory(&temp_dir);
     let mut session = AgentSession::new(
         temp_dir.clone(),
@@ -70,7 +74,9 @@ async fn test_headless_deny_handler_fails_closed() {
             ..Default::default()
         },
     );
-    session.approval_handler = Some(Arc::new(mehh_coding_agent::tool_inspection::HeadlessDenyHandler));
+    session.approval_handler = Some(Arc::new(
+        mehh_coding_agent::tool_inspection::HeadlessDenyHandler,
+    ));
 
     let (_msg, _hist, config) = session.prepare_prompt("test prompt");
     let before_hook = config.before_tool_call.unwrap();
@@ -104,7 +110,10 @@ async fn test_headless_deny_handler_fails_closed() {
     };
 
     let result = before_hook(before_ctx, CancellationToken::new()).await;
-    assert!(result.block, "Mutating tool must be blocked in headless mode when unapproved");
+    assert!(
+        result.block,
+        "Mutating tool must be blocked in headless mode when unapproved"
+    );
 }
 
 #[test]
@@ -121,7 +130,8 @@ fn test_workspace_settings_escalation_guard() {
         &global_path,
         &local_path,
         true,
-    ).unwrap();
+    )
+    .unwrap();
 
     assert_eq!(
         loaded.permission_mode,

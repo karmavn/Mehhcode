@@ -76,13 +76,13 @@ pub enum McpContentBlock {
     #[serde(rename = "image")]
     Image {
         data: String,
-        #[serde(alias = "mime_type")]
+        #[serde(rename = "mimeType", alias = "mime_type")]
         mime_type: String,
     },
     #[serde(rename = "audio")]
     Audio {
         data: String,
-        #[serde(alias = "mime_type")]
+        #[serde(rename = "mimeType", alias = "mime_type")]
         mime_type: String,
     },
     #[serde(rename = "resource_link")]
@@ -91,7 +91,12 @@ pub enum McpContentBlock {
         name: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         description: Option<String>,
-        #[serde(default, alias = "mime_type", skip_serializing_if = "Option::is_none")]
+        #[serde(
+            default,
+            rename = "mimeType",
+            alias = "mime_type",
+            skip_serializing_if = "Option::is_none"
+        )]
         mime_type: Option<String>,
     },
     #[serde(rename = "resource")]
@@ -168,7 +173,50 @@ impl McpRequestOptions {
 }
 
 type PendingResponseSender = oneshot::Sender<Result<serde_json::Value, String>>;
-type PendingRequestsMap = Arc<Mutex<HashMap<String, PendingResponseSender>>>;
+type PendingRequestsMap = Arc<std::sync::Mutex<HashMap<String, PendingResponseSender>>>;
+
+fn lock_std<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// RAII cleanup for an in-flight request. If the caller's future is dropped
+/// (external timeout, `select!`, task cancellation), the pending entries are
+/// still removed and a best-effort `notifications/cancelled` is emitted.
+struct PendingRequestGuard {
+    pending: PendingRequestsMap,
+    progress: Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<McpProgressNotification>>>>,
+    transport: Arc<dyn McpTransport>,
+    key: String,
+    request_id: serde_json::Value,
+    notify_cancel: bool,
+    active: bool,
+}
+
+impl Drop for PendingRequestGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        self.active = false;
+        lock_std(&self.pending).remove(&self.key);
+        lock_std(&self.progress).remove(&self.key);
+        if self.notify_cancel {
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let notif = JsonRpcNotification::new(
+                    "notifications/cancelled",
+                    Some(serde_json::json!({
+                        "requestId": self.request_id,
+                        "reason": "cancelled"
+                    })),
+                );
+                let transport = self.transport.clone();
+                handle.spawn(async move {
+                    let _ = transport.send(JsonRpcMessage::Notification(notif)).await;
+                });
+            }
+        }
+    }
+}
 
 /// Asynchronous client for communicating with an MCP server over an `McpTransport`.
 pub struct McpClient {
@@ -186,6 +234,7 @@ pub struct McpClient {
     server_capabilities: Arc<RwLock<Option<serde_json::Value>>>,
     roots: Arc<Vec<McpRoot>>,
     reader_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    writer_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl McpClient {
@@ -200,7 +249,7 @@ impl McpClient {
         transport: Arc<dyn McpTransport>,
         roots: Vec<McpRoot>,
     ) -> anyhow::Result<Self> {
-        let pending = Arc::new(Mutex::new(HashMap::new()));
+        let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let progress_senders = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let incoming_requests = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let request_handlers = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -228,7 +277,20 @@ impl McpClient {
             server_capabilities: server_capabilities.clone(),
             roots: roots_arc.clone(),
             reader_task: Mutex::new(None),
+            writer_task: Mutex::new(None),
         };
+
+        // Dedicated writer task: the reader loop must never block on transport.send().
+        let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<JsonRpcMessage>(256);
+        let transport_writer = transport.clone();
+        let writer_handle = tokio::spawn(async move {
+            while let Some(msg) = writer_rx.recv().await {
+                if transport_writer.send(msg).await.is_err() {
+                    break;
+                }
+            }
+        });
+        *client.writer_task.lock().await = Some(writer_handle);
 
         // Start background reader task
         let transport_reader = transport.clone();
@@ -247,7 +309,7 @@ impl McpClient {
                 match msg_res {
                     Ok(JsonRpcMessage::Response(resp)) => {
                         let key = id_to_key(&resp.id);
-                        let mut map = pending_reader.lock().await;
+                        let mut map = lock_std(&pending_reader);
                         if let Some(tx) = map.remove(&key) {
                             if let Some(err) = resp.error {
                                 let msg = if let Some(data) = err.data {
@@ -274,7 +336,7 @@ impl McpClient {
                                 let mut inc = incoming_reader.lock().unwrap();
                                 inc.insert(key.clone(), cancel.clone());
                             }
-                            let transport_writer = transport_reader.clone();
+                            let writer_for_handler = writer_tx.clone();
                             let id_clone = req.id.clone();
                             let incoming_map = incoming_reader.clone();
                             tokio::spawn(async move {
@@ -286,23 +348,23 @@ impl McpClient {
                                 match res {
                                     Ok(val) => {
                                         let resp = JsonRpcResponse::success(id_clone, val);
-                                        let _ = transport_writer.send(JsonRpcMessage::Response(resp)).await;
+                                        let _ = writer_for_handler.send(JsonRpcMessage::Response(resp)).await;
                                     }
                                     Err(e) => {
                                         let resp = JsonRpcResponse::error(id_clone, -32603, e.to_string(), None);
-                                        let _ = transport_writer.send(JsonRpcMessage::Response(resp)).await;
+                                        let _ = writer_for_handler.send(JsonRpcMessage::Response(resp)).await;
                                     }
                                 }
                             });
                         } else if req.method == "ping" {
                             let resp = JsonRpcResponse::success(req.id, serde_json::json!({}));
-                            let _ = transport_reader.send(JsonRpcMessage::Response(resp)).await;
+                            let _ = writer_tx.send(JsonRpcMessage::Response(resp)).await;
                         } else if req.method == "roots/list" {
                             let resp = JsonRpcResponse::success(
                                 req.id,
                                 serde_json::json!({ "roots": *roots_reader }),
                             );
-                            let _ = transport_reader.send(JsonRpcMessage::Response(resp)).await;
+                            let _ = writer_tx.send(JsonRpcMessage::Response(resp)).await;
                         } else {
                             let resp = JsonRpcResponse::error(
                                 req.id,
@@ -310,7 +372,7 @@ impl McpClient {
                                 format!("Method not found: {}", req.method),
                                 None,
                             );
-                            let _ = transport_reader.send(JsonRpcMessage::Response(resp)).await;
+                            let _ = writer_tx.send(JsonRpcMessage::Response(resp)).await;
                         }
                     }
                     Ok(JsonRpcMessage::Notification(notif)) => {
@@ -365,7 +427,7 @@ impl McpClient {
             }
             let was_closed = closed_reader.swap(true, Ordering::SeqCst);
             let final_reason = "MCP connection closed".to_string();
-            let mut map = pending_reader.lock().await;
+            let mut map = lock_std(&pending_reader);
             for (_, tx) in map.drain() {
                 let _ = tx.send(Err(final_reason.clone()));
             }
@@ -394,7 +456,7 @@ impl McpClient {
             };
 
             let init_params = serde_json::json!({
-                "protocolVersion": "2025-06-18",
+                "protocolVersion": SUPPORTED_PROTOCOL_VERSIONS[0],
                 "capabilities": capabilities,
                 "clientInfo": {
                     "name": "mehh",
@@ -425,6 +487,8 @@ impl McpClient {
                 );
             }
 
+            // Inform the transport so subsequent HTTP requests carry MCP-Protocol-Version.
+            transport.on_protocol_negotiated(&negotiated_version).await;
             {
                 let mut pv_guard = server_protocol_version.write().await;
                 *pv_guard = Some(negotiated_version);
@@ -490,21 +554,30 @@ impl McpClient {
         params: Option<serde_json::Value>,
         options: McpRequestOptions,
     ) -> anyhow::Result<serde_json::Value> {
-        if self.is_closed.load(Ordering::SeqCst) {
-            anyhow::bail!("MCP connection is closed");
-        }
-
         let id = create_request_id();
         let key = id_to_key(&id);
         let (tx, mut rx) = oneshot::channel();
+        let mut guard = PendingRequestGuard {
+            pending: self.pending_requests.clone(),
+            progress: self.progress_senders.clone(),
+            transport: self.transport.clone(),
+            key: key.clone(),
+            request_id: id.clone(),
+            notify_cancel: false,
+            active: true,
+        };
         {
-            let mut map = self.pending_requests.lock().await;
+            // Check closed state and register atomically under the same lock as close().
+            let mut map = lock_std(&self.pending_requests);
+            if self.is_closed.load(Ordering::SeqCst) {
+                anyhow::bail!("MCP connection is closed");
+            }
             map.insert(key.clone(), tx);
         }
 
         let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        {
-            let mut map = self.progress_senders.lock().unwrap();
+        if options.on_progress.is_some() {
+            let mut map = lock_std(&self.progress_senders);
             map.insert(key.clone(), progress_tx);
         }
 
@@ -548,6 +621,7 @@ impl McpClient {
                         match send_res {
                             Ok(()) => {
                                 sent = true;
+                                guard.notify_cancel = !matches!(method, "initialize");
                             }
                             Err(e) => {
                                 break Err(anyhow::anyhow!("Failed to send MCP request: {e}"));
@@ -580,7 +654,7 @@ impl McpClient {
                         is_cancelled = true;
                         break Err(anyhow::anyhow!("MCP request cancelled"));
                     }
-                    Some(prog) = progress_rx.recv() => {
+                    Some(prog) = progress_rx.recv(), if options.on_progress.is_some() => {
                         deadline = tokio::time::Instant::now() + timeout_dur;
                         if let Some(cb) = &options.on_progress {
                             cb(prog);
@@ -591,11 +665,10 @@ impl McpClient {
         };
 
         {
-            let mut map = self.pending_requests.lock().await;
-            map.remove(&key);
-            let mut pmap = self.progress_senders.lock().unwrap();
-            pmap.remove(&key);
+            lock_std(&self.pending_requests).remove(&key);
+            lock_std(&self.progress_senders).remove(&key);
         }
+        guard.active = false;
 
         match res {
             Ok(val) => Ok(val),
@@ -822,15 +895,21 @@ impl McpClient {
 
     /// Closes the client and tears down the underlying transport.
     pub async fn close(&self) -> anyhow::Result<()> {
-        let was_closed = self.is_closed.swap(true, Ordering::SeqCst);
-        if let Some(handle) = self.reader_task.lock().await.take() {
-            handle.abort();
-        }
-        {
-            let mut map = self.pending_requests.lock().await;
+        // Set the closed flag and drain pending requests under the same lock used
+        // by request_with_options, so no request can register after the drain.
+        let was_closed = {
+            let mut map = lock_std(&self.pending_requests);
+            let was = self.is_closed.swap(true, Ordering::SeqCst);
             for (_, tx) in map.drain() {
                 let _ = tx.send(Err("MCP connection closed".to_string()));
             }
+            was
+        };
+        if let Some(handle) = self.reader_task.lock().await.take() {
+            handle.abort();
+        }
+        if let Some(handle) = self.writer_task.lock().await.take() {
+            handle.abort();
         }
         if !was_closed {
             let listeners = {
@@ -871,6 +950,24 @@ impl McpClient {
     }
 }
 
+impl Drop for McpClient {
+    fn drop(&mut self) {
+        // Stop background tasks even when callers forget close(). Aborting the
+        // writer task drops its transport Arc, which terminates stdio children.
+        self.is_closed.store(true, Ordering::SeqCst);
+        if let Ok(mut guard) = self.reader_task.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+        if let Ok(mut guard) = self.writer_task.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod client_tests {
     use super::*;
@@ -905,7 +1002,7 @@ mod client_tests {
             transport: Arc::new(SlowSendTransport {
                 closed: closed.clone(),
             }),
-            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             progress_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             incoming_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -918,6 +1015,7 @@ mod client_tests {
             server_capabilities: Arc::new(RwLock::new(None)),
             roots: Arc::new(Vec::new()),
             reader_task: Mutex::new(None),
+            writer_task: Mutex::new(None),
         };
 
         let start = std::time::Instant::now();
@@ -927,7 +1025,7 @@ mod client_tests {
             .unwrap_err();
         assert!(start.elapsed() < Duration::from_secs(2));
         assert!(err.to_string().contains("timed out"));
-        assert!(client.pending_requests.lock().await.is_empty());
+        assert!(lock_std(&client.pending_requests).is_empty());
     }
 
     struct FailingInitTransport {
@@ -1044,7 +1142,7 @@ mod client_tests {
 
         let client = McpClient {
             transport: client_transport.clone(),
-            pending_requests: Arc::new(Mutex::new(HashMap::new())),
+            pending_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             progress_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             incoming_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -1057,6 +1155,7 @@ mod client_tests {
             server_capabilities: Arc::new(RwLock::new(None)),
             roots: Arc::new(Vec::new()),
             reader_task: Mutex::new(None),
+            writer_task: Mutex::new(None),
         };
 
         let err = client
@@ -1506,5 +1605,68 @@ mod client_tests {
 
         server_task.await.unwrap();
         client.close().await.unwrap();
+    }
+
+    #[test]
+    fn test_content_block_accepts_spec_mime_type() {
+        let image: McpContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "image",
+            "data": "AQID",
+            "mimeType": "image/png"
+        }))
+        .expect("spec-compliant image block must deserialize");
+        match image {
+            McpContentBlock::Image { mime_type, .. } => assert_eq!(mime_type, "image/png"),
+            _ => panic!("expected image block"),
+        }
+
+        let link: McpContentBlock = serde_json::from_value(serde_json::json!({
+            "type": "resource_link",
+            "uri": "file:///docs/readme.md",
+            "name": "readme",
+            "mimeType": "text/markdown"
+        }))
+        .unwrap();
+        match link {
+            McpContentBlock::ResourceLink { mime_type, .. } => {
+                assert_eq!(mime_type.as_deref(), Some("text/markdown"));
+            }
+            _ => panic!("expected resource link block"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dropped_request_future_cleans_pending_entries() {
+        let client = McpClient {
+            transport: Arc::new(SlowSendTransport {
+                closed: Arc::new(AtomicBool::new(false)),
+            }),
+            pending_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            progress_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            incoming_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            request_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            notification_listeners: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            error_listeners: Arc::new(std::sync::Mutex::new(Vec::new())),
+            close_listeners: Arc::new(std::sync::Mutex::new(Vec::new())),
+            is_closed: Arc::new(AtomicBool::new(false)),
+            server_protocol_version: Arc::new(RwLock::new(None)),
+            server_info: Arc::new(RwLock::new(None)),
+            server_capabilities: Arc::new(RwLock::new(None)),
+            roots: Arc::new(Vec::new()),
+            reader_task: Mutex::new(None),
+            writer_task: Mutex::new(None),
+        };
+        let pending = client.pending_requests.clone();
+        let progress = client.progress_senders.clone();
+        {
+            let fut = client.request_with_options(
+                "tools/list",
+                None,
+                McpRequestOptions::new().with_progress(Arc::new(|_| {})),
+            );
+            let _ = tokio::time::timeout(Duration::from_millis(20), fut).await;
+        }
+        assert!(lock_std(&pending).is_empty(), "pending entry must be removed on future drop");
+        assert!(lock_std(&progress).is_empty(), "progress entry must be removed on future drop");
     }
 }

@@ -9,7 +9,13 @@ use tokio_util::sync::CancellationToken;
 
 fn template(
     lead_turns: usize,
-) -> (LeadWorkerManager, Arc<FauxProvider>, Arc<FauxProvider>, Model, Model) {
+) -> (
+    LeadWorkerManager,
+    Arc<FauxProvider>,
+    Arc<FauxProvider>,
+    Model,
+    Model,
+) {
     let mut lead = faux_model();
     lead.id = "lead-x".to_string();
     let mut worker = faux_model();
@@ -48,7 +54,10 @@ async fn test_research_subagent_starts_on_worker() {
         .with_lead_worker(Arc::new(std::sync::Mutex::new(mgr)));
 
     let mut params = Map::new();
-    params.insert("prompt".to_string(), Value::String("research task".to_string()));
+    params.insert(
+        "prompt".to_string(),
+        Value::String("research task".to_string()),
+    );
     params.insert("mode".to_string(), Value::String("research".to_string()));
 
     let res = sub
@@ -81,7 +90,10 @@ async fn test_worker_error_rescues_via_lead_then_returns() {
         .with_lead_worker(Arc::new(std::sync::Mutex::new(mgr)));
 
     let mut params = Map::new();
-    params.insert("prompt".to_string(), Value::String("research task".to_string()));
+    params.insert(
+        "prompt".to_string(),
+        Value::String("research task".to_string()),
+    );
     params.insert("mode".to_string(), Value::String("research".to_string()));
 
     let res = sub
@@ -104,7 +116,10 @@ async fn test_model_tier_lead_overrides_mode_routing() {
         .with_lead_worker(Arc::new(std::sync::Mutex::new(mgr)));
 
     let mut params = Map::new();
-    params.insert("prompt".to_string(), Value::String("research task".to_string()));
+    params.insert(
+        "prompt".to_string(),
+        Value::String("research task".to_string()),
+    );
     params.insert("mode".to_string(), Value::String("research".to_string()));
     params.insert("model_tier".to_string(), Value::String("lead".to_string()));
 

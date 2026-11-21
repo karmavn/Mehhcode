@@ -21,12 +21,15 @@ pub fn create_request_id() -> serde_json::Value {
     serde_json::Value::from(next_request_id())
 }
 
-/// Normalizes a JSON-RPC ID (number or string) into a consistent string key for map indexing.
+/// Normalizes a JSON-RPC ID into a map key that preserves its JSON type.
+///
+/// A number `42` and a string `"42"` are distinct JSON-RPC IDs and must not
+/// alias each other in pending-request or incoming-request maps.
 pub fn id_to_key(id: &serde_json::Value) -> String {
     match id {
-        serde_json::Value::String(s) => s.clone(),
-        serde_json::Value::Number(n) => n.to_string(),
-        other => other.to_string(),
+        serde_json::Value::String(s) => format!("s:{s}"),
+        serde_json::Value::Number(n) => format!("n:{n}"),
+        other => format!("o:{other}"),
     }
 }
 
@@ -152,7 +155,11 @@ impl<'de> Deserialize<'de> for JsonRpcMessage {
     {
         let val = serde_json::Value::deserialize(deserializer)?;
         if let Some(obj) = val.as_object() {
-            let has_id = obj.contains_key("id");
+            if obj.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+                return Err(serde::de::Error::custom("Invalid JSON-RPC version: expected '2.0'"));
+            }
+            let id_value = obj.get("id");
+            let has_id = id_value.is_some_and(|v| !v.is_null());
             let has_method = obj.contains_key("method");
             if has_method {
                 if has_id {
@@ -162,7 +169,8 @@ impl<'de> Deserialize<'de> for JsonRpcMessage {
                     let notif: JsonRpcNotification = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
                     return Ok(JsonRpcMessage::Notification(notif));
                 }
-            } else if has_id {
+            } else if id_value.is_some() {
+                // A null id is only valid on a response (e.g. a parse-error reply), never on a request.
                 let resp: JsonRpcResponse = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
                 return Ok(JsonRpcMessage::Response(resp));
             }
@@ -185,8 +193,37 @@ mod tests {
 
     #[test]
     fn test_id_to_key() {
-        assert_eq!(id_to_key(&serde_json::json!(42)), "42");
-        assert_eq!(id_to_key(&serde_json::json!("abc")), "abc");
+        assert_eq!(id_to_key(&serde_json::json!(42)), "n:42");
+        assert_eq!(id_to_key(&serde_json::json!("42")), "s:42");
+        assert_ne!(
+            id_to_key(&serde_json::json!(42)),
+            id_to_key(&serde_json::json!("42"))
+        );
+        assert_eq!(id_to_key(&serde_json::json!("abc")), "s:abc");
+    }
+
+    #[test]
+    fn test_message_rejects_wrong_version_and_null_id_request() {
+        let bad_version = serde_json::json!({
+            "jsonrpc": "1.0", "method": "tools/list", "id": 1
+        });
+        assert!(serde_json::from_value::<JsonRpcMessage>(bad_version).is_err());
+
+        let null_id_request = serde_json::json!({
+            "jsonrpc": "2.0", "method": "tools/list", "id": null
+        });
+        assert!(matches!(
+            serde_json::from_value::<JsonRpcMessage>(null_id_request).unwrap(),
+            JsonRpcMessage::Notification(_)
+        ));
+
+        let null_id_response = serde_json::json!({
+            "jsonrpc": "2.0", "id": null, "error": {"code": -32700, "message": "Parse error"}
+        });
+        assert!(matches!(
+            serde_json::from_value::<JsonRpcMessage>(null_id_response).unwrap(),
+            JsonRpcMessage::Response(_)
+        ));
     }
 
     #[test]

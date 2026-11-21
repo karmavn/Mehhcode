@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::time::SystemTime;
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 
 /// Current unix timestamp in milliseconds.
@@ -50,8 +51,22 @@ pub fn serialize_assistant_with_role<S>(msg: &AssistantMessage, serializer: S) -
 where
     S: serde::Serializer,
 {
-    let val = assistant_message_to_json(msg);
-    val.serialize(serializer)
+    let mut map = serializer.serialize_map(None)?;
+    map.serialize_entry("role", "assistant")?;
+    map.serialize_entry("content", &msg.content)?;
+    map.serialize_entry("api", &msg.api)?;
+    map.serialize_entry("provider", &msg.provider)?;
+    map.serialize_entry("model", &msg.model)?;
+    if let Some(ref response_id) = msg.response_id {
+        map.serialize_entry("responseId", response_id)?;
+    }
+    map.serialize_entry("usage", &msg.usage)?;
+    map.serialize_entry("stopReason", &msg.stop_reason)?;
+    if let Some(ref error) = msg.error_message {
+        map.serialize_entry("errorMessage", error)?;
+    }
+    map.serialize_entry("timestamp", &msg.timestamp)?;
+    map.end()
 }
 
 /// Serializes a ToolCall ensuring "type": "toolCall" is included.
@@ -70,8 +85,18 @@ pub fn serialize_tool_call_with_type<S>(tc: &ToolCall, serializer: S) -> Result<
 where
     S: serde::Serializer,
 {
-    let val = tool_call_to_json(tc);
-    val.serialize(serializer)
+    let mut map = serializer.serialize_map(None)?;
+    map.serialize_entry("type", "toolCall")?;
+    map.serialize_entry("id", &tc.id)?;
+    map.serialize_entry("name", &tc.name)?;
+    map.serialize_entry("arguments", &tc.arguments)?;
+    if let Some(ref arguments_error) = tc.arguments_error {
+        map.serialize_entry("argumentsError", arguments_error)?;
+    }
+    if let Some(ref thought_signature) = tc.thought_signature {
+        map.serialize_entry("thoughtSignature", thought_signature)?;
+    }
+    map.end()
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
@@ -260,6 +285,16 @@ impl AssistantMessage {
         }
     }
 
+    /// Clones metadata plus a single content block, avoiding deep-cloning
+    /// accumulated blocks on every streaming chunk.
+    pub fn metadata_clone_with_block(&self, index: usize) -> Self {
+        let mut clone = self.metadata_clone();
+        if let Some(block) = self.content.get(index) {
+            clone.content.push(block.clone());
+        }
+        clone
+    }
+
     pub fn text_content(&self) -> String {
         self.content
             .iter()
@@ -342,6 +377,9 @@ pub struct ModelCompat {
     pub allow_empty_signature: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_strict_tools: Option<bool>,
+    /// Whether the OpenAI-compatible endpoint accepts `stream_options.include_usage`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_usage: Option<bool>,
 }
 
 pub type ThinkingLevelMap = HashMap<String, Option<String>>;
@@ -825,5 +863,45 @@ mod tests {
             resolve_cache_retention_from(None, Some("invalid")),
             CacheRetention::Short
         );
+    }
+
+    #[test]
+    fn serializer_helpers_preserve_legacy_json_fields() {
+        let msg = AssistantMessage {
+            content: vec![AssistantContentBlock::Text(TextContent {
+                text: "hello".to_string(),
+                text_signature: None,
+            })],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            response_id: Some("r1".to_string()),
+            usage: Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: Some("boom".to_string()),
+            timestamp: 1234,
+        };
+        let partial_event = AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: "hello".to_string(),
+            partial: msg.clone(),
+        };
+        let partial_json = serde_json::to_value(&partial_event).unwrap();
+        assert_eq!(partial_json["partial"], assistant_message_to_json(&msg));
+
+        let tool_call = ToolCall {
+            id: "t1".to_string(),
+            name: "bash".to_string(),
+            arguments: serde_json::json!({ "command": "ls" }).as_object().unwrap().clone(),
+            arguments_error: Some("bad args".to_string()),
+            thought_signature: Some("sig".to_string()),
+        };
+        let tool_event = AssistantMessageEvent::ToolCallEnd {
+            content_index: 0,
+            tool_call: tool_call.clone(),
+            partial: msg,
+        };
+        let tool_json = serde_json::to_value(&tool_event).unwrap();
+        assert_eq!(tool_json["toolCall"], tool_call_to_json(&tool_call));
     }
 }

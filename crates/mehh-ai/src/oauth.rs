@@ -159,12 +159,63 @@ pub fn build_authorize_url(
 }
 
 const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+/// A preconnect socket may stay open without sending any bytes. Never let one
+/// block the real callback behind it.
+const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 async fn send_oauth_request(req: reqwest::RequestBuilder) -> anyhow::Result<reqwest::Response> {
     let resp = tokio::time::timeout(OAUTH_HTTP_TIMEOUT, req.send())
         .await
         .map_err(|_| anyhow::anyhow!("OAuth HTTP request timed out after 30s"))??;
-    Ok(resp.error_for_status()?)
+    if resp.status().is_success() {
+        return Ok(resp);
+    }
+    // Keep the provider's error body: it usually explains the real failure.
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .unwrap_or_else(|e| format!("<failed to read error body: {e}>"));
+    anyhow::bail!("OAuth HTTP {status}: {body}")
+}
+
+fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// Percent-decodes a string, leaving malformed escapes untouched.
+pub fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            if let (Some(hi), Some(lo)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        if bytes[i] == b'+' {
+            out.push(b' ');
+        } else {
+            out.push(bytes[i]);
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Exchanges an authorization code and PKCE verifier for OAuth access and refresh tokens.
@@ -403,12 +454,22 @@ pub async fn start_copilot_device_flow(client: &reqwest::Client) -> anyhow::Resu
     })
 }
 
+/// Outcome of a single device-code poll.
+#[derive(Debug)]
+pub enum CopilotDevicePoll {
+    /// Authorization has not been granted yet.
+    Pending,
+    /// RFC 8628 `slow_down`: the caller must increase its poll interval by 5s.
+    SlowDown,
+    /// Authorization completed.
+    Complete(StoredCredential),
+}
+
 /// Polls GitHub for token completion during Copilot Device Code Flow.
-/// Returns Ok(None) while user authorization is pending.
 pub async fn poll_copilot_device_token(
     client: &reqwest::Client,
     device_code: &str,
-) -> anyhow::Result<Option<StoredCredential>> {
+) -> anyhow::Result<CopilotDevicePoll> {
     let mut params = HashMap::new();
     params.insert("client_id", "Iv1.b507a08c87ecfe98");
     params.insert("device_code", device_code);
@@ -427,7 +488,8 @@ pub async fn poll_copilot_device_token(
 
     if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
         match err {
-            "authorization_pending" | "slow_down" => return Ok(None),
+            "authorization_pending" => return Ok(CopilotDevicePoll::Pending),
+            "slow_down" => return Ok(CopilotDevicePoll::SlowDown),
             other => {
                 let desc = json
                     .get("error_description")
@@ -465,7 +527,7 @@ pub async fn poll_copilot_device_token(
         .as_i64()
         .ok_or_else(|| anyhow::anyhow!("Missing expires_at in Copilot token exchange"))?;
 
-    Ok(Some(StoredCredential::OAuth {
+    Ok(CopilotDevicePoll::Complete(StoredCredential::OAuth {
         access: token,
         refresh: github_token,
         expires: (expires_at * 1000).saturating_sub(300_000),
@@ -483,57 +545,90 @@ pub async fn wait_for_loopback_callback(
 ) -> anyhow::Result<String> {
     tokio::time::timeout(timeout, async {
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await?;
-        let (mut socket, _) = listener.accept().await?;
 
-        let mut buf = [0u8; 4096];
-        let n = socket.read(&mut buf).await?;
-        let request_str = String::from_utf8_lossy(&buf[..n]);
+        // Browsers open preconnect sockets and request /favicon.ico. Ignore
+        // anything that is not the OAuth callback instead of failing login.
+        loop {
+            let (mut socket, _) = listener.accept().await?;
+            let mut buf = [0u8; 4096];
+            let n = match tokio::time::timeout(CALLBACK_READ_TIMEOUT, socket.read(&mut buf)).await {
+                Ok(Ok(n)) => n,
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => continue,
+            };
+            if n == 0 {
+                continue;
+            }
+            let request_str = String::from_utf8_lossy(&buf[..n]);
 
-        let req_line = request_str
-            .lines()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("Empty HTTP request"))?;
+            let path = request_str
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or("");
+            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
 
-        let path = req_line
-            .split_whitespace()
-            .nth(1)
-            .ok_or_else(|| anyhow::anyhow!("Invalid HTTP request line"))?;
-
-        let query = path
-            .split_once('?')
-            .map(|(_, q)| q)
-            .unwrap_or("");
-
-        let mut code_opt = None;
-        let mut state_opt = None;
-
-        for pair in query.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k == "code" {
-                    code_opt = Some(v.to_string());
-                } else if k == "state" {
-                    state_opt = Some(v.to_string());
+            let mut code_opt = None;
+            let mut state_opt = None;
+            let mut error_opt = None;
+            let mut error_desc = None;
+            for pair in query.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    let decoded = percent_decode(v);
+                    match k {
+                        "code" => code_opt = Some(decoded),
+                        "state" => state_opt = Some(decoded),
+                        "error" => error_opt = Some(decoded),
+                        "error_description" => error_desc = Some(decoded),
+                        _ => {}
+                    }
                 }
             }
+
+            if let Some(error) = error_opt {
+                let html = format!(
+                    "<!DOCTYPE html><html><body><h1>Authentication Failed</h1><p>{}</p></body></html>",
+                    html_escape(&error)
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    html.len(),
+                    html
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                match error_desc {
+                    Some(desc) => anyhow::bail!("OAuth provider error: {error} - {desc}"),
+                    None => anyhow::bail!("OAuth provider error: {error}"),
+                }
+            }
+
+            if code_opt.is_none() && state_opt.is_none() {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
+            }
+
+            let state = state_opt
+                .ok_or_else(|| anyhow::anyhow!("Missing state in callback URL"))?;
+            if state != expected_state {
+                anyhow::bail!("State mismatch in callback URL");
+            }
+            let code = code_opt
+                .ok_or_else(|| anyhow::anyhow!("Missing code in callback URL"))?;
+
+            let html = "<!DOCTYPE html><html><body><h1>Authentication Successful</h1><p>You can close this tab and return to the application.</p></body></html>";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                html.len(),
+                html
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+            let _ = socket.flush().await;
+
+            return Ok(code);
         }
-
-        let state = state_opt.ok_or_else(|| anyhow::anyhow!("Missing state in callback URL"))?;
-        if state != expected_state {
-            anyhow::bail!("State mismatch in callback URL");
-        }
-
-        let code = code_opt.ok_or_else(|| anyhow::anyhow!("Missing code in callback URL"))?;
-
-        let html = "<!DOCTYPE html><html><body><h1>Authentication Successful</h1><p>You can close this tab and return to the application.</p></body></html>";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            html.len(),
-            html
-        );
-        let _ = socket.write_all(response.as_bytes()).await;
-        let _ = socket.flush().await;
-
-        Ok(code)
     })
     .await
     .map_err(|_| anyhow::anyhow!("Timed out waiting for loopback callback on port {port}"))?
@@ -617,8 +712,16 @@ pub struct FileLockGuard {
 impl Drop for FileLockGuard {
     fn drop(&mut self) {
         if let Some(file) = self.file.take() {
-            let _ = file.unlock();
-            drop(file);
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle) => {
+                    let _ = handle.spawn_blocking(move || {
+                        let _ = file.unlock();
+                    });
+                }
+                Err(_) => {
+                    let _ = file.unlock();
+                }
+            }
         }
     }
 }
@@ -633,13 +736,13 @@ pub async fn acquire_file_lock(
     use anyhow::Context;
     let in_process_guard = in_process_mutex.lock_owned().await;
 
-    if let Some(parent) = lock_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("Failed to create parent directory for lock file '{}'", parent.display()))?;
-    }
-
     let path_clone = lock_path.to_path_buf();
     let file = tokio::task::spawn_blocking(move || -> anyhow::Result<std::fs::File> {
+        if let Some(parent) = path_clone.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!("Failed to create parent directory for lock file '{}'", parent.display())
+            })?;
+        }
         let mut opts = std::fs::OpenOptions::new();
         opts.create(true).read(true).write(true);
         #[cfg(unix)]

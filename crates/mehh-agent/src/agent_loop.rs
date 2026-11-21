@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 use mehh_ai::{
@@ -72,8 +72,9 @@ fn resolve_tools(config: &AgentLoopConfig) -> Vec<Arc<dyn AgentTool>> {
             .read()
             .expect("dynamic_tools RwLock poisoned")
             .clone();
+        let mut names: HashSet<String> = tools.iter().map(|t| t.name().to_string()).collect();
         for tool in dyn_snapshot {
-            if !tools.iter().any(|existing| existing.name() == tool.name()) {
+            if names.insert(tool.name().to_string()) {
                 tools.push(tool);
             }
         }
@@ -182,7 +183,7 @@ pub async fn run_agent_loop(
                             current_api_key = ak;
                         }
                         if let Some(tl) = update.thinking_level {
-                            current_thinking_level = Some(tl);
+                            current_thinking_level = tl;
                         }
                     }
                 }
@@ -210,11 +211,13 @@ pub async fn run_agent_loop(
                 current_messages = hook(current_messages, config.cancel.clone()).await;
             }
 
+            let mut active_tools = resolve_tools(&config);
+
             if let Some(ref hook) = config.prepare_request {
                 let req_ctx = crate::types::PrepareRequestContext {
                     context: crate::types::AgentContext {
                         messages: current_messages.clone(),
-                        tools: Some(resolve_tools(&config)),
+                        tools: Some(active_tools.clone()),
                     },
                     model: current_model.clone(),
                     thinking_level: current_thinking_level,
@@ -222,6 +225,9 @@ pub async fn run_agent_loop(
                 if let Some(update) = hook(req_ctx, config.cancel.clone()).await {
                     if let Some(ctx) = update.context {
                         current_messages = ctx.messages;
+                        if let Some(tools) = ctx.tools {
+                            active_tools = tools;
+                        }
                     }
                     if let Some(m) = update.model {
                         current_model = m;
@@ -233,13 +239,14 @@ pub async fn run_agent_loop(
                         current_api_key = ak;
                     }
                     if let Some(tl) = update.thinking_level {
-                        current_thinking_level = Some(tl);
+                        current_thinking_level = tl;
                     }
                 }
             }
 
             let assistant_message = stream_assistant_response(
                 &current_messages,
+                &active_tools,
                 &current_model,
                 &current_provider,
                 current_api_key.as_deref(),
@@ -292,6 +299,7 @@ pub async fn run_agent_loop(
                     let (batch, terminate) = execute_tool_calls(
                         &assistant_message,
                         &tool_calls,
+                        &active_tools,
                         &current_messages,
                         &config,
                         &on_event,
@@ -338,12 +346,14 @@ pub async fn run_agent_loop(
                 break 'outer;
             }
 
-            last_completed_turn = Some(crate::types::AgentTurnContext {
-                turn_index: turns_completed,
-                messages: current_messages.clone(),
-                assistant_message: assistant_message.clone(),
-                tool_results: tool_results.clone(),
-            });
+            if config.prepare_next_turn.is_some() {
+                last_completed_turn = Some(crate::types::AgentTurnContext {
+                    turn_index: turns_completed,
+                    messages: current_messages.clone(),
+                    assistant_message: assistant_message.clone(),
+                    tool_results: tool_results.clone(),
+                });
+            }
 
             pending_messages = drain_queue(&config.steering_queue, config.steering_mode);
 
@@ -394,6 +404,7 @@ pub async fn run_agent_loop(
 
 async fn stream_assistant_response(
     messages: &[Message],
+    tools: &[Arc<dyn AgentTool>],
     model: &Model,
     provider: &Arc<dyn mehh_ai::LlmProvider>,
     api_key: Option<&str>,
@@ -407,8 +418,7 @@ async fn stream_assistant_response(
         }
     };
 
-    let active_tools = resolve_tools(config);
-    let tool_definitions: Vec<ToolDefinition> = active_tools
+    let tool_definitions: Vec<ToolDefinition> = tools
         .iter()
         .map(|t| tool_to_definition(t.as_ref()))
         .collect();
@@ -438,7 +448,7 @@ async fn stream_assistant_response(
     let mut final_message: Option<AssistantMessage> = None;
 
     while let Some(event) = stream.next().await {
-        let partial_update = match &event {
+        let partial_update: Option<&AssistantMessage> = match &event {
             AssistantMessageEvent::TextStart { partial, .. }
             | AssistantMessageEvent::TextDelta { partial, .. }
             | AssistantMessageEvent::TextEnd { partial, .. }
@@ -447,7 +457,7 @@ async fn stream_assistant_response(
             | AssistantMessageEvent::ThinkingEnd { partial, .. }
             | AssistantMessageEvent::ToolCallStart { partial, .. }
             | AssistantMessageEvent::ToolCallDelta { partial, .. }
-            | AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial.clone()),
+            | AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial),
             _ => None,
         };
 
@@ -459,7 +469,7 @@ async fn stream_assistant_response(
                 });
             }
             emit(AgentEvent::MessageUpdate {
-                message: partial,
+                message: partial.clone(),
                 assistant_message_event: event,
             });
             continue;
@@ -503,7 +513,7 @@ async fn stream_assistant_response(
     if let Some(msg) = final_message {
         msg
     } else {
-        let mut fallback = AssistantMessage::empty_for_model(&config.model);
+        let mut fallback = AssistantMessage::empty_for_model(model);
         let aborted = config.cancel.is_cancelled();
         fallback.stop_reason = if aborted {
             StopReason::Aborted
@@ -600,6 +610,35 @@ struct SingleToolOutcome {
     terminate: bool,
 }
 
+fn aborted_tool_outcome(
+    tool_call: &ToolCall,
+    on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
+) -> SingleToolOutcome {
+    let result = AgentToolResult::text("Operation aborted");
+    if let Some(ref cb) = on_event {
+        cb(AgentEvent::ToolExecutionEnd {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            result: result.clone(),
+            is_error: true,
+            duration_ms: None,
+        });
+    }
+    SingleToolOutcome {
+        tool_result_message: ToolResultMessage {
+            tool_call_id: tool_call.id.clone(),
+            tool_name: tool_call.name.clone(),
+            content: result.content,
+            details: result.details,
+            is_error: true,
+            timestamp: now_ms(),
+            duration_ms: None,
+            usage: None,
+        },
+        terminate: false,
+    }
+}
+
 async fn execute_single_tool(
     assistant_message: &AssistantMessage,
     tool_call: &ToolCall,
@@ -614,9 +653,17 @@ async fn execute_single_tool(
         }
     };
 
-    let agent_ctx = crate::types::AgentContext {
-        messages: current_messages.to_vec(),
-        tools: Some(tools.to_vec()),
+    if config.cancel.is_cancelled() {
+        return aborted_tool_outcome(tool_call, on_event);
+    }
+
+    let agent_ctx = if config.before_tool_call.is_some() || config.after_tool_call.is_some() {
+        Some(crate::types::AgentContext {
+            messages: current_messages.to_vec(),
+            tools: Some(tools.to_vec()),
+        })
+    } else {
+        None
     };
 
     let tool_opt = tools.iter().find(|t| t.name() == tool_call.name);
@@ -681,7 +728,7 @@ async fn execute_single_tool(
             assistant_message: assistant_message.clone(),
             tool_call: tool_call.clone(),
             args: validated_args.clone(),
-            context: agent_ctx.clone(),
+            context: agent_ctx.clone().expect("agent context required by before_tool_call"),
         };
         let before_res = hook(before_ctx, config.cancel.clone()).await;
         if before_res.block {
@@ -716,27 +763,7 @@ async fn execute_single_tool(
     }
 
     if config.cancel.is_cancelled() {
-        let res = AgentToolResult::text("Operation aborted");
-        emit(AgentEvent::ToolExecutionEnd {
-            tool_call_id: tool_call.id.clone(),
-            tool_name: tool_call.name.clone(),
-            result: res.clone(),
-            is_error: true,
-            duration_ms: None,
-        });
-        return SingleToolOutcome {
-            tool_result_message: ToolResultMessage {
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                content: res.content,
-                details: res.details,
-                is_error: true,
-                timestamp: now_ms(),
-                duration_ms: None,
-                usage: None,
-            },
-            terminate: false,
-        };
+        return aborted_tool_outcome(tool_call, on_event);
     }
 
     let on_update_cb: Option<AgentToolUpdateCallback> = if on_event.is_some() {
@@ -787,7 +814,7 @@ async fn execute_single_tool(
             args: validated_args.clone(),
             result: result.clone(),
             is_error,
-            context: agent_ctx,
+            context: agent_ctx.expect("agent context required by after_tool_call"),
         };
         let after_res = hook(after_ctx, config.cancel.clone()).await;
         let content_replaced = after_res.content.is_some();
@@ -946,11 +973,11 @@ async fn execute_tool_calls_parallel(
 async fn execute_tool_calls(
     assistant_message: &AssistantMessage,
     tool_calls: &[ToolCall],
+    tools: &[Arc<dyn AgentTool>],
     current_messages: &[Message],
     config: &AgentLoopConfig,
     on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
 ) -> (Vec<ToolResultMessage>, bool) {
-    let tools = resolve_tools(config);
     let has_sequential = tool_calls.iter().any(|tc| {
         tools
             .iter()
@@ -1641,5 +1668,150 @@ mod tests {
         assert!(turns.len() >= 3, "Expected at least 3 turns, got {}", turns.len());
         assert_eq!(turns[1], vec!["steer 1".to_string()], "Turn 2 should only have steer 1");
         assert_eq!(turns[2], vec!["steer 2".to_string()], "Turn 3 should only have steer 2");
+    }
+
+    struct SilentProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SilentProvider {
+        fn stream(
+            &self,
+            model: &Model,
+            _context: &Context,
+            _options: &StreamOptions,
+            _cancel: CancellationToken,
+        ) -> mehh_ai::AssistantEventStream {
+            let (sender, stream) = mehh_ai::create_event_stream();
+            sender.push(AssistantMessageEvent::Start {
+                partial: AssistantMessage::empty_for_model(model),
+            });
+            drop(sender);
+            stream
+        }
+    }
+
+    #[tokio::test]
+    async fn stream_closed_without_final_message_uses_prepared_model() {
+        let mut config = AgentLoopConfig::new(faux_model(), Arc::new(SilentProvider));
+        config.prepare_request = Some(Arc::new(|req, _cancel| {
+            let mut routed = req.model.clone();
+            routed.id = "routed-model".to_string();
+            routed.api = "routed-api".to_string();
+            routed.provider = "routed-provider".to_string();
+            Box::pin(async move {
+                Some(crate::types::AgentRequestUpdate {
+                    model: Some(routed),
+                    ..Default::default()
+                })
+            })
+        }));
+
+        let out = run_agent_loop(vec![], vec![], config, None).await;
+        let assistant = out.iter().find_map(|msg| match msg {
+            Message::Assistant(a) => Some(a),
+            _ => None,
+        });
+        let assistant = assistant.expect("fallback assistant message");
+        assert_eq!(assistant.model, "routed-model");
+        assert_eq!(assistant.api, "routed-api");
+        assert_eq!(assistant.provider, "routed-provider");
+    }
+
+    #[tokio::test]
+    async fn prepare_request_hook_tools_are_used_by_stream() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_assistant_message("ok"));
+        let mut config = AgentLoopConfig::new(faux_model(), provider.clone());
+        config.tools = vec![Arc::new(DummyTool {
+            tool_name: "base_tool".to_string(),
+            mode: ToolExecutionMode::Parallel,
+            on_exec: None,
+        })];
+        let replacement = Arc::new(DummyTool {
+            tool_name: "hook_tool".to_string(),
+            mode: ToolExecutionMode::Parallel,
+            on_exec: None,
+        });
+        let hook_tools = replacement.clone();
+        config.prepare_request = Some(Arc::new(move |req, _cancel| {
+            let tools: Vec<Arc<dyn AgentTool>> = vec![hook_tools.clone()];
+            Box::pin(async move {
+                Some(crate::types::AgentRequestUpdate {
+                    context: Some(crate::types::AgentContext {
+                        messages: req.context.messages,
+                        tools: Some(tools),
+                    }),
+                    ..Default::default()
+                })
+            })
+        }));
+
+        let _ = run_agent_loop(vec![], vec![], config, None).await;
+        let requests = provider.recorded_requests();
+        let tools = requests[0]
+            .context
+            .tools
+            .as_ref()
+            .expect("stream received tool definitions");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "hook_tool");
+    }
+
+    #[tokio::test]
+    async fn cancelled_tool_does_not_invoke_before_hook() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let hook_calls = Arc::new(AtomicUsize::new(0));
+        let calls = hook_calls.clone();
+        let mut config = AgentLoopConfig::new(faux_model(), Arc::new(FauxProvider::new()));
+        config.tools = vec![Arc::new(DummyTool {
+            tool_name: "some_tool".to_string(),
+            mode: ToolExecutionMode::Parallel,
+            on_exec: None,
+        })];
+        config.before_tool_call = Some(Arc::new(move |_ctx, _cancel| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { crate::types::BeforeToolCallResult::default() })
+        }));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        config.cancel = cancel;
+
+        let assistant = faux_assistant_message("unused");
+        let tool_call = faux_tool_call("c-cancel", "some_tool", serde_json::json!({}));
+        let outcome = execute_single_tool(
+            &assistant,
+            &tool_call,
+            &config.tools,
+            &[],
+            &config,
+            &None,
+        )
+        .await;
+
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 0);
+        assert!(outcome.tool_result_message.is_error);
+    }
+
+    #[tokio::test]
+    async fn prepare_request_can_clear_thinking_level() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_assistant_message("ok"));
+        let mut config = AgentLoopConfig::new(faux_model(), provider.clone());
+        config.stream_options.reasoning = Some(mehh_ai::ThinkingLevel::High);
+        config.prepare_request = Some(Arc::new(|_req, _cancel| {
+            Box::pin(async {
+                Some(crate::types::AgentRequestUpdate {
+                    thinking_level: Some(None),
+                    ..Default::default()
+                })
+            })
+        }));
+
+        let _ = run_agent_loop(vec![], vec![], config, None).await;
+        assert!(provider.recorded_requests()[0]
+            .options
+            .reasoning
+            .is_none());
     }
 }

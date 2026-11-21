@@ -1,12 +1,12 @@
 //! Session management with JSONL v3 format, tree branching, and compaction.
 
+use anyhow::{anyhow, Context, Result};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use anyhow::{anyhow, Context, Result};
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use mehh_ai::{now_ms, Message, SystemMessage, ThinkingLevel, UserMessage};
@@ -14,7 +14,9 @@ use mehh_ai::{now_ms, Message, SystemMessage, ThinkingLevel, UserMessage};
 /// Generates an ISO 8601 UTC timestamp string (e.g. `2026-11-12T13:17:17.000Z`).
 pub fn now_iso8601() -> String {
     let now = std::time::SystemTime::now();
-    let duration = now.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    let duration = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
     let total_secs = duration.as_secs();
     let millis = duration.subsec_millis();
 
@@ -189,7 +191,9 @@ impl ContextEditableContent {
                 mehh_ai::UserContent::Text(text)
             }
             Self::Value(v) => {
-                if let Ok(blocks) = serde_json::from_value::<Vec<mehh_ai::UserContentBlock>>(v.clone()) {
+                if let Ok(blocks) =
+                    serde_json::from_value::<Vec<mehh_ai::UserContentBlock>>(v.clone())
+                {
                     mehh_ai::UserContent::Blocks(blocks)
                 } else if let Some(s) = v.as_str() {
                     mehh_ai::UserContent::Text(s.to_string())
@@ -217,14 +221,18 @@ impl ContextEditableContent {
     pub fn to_tool_result_content(&self) -> Vec<mehh_ai::ToolResultContentBlock> {
         match self {
             Self::ToolResult(blocks) => blocks.clone(),
-            Self::Text(s) => vec![mehh_ai::ToolResultContentBlock::Text(mehh_ai::TextContent {
-                text: s.clone(),
-                text_signature: None,
-            })],
-            _ => vec![mehh_ai::ToolResultContentBlock::Text(mehh_ai::TextContent {
-                text: self.to_text(),
-                text_signature: None,
-            })],
+            Self::Text(s) => vec![mehh_ai::ToolResultContentBlock::Text(
+                mehh_ai::TextContent {
+                    text: s.clone(),
+                    text_signature: None,
+                },
+            )],
+            _ => vec![mehh_ai::ToolResultContentBlock::Text(
+                mehh_ai::TextContent {
+                    text: self.to_text(),
+                    text_signature: None,
+                },
+            )],
         }
     }
 }
@@ -446,7 +454,10 @@ pub fn list_sessions(cwd: &Path) -> Result<Vec<SessionSummary>> {
                             let first_line = txt.lines().next().unwrap_or("").trim();
                             if !first_line.is_empty() {
                                 let snippet = if first_line.chars().count() > 80 {
-                                    format!("{}...", first_line.chars().take(77).collect::<String>())
+                                    format!(
+                                        "{}...",
+                                        first_line.chars().take(77).collect::<String>()
+                                    )
                                 } else {
                                     first_line.to_string()
                                 };
@@ -655,7 +666,10 @@ impl SessionManager {
             }
 
             let header = header.ok_or_else(|| {
-                anyhow!("Session file is empty or missing header: {}", file_path.display())
+                anyhow!(
+                    "Session file is empty or missing header: {}",
+                    file_path.display()
+                )
             })?;
             let leaf_id = persisted_leaf_id
                 .filter(|id| by_id.contains_key(id))
@@ -799,7 +813,11 @@ impl SessionManager {
 
     /// Sets or clears the session name via a SessionInfo entry.
     pub fn set_session_name(&mut self, name: Option<String>) -> Result<()> {
-        let trimmed = name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+        let trimmed = name
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from);
         self.append_entry(SessionEntryKind::SessionInfo { name: trimmed })?;
         Ok(())
     }
@@ -809,7 +827,11 @@ impl SessionManager {
         let path = self.active_path_entries();
         for entry in path.into_iter().rev() {
             if let SessionEntryKind::SessionInfo { name } = &entry.kind {
-                return name.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+                return name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from);
             }
         }
         None
@@ -825,7 +847,10 @@ impl SessionManager {
                     .append(true)
                     .open(path)
                     .with_context(|| {
-                        format!("Failed to persist branch selection to session file: {}", path.display())
+                        format!(
+                            "Failed to persist branch selection to session file: {}",
+                            path.display()
+                        )
                     })?;
                 let line = serde_json::to_string(&PersistedBranchSelection::new(entry_id))?;
                 writeln!(file, "{line}")?;
@@ -1043,7 +1068,9 @@ impl SessionManager {
                 .write(true)
                 .truncate(true)
                 .open(&new_path)
-                .with_context(|| format!("Failed to create new session file: {}", new_path.display()))?;
+                .with_context(|| {
+                    format!("Failed to create new session file: {}", new_path.display())
+                })?;
 
             let header_line = serde_json::to_string(&self.header)?;
             writeln!(file, "{header_line}")?;
@@ -1069,7 +1096,10 @@ impl SessionManager {
             }
         }
         path_indices.reverse();
-        path_indices.into_iter().map(|idx| &self.entries[idx]).collect()
+        path_indices
+            .into_iter()
+            .map(|idx| &self.entries[idx])
+            .collect()
     }
 
     /// Returns the working directory recorded in the session header.
@@ -1161,7 +1191,10 @@ impl SessionManager {
 
         let mut children_map: HashMap<Option<&str>, Vec<&SessionEntry>> = HashMap::new();
         for entry in &self.entries {
-            let p = entry.parent_id.as_deref().filter(|pid| self.by_id.contains_key(*pid));
+            let p = entry
+                .parent_id
+                .as_deref()
+                .filter(|pid| self.by_id.contains_key(*pid));
             children_map.entry(p).or_default().push(entry);
         }
 
@@ -1245,7 +1278,12 @@ impl SessionManager {
             .write(true)
             .truncate(true)
             .open(&new_session_path)
-            .with_context(|| format!("Failed to create forked session file: {}", new_session_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "Failed to create forked session file: {}",
+                    new_session_path.display()
+                )
+            })?;
 
         writeln!(file, "{}", serde_json::to_string(&new_header)?)?;
 
@@ -1306,7 +1344,12 @@ impl SessionManager {
             .write(true)
             .truncate(true)
             .open(&new_session_path)
-            .with_context(|| format!("Failed to create cloned session file: {}", new_session_path.display()))?;
+            .with_context(|| {
+                format!(
+                    "Failed to create cloned session file: {}",
+                    new_session_path.display()
+                )
+            })?;
 
         writeln!(file, "{}", serde_json::to_string(&new_header)?)?;
 
@@ -1350,7 +1393,10 @@ fn entry_to_label(entry: &SessionEntry) -> String {
                 let txt = a.text_content();
                 let line = txt.lines().next().unwrap_or("").trim();
                 if line.chars().count() > 40 {
-                    format!("Assistant: {}...", line.chars().take(37).collect::<String>())
+                    format!(
+                        "Assistant: {}...",
+                        line.chars().take(37).collect::<String>()
+                    )
                 } else if line.is_empty() {
                     let tc = a.tool_calls();
                     if !tc.is_empty() {
@@ -1379,7 +1425,10 @@ fn entry_to_label(entry: &SessionEntry) -> String {
         SessionEntryKind::Compaction { summary, .. } => {
             let line = summary.lines().next().unwrap_or("").trim();
             if line.chars().count() > 40 {
-                format!("Compaction: {}...", line.chars().take(37).collect::<String>())
+                format!(
+                    "Compaction: {}...",
+                    line.chars().take(37).collect::<String>()
+                )
             } else {
                 format!("Compaction: {line}")
             }
@@ -1405,18 +1454,28 @@ fn entry_to_label(entry: &SessionEntry) -> String {
                 format!("Usage: {k} ({m})")
             }
         }
-        SessionEntryKind::CustomMessage { custom_type, content, .. } => {
+        SessionEntryKind::CustomMessage {
+            custom_type,
+            content,
+            ..
+        } => {
             let txt = content.text();
             let line = txt.lines().next().unwrap_or("").trim();
             if line.chars().count() > 40 {
-                format!("CustomMessage [{custom_type}]: {}...", line.chars().take(30).collect::<String>())
+                format!(
+                    "CustomMessage [{custom_type}]: {}...",
+                    line.chars().take(30).collect::<String>()
+                )
             } else if line.is_empty() {
                 format!("CustomMessage [{custom_type}]")
             } else {
                 format!("CustomMessage [{custom_type}]: {line}")
             }
         }
-        SessionEntryKind::ContextEdit { target_id, replacement } => {
+        SessionEntryKind::ContextEdit {
+            target_id,
+            replacement,
+        } => {
             if replacement.is_some() {
                 format!("ContextEdit: replace {target_id}")
             } else {
@@ -1507,7 +1566,9 @@ mod tests {
 
         // Entry 2: Assistant reply
         let m2 = session
-            .append_message(Message::Assistant(mehh_ai::faux_assistant_message("Here is code")))
+            .append_message(Message::Assistant(mehh_ai::faux_assistant_message(
+                "Here is code",
+            )))
             .unwrap();
 
         // Entry 3: Branch A follow-up
@@ -1580,7 +1641,8 @@ mod tests {
 
     #[test]
     fn test_list_sessions() {
-        let temp_dir = std::env::temp_dir().join(format!("mehh_list_sessions_test_{}", Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("mehh_list_sessions_test_{}", Uuid::now_v7()));
         create_dir_all(&temp_dir).unwrap();
 
         // Initially empty
@@ -1617,10 +1679,16 @@ mod tests {
         let sessions = list_sessions(&temp_dir).unwrap();
         assert_eq!(sessions.len(), 2);
         // Newest timestamp first: session2 then session1
-        assert_eq!(sessions[0].first_prompt.as_deref(), Some("Second session prompt"));
+        assert_eq!(
+            sessions[0].first_prompt.as_deref(),
+            Some("Second session prompt")
+        );
         assert_eq!(sessions[0].name, None);
         assert_eq!(sessions[1].name.as_deref(), Some("First Named Session"));
-        assert_eq!(sessions[1].first_prompt.as_deref(), Some("Initial prompt for session 1"));
+        assert_eq!(
+            sessions[1].first_prompt.as_deref(),
+            Some("Initial prompt for session 1")
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
         let _ = std::fs::remove_dir_all(sdir);
@@ -1846,7 +1914,9 @@ mod tests {
 
         // Overwrite label on m1 and set label on m2
         session.append_label(&m1, Some("v2.0".to_string())).unwrap();
-        session.append_label(&m2, Some("feature".to_string())).unwrap();
+        session
+            .append_label(&m2, Some("feature".to_string()))
+            .unwrap();
 
         let rpc_tree2 = session.build_rpc_tree();
         assert_eq!(rpc_tree2[0].labels, vec!["v2.0".to_string()]);
@@ -1863,7 +1933,9 @@ mod tests {
         let session = SessionManager::create_default_file(temp.path()).unwrap();
         let res = session.fork_at(Some("non_existent_id"));
         match res {
-            Err(e) => assert!(e.to_string().contains("Target entry ID not found in session: non_existent_id")),
+            Err(e) => assert!(e
+                .to_string()
+                .contains("Target entry ID not found in session: non_existent_id")),
             Ok(_) => panic!("Expected fork_at to fail for non_existent_id"),
         }
     }
@@ -1872,8 +1944,12 @@ mod tests {
     fn test_list_sessions_reflects_latest_renamed_session_name() {
         let temp = crate::TempTestDir::new("list_rename");
         let mut session = SessionManager::create_default_file(temp.path()).unwrap();
-        session.set_session_name(Some("Original Name".to_string())).unwrap();
-        session.set_session_name(Some("Renamed Name".to_string())).unwrap();
+        session
+            .set_session_name(Some("Original Name".to_string()))
+            .unwrap();
+        session
+            .set_session_name(Some("Renamed Name".to_string()))
+            .unwrap();
 
         let list = list_sessions(temp.path()).unwrap();
         assert_eq!(list.len(), 1);
@@ -1909,6 +1985,9 @@ mod tests {
         let list = list_sessions(temp.path()).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].name, None);
-        assert_eq!(list[0].first_prompt.as_deref(), Some("Actual user goal here"));
+        assert_eq!(
+            list[0].first_prompt.as_deref(),
+            Some("Actual user goal here")
+        );
     }
 }

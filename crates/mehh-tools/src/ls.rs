@@ -1,30 +1,37 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::context::{self, PathPolicy};
+
 #[derive(Debug, Clone)]
 pub struct LsTool {
     pub cwd: PathBuf,
+    pub path_policy: PathPolicy,
 }
 
 impl LsTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            path_policy: PathPolicy::Unrestricted,
+        }
     }
 
-    fn resolve_path(&self, p: &str) -> PathBuf {
-        let path = Path::new(p);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.cwd.join(path)
-        }
+    pub fn with_path_policy(mut self, policy: PathPolicy) -> Self {
+        self.path_policy = policy;
+        self
+    }
+
+    fn resolve_path(&self, p: &str) -> Result<PathBuf, String> {
+        context::resolve_path(&self.cwd, &self.path_policy, p)
     }
 }
 
 const LS_MAX_OUTPUT_BYTES: usize = 100 * 1024;
+const LS_MAX_ENTRIES: usize = 10_000;
 
 #[async_trait]
 impl AgentTool for LsTool {
@@ -84,7 +91,7 @@ impl AgentTool for LsTool {
             .unwrap_or(500)
             .max(1) as usize;
 
-        let dir_path = self.resolve_path(&path_str);
+        let dir_path = self.resolve_path(&path_str)?;
         let cancel_clone = cancel.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -100,9 +107,14 @@ impl AgentTool for LsTool {
                 .map_err(|e| format!("Cannot read directory: {}", e))?;
 
             let mut entries = Vec::new();
+            let mut entry_cap_reached = false;
             for entry_res in read_dir {
                 if cancel_clone.is_cancelled() {
                     return Err("Tool execution cancelled".to_string());
+                }
+                if entries.len() >= LS_MAX_ENTRIES {
+                    entry_cap_reached = true;
+                    break;
                 }
 
                 let entry = match entry_res {
@@ -111,7 +123,9 @@ impl AgentTool for LsTool {
                 };
 
                 let name = entry.file_name().to_string_lossy().to_string();
-                let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                // metadata() follows symlinks, so a symlinked directory gets
+                // the '/' suffix instead of being shown as a plain file.
+                let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
 
                 if is_dir {
                     entries.push(format!("{}/", name));
@@ -149,6 +163,11 @@ impl AgentTool for LsTool {
                 output.push_str(&format!(
                     "\n\n[Output truncated at {} byte limit]",
                     LS_MAX_OUTPUT_BYTES
+                ));
+            } else if entry_cap_reached {
+                output.push_str(&format!(
+                    "\n\n[Stopped after scanning {} entries]",
+                    LS_MAX_ENTRIES
                 ));
             } else if limit_reached {
                 output.push_str(&format!(

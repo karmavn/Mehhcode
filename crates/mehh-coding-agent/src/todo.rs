@@ -1,9 +1,9 @@
-use std::path::Path;
-use std::sync::Arc;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::path::Path;
+use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -121,7 +121,11 @@ impl TodoState {
             None
         };
 
-        if self.items.is_empty() && persistent_memory.as_ref().is_none_or(|s| s.trim().is_empty()) {
+        if self.items.is_empty()
+            && persistent_memory
+                .as_ref()
+                .is_none_or(|s| s.trim().is_empty())
+        {
             return None;
         }
 

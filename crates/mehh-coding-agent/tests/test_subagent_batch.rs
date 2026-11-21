@@ -4,7 +4,9 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback};
-use mehh_ai::{faux_assistant_message, faux_model, faux_tool_call, faux_tool_call_message, FauxProvider};
+use mehh_ai::{
+    faux_assistant_message, faux_model, faux_tool_call, faux_tool_call_message, FauxProvider,
+};
 use mehh_coding_agent::subagent::SubagentTool;
 use serde_json::{json, Map, Value};
 use std::sync::Mutex;

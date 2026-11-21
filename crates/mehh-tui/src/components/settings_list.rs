@@ -3,6 +3,7 @@
 
 use crate::ansi::{truncate_to_width, visible_width, wrap_text_with_ansi};
 use crate::fuzzy::fuzzy_filter_indexed;
+use crate::theme::Theme;
 use crate::tui::Component;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +48,7 @@ pub struct SettingsList {
     pub selected: usize,
     pub max_visible: usize,
     pub filter: String,
+    pub theme: Theme,
 }
 
 impl SettingsList {
@@ -56,7 +58,13 @@ impl SettingsList {
             selected: 0,
             max_visible: max_visible.max(1),
             filter: String::new(),
+            theme: Theme::default(),
         }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     pub fn set_items(&mut self, items: Vec<SettingItem>) {
@@ -179,7 +187,12 @@ impl Component for SettingsList {
     fn render(&self, width: usize) -> Vec<String> {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
-            return vec![truncate_to_width("  No matching settings", width, "...", false)];
+            return vec![truncate_to_width(
+                "  No matching settings",
+                width,
+                "...",
+                false,
+            )];
         }
 
         let total = filtered.len();
@@ -204,9 +217,9 @@ impl Component for SettingsList {
             let is_selected = actual_idx == selected;
 
             let prefix = if is_selected {
-                "\x1b[36m> \x1b[0m"
+                self.theme.fg(&self.theme.accent, "> ")
             } else {
-                "  "
+                "  ".to_string()
             };
 
             let label_len = visible_width(&item.label);
@@ -223,9 +236,9 @@ impl Component for SettingsList {
             };
 
             let value_styled = if is_selected {
-                format!("\x1b[36m{}\x1b[0m", item.current_value)
+                self.theme.fg(&self.theme.accent, &item.current_value)
             } else {
-                format!("\x1b[2m{}\x1b[0m", item.current_value)
+                self.theme.fg(&self.theme.dim, &item.current_value)
             };
 
             let row = format!("{prefix}{label_styled}  {value_styled}");
@@ -234,7 +247,11 @@ impl Component for SettingsList {
 
         if total > max_vis {
             lines.push(truncate_to_width(
-                &format!("  \x1b[2m({}/{})\x1b[0m", selected + 1, total),
+                &format!(
+                    "  {}",
+                    self.theme
+                        .fg(&self.theme.dim, &format!("({}/{})", selected + 1, total))
+                ),
                 width,
                 "...",
                 false,
@@ -246,13 +263,22 @@ impl Component for SettingsList {
             lines.push(String::new());
             let wrapped = wrap_text_with_ansi(desc, width.saturating_sub(4).max(10));
             for w in wrapped {
-                lines.push(truncate_to_width(&format!("  \x1b[2m{w}\x1b[0m"), width, "...", false));
+                lines.push(truncate_to_width(
+                    &format!("  {}", self.theme.fg(&self.theme.dim, &w)),
+                    width,
+                    "...",
+                    false,
+                ));
             }
         }
 
         lines.push(String::new());
         lines.push(truncate_to_width(
-            "  \x1b[2mEnter/Space to change · Esc to close\x1b[0m",
+            &format!(
+                "  {}",
+                self.theme
+                    .fg(&self.theme.dim, "Enter/Space to change · Esc to close")
+            ),
             width,
             "...",
             false,
@@ -295,8 +321,11 @@ mod tests {
             SettingItem::new("theme", "Color theme", "dark")
                 .with_values(vec!["dark".into(), "light".into()])
                 .with_description("Active color theme for the TUI"),
-            SettingItem::new("mode", "Queue mode", "none")
-                .with_values(vec!["none".into(), "all".into(), "one_at_a_time".into()]),
+            SettingItem::new("mode", "Queue mode", "none").with_values(vec![
+                "none".into(),
+                "all".into(),
+                "one_at_a_time".into(),
+            ]),
         ];
         let mut list = SettingsList::new(items, 5);
 
@@ -304,7 +333,9 @@ mod tests {
         assert!(lines[0].contains("> "));
         assert!(lines[0].contains("Color theme"));
         assert!(lines[0].contains("dark"));
-        assert!(lines.iter().any(|l| l.contains("Active color theme for the TUI")));
+        assert!(lines
+            .iter()
+            .any(|l| l.contains("Active color theme for the TUI")));
 
         // Cycle theme
         let cycled = list.cycle_current();
@@ -333,10 +364,8 @@ mod tests {
 
     #[test]
     fn test_settings_list_out_of_bounds_selected_render_does_not_panic() {
-        let items = vec![
-            SettingItem::new("theme", "Color theme", "dark")
-                .with_values(vec!["dark".into(), "light".into()]),
-        ];
+        let items = vec![SettingItem::new("theme", "Color theme", "dark")
+            .with_values(vec!["dark".into(), "light".into()])];
         let mut list = SettingsList::new(items, 5);
         list.selected = 100;
         let lines = list.render(60);

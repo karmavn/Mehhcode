@@ -120,11 +120,19 @@ impl ModelRegistry {
         for (provider_name, cfg) in parsed.providers {
             let provider_trimmed = provider_name.trim().to_string();
             if provider_trimmed.is_empty() {
-                bail!("Provider key in models config '{}' cannot be empty", path.display());
+                bail!(
+                    "Provider key in models config '{}' cannot be empty",
+                    path.display()
+                );
             }
 
             let provider_key = provider_trimmed.to_ascii_lowercase();
-            if let Some(key) = cfg.api_key.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if let Some(key) = cfg
+                .api_key
+                .as_ref()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 provider_api_keys.insert(provider_key.clone(), key.to_string());
             }
 
@@ -251,7 +259,11 @@ impl ModelRegistry {
                         .max_tokens
                         .or_else(|| base_existing.map(|m| m.max_tokens))
                         .unwrap_or(16_384),
-                    headers: if headers.is_empty() { None } else { Some(headers) },
+                    headers: if headers.is_empty() {
+                        None
+                    } else {
+                        Some(headers)
+                    },
                     compat: entry
                         .compat
                         .or_else(|| base_existing.and_then(|m| m.compat.clone())),
@@ -354,7 +366,9 @@ mod tests {
         let reg = ModelRegistry::builtin_only();
         let sonnet = reg.resolve_exact("anthropic", "claude-sonnet-4-5").unwrap();
         assert!(!sonnet.base_url.is_empty());
-        assert!(reg.resolve_exact("openai", "nonexistent-model-xyz").is_none());
+        assert!(reg
+            .resolve_exact("openai", "nonexistent-model-xyz")
+            .is_none());
     }
 
     #[test]
@@ -421,7 +435,10 @@ mod tests {
         assert_eq!(compat.force_adaptive_thinking, Some(true));
         assert_eq!(compat.supports_temperature, None);
 
-        let map = model.thinking_level_map.as_ref().expect("thinking_level_map present");
+        let map = model
+            .thinking_level_map
+            .as_ref()
+            .expect("thinking_level_map present");
         assert_eq!(map.get("low"), Some(&Some("min".to_string())));
         assert_eq!(map.get("high"), Some(&Some("max".to_string())));
         assert_eq!(map.get("off"), Some(&None));

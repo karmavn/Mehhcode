@@ -1,14 +1,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use mehh_ai::{TextContent, ToolResultContentBlock};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::context::{self, PathPolicy};
+use crate::core::fs::atomic_write;
+use crate::core::output::truncate_head;
 use crate::file_mutation_queue::{get_mutation_queue_key, with_file_mutation_queue};
 
+const MAX_DIFF_BYTES: usize = 64 * 1024;
 const MAX_SNAPSHOTS_PER_FILE: usize = 20;
 pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOTAL_UNDO_BYTES: usize = 16 * 1024 * 1024;
@@ -47,6 +51,10 @@ impl EditUndoStore {
         }
     }
 
+    fn lock_inner(&self) -> MutexGuard<'_, EditUndoStoreInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn push_snapshot(&self, path: &Path, snapshot: FileSnapshot) {
         let size = match &snapshot {
             FileSnapshot::Existed { bytes, .. } => {
@@ -59,7 +67,7 @@ impl EditUndoStore {
         };
 
         let key = get_mutation_queue_key(path);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
 
         while inner.total_bytes + size > MAX_TOTAL_UNDO_BYTES && !inner.order.is_empty() {
             let oldest_key = inner.order.remove(0);
@@ -87,9 +95,21 @@ impl EditUndoStore {
         inner.order.push(key);
     }
 
+    /// Read the most recent snapshot without consuming it. Callers that write
+    /// first and pop afterwards keep the undo history if the write fails.
+    pub fn peek_snapshot(&self, path: &Path) -> Option<FileSnapshot> {
+        let key = get_mutation_queue_key(path);
+        let inner = self.lock_inner();
+        inner
+            .snapshots
+            .get(&key)
+            .and_then(|history| history.last())
+            .map(|entry| entry.snapshot.clone())
+    }
+
     pub fn pop_snapshot(&self, path: &Path) -> Option<FileSnapshot> {
         let key = get_mutation_queue_key(path);
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.lock_inner();
         let (entry, is_empty) = {
             if let Some(history) = inner.snapshots.get_mut(&key) {
                 let popped = history.pop();
@@ -116,7 +136,7 @@ impl EditUndoStore {
 
     pub fn has_snapshot(&self, path: &Path) -> bool {
         let key = get_mutation_queue_key(path);
-        let inner = self.inner.lock().unwrap();
+        let inner = self.lock_inner();
         inner.snapshots.get(&key).is_some_and(|h| !h.is_empty())
     }
 }
@@ -124,21 +144,26 @@ impl EditUndoStore {
 #[derive(Debug, Clone)]
 pub struct UndoEditTool {
     pub cwd: PathBuf,
+    pub path_policy: PathPolicy,
     pub undo_store: Arc<EditUndoStore>,
 }
 
 impl UndoEditTool {
     pub fn new(cwd: PathBuf, undo_store: Arc<EditUndoStore>) -> Self {
-        Self { cwd, undo_store }
+        Self {
+            cwd,
+            path_policy: PathPolicy::Unrestricted,
+            undo_store,
+        }
     }
 
-    fn resolve_path(&self, p: &str) -> PathBuf {
-        let path = Path::new(p);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.cwd.join(path)
-        }
+    pub fn with_path_policy(mut self, policy: PathPolicy) -> Self {
+        self.path_policy = policy;
+        self
+    }
+
+    fn resolve_path(&self, p: &str) -> Result<PathBuf, String> {
+        context::resolve_path(&self.cwd, &self.path_policy, p)
     }
 }
 
@@ -189,7 +214,7 @@ impl AgentTool for UndoEditTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter 'path'".to_string())?;
 
-        let full_path = self.resolve_path(path_str);
+        let full_path = self.resolve_path(path_str)?;
         let undo_store = self.undo_store.clone();
         let cancel_inner = cancel.clone();
 
@@ -199,7 +224,7 @@ impl AgentTool for UndoEditTool {
             }
 
             let snapshot = undo_store
-                .pop_snapshot(&full_path)
+                .peek_snapshot(&full_path)
                 .ok_or_else(|| format!("No previous edit history found for {}", path_str))?;
 
             match snapshot {
@@ -209,6 +234,7 @@ impl AgentTool for UndoEditTool {
                             .await
                             .map_err(|e| format!("Failed to remove {}: {}", path_str, e))?;
                     }
+                    undo_store.pop_snapshot(&full_path);
                     Ok(AgentToolResult::text(format!(
                         "Reverted creation of {}: file deleted.",
                         path_str
@@ -224,17 +250,18 @@ impl AgentTool for UndoEditTool {
                         None
                     };
 
-                    tokio::fs::write(&full_path, &original_bytes)
-                        .await
-                        .map_err(|e| format!("Failed to restore {}: {}", path_str, e))?;
+                    atomic_write(&full_path, &original_bytes).await?;
+                    undo_store.pop_snapshot(&full_path);
 
                     let restored_str = String::from_utf8_lossy(&original_bytes);
                     let diff = if let Some(ref curr) = current_str {
-                        similar::TextDiff::from_lines(curr.as_str(), restored_str.as_ref())
-                            .unified_diff()
-                            .context_radius(3)
-                            .header(path_str, path_str)
-                            .to_string()
+                        let raw_diff =
+                            similar::TextDiff::from_lines(curr.as_str(), restored_str.as_ref())
+                                .unified_diff()
+                                .context_radius(3)
+                                .header(path_str, path_str)
+                                .to_string();
+                        truncate_head(&raw_diff, MAX_DIFF_BYTES, "\n... [diff truncated]")
                     } else {
                         format!("Restored {} bytes", original_bytes.len())
                     };

@@ -10,8 +10,8 @@ use mehh_agent::AgentTool;
 use mehh_mcp::{
     create_mcp_agent_tools, load_mcp_configs_with_trust, ListMcpResourceTemplatesTool,
     ListMcpResourcesTool, McpAuthEntry, McpAuthStore, McpClient, McpRoot, McpServerConfig,
-    McpServerRegistry, McpToolInfo, McpTransport, OAuthTokens, ReadMcpResourceTool,
-    StdioTransport, StoredMcpBearerProvider, StreamableHttpTransport,
+    McpServerRegistry, McpToolInfo, McpTransport, OAuthTokens, ReadMcpResourceTool, StdioTransport,
+    StoredMcpBearerProvider, StreamableHttpTransport,
 };
 
 /// Connection status summary for an MCP server.
@@ -26,11 +26,26 @@ pub struct McpConnectionSummary {
 pub fn cwd_to_root_uri(cwd: &Path) -> String {
     let abs = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
     let path_str = abs.to_string_lossy().replace('\\', "/");
-    let clean = path_str.trim_start_matches("//?/");
-    if clean.starts_with('/') {
-        format!("file://{clean}")
+    // Strip the Windows extended-length (\\?\) prefix before percent-encoding.
+    // Otherwise '?' becomes %3F and the drive-letter ':' becomes %3A, so the
+    // prefix trim becomes a no-op and the drive-letter special case never fires.
+    let path_str = path_str.trim_start_matches("//?/");
+    let encoded = path_str
+        .split('/')
+        .enumerate()
+        .map(|(i, segment)| {
+            if i == 0 && segment.len() == 2 && segment.as_bytes()[1] == b':' {
+                format!("{}:", mehh_ai::percent_encode(&segment[..1]))
+            } else {
+                mehh_ai::percent_encode(segment)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    if encoded.starts_with('/') {
+        format!("file://{encoded}")
     } else {
-        format!("file:///{clean}")
+        format!("file:///{encoded}")
     }
 }
 
@@ -52,8 +67,10 @@ impl Default for McpManager {
     fn default() -> Self {
         let registry: McpServerRegistry = Arc::new(tokio::sync::RwLock::new(Vec::new()));
         let auth_store = Arc::new(McpAuthStore::try_new().unwrap_or_else(|_| {
-            let fallback = std::env::temp_dir()
-                .join(format!("mehh-mcp-auth-fallback-{}.json", std::process::id()));
+            let fallback = std::env::temp_dir().join(format!(
+                "mehh-mcp-auth-fallback-{}.json",
+                std::process::id()
+            ));
             McpAuthStore::try_with_path(fallback)
                 .expect("temp-dir MCP auth store fallback must initialize")
         }));
@@ -200,7 +217,7 @@ impl McpManager {
     ) -> anyhow::Result<Arc<dyn McpTransport>> {
         if let Some(ref cmd) = cfg.command {
             let cwd_ref = cfg.cwd.as_deref().or(Some(cwd));
-            StdioTransport::spawn(cmd, &cfg.args, &cfg.env, cwd_ref)
+            StdioTransport::spawn(cmd, cfg.args(), &cfg.env, cwd_ref)
                 .map(|t| Arc::new(t) as Arc<dyn McpTransport>)
         } else if let Some(ref url) = cfg.url {
             let needs_oauth = cfg.auth.as_deref() == Some("oauth")
@@ -248,7 +265,7 @@ impl McpManager {
         }];
 
         let timeout_duration = cfg
-            .timeout_ms
+            .effective_timeout_ms()
             .map(Duration::from_millis)
             .unwrap_or_else(|| Duration::from_secs(15));
 
@@ -285,12 +302,14 @@ impl McpManager {
 
     /// Returns true and resets the dirty flag if any server reported `notifications/tools/list_changed`.
     pub fn take_tools_dirty(&self) -> bool {
-        self.tools_dirty.swap(false, std::sync::atomic::Ordering::SeqCst)
+        self.tools_dirty
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Explicitly marks the tools dirty flag.
     pub fn mark_tools_dirty(&self) {
-        self.tools_dirty.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.tools_dirty
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Fetches the latest tools from all connected MCP clients and updates active tools.
@@ -305,6 +324,11 @@ impl McpManager {
         }
         if changed {
             self.rebuild_tools();
+            for summary in &mut self.summaries {
+                if let Some(tools) = self.server_tools.get(&summary.server) {
+                    summary.tool_count = tools.len();
+                }
+            }
         }
         Ok(changed)
     }
@@ -468,12 +492,8 @@ impl McpManager {
 
         on_url(&auth_url);
 
-        let auth_code = mehh_mcp::oauth::run_loopback_callback(
-            port,
-            &state,
-            Duration::from_secs(120),
-        )
-        .await?;
+        let auth_code =
+            mehh_mcp::oauth::run_loopback_callback(port, &state, Duration::from_secs(120)).await?;
 
         let mut form_params: HashMap<&str, &str> = HashMap::new();
         form_params.insert("grant_type", "authorization_code");
@@ -533,9 +553,8 @@ mod tests {
     #[tokio::test]
     async fn test_mcp_manager_empty_configs() {
         let temp_dir = crate::TempTestDir::new("mcp_mgr");
-        let store = Arc::new(
-            McpAuthStore::try_with_path(temp_dir.path().join("mcp-auth.json")).unwrap(),
-        );
+        let store =
+            Arc::new(McpAuthStore::try_with_path(temp_dir.path().join("mcp-auth.json")).unwrap());
         let configs = HashMap::new();
         let mgr = McpManager::connect_with_configs(temp_dir.path(), configs, store).await;
         assert!(mgr.tools().is_empty());
@@ -554,6 +573,28 @@ mod tests {
         let unix_p = Path::new("/var/project");
         let unix_uri = cwd_to_root_uri(unix_p);
         assert!(unix_uri.starts_with("file://"));
+    }
+
+    #[test]
+    fn test_cwd_to_root_uri_existing_dir_has_no_encoded_extended_prefix() {
+        // Use a real directory so canonicalize() succeeds. On Windows the canonical
+        // path carries the \\?\ extended-length prefix; it must be stripped before
+        // percent-encoding, and the drive-letter colon must remain unescaped.
+        let dir = std::env::temp_dir();
+        let uri = cwd_to_root_uri(&dir);
+        assert!(uri.starts_with("file:///"), "unexpected uri: {uri}");
+        assert!(
+            !uri.contains("%3F"),
+            "extended-length '?' leaked into uri: {uri}"
+        );
+        assert!(
+            !uri.contains("%3A"),
+            "drive-letter colon was percent-encoded: {uri}"
+        );
+        assert!(
+            !uri.contains("//%"),
+            "double-encoded prefix leaked into uri: {uri}"
+        );
     }
 
     #[tokio::test]
@@ -587,8 +628,8 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_changed_refreshes_catalog_and_codemode() {
-        use mehh_mcp::transport::{InMemoryTransport, McpTransport};
         use mehh_mcp::jsonrpc::{JsonRpcMessage, JsonRpcNotification, JsonRpcResponse};
+        use mehh_mcp::transport::{InMemoryTransport, McpTransport};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let (client_transport, server_transport) = InMemoryTransport::pair();
@@ -611,7 +652,10 @@ mod tests {
                             "serverInfo": { "name": "mock-server", "version": "1.0.0" }
                         }),
                     );
-                    server_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+                    server_transport
+                        .send(JsonRpcMessage::Response(resp))
+                        .await
+                        .unwrap();
                 }
                 let _ = server_transport.recv().await; // notifications/initialized
 
@@ -639,8 +683,14 @@ mod tests {
                                     }),
                                 ]
                             };
-                            let resp = JsonRpcResponse::success(req.id, serde_json::json!({ "tools": tools }));
-                            server_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+                            let resp = JsonRpcResponse::success(
+                                req.id,
+                                serde_json::json!({ "tools": tools }),
+                            );
+                            server_transport
+                                .send(JsonRpcMessage::Response(resp))
+                                .await
+                                .unwrap();
                         }
                         _ => {}
                     }
@@ -695,8 +745,14 @@ mod tests {
         session.enable_mcp_and_codemode(mgr.tools().to_vec(), true);
         assert!(!mgr.take_tools_dirty());
         let codemode = session.codemode_tool().expect("codemode should be enabled");
-        assert!(codemode.tools().iter().any(|t| t.name() == "mcp__mock__initial_tool"));
-        assert!(!codemode.tools().iter().any(|t| t.name() == "mcp__mock__new_tool"));
+        assert!(codemode
+            .tools()
+            .iter()
+            .any(|t| t.name() == "mcp__mock__initial_tool"));
+        assert!(!codemode
+            .tools()
+            .iter()
+            .any(|t| t.name() == "mcp__mock__new_tool"));
 
         // Now simulate server notifying tools/list_changed
         server_transport
@@ -708,15 +764,26 @@ mod tests {
             .unwrap();
 
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(mgr.take_tools_dirty(), "dirty flag must be true after notification");
+        assert!(
+            mgr.take_tools_dirty(),
+            "dirty flag must be true after notification"
+        );
 
         let refreshed = mgr.refresh_server_tools().await.unwrap();
         assert!(refreshed);
 
         session.sync_mcp_tools(mgr.tools().to_vec(), true);
-        let updated_codemode = session.codemode_tool().expect("codemode should still be present");
-        assert!(updated_codemode.tools().iter().any(|t| t.name() == "mcp__mock__initial_tool"));
-        assert!(updated_codemode.tools().iter().any(|t| t.name() == "mcp__mock__new_tool"));
+        let updated_codemode = session
+            .codemode_tool()
+            .expect("codemode should still be present");
+        assert!(updated_codemode
+            .tools()
+            .iter()
+            .any(|t| t.name() == "mcp__mock__initial_tool"));
+        assert!(updated_codemode
+            .tools()
+            .iter()
+            .any(|t| t.name() == "mcp__mock__new_tool"));
 
         mgr.close_all().await;
     }

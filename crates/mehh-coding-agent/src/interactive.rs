@@ -14,12 +14,15 @@ use crossterm::event::{Event, MouseEventKind};
 use futures::FutureExt;
 use mehh_agent::{run_agent_loop, AgentEvent, AgentTool, QueueMode};
 use mehh_ai::oauth::{self, OAuthProviderKind, StoredCredential};
-use mehh_ai::{AssistantContentBlock, AssistantMessageEvent, Message, StopReason, ThinkingLevel};
+use mehh_ai::{
+    AssistantContentBlock, AssistantMessageEvent, Message, StopReason, ThinkingLevel, UserContent,
+    UserContentBlock,
+};
 use mehh_tui::{
     normalize_crossterm_key, truncate_to_width, wrap_text_with_ansi, BorderStyle, BorderedBox,
     Component, CrosstermTerminal, Editor, EditorOutput, Keybindings, Loader, MarkdownView,
-    SelectItem, SelectList, SettingItem, SettingsList, Terminal, Theme, TuiAction, TuiRenderer,
-    WheelScrollAccelerator,
+    SelectItem, SelectList, SettingItem, SettingsList, Terminal, Text, Theme, TuiAction,
+    TuiRenderer, WheelScrollAccelerator,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -41,7 +44,10 @@ pub struct SubagentChildRow {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TranscriptItem {
     User(String),
-    Assistant { thinking: String, text: String },
+    Assistant {
+        thinking: String,
+        text: String,
+    },
     ToolCall {
         id: String,
         name: String,
@@ -124,7 +130,11 @@ impl crate::tool_inspection::ApprovalHandler for InteractiveApprovalBroker {
             preview: preview.map(str::to_string),
             reply_tx,
         };
-        if self.tx.send(AgentSignal::ToolApprovalRequest(pending)).is_err() {
+        if self
+            .tx
+            .send(AgentSignal::ToolApprovalRequest(pending))
+            .is_err()
+        {
             return false;
         }
         reply_rx.await.unwrap_or(false)
@@ -224,28 +234,35 @@ pub fn route_busy_input(input: &str) -> BusyInput {
 pub fn builtin_slash_commands() -> Vec<SelectItem> {
     vec![
         SelectItem::new("/help", "/help").with_description("Show help and available commands"),
-        SelectItem::new("/mode", "/mode").with_description("Set permission mode (auto/smart_approve/approve/chat)"),
+        SelectItem::new("/mode", "/mode")
+            .with_description("Set permission mode (auto/smart_approve/approve/chat)"),
         SelectItem::new("/new", "/new").with_description("Start a fresh session"),
         SelectItem::new("/compact", "/compact").with_description("Compact session history"),
         SelectItem::new("/model", "/model").with_description("Switch active model"),
-        SelectItem::new("/thinking", "/thinking").with_description("Set thinking level (off/low/medium/high)"),
-        SelectItem::new("/theme", "/theme").with_description("Set color theme (dark/light or theme name)"),
+        SelectItem::new("/thinking", "/thinking")
+            .with_description("Set thinking level (off/low/medium/high)"),
+        SelectItem::new("/theme", "/theme")
+            .with_description("Set color theme (dark/light or theme name)"),
         SelectItem::new("/settings", "/settings").with_description("Browse and toggle settings"),
         SelectItem::new("/tools", "/tools").with_description("List active tools"),
-        SelectItem::new("/mcp", "/mcp").with_description("MCP server status, reconnect, auth and resources"),
+        SelectItem::new("/mcp", "/mcp")
+            .with_description("MCP server status, reconnect, auth and resources"),
         SelectItem::new("/tree", "/tree").with_description("Browse and switch session branches"),
         SelectItem::new("/fork", "/fork").with_description("Fork the session at an entry"),
         SelectItem::new("/clone", "/clone").with_description("Clone the current session"),
         SelectItem::new("/resume", "/resume").with_description("Resume a saved session"),
         SelectItem::new("/login", "/login").with_description("Log in to a provider"),
-        SelectItem::new("/logout", "/logout").with_description("Remove a stored provider credential"),
+        SelectItem::new("/logout", "/logout")
+            .with_description("Remove a stored provider credential"),
         SelectItem::new("/follow-up", "/follow-up").with_description("Queue a follow-up message"),
         SelectItem::new("/copy", "/copy").with_description("Copy last agent message to clipboard"),
         SelectItem::new("/name", "/name").with_description("Set session display name"),
         SelectItem::new("/session", "/session").with_description("Show session info and stats"),
         SelectItem::new("/hotkeys", "/hotkeys").with_description("Show all keyboard shortcuts"),
-        SelectItem::new("/reload", "/reload").with_description("Reload keybindings, skills, prompts, themes, and context files"),
-        SelectItem::new("/scoped-models", "/scoped-models").with_description("Enable/disable models for cycling"),
+        SelectItem::new("/reload", "/reload")
+            .with_description("Reload keybindings, skills, prompts, themes, and context files"),
+        SelectItem::new("/scoped-models", "/scoped-models")
+            .with_description("Enable/disable models for cycling"),
         SelectItem::new("/export", "/export").with_description("Export session to a JSONL file"),
         SelectItem::new("/import", "/import").with_description("Import a JSONL session"),
         SelectItem::new("/clear", "/clear").with_description("Clear terminal transcript"),
@@ -275,11 +292,7 @@ pub fn copy_toggle(target: &mut Settings, source: &Settings, key: &str) {
 /// The target file is loaded first, so a malformed file is reported instead of
 /// overwritten, and only the changed key is written, so project-local values of
 /// the other keys are not promoted into the global configuration.
-pub fn persist_settings(
-    settings: &Settings,
-    key: &str,
-    path: Option<&Path>,
-) -> anyhow::Result<()> {
+pub fn persist_settings(settings: &Settings, key: &str, path: Option<&Path>) -> anyhow::Result<()> {
     let file_path = match path {
         Some(p) => p.to_path_buf(),
         None => SettingsManager::global_path()?,
@@ -339,9 +352,7 @@ pub async fn perform_login(
     }
 
     let kind = crate::auth::oauth_kind_for_provider(provider).ok_or_else(|| {
-        anyhow::anyhow!(
-            "Provider '{provider}' does not support OAuth. Provide an API key instead."
-        )
+        anyhow::anyhow!("Provider '{provider}' does not support OAuth. Provide an API key instead.")
     })?;
 
     let client = mehh_ai::default_http_client();
@@ -431,10 +442,15 @@ async fn login_via_device_flow(client: &reqwest::Client) -> anyhow::Result<Store
     let deadline = std::time::Instant::now() + Duration::from_secs(challenge.expires_in_secs);
     let interval = Duration::from_secs(challenge.interval_secs.max(1));
 
+    let mut poll_interval = interval;
     while std::time::Instant::now() < deadline {
-        tokio::time::sleep(interval).await;
-        if let Some(cred) = oauth::poll_copilot_device_token(client, &challenge.device_code).await? {
-            return Ok(cred);
+        tokio::time::sleep(poll_interval).await;
+        match oauth::poll_copilot_device_token(client, &challenge.device_code).await? {
+            oauth::CopilotDevicePoll::Complete(cred) => return Ok(cred),
+            oauth::CopilotDevicePoll::SlowDown => {
+                poll_interval += Duration::from_secs(5);
+            }
+            oauth::CopilotDevicePoll::Pending => {}
         }
     }
 
@@ -468,7 +484,12 @@ fn message_to_transcript_item(message: &Message) -> TranscriptItem {
             is_error: tr.is_error,
             args_summary: String::new(),
             output_preview: Vec::new(),
-            diff: tr.details.as_ref().and_then(|d| d.get("diff")).and_then(|v| v.as_str()).map(str::to_string),
+            diff: tr
+                .details
+                .as_ref()
+                .and_then(|d| d.get("diff"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
         },
         Message::System(s) => TranscriptItem::System(s.content.clone()),
     }
@@ -641,6 +662,46 @@ fn build_settings_list(settings: &Settings) -> SettingsList {
     SettingsList::new(items, 8)
 }
 
+/// Rebuild the settings overlay after a toggle without moving the cursor.
+/// `SelectList::set_items` resets selection to zero, so restore it explicitly.
+fn refresh_settings_selector(state: &mut InteractiveState, settings: &Settings) {
+    let prev = state
+        .selector
+        .as_ref()
+        .map(|sel| sel.list.selected)
+        .unwrap_or(0);
+    if let Some(sel) = state.selector.as_mut() {
+        sel.list.set_items(settings_selector_items(settings));
+        sel.list.selected = prev.min(sel.list.items.len().saturating_sub(1));
+        let mut detail = build_settings_list(settings);
+        detail.selected = sel.list.selected;
+        sel.settings_list = Some(detail);
+    }
+}
+
+/// Feed a typed character or Backspace into a picker's fuzzy filter.
+/// Returns false for navigation/action keys so the caller keeps handling them.
+fn update_selector_filter(selector: &mut Selector, key: &str) -> bool {
+    let next = if key == "backspace" {
+        let mut filter = selector.list.filter.clone();
+        if filter.pop().is_none() {
+            return true;
+        }
+        filter
+    } else if key.chars().count() == 1
+        && key.chars().all(|c| !c.is_control() && !c.is_whitespace())
+    {
+        format!("{}{}", selector.list.filter, key)
+    } else {
+        return false;
+    };
+    selector.list.set_filter(&next);
+    if let Some(ref mut detail) = selector.settings_list {
+        detail.set_filter(&next);
+    }
+    true
+}
+
 /// Cycles a single setting value and applies it to the running session.
 fn apply_setting_cycle(
     key: &str,
@@ -708,19 +769,6 @@ fn apply_setting_cycle(
     }
 }
 
-/// Returns true when a tool name belongs to the MCP or codemode tool family.
-fn is_derived_tool(name: &str) -> bool {
-    name.starts_with("mcp__")
-        || matches!(
-            name,
-            "list_mcp_resources"
-                | "list_mcp_resource_templates"
-                | "read_mcp_resource"
-                | "codemode"
-                | "tool_search"
-        )
-}
-
 /// Splits a rendered system prompt into its preamble and its addendum.
 fn split_system_prompt(prompt: &str) -> (Option<String>, Option<String>) {
     let mut sections = prompt.split("\n\n");
@@ -753,28 +801,15 @@ fn sync_mcp_tools(
     mcp_tools: Vec<Arc<dyn AgentTool>>,
     codemode_enabled: bool,
 ) {
-    let has_explicit_overrides =
-        session.custom_system_prompt.is_some() || session.append_system_prompt.is_some();
-    let (preamble, addendum) = if has_explicit_overrides {
-        (None, None)
-    } else {
-        split_system_prompt(&session.system_prompt)
-    };
-
-    session.tools.retain(|t| !is_derived_tool(t.name()));
-    session.clear_deferred_mcp_tools();
-    session.enable_mcp_and_codemode(mcp_tools, codemode_enabled);
-
-    if !has_explicit_overrides {
-        let tool_names: Vec<&str> = session.tools().iter().map(|t| t.name()).collect();
-        session.set_system_prompt(crate::system_prompt::build_system_prompt_with_skills(
-            &session.cwd,
-            preamble.as_deref(),
-            addendum.as_deref(),
-            &tool_names,
-            session.skills(),
-        ));
+    // `AgentSession::sync_mcp_tools` preserves the CodemodeTool and deferred
+    // catalog handles. Carry rendered prompt overrides into its explicit slots
+    // so rebuilding the system prompt does not drop them.
+    if session.custom_system_prompt.is_none() && session.append_system_prompt.is_none() {
+        let (preamble, addendum) = split_system_prompt(&session.system_prompt);
+        session.custom_system_prompt = preamble;
+        session.append_system_prompt = addendum;
     }
+    session.sync_mcp_tools(mcp_tools, codemode_enabled);
 }
 
 /// Switches the session's model via [`ModelRegistry`] and asynchronously refreshes credentials.
@@ -793,14 +828,15 @@ async fn apply_interactive_model_switch(
         }
     };
     let Some(m) = reg.resolve(target, None) else {
-        state.items.push(TranscriptItem::System(format!(
-            "Unknown model: '{target}'"
-        )));
+        state
+            .items
+            .push(TranscriptItem::System(format!("Unknown model: '{target}'")));
         return;
     };
 
     let resolved_key = if m.provider != "faux" && m.api != "faux" {
-        match crate::auth::resolve_api_key_async(&m.provider, None, state.auth_file.as_deref()).await
+        match crate::auth::resolve_api_key_async(&m.provider, None, state.auth_file.as_deref())
+            .await
         {
             Ok(key) => key.or_else(|| reg.provider_api_key(&m.provider).map(str::to_string)),
             Err(e) => {
@@ -837,7 +873,10 @@ pub fn format_hotkeys(keybindings: &Keybindings) -> String {
         (TuiAction::Newline, "Insert newline"),
         (TuiAction::Interrupt, "Cancel turn / Interrupt"),
         (TuiAction::ClearOrExit, "Exit interactive session"),
-        (TuiAction::TabComplete, "Autocomplete slash commands / files"),
+        (
+            TuiAction::TabComplete,
+            "Autocomplete slash commands / files",
+        ),
         (TuiAction::ScrollUp, "Scroll up"),
         (TuiAction::ScrollDown, "Scroll down"),
         (TuiAction::HistoryPrev, "Previous history item"),
@@ -873,7 +912,10 @@ pub async fn handle_slash_command(
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next();
     let rest = parts.collect::<Vec<_>>().join(" ");
-    let full_arg = trimmed.strip_prefix(cmd).map(str::trim).filter(|s| !s.is_empty());
+    let full_arg = trimmed
+        .strip_prefix(cmd)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
 
     match cmd {
         "/exit" | "/quit" => SlashCommandOutcome::Quit,
@@ -913,7 +955,9 @@ Keybindings:
   Ctrl+C       Interrupt the turn, clear the input, or exit on an empty prompt
   Esc          Interrupt the turn, clear the input, or exit on an empty prompt
   Up / Down    Navigate history or autocomplete";
-            state.items.push(TranscriptItem::System(help_text.to_string()));
+            state
+                .items
+                .push(TranscriptItem::System(help_text.to_string()));
             SlashCommandOutcome::Handled
         }
         "/mode" => {
@@ -922,7 +966,10 @@ Keybindings:
                     Ok(new_mode) => {
                         session.inspection_manager.set_mode(new_mode).await;
                         session.settings.permission_mode = Some(new_mode);
-                        state.items.push(TranscriptItem::System(format!("Permission mode set to: {:?}", new_mode)));
+                        state.items.push(TranscriptItem::System(format!(
+                            "Permission mode set to: {:?}",
+                            new_mode
+                        )));
                     }
                     Err(e) => {
                         state.items.push(TranscriptItem::System(e));
@@ -1005,19 +1052,27 @@ Keybindings:
                 match level_str.to_lowercase().as_str() {
                     "off" | "none" => {
                         session.set_thinking_level(None);
-                        state.items.push(TranscriptItem::System("Thinking disabled".to_string()));
+                        state
+                            .items
+                            .push(TranscriptItem::System("Thinking disabled".to_string()));
                     }
                     "low" => {
                         session.set_thinking_level(Some(ThinkingLevel::Low));
-                        state.items.push(TranscriptItem::System("Thinking set to low".to_string()));
+                        state
+                            .items
+                            .push(TranscriptItem::System("Thinking set to low".to_string()));
                     }
                     "medium" | "med" => {
                         session.set_thinking_level(Some(ThinkingLevel::Medium));
-                        state.items.push(TranscriptItem::System("Thinking set to medium".to_string()));
+                        state
+                            .items
+                            .push(TranscriptItem::System("Thinking set to medium".to_string()));
                     }
                     "high" => {
                         session.set_thinking_level(Some(ThinkingLevel::High));
-                        state.items.push(TranscriptItem::System("Thinking set to high".to_string()));
+                        state
+                            .items
+                            .push(TranscriptItem::System("Thinking set to high".to_string()));
                     }
                     other => {
                         state.items.push(TranscriptItem::System(format!(
@@ -1083,7 +1138,11 @@ Keybindings:
         }
         "/tools" => {
             let tool_names: Vec<&str> = session.tools().iter().map(|t| t.name()).collect();
-            let summary = format!("Active tools ({}): {}", tool_names.len(), tool_names.join(", "));
+            let summary = format!(
+                "Active tools ({}): {}",
+                tool_names.len(),
+                tool_names.join(", ")
+            );
             state.items.push(TranscriptItem::System(summary));
             SlashCommandOutcome::Handled
         }
@@ -1107,7 +1166,9 @@ Keybindings:
                                 ));
                             }
                         }
-                        state.items.push(TranscriptItem::System(out.trim_end().to_string()));
+                        state
+                            .items
+                            .push(TranscriptItem::System(out.trim_end().to_string()));
                     }
                 }
                 Some("reconnect") => {
@@ -1177,43 +1238,43 @@ Keybindings:
                         }
                     }
                 }
-                Some("resources") => {
-                    match mcp_manager {
-                        None => state.items.push(TranscriptItem::System(
-                            "MCP is not enabled for this session.".to_string(),
-                        )),
-                        Some(mgr) => {
-                            let registry = mgr.registry();
-                            let entries = registry.read().await.clone();
-                            if entries.is_empty() {
-                                state.items.push(TranscriptItem::System(
-                                    "No MCP servers are connected.".to_string(),
-                                ));
-                            } else {
-                                let mut out = String::from("MCP Resources:\n");
-                                for (server, client) in entries {
-                                    match client.list_resources().await {
-                                        Ok(resources) if resources.is_empty() => {
-                                            out.push_str(&format!("  - {server}: no resources\n"));
-                                        }
-                                        Ok(resources) => {
-                                            for r in resources {
-                                                out.push_str(&format!(
-                                                    "  - {server}: {} ({})\n",
-                                                    r.name, r.uri
-                                                ));
-                                            }
-                                        }
-                                        Err(e) => {
-                                            out.push_str(&format!("  - {server}: error: {e}\n"));
+                Some("resources") => match mcp_manager {
+                    None => state.items.push(TranscriptItem::System(
+                        "MCP is not enabled for this session.".to_string(),
+                    )),
+                    Some(mgr) => {
+                        let registry = mgr.registry();
+                        let entries = registry.read().await.clone();
+                        if entries.is_empty() {
+                            state.items.push(TranscriptItem::System(
+                                "No MCP servers are connected.".to_string(),
+                            ));
+                        } else {
+                            let mut out = String::from("MCP Resources:\n");
+                            for (server, client) in entries {
+                                match client.list_resources().await {
+                                    Ok(resources) if resources.is_empty() => {
+                                        out.push_str(&format!("  - {server}: no resources\n"));
+                                    }
+                                    Ok(resources) => {
+                                        for r in resources {
+                                            out.push_str(&format!(
+                                                "  - {server}: {} ({})\n",
+                                                r.name, r.uri
+                                            ));
                                         }
                                     }
+                                    Err(e) => {
+                                        out.push_str(&format!("  - {server}: error: {e}\n"));
+                                    }
                                 }
-                                state.items.push(TranscriptItem::System(out.trim_end().to_string()));
                             }
+                            state
+                                .items
+                                .push(TranscriptItem::System(out.trim_end().to_string()));
                         }
                     }
-                }
+                },
                 Some(other) => {
                     state.items.push(TranscriptItem::System(format!(
                         "Unknown /mcp subcommand: '{other}'. Use status, reconnect, auth or resources."
@@ -1225,7 +1286,7 @@ Keybindings:
         "/tree" => {
             match arg {
                 Some(arg_str) => {
-                    let parts = arg_str.split_whitespace();
+                    let parts = full_arg.unwrap_or(arg_str).split_whitespace();
                     let mut entry_id = None;
                     let mut summarize = false;
                     for p in parts {
@@ -1241,7 +1302,10 @@ Keybindings:
                                 state.items = rebuild_transcript_items(session);
                                 state.scroll_offset = 0;
                                 let msg = if let Some(s) = summary_opt {
-                                    format!("Switched to branch at {id} with branch summary ({})", s.len())
+                                    format!(
+                                        "Switched to branch at {id} with branch summary ({})",
+                                        s.len()
+                                    )
                                 } else {
                                     format!("Switched to branch at {id}")
                                 };
@@ -1256,9 +1320,9 @@ Keybindings:
                 None => {
                     let tree = session.session().build_tree();
                     if tree.is_empty() {
-                        state.items.push(TranscriptItem::System(
-                            "Session tree is empty.".to_string(),
-                        ));
+                        state
+                            .items
+                            .push(TranscriptItem::System("Session tree is empty.".to_string()));
                     } else {
                         let items: Vec<SelectItem> = tree
                             .iter()
@@ -1310,8 +1374,9 @@ Keybindings:
                             "Forked session into {new_id}"
                         )));
                     }
-                    Err(e) => state.items
-                        .push(TranscriptItem::System(format!("Failed to fork session: {e}"))),
+                    Err(e) => state.items.push(TranscriptItem::System(format!(
+                        "Failed to fork session: {e}"
+                    ))),
                 },
             }
             SlashCommandOutcome::Handled
@@ -1327,9 +1392,9 @@ Keybindings:
                         "Cloned session into {new_id}"
                     )));
                 }
-                Err(e) => state
-                    .items
-                    .push(TranscriptItem::System(format!("Failed to clone session: {e}"))),
+                Err(e) => state.items.push(TranscriptItem::System(format!(
+                    "Failed to clone session: {e}"
+                ))),
             }
             SlashCommandOutcome::Handled
         }
@@ -1385,7 +1450,8 @@ Keybindings:
                 }
                 None => {
                     let items = vec![
-                        SelectItem::new("anthropic", "anthropic").with_description("Claude (OAuth)"),
+                        SelectItem::new("anthropic", "anthropic")
+                            .with_description("Claude (OAuth)"),
                         SelectItem::new("openai", "openai").with_description("ChatGPT (OAuth)"),
                         SelectItem::new("github-copilot", "github-copilot")
                             .with_description("GitHub Copilot (device code)"),
@@ -1419,16 +1485,16 @@ Keybindings:
             SlashCommandOutcome::Handled
         }
         "/follow-up" => {
-            let text = rest.trim();
+            let text = full_arg.unwrap_or_default().trim();
             if text.is_empty() {
                 state.items.push(TranscriptItem::System(
                     "Usage: /follow-up <text>".to_string(),
                 ));
             } else {
                 session.follow_up(text.to_string());
-                state.items.push(TranscriptItem::System(format!(
-                    "Queued follow-up: {text}"
-                )));
+                state
+                    .items
+                    .push(TranscriptItem::System(format!("Queued follow-up: {text}")));
             }
             SlashCommandOutcome::Handled
         }
@@ -1442,15 +1508,21 @@ Keybindings:
                 Some(text) if !text.trim().is_empty() => {
                     match crate::clipboard::copy_to_clipboard(&text) {
                         Ok(()) => {
-                            state.items.push(TranscriptItem::System("Copied message to clipboard.".to_string()));
+                            state.items.push(TranscriptItem::System(
+                                "Copied message to clipboard.".to_string(),
+                            ));
                         }
                         Err(err) => {
-                            state.items.push(TranscriptItem::System(format!("Failed to copy to clipboard: {err}")));
+                            state.items.push(TranscriptItem::System(format!(
+                                "Failed to copy to clipboard: {err}"
+                            )));
                         }
                     }
                 }
                 _ => {
-                    state.items.push(TranscriptItem::System("No assistant message to copy.".to_string()));
+                    state.items.push(TranscriptItem::System(
+                        "No assistant message to copy.".to_string(),
+                    ));
                 }
             }
             SlashCommandOutcome::Handled
@@ -1459,12 +1531,19 @@ Keybindings:
             match full_arg {
                 Some(name) => {
                     let trimmed = name.trim().to_string();
-                    match session.session_mut().set_session_name(Some(trimmed.clone())) {
+                    match session
+                        .session_mut()
+                        .set_session_name(Some(trimmed.clone()))
+                    {
                         Ok(()) => {
-                            state.items.push(TranscriptItem::System(format!("Set session name to '{trimmed}'")));
+                            state.items.push(TranscriptItem::System(format!(
+                                "Set session name to '{trimmed}'"
+                            )));
                         }
                         Err(e) => {
-                            state.items.push(TranscriptItem::System(format!("Failed to set session name: {e}")));
+                            state.items.push(TranscriptItem::System(format!(
+                                "Failed to set session name: {e}"
+                            )));
                         }
                     }
                 }
@@ -1477,9 +1556,13 @@ Keybindings:
                         }
                     });
                     if let Some(n) = current_name {
-                        state.items.push(TranscriptItem::System(format!("Session name: '{n}'")));
+                        state
+                            .items
+                            .push(TranscriptItem::System(format!("Session name: '{n}'")));
                     } else {
-                        state.items.push(TranscriptItem::System("Session has no name set.".to_string()));
+                        state.items.push(TranscriptItem::System(
+                            "Session has no name set.".to_string(),
+                        ));
                     }
                 }
             }
@@ -1492,7 +1575,10 @@ Keybindings:
             let msg_count = messages.len();
             let tokens = crate::compaction::estimate_context_tokens(&messages);
             let s_id = s.session_id();
-            let s_file = s.file_path().map(|p| p.display().to_string()).unwrap_or_else(|| "in-memory".to_string());
+            let s_file = s
+                .file_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "in-memory".to_string());
             let m_id = &session.model().id;
             let m_prov = &session.model().provider;
             let thinking = session.thinking_level();
@@ -1502,14 +1588,18 @@ Keybindings:
             SlashCommandOutcome::Handled
         }
         "/hotkeys" => {
-            state.items.push(TranscriptItem::System(format_hotkeys(&state.keybindings)));
+            state
+                .items
+                .push(TranscriptItem::System(format_hotkeys(&state.keybindings)));
             SlashCommandOutcome::Handled
         }
         "/reload" => {
             session.reload();
             state.theme = Theme::load(session.settings.theme.as_deref());
             state.keybindings = Keybindings::default_bindings();
-            state.items.push(TranscriptItem::System("Reloaded settings, skills, and prompt templates.".to_string()));
+            state.items.push(TranscriptItem::System(
+                "Reloaded settings, skills, and prompt templates.".to_string(),
+            ));
             SlashCommandOutcome::Handled
         }
         "/scoped-models" => {
@@ -1517,7 +1607,10 @@ Keybindings:
                 Some(arg_str) => {
                     if let Ok(reg) = crate::models_config::ModelRegistry::load_default() {
                         let mut resolved = Vec::new();
-                        for token in arg_str.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
+                        for token in arg_str
+                            .split(|c: char| c == ',' || c.is_whitespace())
+                            .filter(|t| !t.is_empty())
+                        {
                             let parts: Vec<&str> = token.split('/').collect();
                             let model_opt = if parts.len() == 2 {
                                 reg.resolve_exact(parts[0], parts[1])
@@ -1530,32 +1623,50 @@ Keybindings:
                         }
                         let count = resolved.len();
                         session.set_scoped_models(resolved);
-                        state.items.push(TranscriptItem::System(format!("Configured {count} scoped models for cycling.")));
+                        state.items.push(TranscriptItem::System(format!(
+                            "Configured {count} scoped models for cycling."
+                        )));
                     } else {
-                        state.items.push(TranscriptItem::System("Failed to load models registry.".to_string()));
+                        state.items.push(TranscriptItem::System(
+                            "Failed to load models registry.".to_string(),
+                        ));
                     }
                 }
                 None => {
                     let current = session.scoped_models();
                     if current.is_empty() {
-                        state.items.push(TranscriptItem::System("No scoped models configured (cycles through all models).".to_string()));
+                        state.items.push(TranscriptItem::System(
+                            "No scoped models configured (cycles through all models).".to_string(),
+                        ));
                     } else {
-                        let names: Vec<String> = current.iter().map(|m| format!("{}/{}", m.provider, m.id)).collect();
-                        state.items.push(TranscriptItem::System(format!("Scoped models:\n  {}", names.join("\n  "))));
+                        let names: Vec<String> = current
+                            .iter()
+                            .map(|m| format!("{}/{}", m.provider, m.id))
+                            .collect();
+                        state.items.push(TranscriptItem::System(format!(
+                            "Scoped models:\n  {}",
+                            names.join("\n  ")
+                        )));
                     }
                 }
             }
             SlashCommandOutcome::Handled
         }
         "/export" => {
-            let default_path = PathBuf::from(format!("session_{}.jsonl", session.session().session_id()));
+            let default_path =
+                PathBuf::from(format!("session_{}.jsonl", session.session().session_id()));
             let out_path = full_arg.map(PathBuf::from).unwrap_or(default_path);
             match session.session().export_jsonl(&out_path) {
                 Ok(()) => {
-                    state.items.push(TranscriptItem::System(format!("Exported session to {}", out_path.display())));
+                    state.items.push(TranscriptItem::System(format!(
+                        "Exported session to {}",
+                        out_path.display()
+                    )));
                 }
                 Err(e) => {
-                    state.items.push(TranscriptItem::System(format!("Failed to export session: {e}")));
+                    state.items.push(TranscriptItem::System(format!(
+                        "Failed to export session: {e}"
+                    )));
                 }
             }
             SlashCommandOutcome::Handled
@@ -1570,15 +1681,22 @@ Keybindings:
                             session.session = new_session;
                             state.items = rebuild_transcript_items(session);
                             state.scroll_offset = 0;
-                            state.items.push(TranscriptItem::System(format!("Imported session {id} from {}", path.display())));
+                            state.items.push(TranscriptItem::System(format!(
+                                "Imported session {id} from {}",
+                                path.display()
+                            )));
                         }
                         Err(e) => {
-                            state.items.push(TranscriptItem::System(format!("Failed to import session: {e}")));
+                            state.items.push(TranscriptItem::System(format!(
+                                "Failed to import session: {e}"
+                            )));
                         }
                     }
                 }
                 None => {
-                    state.items.push(TranscriptItem::System("Usage: /import <session_file.jsonl>".to_string()));
+                    state.items.push(TranscriptItem::System(
+                        "Usage: /import <session_file.jsonl>".to_string(),
+                    ));
                 }
             }
             SlashCommandOutcome::Handled
@@ -1602,10 +1720,8 @@ fn resume_selector_items(sessions: &[SessionSummary]) -> Vec<SelectItem> {
                 .clone()
                 .or_else(|| s.first_prompt.clone())
                 .unwrap_or_else(|| s.id.clone());
-            SelectItem::new(s.path.display().to_string(), label).with_description(format!(
-                "{} • {} entries",
-                s.timestamp, s.entry_count
-            ))
+            SelectItem::new(s.path.display().to_string(), label)
+                .with_description(format!("{} • {} entries", s.timestamp, s.entry_count))
         })
         .collect()
 }
@@ -1666,35 +1782,36 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 }
             }
         }
-        AgentEvent::MessageUpdate { assistant_message_event, .. } => {
-            match assistant_message_event {
-                AssistantMessageEvent::TextDelta { delta, .. } => {
-                    if let Some(TranscriptItem::Assistant { text, .. }) = state.items.last_mut() {
-                        text.push_str(delta);
-                    } else {
-                        state.items.push(TranscriptItem::Assistant {
-                            thinking: String::new(),
-                            text: delta.clone(),
-                        });
-                    }
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => match assistant_message_event {
+            AssistantMessageEvent::TextDelta { delta, .. } => {
+                if let Some(TranscriptItem::Assistant { text, .. }) = state.items.last_mut() {
+                    text.push_str(delta);
+                } else {
+                    state.items.push(TranscriptItem::Assistant {
+                        thinking: String::new(),
+                        text: delta.clone(),
+                    });
                 }
-                AssistantMessageEvent::ThinkingDelta { delta, .. } => {
-                    if let Some(TranscriptItem::Assistant { thinking, .. }) = state.items.last_mut() {
-                        thinking.push_str(delta);
-                    } else {
-                        state.items.push(TranscriptItem::Assistant {
-                            thinking: delta.clone(),
-                            text: String::new(),
-                        });
-                    }
-                }
-                AssistantMessageEvent::Error { error, .. } => {
-                    let notice = format_assistant_stop_notice(error);
-                    push_turn_error_once(state, notice);
-                }
-                _ => {}
             }
-        }
+            AssistantMessageEvent::ThinkingDelta { delta, .. } => {
+                if let Some(TranscriptItem::Assistant { thinking, .. }) = state.items.last_mut() {
+                    thinking.push_str(delta);
+                } else {
+                    state.items.push(TranscriptItem::Assistant {
+                        thinking: delta.clone(),
+                        text: String::new(),
+                    });
+                }
+            }
+            AssistantMessageEvent::Error { error, .. } => {
+                let notice = format_assistant_stop_notice(error);
+                push_turn_error_once(state, notice);
+            }
+            _ => {}
+        },
         AgentEvent::MessageEnd { message } => {
             if let Message::Assistant(a) = message {
                 state.total_input_tokens += a.usage.input;
@@ -1711,7 +1828,11 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 }
             }
         }
-        AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => {
             state.status = Some(format!("Executing {tool_name}..."));
             if tool_name == "subagent" {
                 let mode = args
@@ -1732,7 +1853,11 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 p.to_string()
             } else if let Some(cmd) = args.get("command").and_then(|v| v.as_str()) {
                 cmd.chars().take(40).collect::<String>()
-            } else if let Some(q) = args.get("query").or_else(|| args.get("pattern")).and_then(|v| v.as_str()) {
+            } else if let Some(q) = args
+                .get("query")
+                .or_else(|| args.get("pattern"))
+                .and_then(|v| v.as_str())
+            {
                 q.to_string()
             } else {
                 String::new()
@@ -1747,7 +1872,11 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 diff: None,
             });
         }
-        AgentEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } => {
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            partial_result,
+            ..
+        } => {
             // Structured subagent updates: upsert a child row keyed by child_id,
             // or move the group's status on terminal events.
             if let Some(sub) = partial_result
@@ -1863,7 +1992,13 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 return;
             }
             for item in state.items.iter_mut().rev() {
-                if let TranscriptItem::ToolCall { id, status, output_preview, .. } = item {
+                if let TranscriptItem::ToolCall {
+                    id,
+                    status,
+                    output_preview,
+                    ..
+                } = item
+                {
                     if id == tool_call_id {
                         *status = "running".to_string();
                         for block in &partial_result.content {
@@ -1881,13 +2016,29 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 }
             }
         }
-        AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, is_error, result, .. } => {
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            is_error,
+            result,
+            ..
+        } => {
             state.status = None;
             if tool_name == "subagent" {
                 for item in state.items.iter_mut().rev() {
-                    if let TranscriptItem::Subagent { id, status, is_error: err, .. } = item {
+                    if let TranscriptItem::Subagent {
+                        id,
+                        status,
+                        is_error: err,
+                        ..
+                    } = item
+                    {
                         if id == tool_call_id {
-                            *status = if *is_error { "failed".to_string() } else { "completed".to_string() };
+                            *status = if *is_error {
+                                "failed".to_string()
+                            } else {
+                                "completed".to_string()
+                            };
                             *err = *is_error;
                             break;
                         }
@@ -1896,17 +2047,36 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 return;
             }
             for item in state.items.iter_mut().rev() {
-                if let TranscriptItem::ToolCall { id, status, is_error: err, diff, output_preview, .. } = item {
+                if let TranscriptItem::ToolCall {
+                    id,
+                    status,
+                    is_error: err,
+                    diff,
+                    output_preview,
+                    ..
+                } = item
+                {
                     if id == tool_call_id {
-                        *status = if *is_error { "failed".to_string() } else { "completed".to_string() };
+                        *status = if *is_error {
+                            "failed".to_string()
+                        } else {
+                            "completed".to_string()
+                        };
                         *err = *is_error;
-                        if let Some(d) = result.details.as_ref().and_then(|m| m.get("diff")).and_then(|v| v.as_str()) {
+                        if let Some(d) = result
+                            .details
+                            .as_ref()
+                            .and_then(|m| m.get("diff"))
+                            .and_then(|v| v.as_str())
+                        {
                             *diff = Some(d.to_string());
                         }
                         if *is_error && output_preview.is_empty() {
                             for block in &result.content {
                                 if let mehh_ai::ToolResultContentBlock::Text(ref tc) = block {
-                                    for line in tc.text.lines().filter(|l| !l.trim().is_empty()).take(8) {
+                                    for line in
+                                        tc.text.lines().filter(|l| !l.trim().is_empty()).take(8)
+                                    {
                                         output_preview.push(line.to_string());
                                     }
                                 }
@@ -1932,46 +2102,84 @@ pub fn render_interactive_frame(
     let height = height.max(5);
     let theme = &state.theme;
 
-    // 1. Header
-    let short_id: String = session.session().session_id().chars().take(8).collect();
-    let cwd_str = session.cwd.to_string_lossy();
-    let header_text = format!(
-        "{} {} {} {} {} {} {} {} {}",
-        theme.fg(&theme.accent, "mehh"),
-        theme.fg(&theme.dim, "|"),
-        theme.fg(&theme.text, &session.model.name),
-        theme.fg(&theme.dim, &format!("({})", session.model.provider)),
-        theme.fg(&theme.dim, "|"),
-        theme.fg(&theme.dim, "session:"),
-        theme.fg(&theme.warning, &short_id),
-        theme.fg(&theme.dim, "|"),
-        theme.fg(&theme.dim, &cwd_str),
-    );
-    let header_line = truncate_to_width(&header_text, width, "...", false);
-    let sep_line = truncate_to_width(
-        &theme.fg(&theme.dim, &"─".repeat(width)),
-        width,
-        "",
-        false,
-    );
-    let header_lines = vec![header_line, sep_line];
+    // 1. Header — a welcome card replaces the status strip on an empty session.
+    let header_lines: Vec<String> = if state.items.is_empty() {
+        let cwd_str = session.cwd.to_string_lossy();
+        let rule = "─".repeat(width.saturating_sub(4).max(1));
+        vec![
+            String::new(),
+            format!(
+                "  {} v{}",
+                theme.fg(&theme.accent, "mehh"),
+                env!("CARGO_PKG_VERSION")
+            ),
+            format!(
+                "  {} {}",
+                theme.fg(&theme.text, &session.model.name),
+                theme.fg(&theme.dim, &format!("· {cwd_str}"))
+            ),
+            String::new(),
+            theme.fg(
+                &theme.dim,
+                "  /help commands   @file attach   Shift+Enter newline",
+            ),
+            theme.fg(&theme.border_muted, &format!("  {rule}")),
+        ]
+        .into_iter()
+        .map(|line| truncate_to_width(&line, width, "...", false))
+        .collect()
+    } else {
+        let short_id: String = session.session().session_id().chars().take(8).collect();
+        let cwd_str = session.cwd.to_string_lossy();
+        let header_text = format!(
+            "{} {} {} {} {} {} {} {} {}",
+            theme.fg(&theme.accent, "mehh"),
+            theme.fg(&theme.dim, "|"),
+            theme.fg(&theme.text, &session.model.name),
+            theme.fg(&theme.dim, &format!("({})", session.model.provider)),
+            theme.fg(&theme.dim, "|"),
+            theme.fg(&theme.dim, "session:"),
+            theme.fg(&theme.warning, &short_id),
+            theme.fg(&theme.dim, "|"),
+            theme.fg(&theme.dim, &cwd_str),
+        );
+        let sep_line = theme.fg(&theme.border_muted, &"─".repeat(width));
+        vec![
+            truncate_to_width(&header_text, width, "...", false),
+            truncate_to_width(&sep_line, width, "", false),
+        ]
+    };
 
-    // 2. Footer
+    // 2. Footer with a live context-window meter.
     let thinking_str = session
         .thinking_level()
         .map(thinking_level_label)
         .unwrap_or("off");
-    let footer_text = theme.fg(
-        &theme.dim,
-        &format!(
-            "{}/{} • thinking: {} • tokens: {} in / {} out • cost: ${:.4} • /help",
-            session.model.provider,
-            session.model.id,
-            thinking_str,
-            state.total_input_tokens,
-            state.total_output_tokens,
-            state.total_cost
-        ),
+    let ctx_tokens =
+        crate::compaction::estimate_context_tokens(&session.session().build_context_messages())
+            as u64;
+    let ctx_pct = ctx_tokens
+        .saturating_mul(100)
+        .checked_div(session.model.context_window.max(1) as u64)
+        .unwrap_or(0)
+        .min(999);
+    let ctx_color = if ctx_pct >= 85 {
+        &theme.error
+    } else if ctx_pct >= 70 {
+        &theme.warning
+    } else {
+        &theme.dim
+    };
+    // The header already carries provider/model; the footer keeps live metrics only.
+    let footer_base = format!(
+        "thinking: {} • tokens: {} in / {} out • cost: ${:.4}",
+        thinking_str, state.total_input_tokens, state.total_output_tokens, state.total_cost
+    );
+    let footer_text = format!(
+        "{}  {}  {}",
+        theme.fg(&theme.dim, &footer_base),
+        theme.fg(ctx_color, &format!("ctx {}%", ctx_pct)),
+        theme.fg(&theme.dim, "/help")
     );
     let footer_lines = vec![truncate_to_width(&footer_text, width, "...", false)];
 
@@ -1988,13 +2196,38 @@ pub fn render_interactive_frame(
         };
         let component: Box<dyn Component> = if selector.kind == SelectorKind::Settings {
             if let Some(ref sl) = selector.settings_list {
-                Box::new(sl.clone())
+                Box::new(sl.clone().with_theme(theme.clone()))
             } else {
-                Box::new(selector.list.clone())
+                Box::new(selector.list.clone().with_theme(theme.clone()))
             }
         } else {
-            Box::new(selector.list.clone())
+            Box::new(selector.list.clone().with_theme(theme.clone()))
         };
+        if !selector.list.filter.is_empty() {
+            bottom_lines.push(truncate_to_width(
+                &theme.fg(&theme.accent, &format!("  Search: {}", selector.list.filter)),
+                width,
+                "...",
+                false,
+            ));
+        }
+        if selector.kind == SelectorKind::ToolApproval {
+            if let Some(ref pending) = state.pending_approval {
+                let mut detail = format!(
+                    "{}  {}\n{}\n",
+                    theme.fg(&theme.accent, "tool"),
+                    theme.fg(&theme.text, &pending.tool_name),
+                    theme.fg(&theme.muted, &pending.reason)
+                );
+                if let Some(ref preview) = pending.preview {
+                    detail.push_str(preview);
+                }
+                let panel = BorderedBox::new(Box::new(Text::new(detail)))
+                    .with_title("Command preview · verify before approving")
+                    .with_style(BorderStyle::Rounded);
+                bottom_lines.extend(panel.render(width));
+            }
+        }
         let boxed = BorderedBox::new(component)
             .with_title(title)
             .with_style(BorderStyle::Rounded);
@@ -2002,8 +2235,7 @@ pub fn render_interactive_frame(
     }
 
     if state.is_busy {
-        let spinner =
-            mehh_tui::BRAILLE_FRAMES[state.loader.frame % mehh_tui::BRAILLE_FRAMES.len()];
+        let spinner = mehh_tui::BRAILLE_FRAMES[state.loader.frame % mehh_tui::BRAILLE_FRAMES.len()];
         let loader_line = format!(
             "{} {}",
             theme.fg(&theme.accent, spinner),
@@ -2021,42 +2253,88 @@ pub fn render_interactive_frame(
         bottom_lines.extend(loader_lines);
     }
 
-    // The queue counters stay visible while a message is queued, even when no
-    // turn is running, so a queued follow-up is never invisible.
-    let steering = session.pending_steering_count();
-    let follow_up = session.pending_follow_up_count();
-    if state.is_busy || steering > 0 || follow_up > 0 {
-        let counters = format!("steering: {steering} • follow-up: {follow_up}");
+    if state.scroll_offset > 0 {
+        let pill = format!(
+            "↑ Viewing history (-{} lines) · Ctrl+End to bottom",
+            state.scroll_offset
+        );
         bottom_lines.push(truncate_to_width(
-            &format!("  {}", theme.fg(&theme.dim, &counters)),
+            &theme.fg(&theme.warning, &pill),
             width,
             "...",
             false,
         ));
     }
 
-    bottom_lines.extend(editor.render(width));
+    // Queue counters are pills: print only the queues that actually hold messages.
+    let steering = session.pending_steering_count();
+    let follow_up = session.pending_follow_up_count();
+    let mut queued = Vec::new();
+    if steering > 0 {
+        queued.push(format!("steering: {steering}"));
+    }
+    if follow_up > 0 {
+        queued.push(format!("follow-up: {follow_up}"));
+    }
+    if !queued.is_empty() {
+        bottom_lines.push(truncate_to_width(
+            &format!("  {}", theme.fg(&theme.dim, &queued.join(" • "))),
+            width,
+            "...",
+            false,
+        ));
+    }
+
+    // Prompt dock: a thin two-line frame keeps the input visually anchored.
+    // Re-theme the cloned view so `/theme` applies to autocomplete and paste chips instantly.
+    if state.selector.is_none() {
+        let mut themed_editor = editor.clone();
+        themed_editor.theme = theme.clone();
+        if let Some(ac) = themed_editor.autocomplete.as_mut() {
+            ac.theme = theme.clone();
+        }
+        let dock = BorderedBox::new(Box::new(themed_editor)).with_style(BorderStyle::Rounded);
+        bottom_lines.extend(dock.render(width));
+    } else {
+        bottom_lines.extend(editor.render(width));
+    }
 
     // 4. Transcript
     let hide_thinking = session.settings.hide_thinking_block.unwrap_or(false);
     let mut transcript_lines = Vec::with_capacity(state.items.len().saturating_mul(4).max(64));
-    let mut md_cache = state.markdown_cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut md_cache = state
+        .markdown_cache
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     if md_cache.len() > state.items.len().saturating_mul(2).saturating_add(16) {
         md_cache.clear();
     }
     for (item_idx, item) in state.items.iter().enumerate() {
+        // Breathing room between turns; the transcript is a timeline, not a log dump.
+        if item_idx > 0 {
+            transcript_lines.push(String::new());
+        }
         match item {
             TranscriptItem::User(text) => {
+                let marker = format!("❯ {text}");
+                let pad = width.saturating_sub(mehh_tui::visible_width(&marker) + 1);
                 let formatted = format!(
-                    "{} {}",
-                    theme.fg(&theme.user_prefix, "> "),
-                    theme.fg(&theme.text, text)
+                    "{bg} {prefix}❯{reset}{bg}{color} {body}{padding}{reset}",
+                    bg = theme.user_bg,
+                    prefix = theme.user_prefix,
+                    reset = "\x1b[0m",
+                    color = theme.text,
+                    body = text,
+                    padding = " ".repeat(pad),
                 );
-                transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
+                for line in wrap_text_with_ansi(&formatted, width) {
+                    transcript_lines.push(format!("{line}\x1b[0m"));
+                }
             }
             TranscriptItem::Assistant { thinking, text } => {
                 if !thinking.is_empty() && !hide_thinking {
-                    let formatted = theme.fg(&theme.thinking_text, &format!("thinking: {thinking}"));
+                    let formatted =
+                        theme.fg(&theme.thinking_text, &format!("thinking: {thinking}"));
                     transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
                 }
                 if !text.is_empty() {
@@ -2067,13 +2345,15 @@ pub fn render_interactive_frame(
                             continue;
                         }
                     }
-                    let rendered = MarkdownView::new(text).with_theme(theme.clone()).render(width);
+                    let rendered = MarkdownView::new(text)
+                        .with_theme(theme.clone())
+                        .render(width);
                     transcript_lines.extend(rendered.iter().cloned());
                     md_cache.insert(key, (theme.name.clone(), text.clone(), rendered));
                 }
             }
             TranscriptItem::ToolCall {
-                id,
+                id: _id,
                 name,
                 status,
                 is_error,
@@ -2093,11 +2373,14 @@ pub fn render_interactive_frame(
                 } else {
                     String::new()
                 };
+                let status_part = if status == "completed" {
+                    String::new()
+                } else {
+                    format!(" {}", theme.fg(&theme.dim, status))
+                };
                 let formatted = format!(
-                    "  {sym} {}{summary_part} {}: {}",
-                    theme.fg(&theme.text, name),
-                    theme.fg(&theme.dim, &format!("({id})")),
-                    theme.fg(&theme.dim, status)
+                    "  {sym} {}{summary_part}{status_part}",
+                    theme.fg(&theme.text, name)
                 );
                 transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
 
@@ -2108,21 +2391,25 @@ pub fn render_interactive_frame(
 
                 if let Some(diff_str) = diff {
                     for line in diff_str.lines().take(24) {
-                        let colorized = if line.starts_with('+') && !line.starts_with("+++") {
-                            theme.fg(&theme.tool_success, line)
-                        } else if line.starts_with('-') && !line.starts_with("---") {
-                            theme.fg(&theme.tool_error, line)
-                        } else if line.starts_with("@@") {
-                            theme.fg(&theme.accent, line)
-                        } else {
-                            theme.fg(&theme.dim, line)
-                        };
-                        transcript_lines.extend(wrap_text_with_ansi(&format!("    {colorized}"), width));
+                        let (color, bg): (&str, &str) =
+                            if line.starts_with('+') && !line.starts_with("+++") {
+                                (theme.tool_success.as_str(), theme.diff_add_bg.as_str())
+                            } else if line.starts_with('-') && !line.starts_with("---") {
+                                (theme.tool_error.as_str(), theme.diff_del_bg.as_str())
+                            } else if line.starts_with("@@") {
+                                (theme.accent.as_str(), "")
+                            } else {
+                                (theme.dim.as_str(), "")
+                            };
+                        let colorized = format!("{color}{bg}{line}");
+                        for wrapped in wrap_text_with_ansi(&format!("    {colorized}"), width) {
+                            transcript_lines.push(format!("{wrapped}\x1b[0m"));
+                        }
                     }
                 }
             }
             TranscriptItem::Subagent {
-                id,
+                id: _id,
                 mode,
                 status,
                 is_error,
@@ -2136,9 +2423,8 @@ pub fn render_interactive_frame(
                     theme.fg(&theme.tool_pending, "⚙")
                 };
                 let formatted = format!(
-                    "  {sym} subagent [{}] {}: {}",
+                    "  {sym} subagent {} {}",
                     theme.fg(&theme.accent, mode),
-                    theme.fg(&theme.dim, &format!("({id})")),
                     theme.fg(&theme.dim, status)
                 );
                 transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
@@ -2151,7 +2437,8 @@ pub fn render_interactive_frame(
                     } else {
                         theme.fg(&theme.tool_pending, "⚙")
                     };
-                    let mut row_line = format!("    {row_sym} {}", theme.fg(&theme.text, &row.label));
+                    let mut row_line =
+                        format!("    {row_sym} {}", theme.fg(&theme.text, &row.label));
                     if row.label != row.status && !row.status.is_empty() {
                         row_line.push_str(&format!(": {}", theme.fg(&theme.dim, &row.status)));
                     }
@@ -2176,7 +2463,7 @@ pub fn render_interactive_frame(
     let used_lines = header_lines.len() + footer_lines.len() + bottom_lines.len();
     let available_height = height.saturating_sub(used_lines);
 
-    let visible_transcript = if available_height == 0 {
+    let mut visible_transcript = if available_height == 0 {
         state.last_max_scroll.store(0, Ordering::Relaxed);
         Vec::new()
     } else if transcript_lines.len() > available_height {
@@ -2191,6 +2478,11 @@ pub fn render_interactive_frame(
         transcript_lines
     };
 
+    // Anchor the prompt dock and footer to the bottom row. Without this pad the
+    // editor sits directly under the header and drifts down with every message.
+    let pad = available_height.saturating_sub(visible_transcript.len());
+    visible_transcript.extend(vec![String::new(); pad]);
+
     let mut frame = Vec::with_capacity(height);
     frame.extend(header_lines);
     frame.extend(visible_transcript);
@@ -2204,6 +2496,7 @@ pub fn render_interactive_frame(
 pub(crate) enum AgentSignal {
     ReadyForTurn {
         prompt_text: String,
+        blocks: Vec<UserContentBlock>,
         new_api_key: Option<String>,
         compaction: Option<(String, String, u64)>,
         warning: Option<String>,
@@ -2234,20 +2527,17 @@ fn apply_agent_signal(
 ) -> bool {
     match signal {
         AgentSignal::ToolApprovalRequest(pending) => {
-            let desc = if let Some(ref p) = pending.preview {
-                format!("{}: {}", pending.reason, p)
-            } else {
-                pending.reason.clone()
-            };
+            // The reason and full preview live in their own panel; never hide them
+            // inside a list row where truncate_to_width would cut the command.
             let items = vec![
                 SelectItem::new("allow_once", "Allow once (y/Enter)")
-                    .with_description(desc),
+                    .with_description("Approve this tool call once"),
                 SelectItem::new("allow_session", "Allow for session (a)")
                     .with_description("Auto-approve this tool until session ends"),
-                SelectItem::new("always_allow", "Always allow (A)")
-                    .with_description("Persist always-allow rule to ~/.mehh/agent/permissions.json"),
-                SelectItem::new("deny", "Deny (n/Esc)")
-                    .with_description("Block this tool call"),
+                SelectItem::new("always_allow", "Always allow (A)").with_description(
+                    "Persist always-allow rule to ~/.mehh/agent/permissions.json",
+                ),
+                SelectItem::new("deny", "Deny (n/Esc)").with_description("Block this tool call"),
             ];
             state.pending_approval = Some(pending);
             state.selector = Some(Selector {
@@ -2276,8 +2566,10 @@ fn apply_agent_signal(
             state.is_busy = false;
             state.status = None;
             *session.active_cancel_slot().lock().unwrap() = None;
-            if let Some(Message::Assistant(a)) =
-                messages.iter().rev().find(|m| matches!(m, Message::Assistant(_)))
+            if let Some(Message::Assistant(a)) = messages
+                .iter()
+                .rev()
+                .find(|m| matches!(m, Message::Assistant(_)))
             {
                 if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) {
                     let notice = format_assistant_stop_notice(a);
@@ -2285,9 +2577,9 @@ fn apply_agent_signal(
                 }
             }
             if let Err(e) = session.finish_prompt(&messages) {
-                state
-                    .items
-                    .push(TranscriptItem::System(format!("Failed to persist turn: {e}")));
+                state.items.push(TranscriptItem::System(format!(
+                    "Failed to persist turn: {e}"
+                )));
             }
             true
         }
@@ -2301,9 +2593,9 @@ fn apply_agent_signal(
             state.is_busy = false;
             state.status = None;
             *session.active_cancel_slot().lock().unwrap() = None;
-            state
-                .items
-                .push(TranscriptItem::System(format!("Agent turn failed: {message}")));
+            state.items.push(TranscriptItem::System(format!(
+                "Agent turn failed: {message}"
+            )));
             true
         }
         AgentSignal::PrepFailed(message) => {
@@ -2354,6 +2646,7 @@ async fn handle_agent_signal_async(
     match signal {
         AgentSignal::ReadyForTurn {
             prompt_text,
+            blocks,
             new_api_key,
             compaction,
             warning,
@@ -2389,7 +2682,7 @@ async fn handle_agent_signal_async(
                     "Warning: proactive auto-compaction failed: {w}"
                 )));
             }
-            start_turn(session, state, &prompt_text, agent_tx);
+            start_turn(session, state, &prompt_text, blocks, agent_tx);
             SignalOutcome::RetryStarted
         }
         AgentSignal::Finished(messages) => {
@@ -2434,7 +2727,7 @@ async fn handle_agent_signal_async(
                                 "Context overflow detected; auto-compacted history and retrying turn..."
                                     .to_string(),
                             ));
-                            start_turn(session, state, &retry_text, agent_tx);
+                            start_turn(session, state, &retry_text, Vec::new(), agent_tx);
                             return SignalOutcome::RetryStarted;
                         }
                         Err(e) => {
@@ -2504,10 +2797,24 @@ async fn drain_agent_signals_async(
     next_running
 }
 
+/// Expands `@path` tokens in a submitted TUI prompt into file/image blocks.
+fn expand_prompt_with_files(
+    cwd: &Path,
+    text: &str,
+) -> anyhow::Result<(String, Vec<UserContentBlock>)> {
+    if !text.split_whitespace().any(|token| token.starts_with('@')) {
+        return Ok((text.to_string(), Vec::new()));
+    }
+    let args: Vec<String> = text.split_whitespace().map(str::to_string).collect();
+    let processed = crate::process_file_arguments(cwd, &args)?;
+    Ok((processed.text, processed.blocks))
+}
+
 /// Refreshes credentials and runs optional proactive compaction off the UI thread so the TUI and Ctrl+C remain responsive.
 fn start_turn_preparation(
     session: &AgentSession,
     text: &str,
+    blocks: Vec<UserContentBlock>,
     auth_file: Option<&Path>,
     agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
 ) {
@@ -2586,6 +2893,7 @@ fn start_turn_preparation(
             } else {
                 let _ = tx.send(AgentSignal::ReadyForTurn {
                     prompt_text,
+                    blocks,
                     new_api_key,
                     compaction,
                     warning,
@@ -2656,11 +2964,26 @@ fn start_turn(
     session: &AgentSession,
     state: &mut InteractiveState,
     text: &str,
+    blocks: Vec<UserContentBlock>,
     agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
 ) {
     state.turn_start_idx = Some(state.items.len());
     state.last_turn_error = None;
-    let (user_msg, history, config) = session.prepare_prompt(text);
+    let mut content_blocks = blocks;
+    if !content_blocks
+        .iter()
+        .any(|b| matches!(b, UserContentBlock::Text(_)))
+    {
+        content_blocks.insert(
+            0,
+            UserContentBlock::Text(mehh_ai::TextContent {
+                text: text.to_string(),
+                text_signature: None,
+            }),
+        );
+    }
+    let (user_msg, history, config) =
+        session.prepare_prompt_content(UserContent::Blocks(content_blocks));
 
     let tx_events = agent_tx.clone();
     let tx_done = agent_tx.clone();
@@ -2685,9 +3008,7 @@ fn start_turn(
                 let _ = tx_done.send(AgentSignal::Finished(messages));
             }
             Err(_) => {
-                let _ = tx_done.send(AgentSignal::Failed(
-                    "the agent loop panicked".to_string(),
-                ));
+                let _ = tx_done.send(AgentSignal::Failed("the agent loop panicked".to_string()));
             }
         }
     });
@@ -2714,19 +3035,18 @@ fn update_autocomplete_with_cwd(editor: &mut Editor, current_text: &str, cwd: &P
             .into_iter()
             .filter(|cmd| cmd.id.starts_with(current_text))
             .map(|cmd| {
-                let suffix = cmd.id[current_text.len()..].to_string();
-                let description = match &cmd.description {
-                    Some(d) => format!("{} — {d}", cmd.id),
-                    None => cmd.id.clone(),
-                };
-                SelectItem::new(cmd.id, suffix).with_description(description)
+                let id = cmd.id;
+                let description = cmd
+                    .description
+                    .unwrap_or_else(|| "Slash command".to_string());
+                SelectItem::new(id.clone(), id).with_description(description)
             })
             .collect();
 
         if matches.is_empty() {
             editor.clear_autocomplete();
         } else {
-            editor.set_autocomplete(matches);
+            editor.set_autocomplete_replacing(matches, 0);
         }
         return;
     }
@@ -2797,7 +3117,8 @@ pub async fn run_interactive_mode(
     let mut state = InteractiveState::new(mcp_summaries.to_vec(), &session.settings);
     let mut editor = Editor::new()
         .with_prefix("> ")
-        .with_placeholder("Type a message or /help...");
+        .with_placeholder("Type a message or /help...")
+        .with_theme(state.theme.clone());
     let keybindings = state.keybindings.clone();
 
     // Background input reader thread
@@ -2882,9 +3203,13 @@ pub async fn run_interactive_mode(
                                 if state.selector.as_ref().map(|s| s.kind) == Some(SelectorKind::ToolApproval) {
                                     let mut decision: Option<bool> = None;
                                     let mut persist_rule = false;
+                                    let mut session_rule = false;
                                     match key_str.as_str() {
                                         "y" => decision = Some(true),
-                                        "a" => decision = Some(true),
+                                        "a" => {
+                                            decision = Some(true);
+                                            session_rule = true;
+                                        }
                                         "A" => {
                                             decision = Some(true);
                                             persist_rule = true;
@@ -2898,7 +3223,11 @@ pub async fn run_interactive_mode(
                                                 .map(|i| i.id.as_str())
                                                 .unwrap_or("allow_once");
                                             match selected_id {
-                                                "allow_once" | "allow_session" => decision = Some(true),
+                                                "allow_once" => decision = Some(true),
+                                                "allow_session" => {
+                                                    decision = Some(true);
+                                                    session_rule = true;
+                                                }
                                                 "always_allow" => {
                                                     decision = Some(true);
                                                     persist_rule = true;
@@ -2922,7 +3251,7 @@ pub async fn run_interactive_mode(
                                     if let Some(allowed) = decision {
                                         state.selector = None;
                                         if let Some(pending) = state.pending_approval.take() {
-                                            if persist_rule {
+                                            if persist_rule || session_rule {
                                                 let arg_prefix = pending.args.get("command").and_then(|v| v.as_str()).map(|cmd| {
                                                     cmd.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
                                                 });
@@ -2932,9 +3261,14 @@ pub async fn run_interactive_mode(
                                                     path_glob: None,
                                                     action: crate::permissions::PermissionAction::AlwaysAllow,
                                                 };
-                                                let _ = session.inspection_manager.add_permission_rule(rule).await;
+                                                if persist_rule {
+                                                    let _ = session.inspection_manager.add_permission_rule(rule).await;
+                                                } else {
+                                                    session.inspection_manager.add_session_permission_rule(rule).await;
+                                                }
+                                                let scope = if persist_rule { "Rule" } else { "Session rule" };
                                                 state.items.push(TranscriptItem::System(format!(
-                                                    "Rule added: always allow tool '{}'",
+                                                    "{scope} added: always allow tool '{}'",
                                                     pending.tool_name
                                                 )));
                                             }
@@ -2943,6 +3277,13 @@ pub async fn run_interactive_mode(
                                     }
                                     render_now(&state, &editor, session, &mut terminal, &mut renderer);
                                     continue 'outer;
+                                }
+
+                                if let Some(sel) = state.selector.as_mut() {
+                                    if update_selector_filter(sel, &key_str) {
+                                        render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                                        continue 'outer;
+                                    }
                                 }
 
                                 match key_str.as_str() {
@@ -3025,12 +3366,7 @@ pub async fn run_interactive_mode(
                                                     )),
                                                 }
                                                 // Refresh the labels so they show the new value.
-                                                if let Some(sel) = state.selector.as_mut() {
-                                                    sel.list.set_items(settings_selector_items(&session.settings));
-                                                    let mut sl = build_settings_list(&session.settings);
-                                                    sl.selected = sel.list.selected;
-                                                    sel.settings_list = Some(sl);
-                                                }
+                                                refresh_settings_selector(&mut state, &session.settings);
                                             }
                                             (Some(SelectorKind::Login), Some(item)) => {
                                                 match perform_login(
@@ -3218,6 +3554,23 @@ pub async fn run_interactive_mode(
                                                     }
                                                 }
                                             }
+                                            let (expanded_text, prompt_blocks) =
+                                                match expand_prompt_with_files(&session.cwd, trimmed) {
+                                                    Ok(v) => v,
+                                                    Err(e) => {
+                                                        state.items.push(TranscriptItem::System(
+                                                            format!("Failed to attach @file: {e}"),
+                                                        ));
+                                                        render_now(
+                                                            &state,
+                                                            &editor,
+                                                            session,
+                                                            &mut terminal,
+                                                            &mut renderer,
+                                                        );
+                                                        continue 'outer;
+                                                    }
+                                                };
                                             state.scroll_offset = 0;
                                             state.items.push(TranscriptItem::User(trimmed.to_string()));
                                             state.last_prompt_text = Some(trimmed.to_string());
@@ -3227,7 +3580,8 @@ pub async fn run_interactive_mode(
                                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
                                             start_turn_preparation(
                                                 session,
-                                                trimmed,
+                                                &expanded_text,
+                                                prompt_blocks,
                                                 state.auth_file.as_deref(),
                                                 &agent_tx,
                                             );
@@ -3283,9 +3637,9 @@ pub async fn run_interactive_mode(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mehh_ai::{Model, ModelCost, Usage, UsageCost};
     use crate::session::SessionManager;
     use crate::settings::Settings;
+    use mehh_ai::{Model, ModelCost, Usage, UsageCost};
 
     fn make_test_session() -> AgentSession {
         let temp_dir = std::env::temp_dir().join(format!("mehh_test_int_{}", uuid::Uuid::now_v7()));
@@ -3347,7 +3701,9 @@ mod tests {
             handle_slash_command("/help", &mut session, &mut state, None, false).await,
             SlashCommandOutcome::Handled
         );
-        assert!(matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("Commands:")));
+        assert!(
+            matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("Commands:"))
+        );
 
         // 3. /thinking high
         assert_eq!(
@@ -3355,21 +3711,27 @@ mod tests {
             SlashCommandOutcome::Handled
         );
         assert_eq!(session.thinking_level(), Some(ThinkingLevel::High));
-        assert!(matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("high")));
+        assert!(
+            matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("high"))
+        );
 
         // 4. /tools
         assert_eq!(
             handle_slash_command("/tools", &mut session, &mut state, None, false).await,
             SlashCommandOutcome::Handled
         );
-        assert!(matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("Active tools")));
+        assert!(
+            matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("Active tools"))
+        );
 
         // 5. /mcp
         assert_eq!(
             handle_slash_command("/mcp", &mut session, &mut state, None, false).await,
             SlashCommandOutcome::Handled
         );
-        assert!(matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("test_mcp") && s.contains("3 tools")));
+        assert!(
+            matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("test_mcp") && s.contains("3 tools"))
+        );
 
         // 6. /clear
         assert!(!state.items.is_empty());
@@ -3545,15 +3907,25 @@ mod tests {
         let mut state = make_test_state();
         let tool_id = "tc_sub_1".to_string();
 
-        apply_agent_event(&mut state, &AgentEvent::ToolExecutionStart {
-            tool_call_id: tool_id.clone(),
-            tool_name: "subagent".to_string(),
-            args: serde_json::json!({"mode": "coding"}).as_object().unwrap().clone(),
-        });
-        assert!(matches!(state.items.last().unwrap(), TranscriptItem::Subagent { mode, .. } if mode == "coding"));
+        apply_agent_event(
+            &mut state,
+            &AgentEvent::ToolExecutionStart {
+                tool_call_id: tool_id.clone(),
+                tool_name: "subagent".to_string(),
+                args: serde_json::json!({"mode": "coding"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+        );
+        assert!(
+            matches!(state.items.last().unwrap(), TranscriptItem::Subagent { mode, .. } if mode == "coding")
+        );
 
         let child_update = |id: &str, kind: &str, detail: &str| AgentEvent::ToolExecutionUpdate {
-            tool_call_id: tool_id.clone(), tool_name: "subagent".to_string(), args: serde_json::Map::new(),
+            tool_call_id: tool_id.clone(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::Map::new(),
             partial_result: mehh_agent::AgentToolResult {
                 details: Some(serde_json::json!({"subagent": {
                     "child_id": id, "mode": "coding", "event_kind": kind, "detail": detail
@@ -3563,7 +3935,10 @@ mod tests {
         };
         apply_agent_event(&mut state, &child_update("sub-a", "tool_started", "read"));
         apply_agent_event(&mut state, &child_update("sub-b", "tool_started", "read"));
-        apply_agent_event(&mut state, &child_update("sub-b", "tool_finished", "completed"));
+        apply_agent_event(
+            &mut state,
+            &child_update("sub-b", "tool_finished", "completed"),
+        );
 
         match state.items.last().unwrap() {
             TranscriptItem::Subagent { children, .. } => {
@@ -3580,10 +3955,22 @@ mod tests {
             _ => panic!("expected subagent group"),
         }
 
-        apply_agent_event(&mut state, &AgentEvent::ToolExecutionStart {
-            tool_call_id: "tc_sub_2".to_string(), tool_name: "subagent".to_string(), args: serde_json::Map::new(),
-        });
-        assert_eq!(state.items.iter().filter(|i| matches!(i, TranscriptItem::Subagent { .. })).count(), 2);
+        apply_agent_event(
+            &mut state,
+            &AgentEvent::ToolExecutionStart {
+                tool_call_id: "tc_sub_2".to_string(),
+                tool_name: "subagent".to_string(),
+                args: serde_json::Map::new(),
+            },
+        );
+        assert_eq!(
+            state
+                .items
+                .iter()
+                .filter(|i| matches!(i, TranscriptItem::Subagent { .. }))
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -3591,10 +3978,15 @@ mod tests {
         let session = make_test_session();
         let mut state = make_test_state();
         state.items.push(TranscriptItem::Subagent {
-            id: "tc_x".into(), mode: "coding".into(), status: "running".into(), is_error: false,
+            id: "tc_x".into(),
+            mode: "coding".into(),
+            status: "running".into(),
+            is_error: false,
             children: vec![SubagentChildRow {
-                child_id: "sub-a".into(), label: "tool".into(),
-                status: "running".into(), detail: "read".into(),
+                child_id: "sub-a".into(),
+                label: "tool".into(),
+                status: "running".into(),
+                detail: "read".into(),
             }],
         });
         let editor = Editor::new().with_prefix("> ");
@@ -3612,11 +4004,16 @@ mod tests {
         let session = make_test_session();
         let mut state = make_test_state();
         state.items.push(TranscriptItem::Subagent {
-            id: "tc_done".into(), mode: "coding".into(), status: "completed".into(), is_error: false,
+            id: "tc_done".into(),
+            mode: "coding".into(),
+            status: "completed".into(),
+            is_error: false,
             // A finished tool row carries detail == status.
             children: vec![SubagentChildRow {
-                child_id: "sub-done".into(), label: "tool".into(),
-                status: "completed".into(), detail: "completed".into(),
+                child_id: "sub-done".into(),
+                label: "tool".into(),
+                status: "completed".into(),
+                detail: "completed".into(),
             }],
         });
         let editor = Editor::new().with_prefix("> ");
@@ -3626,7 +4023,10 @@ mod tests {
             .lines()
             .find(|line| line.contains("tool"))
             .expect("child row must render");
-        assert!(row.contains("✓ tool: completed"), "expected completed row: {row}");
+        assert!(
+            row.contains("✓ tool: completed"),
+            "expected completed row: {row}"
+        );
         assert!(
             !row.contains("completed completed"),
             "status must not be duplicated as detail: {row}"
@@ -3637,14 +4037,22 @@ mod tests {
     fn test_subagent_child_lifecycle_events_populate_rows() {
         let mut state = make_test_state();
         let tool_id = "tc_sub_lc".to_string();
-        apply_agent_event(&mut state, &AgentEvent::ToolExecutionStart {
-            tool_call_id: tool_id.clone(),
-            tool_name: "subagent".to_string(),
-            args: serde_json::json!({"mode": "coding"}).as_object().unwrap().clone(),
-        });
+        apply_agent_event(
+            &mut state,
+            &AgentEvent::ToolExecutionStart {
+                tool_call_id: tool_id.clone(),
+                tool_name: "subagent".to_string(),
+                args: serde_json::json!({"mode": "coding"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+        );
 
         let child_update = |id: &str, kind: &str, detail: &str| AgentEvent::ToolExecutionUpdate {
-            tool_call_id: tool_id.clone(), tool_name: "subagent".to_string(), args: serde_json::Map::new(),
+            tool_call_id: tool_id.clone(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::Map::new(),
             partial_result: mehh_agent::AgentToolResult {
                 details: Some(serde_json::json!({"subagent": {
                     "child_id": id, "mode": "coding", "event_kind": kind, "detail": detail
@@ -3656,7 +4064,10 @@ mod tests {
         apply_agent_event(&mut state, &child_update("c1", "started", ""));
         match state.items.last().unwrap() {
             TranscriptItem::Subagent { children, .. } => {
-                let c1 = children.iter().find(|r| r.child_id == "c1").expect("started row");
+                let c1 = children
+                    .iter()
+                    .find(|r| r.child_id == "c1")
+                    .expect("started row");
                 assert_eq!(c1.label, "started");
                 assert_eq!(c1.status, "running");
             }
@@ -3668,11 +4079,17 @@ mod tests {
         apply_agent_event(&mut state, &child_update("c3", "started", ""));
         apply_agent_event(&mut state, &child_update("c3", "blocked", "needs review"));
         // tool_finished without prior tool_started is ignored.
-        apply_agent_event(&mut state, &child_update("ghost", "tool_finished", "completed"));
+        apply_agent_event(
+            &mut state,
+            &child_update("ghost", "tool_finished", "completed"),
+        );
         // tool_started replaces the placeholder row.
         apply_agent_event(&mut state, &child_update("c1", "tool_started", "read"));
         // tool_finished updates the running row.
-        apply_agent_event(&mut state, &child_update("c1", "tool_finished", "completed"));
+        apply_agent_event(
+            &mut state,
+            &child_update("c1", "tool_finished", "completed"),
+        );
 
         match state.items.last().unwrap() {
             TranscriptItem::Subagent { children, .. } => {
@@ -3686,7 +4103,11 @@ mod tests {
                 assert_eq!(c2.status, "blocked");
                 assert_eq!(c2.detail, "needs approval");
                 let c3_rows: Vec<_> = children.iter().filter(|r| r.child_id == "c3").collect();
-                assert_eq!(c3_rows.len(), 1, "blocked must update the started row in place");
+                assert_eq!(
+                    c3_rows.len(),
+                    1,
+                    "blocked must update the started row in place"
+                );
                 assert_eq!(c3_rows[0].label, "blocked");
                 assert_eq!(c3_rows[0].status, "blocked");
                 assert_eq!(c3_rows[0].detail, "needs review");
@@ -3700,7 +4121,9 @@ mod tests {
     fn test_render_interactive_frame() {
         let session = make_test_session();
         let mut state = make_test_state();
-        state.items.push(TranscriptItem::User("How are you?".to_string()));
+        state
+            .items
+            .push(TranscriptItem::User("How are you?".to_string()));
         state.items.push(TranscriptItem::Assistant {
             thinking: "Let me check".to_string(),
             text: "I am functioning normally.".to_string(),
@@ -3714,7 +4137,9 @@ mod tests {
             output_preview: Vec::new(),
             diff: None,
         });
-        state.items.push(TranscriptItem::System("System notice: ready".to_string()));
+        state
+            .items
+            .push(TranscriptItem::System("System notice: ready".to_string()));
 
         let editor = Editor::new().with_prefix("> ");
 
@@ -3747,11 +4172,164 @@ mod tests {
         assert!(out.contains("Test Model"));
 
         // Incremental update test
-        state.items.push(TranscriptItem::User("Next question".to_string()));
+        state
+            .items
+            .push(TranscriptItem::User("Next question".to_string()));
         let lines2 = render_interactive_frame(&state, &editor, &session, 80, 24);
         renderer.render_frame(&mut term, lines2, true).unwrap();
         let out2 = term.full_output();
         assert!(out2.contains("Next question"));
+    }
+
+    #[test]
+    fn test_tool_approval_shows_full_reason_and_preview() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        let preview = "cargo test --all\ncargo clippy --all-targets\nrm -rf target";
+        state.pending_approval = Some(PendingApproval {
+            tool_name: "bash".to_string(),
+            args: serde_json::Map::new(),
+            reason: "Run the checks before deleting build output".to_string(),
+            preview: Some(preview.to_string()),
+            reply_tx,
+        });
+        state.selector = Some(Selector {
+            kind: SelectorKind::ToolApproval,
+            list: SelectList::new(
+                vec![SelectItem::new("allow_once", "Allow once (y/Enter)")],
+                6,
+            ),
+            settings_list: None,
+        });
+
+        let editor = Editor::new();
+        let plain = mehh_tui::strip_ansi(
+            &render_interactive_frame(&state, &editor, &session, 100, 30).join("\n"),
+        );
+        assert!(plain.contains("Run the checks before deleting build output"));
+        for line in preview.lines() {
+            assert!(plain.contains(line), "full command line was truncated: {line}");
+        }
+        assert!(plain.contains("Allow once"));
+    }
+
+    #[test]
+    fn test_selector_filter_narrows_items_and_backspace_restores() {
+        let mut sel = Selector {
+            kind: SelectorKind::Model,
+            list: SelectList::new(
+                vec![
+                    SelectItem::new("alpha", "Alpha"),
+                    SelectItem::new("beta", "Beta"),
+                ],
+                8,
+            ),
+            settings_list: None,
+        };
+        for ch in ["b", "e", "t"] {
+            assert!(update_selector_filter(&mut sel, ch));
+        }
+        assert_eq!(sel.list.filter, "bet");
+        assert_eq!(sel.list.selected_item().map(|i| i.id.as_str()), Some("beta"));
+
+        assert!(update_selector_filter(&mut sel, "backspace"));
+        assert_eq!(sel.list.filter, "be");
+        assert!(!update_selector_filter(&mut sel, "enter"));
+    }
+
+    #[test]
+    fn test_slash_autocomplete_shows_full_command_and_replaces_text() {
+        let mut editor = Editor::new();
+        editor.set_text("/mc");
+        update_autocomplete_with_cwd(&mut editor, "/mc", std::path::Path::new("."));
+
+        let ac = editor.autocomplete.as_ref().expect("autocomplete popup");
+        assert_eq!(ac.items[0].label, "/mcp", "popup must show the command, not its suffix");
+        assert_eq!(ac.items[0].id, "/mcp");
+        assert_eq!(editor.autocomplete_replace_start, Some(0));
+
+        editor.handle_key("enter");
+        assert_eq!(editor.text(), "/mcp");
+    }
+
+    #[test]
+    fn test_refresh_settings_selector_preserves_cursor() {
+        let settings = Settings::default();
+        let mut state = make_test_state();
+        state.selector = Some(Selector {
+            kind: SelectorKind::Settings,
+            list: SelectList::new(settings_selector_items(&settings), 8),
+            settings_list: Some(build_settings_list(&settings)),
+        });
+        state.selector.as_mut().unwrap().list.selected = 3;
+
+        refresh_settings_selector(&mut state, &settings);
+
+        let sel = state.selector.as_ref().unwrap();
+        assert_eq!(sel.list.selected, 3, "list cursor must stay on the toggled row");
+        assert_eq!(
+            sel.settings_list.as_ref().unwrap().selected,
+            3,
+            "detail pane must follow the same row"
+        );
+    }
+
+    #[test]
+    fn test_render_interactive_frame_hides_empty_queue_counters() {
+        let session = make_test_session();
+        let state = make_test_state();
+        let editor = Editor::new();
+        let joined = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
+        assert!(!joined.contains("steering: 0"));
+        assert!(!joined.contains("follow-up: 0"));
+    }
+
+    #[test]
+    fn test_render_interactive_frame_tool_call_hides_internal_id() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        state.items.push(TranscriptItem::ToolCall {
+            id: "tc_secret_id".to_string(),
+            name: "read".to_string(),
+            status: "completed".to_string(),
+            is_error: false,
+            args_summary: String::new(),
+            output_preview: Vec::new(),
+            diff: None,
+        });
+        let editor = Editor::new();
+        let plain = mehh_tui::strip_ansi(
+            &render_interactive_frame(&state, &editor, &session, 80, 24).join("\n"),
+        );
+        assert!(plain.contains("read"));
+        assert!(!plain.contains("tc_secret_id"));
+        assert!(
+            !plain.contains("completed"),
+            "completed status is redundant noise"
+        );
+    }
+
+    #[test]
+    fn test_render_interactive_frame_anchors_dock_and_footer_to_bottom() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        for i in 0..3 {
+            state
+                .items
+                .push(TranscriptItem::User(format!("question {i}")));
+        }
+        let editor = Editor::new().with_placeholder("Type a message...");
+        let lines = render_interactive_frame(&state, &editor, &session, 80, 24);
+        assert_eq!(lines.len(), 24, "frame must fill the terminal exactly");
+        assert!(
+            lines[23].contains("/help"),
+            "footer must sit on the last row"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Type a message...")),
+            "editor must stay visible even with a short transcript"
+        );
     }
 
     #[test]
@@ -3768,7 +4346,9 @@ mod tests {
         theme.tool_success = "\x1b[38;2;16;17;18m".to_string();
         state.theme = theme;
 
-        state.items.push(TranscriptItem::User("Hello there".to_string()));
+        state
+            .items
+            .push(TranscriptItem::User("Hello there".to_string()));
         state.items.push(TranscriptItem::Assistant {
             thinking: "pondering".to_string(),
             text: "Hi".to_string(),
@@ -3789,16 +4369,34 @@ mod tests {
         let joined = lines.join("\n");
 
         assert!(joined.contains("\x1b[38;2;1;2;3m"), "accent token missing");
-        assert!(joined.contains("\x1b[38;2;4;5;6m"), "user prefix token missing");
+        assert!(
+            joined.contains("\x1b[38;2;4;5;6m"),
+            "user prefix token missing"
+        );
         assert!(joined.contains("\x1b[38;2;7;8;9m"), "text token missing");
         assert!(joined.contains("\x1b[38;2;10;11;12m"), "dim token missing");
-        assert!(joined.contains("\x1b[38;2;13;14;15m"), "thinking token missing");
-        assert!(joined.contains("\x1b[38;2;16;17;18m"), "tool success token missing");
+        assert!(
+            joined.contains("\x1b[38;2;13;14;15m"),
+            "thinking token missing"
+        );
+        assert!(
+            joined.contains("\x1b[38;2;16;17;18m"),
+            "tool success token missing"
+        );
 
         // No hardcoded ANSI from the previous implementation remains.
-        assert!(!joined.contains("\x1b[1;36m"), "hardcoded header accent remains");
-        assert!(!joined.contains("\x1b[1;32m"), "hardcoded user prefix remains");
-        assert!(!joined.contains("\x1b[2;3m"), "hardcoded thinking style remains");
+        assert!(
+            !joined.contains("\x1b[1;36m"),
+            "hardcoded header accent remains"
+        );
+        assert!(
+            !joined.contains("\x1b[1;32m"),
+            "hardcoded user prefix remains"
+        );
+        assert!(
+            !joined.contains("\x1b[2;3m"),
+            "hardcoded thinking style remains"
+        );
     }
 
     #[test]
@@ -3818,7 +4416,10 @@ mod tests {
         let editor = Editor::new();
         let lines = render_interactive_frame(&state, &editor, &session, 80, 24);
         let joined = lines.join("\n");
-        assert!(joined.contains("\x1b[38;2;200;100;50m"), "markdown heading token missing");
+        assert!(
+            joined.contains("\x1b[38;2;200;100;50m"),
+            "markdown heading token missing"
+        );
     }
 
     #[test]
@@ -3866,7 +4467,9 @@ mod tests {
             handle_slash_command("/theme", &mut session, &mut state, None, false).await,
             SlashCommandOutcome::Handled
         );
-        assert!(matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("light")));
+        assert!(
+            matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("light"))
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3934,10 +4537,7 @@ mod tests {
         }
 
         fn apply_csi(&mut self, params: &str, final_byte: char) {
-            let numbers: Vec<usize> = params
-                .split(';')
-                .filter_map(|p| p.parse().ok())
-                .collect();
+            let numbers: Vec<usize> = params.split(';').filter_map(|p| p.parse().ok()).collect();
             let first: usize = numbers.first().copied().unwrap_or(1);
             match final_byte {
                 'A' => self.row = self.row.saturating_sub(first),
@@ -3967,7 +4567,11 @@ mod tests {
         }
 
         fn line(&self, row: usize) -> String {
-            self.cells[row].iter().collect::<String>().trim_end().to_string()
+            self.cells[row]
+                .iter()
+                .collect::<String>()
+                .trim_end()
+                .to_string()
         }
     }
 
@@ -3982,26 +4586,29 @@ mod tests {
         let mut renderer = TuiRenderer::new();
         let mut screen = Screen::new(24, 80);
 
+        fn row_of(screen: &Screen, needle: &str) -> Option<usize> {
+            (0..24).find(|&i| screen.line(i).contains(needle))
+        }
+
         render_now(&state, &editor, &session, &mut term, &mut renderer);
         screen.feed(&term.full_output());
-        assert!(screen.line(0).contains("mehh"), "row 0 = {:?}", screen.line(0));
-        assert!(screen.line(2).contains("hello"), "row 2 = {:?}", screen.line(2));
-        assert!(
-            screen.line(3).contains("Type a message"),
-            "row 3 = {:?}",
-            screen.line(3)
-        );
-        assert!(screen.line(4).contains("/help"), "row 4 = {:?}", screen.line(4));
+        assert_eq!(row_of(&screen, "mehh"), Some(0));
+        assert_eq!(row_of(&screen, "hello"), Some(2));
+        let editor_row = row_of(&screen, "Type a message").expect("editor placeholder must render");
+        let footer_row = row_of(&screen, "/help").expect("footer must render");
+        // The prompt dock and footer are pinned to the bottom, not floating under the header.
+        assert!(editor_row > 2 && footer_row > editor_row);
+        assert!(footer_row >= 21, "footer row was {footer_row}");
 
-        // Typing must rewrite the input line in place.
+        // Typing must rewrite the input line in place without moving the footer.
         term.clear_output();
         editor.set_text("/pro");
         render_now(&state, &editor, &session, &mut term, &mut renderer);
         screen.feed(&term.full_output());
-        assert!(screen.line(0).contains("mehh"), "row 0 = {:?}", screen.line(0));
-        assert!(screen.line(2).contains("hello"), "row 2 = {:?}", screen.line(2));
-        assert!(screen.line(3).contains("/pro"), "row 3 = {:?}", screen.line(3));
-        assert!(screen.line(4).contains("/help"), "row 4 = {:?}", screen.line(4));
+        assert_eq!(row_of(&screen, "mehh"), Some(0));
+        assert_eq!(row_of(&screen, "hello"), Some(2));
+        assert_eq!(row_of(&screen, "/pro"), Some(editor_row));
+        assert_eq!(row_of(&screen, "/help"), Some(footer_row));
     }
 
     #[tokio::test]
@@ -4063,6 +4670,19 @@ mod tests {
     }
 
     #[test]
+    fn test_interactive_sync_preserves_codemode_handle() {
+        let mut session = make_test_session();
+        session.enable_mcp_and_codemode(Vec::new(), true);
+        let before = session.codemode_tool().expect("codemode enabled");
+        sync_mcp_tools(&mut session, Vec::new(), true);
+        let after = session.codemode_tool().expect("codemode still enabled");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "interactive sync must reuse the codemode handle to keep its script store"
+        );
+    }
+
+    #[test]
     fn test_split_system_prompt_recovers_the_preamble_and_addendum() {
         let prompt = crate::system_prompt::build_system_prompt_with_skills(
             std::path::Path::new("."),
@@ -4074,6 +4694,72 @@ mod tests {
         let (preamble, addendum) = split_system_prompt(&prompt);
         assert_eq!(preamble.as_deref(), Some("PREAMBLE"));
         assert_eq!(addendum.as_deref(), Some("APPENDUM"));
+    }
+
+    #[test]
+    fn test_expand_prompt_with_files_reads_at_file() {
+        let dir = temp_dir("mehh_tui_file_arg");
+        std::fs::write(dir.join("notes.txt"), "notes body").unwrap();
+        let (text, blocks) = expand_prompt_with_files(&dir, "summarize @notes.txt").unwrap();
+        assert!(text.contains("<file name=\"notes.txt\">"));
+        assert!(text.contains("notes body"));
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, UserContentBlock::Text(t) if t.text.contains("notes body"))),
+            "the expanded file must reach the user content blocks"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_follow_up_slash_keeps_full_text() {
+        let mut session = make_test_session();
+        let mut state = make_test_state();
+        handle_slash_command(
+            "/follow-up check tests",
+            &mut session,
+            &mut state,
+            None,
+            false,
+        )
+        .await;
+        assert_eq!(session.pending_follow_up_count(), 1);
+        assert!(state.items.iter().any(|item| matches!(
+            item,
+            TranscriptItem::System(text) if text.contains("Queued follow-up: check tests")
+        )));
+    }
+
+    #[tokio::test]
+    async fn test_tree_slash_accepts_summarize_flag_from_rest() {
+        let mut session = make_test_session();
+        let mut state = make_test_state();
+        let first = session
+            .session_mut()
+            .append_message(Message::User(mehh_ai::UserMessage {
+                content: mehh_ai::UserContent::Text("first".to_string()),
+                timestamp: mehh_ai::now_ms(),
+            }))
+            .unwrap();
+        session
+            .session_mut()
+            .append_message(Message::User(mehh_ai::UserMessage {
+                content: mehh_ai::UserContent::Text("second".to_string()),
+                timestamp: mehh_ai::now_ms(),
+            }))
+            .unwrap();
+        handle_slash_command(
+            &format!("/tree {first} --summarize"),
+            &mut session,
+            &mut state,
+            None,
+            false,
+        )
+        .await;
+        assert!(state.items.iter().any(|item| matches!(
+            item,
+            TranscriptItem::System(text) if text.contains("with branch summary")
+        )));
     }
 
     #[test]
@@ -4105,8 +4791,14 @@ mod tests {
         update_autocomplete_with_cwd(&mut editor, "/t", Path::new("."));
 
         let items = editor.autocomplete.as_ref().expect("popup").items.clone();
-        let theme = items.iter().find(|i| i.id == "/theme").expect("/theme offered");
-        assert_eq!(theme.label, "heme", "the label must be the suffix, not the command");
+        let theme = items
+            .iter()
+            .find(|i| i.id == "/theme")
+            .expect("/theme offered");
+        assert_eq!(
+            theme.label, "heme",
+            "the label must be the suffix, not the command"
+        );
 
         // Applying the completion yields the full command exactly once.
         editor.set_autocomplete(vec![theme.clone()]);
@@ -4294,10 +4986,12 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
         let _keepalive = tx.clone();
 
-        tx.send(AgentSignal::Finished(vec![Message::User(mehh_ai::UserMessage {
-            content: mehh_ai::UserContent::Text("queued".to_string()),
-            timestamp: mehh_ai::now_ms(),
-        })]))
+        tx.send(AgentSignal::Finished(vec![Message::User(
+            mehh_ai::UserMessage {
+                content: mehh_ai::UserContent::Text("queued".to_string()),
+                timestamp: mehh_ai::now_ms(),
+            },
+        )]))
         .unwrap();
 
         let ended = drain_agent_signals(&mut rx, &mut session, &mut state);
@@ -4374,12 +5068,24 @@ mod tests {
         apply_setting_cycle("hide_thinking_block", &mut session, &mut state).unwrap();
         assert_eq!(session.settings.hide_thinking_block, Some(true));
         apply_setting_cycle("default_thinking_level", &mut session, &mut state).unwrap();
-        assert_eq!(session.settings.default_thinking_level, Some(ThinkingLevel::Low));
+        assert_eq!(
+            session.settings.default_thinking_level,
+            Some(ThinkingLevel::Low)
+        );
         assert_eq!(session.thinking_level(), Some(ThinkingLevel::Low));
 
-        persist_settings(&session.settings, "steering_mode", state.settings_file.as_deref()).unwrap();
-        persist_settings(&session.settings, "hide_thinking_block", state.settings_file.as_deref())
-            .unwrap();
+        persist_settings(
+            &session.settings,
+            "steering_mode",
+            state.settings_file.as_deref(),
+        )
+        .unwrap();
+        persist_settings(
+            &session.settings,
+            "hide_thinking_block",
+            state.settings_file.as_deref(),
+        )
+        .unwrap();
         let persisted = SettingsManager::load_file(&settings_file).unwrap();
         assert_eq!(persisted.steering_mode, Some(QueueMode::All));
         assert_eq!(persisted.hide_thinking_block, Some(true));
@@ -4409,7 +5115,14 @@ mod tests {
 
         // /tree with an explicit entry switches the active branch.
         assert_eq!(
-            handle_slash_command(&format!("/tree {first}"), &mut session, &mut state, None, false).await,
+            handle_slash_command(
+                &format!("/tree {first}"),
+                &mut session,
+                &mut state,
+                None,
+                false
+            )
+            .await,
             SlashCommandOutcome::Handled
         );
         assert_eq!(session.session().leaf_id(), Some(first.as_str()));
@@ -4435,7 +5148,14 @@ mod tests {
         // /fork creates a new session and switches to it.
         let original_id = session.session().session_id().to_string();
         assert_eq!(
-            handle_slash_command(&format!("/fork {first}"), &mut session, &mut state, None, false).await,
+            handle_slash_command(
+                &format!("/fork {first}"),
+                &mut session,
+                &mut state,
+                None,
+                false
+            )
+            .await,
             SlashCommandOutcome::Handled
         );
         assert_ne!(session.session().session_id(), original_id);
@@ -4492,7 +5212,9 @@ mod tests {
             .await,
             SlashCommandOutcome::Handled
         );
-        assert!(matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("anthropic")));
+        assert!(
+            matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("anthropic"))
+        );
 
         let entries = crate::auth::load_auth_entries(Some(&auth_file)).unwrap();
         assert!(entries.contains_key("anthropic"));
@@ -4527,13 +5249,17 @@ mod tests {
             handle_slash_command("/mcp reconnect", &mut session, &mut state, None, false).await,
             SlashCommandOutcome::Handled
         );
-        assert!(matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("not enabled")));
+        assert!(
+            matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("not enabled"))
+        );
 
         assert_eq!(
             handle_slash_command("/mcp resources", &mut session, &mut state, None, false).await,
             SlashCommandOutcome::Handled
         );
-        assert!(matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("not enabled")));
+        assert!(
+            matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("not enabled"))
+        );
     }
 
     #[tokio::test]
@@ -4544,7 +5270,7 @@ mod tests {
         let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
         let _keepalive = agent_tx.clone();
 
-        start_turn(&session, &mut state, "hello there", &agent_tx);
+        start_turn(&session, &mut state, "hello there", Vec::new(), &agent_tx);
         assert!(state.is_busy);
 
         // The UI loop keeps receiving events while the turn runs in the background.
@@ -4586,7 +5312,9 @@ mod tests {
             .unwrap();
         session
             .session_mut()
-            .append_message(Message::Assistant(mehh_ai::faux_assistant_message("hi there")))
+            .append_message(Message::Assistant(mehh_ai::faux_assistant_message(
+                "hi there",
+            )))
             .unwrap();
 
         let items = rebuild_transcript_items(&session);
@@ -4645,14 +5373,16 @@ mod tests {
         let mut sm = SessionManager::in_memory(dir.path());
         for i in 0..4 {
             sm.append_message(Message::User(mehh_ai::UserMessage {
-                content: mehh_ai::UserContent::Text(format!("prior prompt {i}: {}", "data ".repeat(800))),
+                content: mehh_ai::UserContent::Text(format!(
+                    "prior prompt {i}: {}",
+                    "data ".repeat(800)
+                )),
                 timestamp: mehh_ai::now_ms(),
             }))
             .unwrap();
-            sm.append_message(Message::Assistant(mehh_ai::faux_assistant_message(format!(
-                "prior reply {i}: {}",
-                "reply ".repeat(800)
-            ))))
+            sm.append_message(Message::Assistant(mehh_ai::faux_assistant_message(
+                format!("prior reply {i}: {}", "reply ".repeat(800)),
+            )))
             .unwrap();
         }
 
@@ -4711,7 +5441,7 @@ mod tests {
         let _keepalive = agent_tx.clone();
         state.last_prompt_text = Some("continue".to_string());
         state.overflow_retried = false;
-        start_turn(&session, &mut state, "continue", &agent_tx);
+        start_turn(&session, &mut state, "continue", Vec::new(), &agent_tx);
 
         while let Some(sig) = agent_rx.recv().await {
             if matches!(
@@ -4722,9 +5452,11 @@ mod tests {
             }
         }
 
-        assert!(session.session().entries().iter().any(|e| {
-            matches!(e.kind, SessionEntryKind::Compaction { .. })
-        }));
+        assert!(session
+            .session()
+            .entries()
+            .iter()
+            .any(|e| { matches!(e.kind, SessionEntryKind::Compaction { .. }) }));
         assert!(state.items.iter().any(|it| matches!(
             it,
             TranscriptItem::Assistant { text, .. } if text.contains("Recovered in interactive!")
@@ -4733,7 +5465,8 @@ mod tests {
 
     #[tokio::test]
     async fn slash_name_session_hotkeys_scoped_models_export_import() {
-        let temp_dir = std::env::temp_dir().join(format!("interactive_slash_{}", uuid::Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("interactive_slash_{}", uuid::Uuid::now_v7()));
         let mut session = AgentSession::new(
             temp_dir.clone(),
             mehh_ai::faux_model(),
@@ -4745,7 +5478,10 @@ mod tests {
 
         // Test /name Demo
         handle_slash_command("/name Demo Session", &mut session, &mut state, None, false).await;
-        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Demo Session"))));
+        assert!(state
+            .items
+            .iter()
+            .any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Demo Session"))));
         assert!(session.session().entries().iter().any(|e| matches!(&e.kind, SessionEntryKind::SessionInfo { name: Some(n) } if n == "Demo Session")));
 
         // Test /name without args reads current name
@@ -4754,36 +5490,70 @@ mod tests {
 
         // Test /session
         handle_slash_command("/session", &mut session, &mut state, None, false).await;
-        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Estimated Context Tokens:"))));
+        assert!(state.items.iter().any(
+            |it| matches!(it, TranscriptItem::System(s) if s.contains("Estimated Context Tokens:"))
+        ));
 
         // Test /hotkeys
         handle_slash_command("/hotkeys", &mut session, &mut state, None, false).await;
-        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Keyboard Shortcuts"))));
+        assert!(state
+            .items
+            .iter()
+            .any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Keyboard Shortcuts"))));
 
         // Test /scoped-models
         handle_slash_command("/scoped-models", &mut session, &mut state, None, false).await;
-        handle_slash_command("/scoped-models faux/faux-model", &mut session, &mut state, None, false).await;
+        handle_slash_command(
+            "/scoped-models faux/faux-model",
+            &mut session,
+            &mut state,
+            None,
+            false,
+        )
+        .await;
 
         // Test /copy with assistant message
-        session.session_mut().append_message(Message::Assistant(mehh_ai::faux_assistant_message("Hello from assistant"))).unwrap();
+        session
+            .session_mut()
+            .append_message(Message::Assistant(mehh_ai::faux_assistant_message(
+                "Hello from assistant",
+            )))
+            .unwrap();
         handle_slash_command("/copy", &mut session, &mut state, None, false).await;
         assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Copied message to clipboard"))));
 
         // Test /reload
         handle_slash_command("/reload", &mut session, &mut state, None, false).await;
-        assert!(state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Reloaded settings"))));
+        assert!(state
+            .items
+            .iter()
+            .any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Reloaded settings"))));
 
         // Test /export and /import
         let export_file = temp_dir.join("exported_session.jsonl");
         let export_arg = export_file.to_string_lossy().to_string();
-        handle_slash_command(&format!("/export {export_arg}"), &mut session, &mut state, None, false).await;
+        handle_slash_command(
+            &format!("/export {export_arg}"),
+            &mut session,
+            &mut state,
+            None,
+            false,
+        )
+        .await;
         assert!(export_file.exists());
 
         // Create a new session and import the exported file
         session.session_mut().new_session().unwrap();
         assert_eq!(session.session().entries().len(), 0);
 
-        handle_slash_command(&format!("/import {export_arg}"), &mut session, &mut state, None, false).await;
+        handle_slash_command(
+            &format!("/import {export_arg}"),
+            &mut session,
+            &mut state,
+            None,
+            false,
+        )
+        .await;
         assert!(!session.session().entries().is_empty());
 
         let _ = std::fs::remove_dir_all(temp_dir);
@@ -4793,7 +5563,9 @@ mod tests {
     async fn test_slash_command_hotkeys_reflects_configured_keybindings() {
         let mut session = make_test_session();
         let mut state = make_test_state();
-        state.keybindings.set_bindings(TuiAction::Submit, vec!["ctrl+enter".to_string()]);
+        state
+            .keybindings
+            .set_bindings(TuiAction::Submit, vec!["ctrl+enter".to_string()]);
 
         handle_slash_command("/hotkeys", &mut session, &mut state, None, false).await;
 
@@ -4807,7 +5579,10 @@ mod tests {
             })
             .expect("must have system message from /hotkeys");
 
-        assert!(last_system_msg.contains("ctrl+enter"), "hotkeys must reflect configured bindings: {last_system_msg}");
+        assert!(
+            last_system_msg.contains("ctrl+enter"),
+            "hotkeys must reflect configured bindings: {last_system_msg}"
+        );
         assert!(last_system_msg.contains("Submit prompt"));
     }
 }

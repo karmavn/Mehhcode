@@ -18,7 +18,9 @@ pub struct DeferredToolMatch {
 
 fn tokenize_terms(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    for chunk in text.split(|c: char| c.is_whitespace() || c == '_' || c == '-' || c == ':' || c == '.') {
+    for chunk in
+        text.split(|c: char| c.is_whitespace() || c == '_' || c == '-' || c == ':' || c == '.')
+    {
         if chunk.is_empty() {
             continue;
         }
@@ -151,7 +153,11 @@ impl DeferredToolCatalog {
             return Vec::new();
         }
         if query_tokens.is_empty() {
-            return deferred_guard.iter().take(max_results).map(Arc::clone).collect();
+            return deferred_guard
+                .iter()
+                .take(max_results)
+                .map(Arc::clone)
+                .collect();
         }
 
         let num_docs = deferred_guard.len() as f64;
@@ -377,10 +383,7 @@ impl AgentTool for ToolSearchTool {
             ));
         }
 
-        let query = params
-            .get("query")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let query = params.get("query").and_then(|v| v.as_str()).unwrap_or("");
         let matches = self.catalog.search(query, max_results);
         let newly_activated = if activate {
             self.catalog.activate(&matches)
@@ -440,8 +443,14 @@ mod tests {
     #[tokio::test]
     async fn test_tool_search_finds_and_activates_deferred_tools() {
         let deferred: Vec<Arc<dyn AgentTool>> = vec![
-            Arc::new(FakeDeferredTool("mcp__gh__list_issues", "List GitHub repository issues")),
-            Arc::new(FakeDeferredTool("mcp__slack__post_msg", "Send message to Slack channel")),
+            Arc::new(FakeDeferredTool(
+                "mcp__gh__list_issues",
+                "List GitHub repository issues",
+            )),
+            Arc::new(FakeDeferredTool(
+                "mcp__slack__post_msg",
+                "Send message to Slack channel",
+            )),
         ];
         let catalog = Arc::new(DeferredToolCatalog::new(deferred));
         let handle = catalog.dynamic_tools_handle();
@@ -449,7 +458,10 @@ mod tests {
 
         let tool = ToolSearchTool::new(Arc::clone(&catalog));
         let mut params = Map::new();
-        params.insert("query".to_string(), Value::String("github issues".to_string()));
+        params.insert(
+            "query".to_string(),
+            Value::String("github issues".to_string()),
+        );
         let res = tool
             .execute("tc_1", params, CancellationToken::new(), None)
             .await

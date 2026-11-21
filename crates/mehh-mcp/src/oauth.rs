@@ -100,14 +100,56 @@ pub fn validate_oauth_url(raw: &str) -> anyhow::Result<reqwest::Url> {
     }
 }
 
-/// Builds an HTTP client for OAuth requests with timeouts and HTTP redirects disabled.
+/// DNS resolver that rejects private/local addresses at connection time.
+///
+/// Checking DNS before sending a request is vulnerable to rebinding: the
+/// second resolution performed by reqwest can return a different address.
+/// Resolving inside the connector makes validation and connection atomic.
+pub(crate) struct SafeDnsResolver;
+
+impl reqwest::dns::Resolve for SafeDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        Box::pin(async move {
+            let host = name.as_str();
+            let clean = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .trim_end_matches('.');
+            let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((clean, 0))
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
+                .collect();
+            if addresses.is_empty() {
+                return Err("DNS resolution returned no addresses".into());
+            }
+            if !is_loopback_host(clean) {
+                for addr in &addresses {
+                    if is_private_or_local_ip(addr.ip()) {
+                        return Err(format!(
+                            "DNS rebinding blocked: '{host}' resolved to private/local IP {}",
+                            addr.ip()
+                        )
+                        .into());
+                    }
+                }
+            }
+            let addrs: reqwest::dns::Addrs = Box::new(addresses.into_iter());
+            Ok(addrs)
+        })
+    }
+}
+
+/// Builds an HTTP client for OAuth requests with timeouts, no redirects and SSRF-safe DNS.
+/// Fails closed if the client cannot be built instead of falling back to an
+/// insecure default client.
 pub fn oauth_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(15))
         .timeout(OAUTH_HTTP_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(std::sync::Arc::new(SafeDnsResolver))
         .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+        .expect("failed to build hardened OAuth HTTP client")
 }
 
 fn is_loopback_host(host: &str) -> bool {
@@ -314,17 +356,31 @@ impl McpAuthStore {
         Ok(map)
     }
 
-    fn save_internal(&self, map: &HashMap<String, McpAuthEntry>) -> anyhow::Result<()> {
-        let parent = self.path.parent().ok_or_else(|| {
-            anyhow::anyhow!("MCP auth store path '{}' has no parent directory", self.path.display())
+    async fn load_fresh(&self) -> anyhow::Result<HashMap<String, McpAuthEntry>> {
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || Self::load_from_path(&path))
+            .await
+            .context("auth store load task panicked")?
+    }
+
+    async fn save_internal(&self, map: &HashMap<String, McpAuthEntry>) -> anyhow::Result<()> {
+        let path = self.path.clone();
+        let map = map.clone();
+        tokio::task::spawn_blocking(move || Self::save_internal_blocking(&path, &map))
+            .await
+            .context("auth store save task panicked")?
+    }
+
+    fn save_internal_blocking(path: &Path, map: &HashMap<String, McpAuthEntry>) -> anyhow::Result<()> {
+        let parent = path.parent().ok_or_else(|| {
+            anyhow::anyhow!("MCP auth store path '{}' has no parent directory", path.display())
         })?;
         std::fs::create_dir_all(parent).with_context(|| {
             format!("Failed to create directory '{}'", parent.display())
         })?;
 
         let json = serde_json::to_string_pretty(map)?;
-        let file_name = self
-            .path
+        let file_name = path
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("mcp-auth.json");
@@ -350,10 +406,10 @@ impl McpAuthStore {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))?;
             }
-            std::fs::rename(&tmp_path, &self.path).with_context(|| {
+            std::fs::rename(&tmp_path, path).with_context(|| {
                 format!(
                     "Failed to atomically replace '{}' with '{}'",
-                    self.path.display(),
+                    path.display(),
                     tmp_path.display()
                 )
             })?;
@@ -367,20 +423,19 @@ impl McpAuthStore {
     }
 
     /// Retrieves the stored entry for a server if present.
+    ///
+    /// Disk is authoritative: another process may have rotated a token since
+    /// this store was created. The in-memory map is only a fallback for a
+    /// transient read failure.
     pub async fn get(&self, server_name: &str, server_url: &str) -> Option<McpAuthEntry> {
         let key = Self::store_key(server_name, server_url);
-        {
-            let map = self.entries.read().await;
-            if let Some(entry) = map.get(&key) {
-                return Some(entry.clone());
+        match self.load_fresh().await {
+            Ok(disk_map) => {
+                let res = disk_map.get(&key).cloned();
+                *self.entries.write().await = disk_map;
+                res
             }
-        }
-        if let Ok(disk_map) = Self::load_from_path(&self.path) {
-            let res = disk_map.get(&key).cloned();
-            *self.entries.write().await = disk_map;
-            res
-        } else {
-            None
+            Err(_) => self.entries.read().await.get(&key).cloned(),
         }
     }
 
@@ -393,9 +448,9 @@ impl McpAuthStore {
     ) -> anyhow::Result<()> {
         let _lock = self.lock().await?;
         let key = Self::store_key(server_name, server_url);
-        let mut disk_map = Self::load_from_path(&self.path)?;
+        let mut disk_map = self.load_fresh().await?;
         disk_map.insert(key, entry);
-        self.save_internal(&disk_map)?;
+        self.save_internal(&disk_map).await?;
         *self.entries.write().await = disk_map;
         Ok(())
     }
@@ -408,10 +463,10 @@ impl McpAuthStore {
     ) -> anyhow::Result<Option<McpAuthEntry>> {
         let _lock = self.lock().await?;
         let key = Self::store_key(server_name, server_url);
-        let mut disk_map = Self::load_from_path(&self.path)?;
+        let mut disk_map = self.load_fresh().await?;
         let removed = disk_map.remove(&key);
         if removed.is_some() {
-            self.save_internal(&disk_map)?;
+            self.save_internal(&disk_map).await?;
         }
         *self.entries.write().await = disk_map;
         Ok(removed)
@@ -419,7 +474,7 @@ impl McpAuthStore {
 
     /// Returns all stored entries.
     pub async fn list(&self) -> HashMap<String, McpAuthEntry> {
-        if let Ok(disk_map) = Self::load_from_path(&self.path) {
+        if let Ok(disk_map) = self.load_fresh().await {
             *self.entries.write().await = disk_map.clone();
             disk_map
         } else {
@@ -710,7 +765,78 @@ pub fn generate_mcp_pkce() -> (String, String) {
     (code_verifier, code_challenge)
 }
 
+/// Decodes one ASCII hex nibble, or `None` for a non-hex byte.
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Decodes an application/x-www-form-urlencoded component (`+` and `%XX`).
+fn percent_decode_form(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                // Decode both nibbles from raw bytes; slicing `value` at byte
+                // offsets is not guaranteed to land on UTF-8 char boundaries.
+                match (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2])) {
+                    (Some(hi), Some(lo)) => {
+                        out.push((hi << 4) | lo);
+                        i += 3;
+                    }
+                    _ => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+async fn read_callback_request(stream: &mut tokio::net::TcpStream) -> anyhow::Result<String> {
+    let mut buf = [0u8; 8192];
+    let mut total = 0;
+    while total < buf.len() {
+        let n = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf[total..])).await??;
+        if n == 0 {
+            break;
+        }
+        total += n;
+        if buf[..total].windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf[..total]).into_owned())
+}
+
+async fn write_callback_response(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(response.as_bytes()).await;
+    let _ = stream.flush().await;
+}
+
 /// Runs a local loopback HTTP callback server on `127.0.0.1:{port}` awaiting authorization callback.
+/// Ignores speculative connections and unrelated paths, and never accepts a callback with a
+/// mismatched `state`.
 pub async fn run_loopback_callback(
     port: u16,
     expected_state: &str,
@@ -721,87 +847,103 @@ pub async fn run_loopback_callback(
         .with_context(|| format!("Failed to bind loopback TCP listener on port {port}"))?;
 
     tokio::time::timeout(timeout, async move {
-        let (mut stream, _) = listener.accept().await?;
-        let mut buf = [0u8; 4096];
-        let mut total_read = 0;
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            let request_str = match tokio::time::timeout(
+                Duration::from_secs(5),
+                read_callback_request(&mut stream),
+            )
+            .await
+            {
+                Ok(Ok(s)) => s,
+                _ => continue, // preconnect socket with no request; keep waiting
+            };
+            let request_line = request_str.lines().next().unwrap_or("");
+            let path_and_query = request_line.split_whitespace().nth(1).unwrap_or("");
+            let query_str = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
 
-        while total_read < buf.len() {
-            let n = stream.read(&mut buf[total_read..]).await?;
-            if n == 0 {
-                break;
-            }
-            total_read += n;
-            if buf[..total_read].windows(4).any(|w| w == b"\r\n\r\n") {
-                break;
-            }
-        }
-
-        let request_str = String::from_utf8_lossy(&buf[..total_read]);
-        let request_line = request_str.lines().next().unwrap_or("");
-        let mut parts = request_line.split_whitespace();
-        let _method = parts.next().unwrap_or("");
-        let path_and_query = parts.next().unwrap_or("");
-
-        let query_str = path_and_query.split_once('?').map(|(_, q)| q).unwrap_or("");
-        let mut code: Option<String> = None;
-        let mut state: Option<String> = None;
-
-        for pair in query_str.split('&') {
-            if let Some((k, v)) = pair.split_once('=') {
-                if k == "code" {
-                    code = Some(v.to_string());
-                } else if k == "state" {
-                    state = Some(v.to_string());
+            let mut params: HashMap<String, String> = HashMap::new();
+            for pair in query_str.split('&') {
+                if let Some((k, v)) = pair.split_once('=') {
+                    params.insert(percent_decode_form(k), percent_decode_form(v));
                 }
             }
-        }
 
-        if state.as_deref() != Some(expected_state) {
-            let err_response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nOAuth state mismatch";
-            let _ = stream.write_all(err_response.as_bytes()).await;
-            let _ = stream.flush().await;
-            anyhow::bail!("OAuth callback state mismatch: expected {expected_state}, got {state:?}");
-        }
-
-        let auth_code = match code {
-            Some(c) => c,
-            None => {
-                let err_response = "HTTP/1.1 400 Bad Request\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nMissing authorization code";
-                let _ = stream.write_all(err_response.as_bytes()).await;
-                let _ = stream.flush().await;
-                anyhow::bail!("OAuth callback did not contain authorization code");
+            if params.get("state").map(String::as_str) != Some(expected_state) {
+                write_callback_response(&mut stream, "400 Bad Request", "OAuth state mismatch").await;
+                continue;
             }
-        };
+            if let Some(error) = params.get("error") {
+                let desc = params.get("error_description").map(String::as_str).unwrap_or("");
+                let body = format!("OAuth authorization failed: {error} {desc}");
+                write_callback_response(&mut stream, "400 Bad Request", &body).await;
+                anyhow::bail!("OAuth callback error: {error} - {desc}");
+            }
+            let Some(auth_code) = params.get("code").cloned() else {
+                write_callback_response(&mut stream, "400 Bad Request", "Missing authorization code").await;
+                continue;
+            };
 
-        let html = "<!DOCTYPE html><html><body style=\"font-family: sans-serif; text-align: center; padding: 40px;\">\
-                    <h2>Authentication Successful</h2><p>You can close this tab and return to the application.</p>\
-                    </body></html>";
-        let ok_response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
-            html.len()
-        );
-        let _ = stream.write_all(ok_response.as_bytes()).await;
-        let _ = stream.flush().await;
-
-        Ok(auth_code)
+            let html = "<!DOCTYPE html><html><body style=\"font-family: sans-serif; text-align: center; padding: 40px;\">\
+                        <h2>Authentication Successful</h2><p>You can close this tab and return to the application.</p>\
+                        </body></html>";
+            let ok_response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",
+                html.len()
+            );
+            let _ = stream.write_all(ok_response.as_bytes()).await;
+            let _ = stream.flush().await;
+            return Ok(auth_code);
+        }
     })
     .await
     .map_err(|_| anyhow::anyhow!("Loopback OAuth callback timed out after {}s", timeout.as_secs()))?
 }
+
+#[tokio::test]
+    async fn test_loopback_callback_ignores_preconnect_and_decodes_code() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let server = tokio::spawn(async move {
+            run_loopback_callback(port, "st%2Fate", Duration::from_secs(5)).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // Speculative connection with no request at all.
+        let pre = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        drop(pre);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let request = "GET /callback?code=abc%2Fdef%2Bghi%3D&state=st%252Fate HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let code = server.await.unwrap().unwrap();
+        assert_eq!(code, "abc/def+ghi=");
+    }
 
 /// Refreshes OAuth 2.0 tokens using a refresh token grant against the token endpoint.
 pub async fn refresh_mcp_tokens(
     client: &reqwest::Client,
     token_endpoint: &str,
     client_id: &str,
+    client_secret: Option<&str>,
     refresh_token: &str,
 ) -> anyhow::Result<OAuthTokens> {
     validate_oauth_request_url(token_endpoint).await?;
-    let params = [
+    let mut params = vec![
         ("grant_type", "refresh_token"),
         ("client_id", client_id),
         ("refresh_token", refresh_token),
     ];
+    if let Some(secret) = client_secret {
+        params.push(("client_secret", secret));
+    }
 
     let resp = tokio::time::timeout(
         OAUTH_HTTP_TIMEOUT,
@@ -836,8 +978,14 @@ pub trait McpBearerProvider: Send + Sync {
     async fn bearer_token(&self) -> anyhow::Result<Option<String>>;
 
     /// Invoked when the transport encounters an HTTP 401 Unauthorized.
+    /// `failed_token` is the token that produced the 401, used to avoid a
+    /// thundering herd of refreshes when several requests fail together.
     /// Returns `Ok(true)` if token was refreshed and request should be retried.
-    async fn on_unauthorized(&self, www_authenticate: Option<&str>) -> anyhow::Result<bool>;
+    async fn on_unauthorized(
+        &self,
+        failed_token: Option<&str>,
+        www_authenticate: Option<&str>,
+    ) -> anyhow::Result<bool>;
 }
 
 /// Bearer provider implementation backed by `McpAuthStore` with single-flight mutex on 401.
@@ -899,8 +1047,19 @@ impl StoredMcpBearerProvider {
             }
         };
 
-        let new_tokens =
-            refresh_mcp_tokens(&self.client, &endpoint, &client_id, &refresh_token).await?;
+        let mut new_tokens = refresh_mcp_tokens(
+            &self.client,
+            &endpoint,
+            &client_id,
+            entry.client_secret.as_deref(),
+            &refresh_token,
+        )
+        .await?;
+        // RFC 6749 section 6: the authorization server MAY omit refresh_token.
+        // Reuse the previous one when that happens, otherwise the client is locked out.
+        if new_tokens.refresh_token.is_none() {
+            new_tokens.refresh_token = Some(refresh_token.clone());
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -950,12 +1109,25 @@ impl McpBearerProvider for StoredMcpBearerProvider {
         Ok(final_entry.and_then(|e| e.tokens).map(|t| t.access_token))
     }
 
-    async fn on_unauthorized(&self, _www_authenticate: Option<&str>) -> anyhow::Result<bool> {
+    async fn on_unauthorized(
+        &self,
+        failed_token: Option<&str>,
+        _www_authenticate: Option<&str>,
+    ) -> anyhow::Result<bool> {
         let _guard = self.refresh_lock.lock().await;
         let entry = match self.auth_store.get(&self.server_name, &self.server_url).await {
             Some(e) => e,
             None => return Ok(false),
         };
+        // Another request may already have refreshed the token while we waited on the lock.
+        if let (Some(failed), Some(current)) = (
+            failed_token,
+            entry.tokens.as_ref().map(|t| t.access_token.as_str()),
+        ) {
+            if current != failed {
+                return Ok(true);
+            }
+        }
         self.do_refresh(&entry).await
     }
 }
@@ -1130,6 +1302,28 @@ mod tests {
 
         let code_res = server_task.await.unwrap();
         assert_eq!(code_res.unwrap(), "test_code_auth");
+    }
+
+    #[tokio::test]
+    async fn test_run_loopback_callback_decodes_non_ascii_query() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let server_task = tokio::spawn(async move {
+            run_loopback_callback(port, "state", Duration::from_secs(5)).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
+        // A raw non-ASCII byte right after a `%` used to make the decoder slice
+        // the query &str at a non-char boundary and panic. The trailing "%aé"
+        // exercises that case; the leading escapes verify normal decoding.
+        let request = "GET /callback?code=caf%C3%A9%2F%aé&state=state HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let code = server_task.await.unwrap().unwrap();
+        assert_eq!(code, "café/%aé");
     }
 
     #[tokio::test]

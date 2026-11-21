@@ -16,14 +16,17 @@ use crate::types::*;
 
 type HmacSha256 = Hmac<Sha256>;
 
-fn sha256_hex(data: &[u8]) -> String {
-    let hash = Sha256::digest(data);
-    let mut s = String::with_capacity(64);
-    for b in hash {
+fn hex_encode(data: &[u8]) -> String {
+    let mut s = String::with_capacity(data.len() * 2);
+    for b in data {
         use std::fmt::Write;
         let _ = write!(&mut s, "{:02x}", b);
     }
     s
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex_encode(&Sha256::digest(data))
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
@@ -98,10 +101,13 @@ pub fn sign_aws_sigv4(
         .collect::<Vec<_>>()
         .join(";");
 
+    // SigV4 canonical URIs are double-encoded for non-S3 services: a `%3A`
+    // in the request path must appear as `%253A` in the string to sign.
+    let canonical_path = path.replace('%', "%25");
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         method.to_uppercase(),
-        path,
+        canonical_path,
         canonical_query,
         canonical_headers,
         signed_headers_names,
@@ -122,7 +128,9 @@ pub fn sign_aws_sigv4(
     let k_region = hmac_sha256(&k_date, region.as_bytes());
     let k_service = hmac_sha256(&k_region, service.as_bytes());
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
-    let signature = sha256_hex(&hmac_sha256(&k_signing, string_to_sign.as_bytes()));
+    // SigV4 signs by hex-encoding the raw HMAC digest. Hashing it a second
+    // time with SHA-256 produces an invalid signature (403 InvalidSignature).
+    let signature = hex_encode(&hmac_sha256(&k_signing, string_to_sign.as_bytes()));
 
     let auth_header = format!(
         "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers_names}, Signature={signature}"
@@ -502,13 +510,13 @@ pub fn build_bedrock_request(
                             }
                         }
                         AssistantContentBlock::Thinking(th) => {
-                            let mut reasoning_obj = serde_json::Map::new();
-                            reasoning_obj.insert("text".to_string(), serde_json::json!(sanitize_surrogates(&th.thinking)));
+                            let mut reasoning_text = serde_json::Map::new();
+                            reasoning_text.insert("text".to_string(), serde_json::json!(sanitize_surrogates(&th.thinking)));
                             if let Some(sig) = &th.thinking_signature {
-                                reasoning_obj.insert("signature".to_string(), serde_json::json!(sig));
+                                reasoning_text.insert("signature".to_string(), serde_json::json!(sig));
                             }
                             content_parts.push(serde_json::json!({
-                                "reasoningContent": reasoning_obj
+                                "reasoningContent": { "reasoningText": reasoning_text }
                             }));
                         }
                         AssistantContentBlock::ToolCall(tc) => {
@@ -645,11 +653,17 @@ pub fn build_bedrock_request(
         );
     }
 
+    let thinking_enabled = model.reasoning && options.reasoning != Some(ThinkingLevel::Off);
+    let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
+
     let mut inference_config = serde_json::Map::new();
+    // Claude on Bedrock rejects temperature != 1 when extended thinking is on.
     if let Some(temp) = options.temperature {
-        inference_config.insert("temperature".to_string(), serde_json::json!(temp));
+        if !thinking_enabled || !is_claude {
+            inference_config.insert("temperature".to_string(), serde_json::json!(temp));
+        }
     }
-    if let Some(max_tokens) = options.max_tokens {
+    if options.max_tokens.is_some() {
         inference_config.insert("maxTokens".to_string(), serde_json::json!(max_tokens));
     }
     if !inference_config.is_empty() {
@@ -682,7 +696,7 @@ pub fn build_bedrock_request(
         }
     }
 
-    if model.reasoning && options.reasoning != Some(ThinkingLevel::Off) {
+    if thinking_enabled {
         let budget = match options.reasoning {
             Some(ThinkingLevel::Minimal) => 1024,
             Some(ThinkingLevel::Low) => 2048,
@@ -692,6 +706,8 @@ pub fn build_bedrock_request(
             }
             _ => 2048,
         };
+        // Bedrock caps budget_tokens at 32768 and requires it below maxTokens.
+        let budget = budget.min(32768).min(max_tokens.saturating_sub(1)).max(1);
         req_map.insert(
             "additionalModelRequestFields".to_string(),
             serde_json::json!({
@@ -894,7 +910,7 @@ impl BedrockStreamState {
                             events.push(AssistantMessageEvent::ToolCallDelta {
                                 content_index: c_idx,
                                 delta: input_delta.to_string(),
-                                partial: self.output.clone(),
+                                partial: self.output.metadata_clone_with_block(c_idx),
                             });
                         }
                     }
@@ -1125,7 +1141,10 @@ impl LlmProvider for BedrockProvider {
                 model.base_url.trim_end_matches('/').to_string()
             };
 
-            let url = format!("{base_url}/model/{}/converse-stream", model.id);
+            // Bedrock model IDs commonly contain ':' (e.g. "...-v1:0"), which
+            // must be percent-encoded in the path. The signer double-encodes it.
+            let encoded_model_id = model.id.replace(':', "%3A");
+            let url = format!("{base_url}/model/{encoded_model_id}/converse-stream");
 
             let resp = match send_with_retry(
                 || {

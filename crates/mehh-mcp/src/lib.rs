@@ -313,8 +313,9 @@ mod tests {
         assert!(configs.contains_key("local_server"));
         let srv = &configs["local_server"];
         assert_eq!(srv.command.as_deref(), Some("python"));
-        assert_eq!(srv.args, vec!["server.py"]);
+        assert_eq!(srv.args(), ["server.py".to_string()]);
         assert!(srv.is_enabled());
+        assert_eq!(srv.effective_timeout_ms(), Some(30_000));
     }
 
     #[tokio::test]

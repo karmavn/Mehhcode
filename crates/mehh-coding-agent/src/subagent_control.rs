@@ -48,26 +48,31 @@ impl SubagentControl {
 
     /// Acquires one global concurrency permit.
     pub async fn acquire(&self) -> tokio::sync::OwnedSemaphorePermit {
-        Arc::clone(&self.permits).acquire_owned().await.expect("semaphore closed")
+        Arc::clone(&self.permits)
+            .acquire_owned()
+            .await
+            .expect("semaphore closed")
     }
 
     /// Registers a child and returns its handle (handle cancel kills the child).
-    pub fn register(&self, agent_id: String, mode: String, cancel: CancellationToken) -> SubagentHandle {
+    pub fn register(
+        &self,
+        agent_id: String,
+        mode: String,
+        cancel: CancellationToken,
+    ) -> SubagentHandle {
         let started_ms = now_ms();
         let steering_queue = Arc::new(Mutex::new(VecDeque::new()));
-        self.children
-            .lock()
-            .unwrap()
-            .insert(
-                agent_id.clone(),
-                SubagentHandle {
-                    agent_id: agent_id.clone(),
-                    mode: mode.clone(),
-                    started_ms,
-                    cancel: cancel.clone(),
-                    steering_queue: steering_queue.clone(),
-                },
-            );
+        self.children.lock().unwrap().insert(
+            agent_id.clone(),
+            SubagentHandle {
+                agent_id: agent_id.clone(),
+                mode: mode.clone(),
+                started_ms,
+                cancel: cancel.clone(),
+                steering_queue: steering_queue.clone(),
+            },
+        );
         SubagentHandle {
             agent_id,
             mode,
@@ -100,10 +105,14 @@ impl SubagentControl {
     pub fn steer(&self, agent_id: &str, text: &str) -> bool {
         let mut children = self.children.lock().unwrap();
         if let Some(handle) = children.get_mut(agent_id) {
-            handle.steering_queue.lock().unwrap().push_back(Message::User(UserMessage {
-                content: UserContent::Text(text.to_string()),
-                timestamp: now_ms(),
-            }));
+            handle
+                .steering_queue
+                .lock()
+                .unwrap()
+                .push_back(Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: now_ms(),
+                }));
             true
         } else {
             false
@@ -135,6 +144,9 @@ static GLOBAL_CONTROL: OnceLock<Arc<SubagentControl>> = OnceLock::new();
 /// above [`DEFAULT_MAX_CONCURRENT_SUBAGENTS`] to avoid cross-test/cross-session
 /// serialization when many callers share this one budget.
 pub fn global_control() -> &'static Arc<SubagentControl> {
-    GLOBAL_CONTROL
-        .get_or_init(|| Arc::new(SubagentControl::new(GLOBAL_DEFAULT_MAX_CONCURRENT_SUBAGENTS)))
+    GLOBAL_CONTROL.get_or_init(|| {
+        Arc::new(SubagentControl::new(
+            GLOBAL_DEFAULT_MAX_CONCURRENT_SUBAGENTS,
+        ))
+    })
 }

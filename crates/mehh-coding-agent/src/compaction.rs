@@ -1,13 +1,17 @@
 //! Context compaction and history summarization for long agent sessions.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
+
 use anyhow::{anyhow, Result};
+use mehh_agent::types::tool_to_definition;
+use mehh_agent::AgentTool;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
 
 use mehh_ai::{
-    now_ms, AssistantContentBlock, Context, LlmProvider, Message, Model,
-    StopReason, StreamOptions, UserContent, UserMessage,
+    now_ms, AssistantContentBlock, Context, LlmProvider, Message, Model, StopReason, StreamOptions,
+    UserContent, UserMessage,
 };
 
 use crate::session::{SessionEntry, SessionEntryKind};
@@ -179,14 +183,14 @@ fn json_serialized_len<T: serde::Serialize + ?Sized>(value: &T) -> usize {
 /// Estimated token count for a message using the `chars.div_ceil(4)` heuristic.
 pub fn estimate_message_tokens(msg: &Message) -> usize {
     let chars = match msg {
-        Message::System(s) => s.content.len(),
+        Message::System(s) => s.content.chars().count(),
         Message::User(u) => match &u.content {
-            UserContent::Text(t) => t.len(),
+            UserContent::Text(t) => t.chars().count(),
             UserContent::Blocks(blocks) => {
                 let mut sum = 0;
                 for b in blocks {
                     match b {
-                        mehh_ai::UserContentBlock::Text(t) => sum += t.text.len(),
+                        mehh_ai::UserContentBlock::Text(t) => sum += t.text.chars().count(),
                         mehh_ai::UserContentBlock::Image(_) => sum += 4800,
                     }
                 }
@@ -197,8 +201,8 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
             let mut sum = 0;
             for b in &a.content {
                 match b {
-                    AssistantContentBlock::Text(t) => sum += t.text.len(),
-                    AssistantContentBlock::Thinking(th) => sum += th.thinking.len(),
+                    AssistantContentBlock::Text(t) => sum += t.text.chars().count(),
+                    AssistantContentBlock::Thinking(th) => sum += th.thinking.chars().count(),
                     AssistantContentBlock::ToolCall(tc) => {
                         sum += tc.name.len() + json_serialized_len(&tc.arguments);
                     }
@@ -210,17 +214,42 @@ pub fn estimate_message_tokens(msg: &Message) -> usize {
             let mut sum = 0;
             for b in &tr.content {
                 match b {
-                    mehh_ai::ToolResultContentBlock::Text(t) => sum += t.text.len(),
+                    mehh_ai::ToolResultContentBlock::Text(t) => sum += t.text.chars().count(),
                     mehh_ai::ToolResultContentBlock::Image(_) => sum += 4800,
                 }
             }
-            if let Some(details) = &tr.details {
-                sum += json_serialized_len(details);
-            }
+            // `details` are session metadata only; they are never serialized to the LLM.
             sum
         }
     };
     chars.div_ceil(4)
+}
+
+/// Token estimate for tool schemas, which occupy context alongside the conversation.
+pub fn estimate_tool_definitions_tokens(tools: &[Arc<dyn AgentTool>]) -> usize {
+    tools
+        .iter()
+        .map(|t| json_serialized_len(&tool_to_definition(t.as_ref())))
+        .sum::<usize>()
+        .div_ceil(4)
+}
+
+/// Projects the entry kinds that `SessionManager::build_context_messages` sends to the LLM.
+fn messages_for_entry(entry: &SessionEntry) -> Vec<Message> {
+    match &entry.kind {
+        SessionEntryKind::Message { message } => vec![message.clone()],
+        SessionEntryKind::CustomMessage { content, .. } => vec![Message::User(UserMessage {
+            content: content.clone(),
+            timestamp: now_ms(),
+        })],
+        SessionEntryKind::BranchSummary { summary, .. } => vec![Message::User(UserMessage {
+            content: UserContent::Text(format!(
+                "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n{summary}\n</summary>"
+            )),
+            timestamp: now_ms(),
+        })],
+        _ => Vec::new(),
+    }
 }
 
 /// Prepared compaction payload containing the cut point, messages to summarize,
@@ -322,9 +351,9 @@ pub fn prepare_compaction(
     }
 
     // Locate latest compaction boundary
-    let last_compaction_pos = entries.iter().rposition(|e| {
-        matches!(&e.kind, SessionEntryKind::Compaction { .. })
-    });
+    let last_compaction_pos = entries
+        .iter()
+        .rposition(|e| matches!(&e.kind, SessionEntryKind::Compaction { .. }));
 
     let (boundary_start, previous_summary) = match last_compaction_pos {
         Some(pos) => {
@@ -344,10 +373,11 @@ pub fn prepare_compaction(
     // Collect valid cut point candidate indices: Message::User or Message::Assistant
     let mut cut_point_candidates = Vec::new();
     for (i, entry) in entries.iter().enumerate().skip(boundary_start) {
-        if let SessionEntryKind::Message { message } = &entry.kind {
-            if is_cut_point_message(message) {
-                cut_point_candidates.push(i);
-            }
+        if messages_for_entry(entry)
+            .iter()
+            .any(|message| is_cut_point_message(message))
+        {
+            cut_point_candidates.push(i);
         }
     }
 
@@ -361,9 +391,10 @@ pub fn prepare_compaction(
         tokens_before += prev.len().div_ceil(4);
     }
     for entry in &entries[boundary_start..] {
-        if let SessionEntryKind::Message { message } = &entry.kind {
-            tokens_before += estimate_message_tokens(message);
-        }
+        tokens_before += messages_for_entry(entry)
+            .iter()
+            .map(estimate_message_tokens)
+            .sum::<usize>();
     }
 
     // Walk backwards from the tail, accumulating tokens until >= keep_recent_tokens
@@ -372,18 +403,18 @@ pub fn prepare_compaction(
     let mut budget_exceeded = false;
 
     for i in (boundary_start..entries.len()).rev() {
-        if let SessionEntryKind::Message { message } = &entries[i].kind {
-            accumulated_tokens += estimate_message_tokens(message);
-            if accumulated_tokens >= keep_recent_tokens {
-                budget_exceeded = true;
-                // Snap to the closest candidate at or after index i
-                cut_index = cut_point_candidates
-                    .iter()
-                    .copied()
-                    .find(|&c| c >= i)
-                    .unwrap_or(*cut_point_candidates.last().unwrap());
-                break;
-            }
+        for msg in &messages_for_entry(&entries[i]) {
+            accumulated_tokens += estimate_message_tokens(msg);
+        }
+        if accumulated_tokens >= keep_recent_tokens {
+            budget_exceeded = true;
+            // Snap to the closest candidate at or after index i
+            cut_index = cut_point_candidates
+                .iter()
+                .copied()
+                .find(|&c| c >= i)
+                .unwrap_or(*cut_point_candidates.last().unwrap());
+            break;
         }
     }
 
@@ -436,9 +467,7 @@ pub fn prepare_compaction(
 
     let mut messages_to_summarize = Vec::new();
     for entry in &entries[boundary_start..first_kept_index] {
-        if let SessionEntryKind::Message { message } = &entry.kind {
-            messages_to_summarize.push(message.clone());
-        }
+        messages_to_summarize.extend(messages_for_entry(entry));
     }
 
     let turn_prefix_messages = Vec::new();
@@ -453,7 +482,10 @@ pub fn prepare_compaction(
     let mut read_files_set = BTreeSet::new();
     let mut modified_files_set = BTreeSet::new();
 
-    for msg in messages_to_summarize.iter().chain(turn_prefix_messages.iter()) {
+    for msg in messages_to_summarize
+        .iter()
+        .chain(turn_prefix_messages.iter())
+    {
         if let Message::Assistant(ast) = msg {
             for call in ast.tool_calls() {
                 if let Some(path_val) = call.arguments.get("path").and_then(|v| v.as_str()) {
@@ -498,11 +530,26 @@ pub async fn compact_with_provider(
     custom_instructions: Option<&str>,
     cancel: CancellationToken,
 ) -> Result<String> {
-    let serialized_conv = serialize_conversation(&prep.messages_to_summarize);
+    let mut serialized_conv = serialize_conversation(&prep.messages_to_summarize);
+    // A reactive overflow compaction starts from a context that is already too
+    // large. Clamp the summarization payload so the summary request itself
+    // cannot overflow the same window.
+    let budget_chars = (model.context_window as usize)
+        .saturating_sub(8192)
+        .saturating_mul(3)
+        .max(4096);
+    if serialized_conv.chars().count() > budget_chars {
+        if let Some((byte_end, _)) = serialized_conv.char_indices().nth(budget_chars) {
+            serialized_conv.truncate(byte_end);
+            serialized_conv.push_str("\n\n[... older history truncated for summarization]");
+        }
+    }
 
     let mut user_prompt = String::new();
     if let Some(prev) = &prep.previous_summary {
-        user_prompt.push_str(&format!("<previous-summary>\n{prev}\n</previous-summary>\n\n"));
+        user_prompt.push_str(&format!(
+            "<previous-summary>\n{prev}\n</previous-summary>\n\n"
+        ));
     }
 
     user_prompt.push_str(&serialized_conv);
@@ -537,7 +584,10 @@ pub async fn compact_with_provider(
     let mut stream = provider.stream(model, &context, &options, cancel);
     let final_msg = stream.collect_final_message().await?;
 
-    if matches!(final_msg.stop_reason, StopReason::Error | StopReason::Aborted) {
+    if matches!(
+        final_msg.stop_reason,
+        StopReason::Error | StopReason::Aborted
+    ) {
         let err = final_msg
             .error_message
             .unwrap_or_else(|| format!("Compaction stopped with {:?}", final_msg.stop_reason));
@@ -565,8 +615,8 @@ pub async fn compact_with_provider(
 mod tests {
     use super::*;
     use mehh_ai::{
-        now_ms, AssistantContentBlock, AssistantMessage, FauxProvider, ModelCost,
-        StopReason, TextContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
+        now_ms, AssistantContentBlock, AssistantMessage, FauxProvider, ModelCost, StopReason,
+        TextContent, ToolCall, ToolResultMessage, Usage, UserContent, UserMessage,
     };
 
     fn make_test_model() -> Model {
@@ -605,9 +655,15 @@ mod tests {
 
         // 2. Assistant tool call (read foo.rs and write bar.rs)
         let mut read_args = serde_json::Map::new();
-        read_args.insert("path".to_string(), serde_json::Value::String("src/foo.rs".to_string()));
+        read_args.insert(
+            "path".to_string(),
+            serde_json::Value::String("src/foo.rs".to_string()),
+        );
         let mut write_args = serde_json::Map::new();
-        write_args.insert("path".to_string(), serde_json::Value::String("src/bar.rs".to_string()));
+        write_args.insert(
+            "path".to_string(),
+            serde_json::Value::String("src/bar.rs".to_string()),
+        );
 
         entries.push(SessionEntry {
             id: "e2".to_string(),
@@ -710,6 +766,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn compact_with_provider_caps_oversized_history() {
+        let mut model = make_test_model();
+        model.context_window = 4096;
+        let prep = CompactionPreparation {
+            first_kept_entry_id: "e2".to_string(),
+            messages_to_summarize: vec![Message::User(UserMessage {
+                content: UserContent::Text("x".repeat(200_000)),
+                timestamp: now_ms(),
+            })],
+            turn_prefix_messages: Vec::new(),
+            tokens_before: 50_000,
+            previous_summary: None,
+            read_files: Vec::new(),
+            modified_files: Vec::new(),
+        };
+        let faux = FauxProvider::new();
+        faux.add_response(mehh_ai::faux_assistant_message("## Goal\nSmall summary"));
+        compact_with_provider(&prep, &model, &faux, None, None, CancellationToken::new())
+            .await
+            .unwrap();
+        let requests = faux.recorded_requests();
+        let request = requests.last().expect("compaction request recorded");
+        let text = match &request.context.messages[0] {
+            Message::User(u) => match &u.content {
+                UserContent::Text(t) => t.clone(),
+                _ => panic!("expected text prompt"),
+            },
+            _ => panic!("expected user prompt"),
+        };
+        assert!(
+            text.len() < 20_000,
+            "summarization prompt grew to {} chars",
+            text.len()
+        );
+    }
+
+    #[test]
+    fn estimate_message_tokens_uses_chars_not_utf8_bytes() {
+        let msg = Message::User(UserMessage {
+            content: UserContent::Text("é".repeat(400)),
+            timestamp: now_ms(),
+        });
+        assert_eq!(estimate_message_tokens(&msg), 100);
+    }
+
+    #[tokio::test]
     async fn test_compact_with_provider_faux() {
         let prep = CompactionPreparation {
             first_kept_entry_id: "entry_123".to_string(),
@@ -743,7 +845,8 @@ mod tests {
         let faux = FauxProvider::new();
         faux.add_response(AssistantMessage {
             content: vec![AssistantContentBlock::Text(TextContent {
-                text: "## Goal\nBuild a parser.\n\n## Progress\n### Done\n- [x] Parser built".to_string(),
+                text: "## Goal\nBuild a parser.\n\n## Progress\n### Done\n- [x] Parser built"
+                    .to_string(),
                 text_signature: None,
             })],
             api: "faux".to_string(),
@@ -759,16 +862,10 @@ mod tests {
         let model = make_test_model();
         let cancel = CancellationToken::new();
 
-        let result = compact_with_provider(
-            &prep,
-            &model,
-            &faux,
-            None,
-            Some("Keep it brief"),
-            cancel,
-        )
-        .await
-        .unwrap();
+        let result =
+            compact_with_provider(&prep, &model, &faux, None, Some("Keep it brief"), cancel)
+                .await
+                .unwrap();
 
         assert!(result.contains("## Goal\nBuild a parser."));
         assert!(result.contains("<read-files>\nparser.rs\n</read-files>"));
@@ -780,19 +877,22 @@ mod tests {
         // Non-ASCII tool output around byte 2000 must not panic when serialized for compaction.
         let mut big = "a".repeat(TOOL_RESULT_MAX_CHARS - 2);
         big.push_str("你好世界🙂extra");
-        let serialized = serialize_conversation(&[Message::ToolResult(mehh_ai::ToolResultMessage {
-            tool_call_id: "c1".to_string(),
-            tool_name: "read".to_string(),
-            content: vec![mehh_ai::ToolResultContentBlock::Text(mehh_ai::TextContent {
-                text: big,
-                text_signature: None,
-            })],
-            details: None,
-            is_error: false,
-            duration_ms: None,
-            usage: None,
-            timestamp: now_ms(),
-        })]);
+        let serialized =
+            serialize_conversation(&[Message::ToolResult(mehh_ai::ToolResultMessage {
+                tool_call_id: "c1".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![mehh_ai::ToolResultContentBlock::Text(
+                    mehh_ai::TextContent {
+                        text: big,
+                        text_signature: None,
+                    },
+                )],
+                details: None,
+                is_error: false,
+                duration_ms: None,
+                usage: None,
+                timestamp: now_ms(),
+            })]);
         assert!(serialized.contains("more characters truncated"));
 
         // Cutting on an assistant entry mid-turn must anchor first_kept_entry_id on that turn's User entry.
@@ -864,7 +964,8 @@ mod tests {
         // Budget is small (50 tokens) so walking backwards from a2 reaches a1 and exceeds budget.
         // a1 is an assistant message whose turn_start is u1 (index 0 == boundary_start).
         // It must advance to u2 instead of returning None.
-        let prep = prepare_compaction(&entries, 50).expect("Compaction should succeed by advancing to next User turn");
+        let prep = prepare_compaction(&entries, 50)
+            .expect("Compaction should succeed by advancing to next User turn");
         assert_eq!(prep.first_kept_entry_id, "u2");
         assert_eq!(prep.messages_to_summarize.len(), 2);
     }

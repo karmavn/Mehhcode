@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use mehh_ai::{faux_model, FauxProvider, LlmProvider, Model, StopReason};
+use std::sync::Arc;
 
 /// Default number of Lead turns granted per rescue before returning to Worker.
 pub const DEFAULT_LEAD_RESCUE_TURNS: usize = 2;
@@ -66,13 +66,7 @@ impl LeadWorkerManager {
         let faux_lead = Arc::new(FauxProvider::default());
         let faux_worker = Arc::new(FauxProvider::default());
 
-        Self::new(
-            lead,
-            faux_lead,
-            Some(worker),
-            Some(faux_worker),
-            lead_turns,
-        )
+        Self::new(lead, faux_lead, Some(worker), Some(faux_worker), lead_turns)
     }
 
     pub fn is_active(&self) -> bool {
@@ -88,10 +82,7 @@ impl LeadWorkerManager {
     }
 
     pub fn active_model_for_turn(&self, turn: usize) -> &str {
-        if !self.locked_to_lead
-            && self.lead_rescue_remaining == 0
-            && turn >= self.lead_turns
-        {
+        if !self.locked_to_lead && self.lead_rescue_remaining == 0 && turn >= self.lead_turns {
             if let Some(ref worker) = self.worker_model {
                 return &worker.id;
             }

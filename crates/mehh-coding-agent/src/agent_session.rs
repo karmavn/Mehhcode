@@ -1,9 +1,38 @@
 //! Orchestrates an agent session with tool executions, model streaming, and history tracking.
 
+/// Marker used by `TodoState::format_moim_block` and by the idempotent injector below.
+const MOIM_START: &str = "<working_checklist>";
+const MOIM_END: &str = "</working_checklist>";
+
+/// Replaces a previously injected MOIM block in place, or appends it once.
+fn replace_moim_text(text: &mut String, block: &str) {
+    if let Some(start) = text.find(MOIM_START) {
+        if let Some(rel_end) = text[start..].find(MOIM_END) {
+            let end = start + rel_end + MOIM_END.len();
+            text.replace_range(start..end, block);
+            return;
+        }
+    }
+    text.push_str("\n\n");
+    text.push_str(block);
+}
+
+/// Removes any previously injected MOIM block. Returns whether text changed.
+fn strip_moim_text(text: &mut String) -> bool {
+    if let Some(start) = text.find(MOIM_START) {
+        if let Some(rel_end) = text[start..].find(MOIM_END) {
+            let end = start + rel_end + MOIM_END.len();
+            text.replace_range(start..end, "");
+            return true;
+        }
+    }
+    false
+}
+
+use anyhow::{anyhow, Result};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
-use anyhow::{anyhow, Result};
 use tokio_util::sync::CancellationToken;
 
 use mehh_agent::{run_agent_loop, AgentEvent, AgentLoopConfig, AgentTool, DEFAULT_MAX_AGENT_TURNS};
@@ -44,6 +73,7 @@ pub struct AgentSession {
     pub thinking_level: Option<ThinkingLevel>,
     pub skills: Vec<Skill>,
     pub prompt_templates: Vec<PromptTemplate>,
+    pub no_context_files: bool,
     pub steering_queue: Arc<Mutex<VecDeque<Message>>>,
     pub follow_up_queue: Arc<Mutex<VecDeque<Message>>>,
     pub active_cancel: Arc<Mutex<Option<CancellationToken>>>,
@@ -58,6 +88,22 @@ pub struct AgentSession {
     pub todo_state: Arc<tokio::sync::RwLock<crate::todo::TodoState>>,
     pub lead_worker: Arc<Mutex<crate::lead_worker::LeadWorkerManager>>,
     pub subagent_control: Arc<SubagentControl>,
+}
+
+/// Resolves the credential that a cross-provider subagent worker must use.
+/// This must never fall back to the Lead key: at turn zero `active_api_key()`
+/// is the Lead key even when the worker model uses a different provider.
+fn subagent_api_key(
+    manager: &crate::lead_worker::LeadWorkerManager,
+    api_key: &Option<String>,
+    worker_provider: &str,
+    session_provider: &str,
+) -> Option<String> {
+    if worker_provider.eq_ignore_ascii_case(session_provider) {
+        api_key.clone()
+    } else {
+        manager.worker_api_key.clone()
+    }
 }
 
 impl AgentSession {
@@ -94,12 +140,15 @@ impl AgentSession {
             crate::tool_inspection::PermissionMode::SmartApprove
         };
         let permission_mode = settings.permission_mode.unwrap_or(default_mode);
-        let perm_store = crate::permissions::PermissionStore::load(&cwd, trusted).unwrap_or_default();
-        let inspection_manager = Arc::new(crate::tool_inspection::ToolInspectionManager::new_with_store(
-            permission_mode,
-            cwd.clone(),
-            perm_store,
-        ));
+        let perm_store =
+            crate::permissions::PermissionStore::load(&cwd, trusted).unwrap_or_default();
+        let inspection_manager = Arc::new(
+            crate::tool_inspection::ToolInspectionManager::new_with_store(
+                permission_mode,
+                cwd.clone(),
+                perm_store,
+            ),
+        );
 
         let (worker_model, worker_provider) = if let Some(ref wm) = settings.worker_model {
             if let Ok(reg) = crate::models_config::ModelRegistry::load_default() {
@@ -136,8 +185,18 @@ impl AgentSession {
         lw_mgr.set_worker_api_key(worker_api_key.clone());
         let lead_worker = Arc::new(Mutex::new(lw_mgr));
 
-        let subagent_model = lead_worker.lock().unwrap().worker_model().cloned().unwrap_or_else(|| model.clone());
-        let subagent_provider = lead_worker.lock().unwrap().worker_provider().cloned().unwrap_or_else(|| provider.clone());
+        let subagent_model = lead_worker
+            .lock()
+            .unwrap()
+            .worker_model()
+            .cloned()
+            .unwrap_or_else(|| model.clone());
+        let subagent_provider = lead_worker
+            .lock()
+            .unwrap()
+            .worker_provider()
+            .cloned()
+            .unwrap_or_else(|| provider.clone());
         let subagent_key = if subagent_model.provider == model.provider {
             None
         } else {
@@ -163,8 +222,7 @@ impl AgentSession {
         let todo_tool = Arc::new(crate::todo::TodoTool::new(todo_state.clone()));
         tools.push(todo_tool);
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        let system_prompt =
-            build_system_prompt_with_skills(&cwd, None, None, &tool_names, &skills);
+        let system_prompt = build_system_prompt_with_skills(&cwd, None, None, &tool_names, &skills);
 
         Self {
             cwd,
@@ -181,6 +239,7 @@ impl AgentSession {
             thinking_level,
             skills,
             prompt_templates,
+            no_context_files: false,
             steering_queue: Arc::new(Mutex::new(VecDeque::new())),
             follow_up_queue: Arc::new(Mutex::new(VecDeque::new())),
             active_cancel: Arc::new(Mutex::new(None)),
@@ -352,13 +411,20 @@ impl AgentSession {
     /// Rebuilds the structured system prompt from current tools, skills, and preserved prompt overrides.
     pub fn rebuild_system_prompt(&mut self) {
         let tool_names: Vec<&str> = self.tools.iter().map(|t| t.name()).collect();
-        self.system_prompt = build_system_prompt_with_skills(
+        self.system_prompt = crate::system_prompt::build_system_prompt_with_skills_and_context(
             &self.cwd,
             self.custom_system_prompt.as_deref(),
             self.append_system_prompt.as_deref(),
             &tool_names,
             &self.skills,
+            !self.no_context_files,
         );
+    }
+
+    /// Skips loading AGENTS.md / CLAUDE.md into the system prompt.
+    pub fn set_no_context_files(&mut self, value: bool) {
+        self.no_context_files = value;
+        self.rebuild_system_prompt();
     }
 
     /// Reloads settings, skills, and prompt templates from disk, then rebuilds system prompt.
@@ -398,6 +464,7 @@ impl AgentSession {
             }
             self.tools.extend(eager);
             self.enable_deferred_mcp_tools(deferred);
+            self.refresh_subagent_tool();
         } else {
             self.tools.extend(mcp_tools);
             if enable_codemode {
@@ -408,10 +475,14 @@ impl AgentSession {
                 self.codemode_tool = None;
             }
             self.rebuild_system_prompt();
+            self.refresh_subagent_tool();
         }
     }
 
-    fn create_codemode_tool(&self, tools: Vec<Arc<dyn AgentTool>>) -> Arc<mehh_codemode::CodemodeTool> {
+    fn create_codemode_tool(
+        &self,
+        tools: Vec<Arc<dyn AgentTool>>,
+    ) -> Arc<mehh_codemode::CodemodeTool> {
         let inspection_mgr = self.inspection_manager.clone();
         let approval_h = self.approval_handler.clone();
         let session_cwd = self.cwd.clone();
@@ -433,23 +504,22 @@ impl AgentSession {
                     args: args_map,
                     is_read_only,
                     cwd: session_cwd,
-                origin: None,
+                    origin: None,
                 };
                 let res = inspection_mgr
                     .inspect_and_authorize(&inspect_ctx, approval_h.as_deref())
                     .await;
                 if res.block {
-                    Err(res.reason.unwrap_or_else(|| "Tool call blocked by inspection policy".to_string()))
+                    Err(res
+                        .reason
+                        .unwrap_or_else(|| "Tool call blocked by inspection policy".to_string()))
                 } else {
                     Ok(())
                 }
             })
         });
 
-        Arc::new(
-            mehh_codemode::CodemodeTool::new(tools)
-                .with_interceptor(interceptor)
-        )
+        Arc::new(mehh_codemode::CodemodeTool::new(tools).with_interceptor(interceptor))
     }
 
     /// Synchronizes updated MCP tools into the session, updating deferred catalog and codemode bindings in-place.
@@ -481,6 +551,7 @@ impl AgentSession {
             }
             self.tools.extend(eager);
             self.enable_deferred_mcp_tools(deferred);
+            self.refresh_subagent_tool();
         } else {
             if self.deferred_catalog.is_some() {
                 self.clear_deferred_mcp_tools();
@@ -499,6 +570,7 @@ impl AgentSession {
                 self.codemode_tool = None;
             }
             self.rebuild_system_prompt();
+            self.refresh_subagent_tool();
         }
     }
 
@@ -527,7 +599,8 @@ impl AgentSession {
         if let Some(ref catalog) = self.deferred_catalog {
             catalog.replace_deferred(deferred);
             if !self.tools.iter().any(|t| t.name() == "tool_search") {
-                self.tools.push(Arc::new(ToolSearchTool::new(catalog.clone())));
+                self.tools
+                    .push(Arc::new(ToolSearchTool::new(catalog.clone())));
             }
         } else {
             let catalog = Arc::new(DeferredToolCatalog::new(deferred));
@@ -548,13 +621,20 @@ impl AgentSession {
             .collect();
         let (subagent_model, subagent_provider, subagent_api_key) = {
             let lw = self.lead_worker.lock().unwrap();
-            let wm = lw.worker_model().cloned().unwrap_or_else(|| self.model.clone());
-            let wp = lw.worker_provider().cloned().unwrap_or_else(|| self.provider.clone());
-            let ak = if wm.provider == self.model.provider {
-                self.api_key.clone()
-            } else {
-                lw.active_api_key()
-            };
+            let wm = lw
+                .worker_model()
+                .cloned()
+                .unwrap_or_else(|| self.model.clone());
+            let wp = lw
+                .worker_provider()
+                .cloned()
+                .unwrap_or_else(|| self.provider.clone());
+            let ak = subagent_api_key(
+                &lw,
+                &self.api_key,
+                wm.provider.as_str(),
+                self.model.provider.as_str(),
+            );
             (wm, wp, ak)
         };
         let updated = Arc::new(
@@ -594,9 +674,7 @@ impl AgentSession {
 
     /// Sets an explicit CLI `--api-key` override that must not be clobbered on same-provider switches.
     pub fn set_explicit_api_key(&mut self, api_key: Option<String>) {
-        self.has_explicit_api_key = api_key
-            .as_deref()
-            .is_some_and(|k| !k.trim().is_empty());
+        self.has_explicit_api_key = api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
         self.api_key = api_key.clone();
         self.lead_worker.lock().unwrap().set_lead_api_key(api_key);
         self.refresh_subagent_tool();
@@ -618,9 +696,15 @@ impl AgentSession {
         if !self.model.provider.eq_ignore_ascii_case(&model.provider) {
             self.api_key = None;
             self.has_explicit_api_key = false;
+            self.lead_worker.lock().unwrap().set_lead_api_key(None);
         }
         self.model = model;
         self.provider = provider;
+        {
+            let mut mgr = self.lead_worker.lock().unwrap();
+            mgr.lead_model = self.model.clone();
+            mgr.lead_provider = self.provider.clone();
+        }
         self.refresh_subagent_tool();
     }
 
@@ -700,6 +784,8 @@ impl AgentSession {
         &self,
         content: UserContent,
     ) -> (Message, Vec<Message>, AgentLoopConfig) {
+        // Routing decisions for the first turn must see a fresh prompt counter.
+        self.lead_worker.lock().unwrap().reset_for_new_prompt();
         let expanded_content = match content {
             UserContent::Text(text) => UserContent::Text(self.expand_input(&text)),
             UserContent::Blocks(blocks) => {
@@ -740,6 +826,14 @@ impl AgentSession {
         config.dynamic_tools = Some(Arc::clone(&self.dynamic_tools));
         config.max_turns = Some(DEFAULT_MAX_AGENT_TURNS);
         config.stream_options.api_key = self.api_key.clone();
+        {
+            let mgr = self.lead_worker.lock().unwrap();
+            if mgr.should_use_worker() {
+                config.model = mgr.active_model();
+                config.provider = mgr.active_provider();
+                config.stream_options.api_key = mgr.worker_api_key.clone();
+            }
+        }
         config.stream_options.reasoning = self.thinking_level;
         if let Some(t) = self.settings.temperature {
             config.stream_options.temperature = Some(t);
@@ -773,13 +867,22 @@ impl AgentSession {
                     args: before_ctx.args,
                     is_read_only,
                     cwd: session_cwd,
-                origin: None,
+                    origin: None,
                 };
 
                 inspection_mgr
                     .inspect_and_authorize(&inspect_ctx, approval_h.as_deref())
                     .await
             })
+        }));
+
+        let lead_worker_outcomes = self.lead_worker.clone();
+        config.after_tool_call = Some(Arc::new(move |after_ctx, _cancel| {
+            lead_worker_outcomes
+                .lock()
+                .unwrap()
+                .record_tool_outcome(after_ctx.is_error);
+            Box::pin(async { mehh_agent::types::AfterToolCallResult::default() })
         }));
 
         let todo_state = self.todo_state.clone();
@@ -796,8 +899,9 @@ impl AgentSession {
                     read.format_moim_block(&session_cwd, session_trusted)
                 };
 
-                if let Some(moim_block) = block_opt {
-                    let mut ctx = req_ctx.context.clone();
+                let mut ctx = req_ctx.context.clone();
+                let mut changed = false;
+                if let Some(ref moim_block) = block_opt {
                     if let Some(Message::User(ref mut u)) = ctx
                         .messages
                         .iter_mut()
@@ -806,14 +910,28 @@ impl AgentSession {
                     {
                         match u.content {
                             UserContent::Text(ref mut t) => {
-                                t.push_str("\n\n");
-                                t.push_str(&moim_block);
+                                replace_moim_text(t, moim_block);
+                                changed = true;
                             }
                             UserContent::Blocks(ref mut blocks) => {
-                                blocks.push(mehh_ai::UserContentBlock::Text(mehh_ai::TextContent {
-                                    text: format!("\n\n{}", moim_block),
-                                    text_signature: None,
-                                }));
+                                if let Some(t) = blocks.iter_mut().find_map(|b| match b {
+                                    mehh_ai::UserContentBlock::Text(t)
+                                        if t.text.contains(MOIM_START) =>
+                                    {
+                                        Some(t)
+                                    }
+                                    _ => None,
+                                }) {
+                                    replace_moim_text(&mut t.text, moim_block);
+                                } else {
+                                    blocks.push(mehh_ai::UserContentBlock::Text(
+                                        mehh_ai::TextContent {
+                                            text: format!("\n\n{}", moim_block),
+                                            text_signature: None,
+                                        },
+                                    ));
+                                }
+                                changed = true;
                             }
                         }
                     } else {
@@ -821,12 +939,36 @@ impl AgentSession {
                         ctx.messages.insert(
                             0,
                             Message::User(UserMessage {
-                                content: UserContent::Text(moim_block),
-                                timestamp: crate::agent_session::now_ms(),
+                                content: UserContent::Text(moim_block.clone()),
+                                timestamp: now_ms(),
                             }),
                         );
+                        changed = true;
                     }
+                } else {
+                    // Checklist cleared: remove the stale injected block as well.
+                    for msg in ctx.messages.iter_mut() {
+                        if let Message::User(u) = msg {
+                            match u.content {
+                                UserContent::Text(ref mut t) => {
+                                    changed |= strip_moim_text(t);
+                                }
+                                UserContent::Blocks(ref mut blocks) => {
+                                    let before = blocks.len();
+                                    blocks.retain(|b| match b {
+                                        mehh_ai::UserContentBlock::Text(t) => {
+                                            !t.text.contains(MOIM_START)
+                                        }
+                                        _ => true,
+                                    });
+                                    changed |= blocks.len() != before;
+                                }
+                            }
+                        }
+                    }
+                }
 
+                if changed {
                     Some(mehh_agent::AgentRequestUpdate {
                         context: Some(ctx),
                         ..Default::default()
@@ -837,7 +979,6 @@ impl AgentSession {
             })
         }));
 
-        self.lead_worker.lock().unwrap().reset_for_new_prompt();
         let lead_worker_turn = self.lead_worker.clone();
         config.prepare_next_turn = Some(Arc::new(move |turn_ctx, _cancel| {
             let lead_worker = lead_worker_turn.clone();
@@ -934,6 +1075,10 @@ impl AgentSession {
         {
             if self.api_key.as_deref() != Some(key.as_str()) {
                 self.api_key = Some(key);
+                self.lead_worker
+                    .lock()
+                    .unwrap()
+                    .set_lead_api_key(self.api_key.clone());
                 self.refresh_subagent_tool();
             }
         }
@@ -951,7 +1096,9 @@ impl AgentSession {
             auto_compact_enabled,
         );
         let current_tokens =
-            crate::compaction::estimate_context_tokens(&self.session.build_context_messages());
+            crate::compaction::estimate_context_tokens(&self.session.build_context_messages())
+                + self.system_prompt.chars().count().div_ceil(4)
+                + crate::compaction::estimate_tool_definitions_tokens(&self.tools);
         if !crate::compaction::should_auto_compact(
             current_tokens,
             usize::try_from(self.model.context_window).unwrap_or(usize::MAX),
@@ -1131,11 +1278,14 @@ impl AgentSession {
             .cloned()
             .collect();
 
-        let prep = match crate::compaction::prepare_compaction(&active_entries, keep_recent_tokens) {
+        let prep = match crate::compaction::prepare_compaction(&active_entries, keep_recent_tokens)
+        {
             Some(p) => p,
             None => return Ok(None),
         };
-        let summary = self.run_prepared_compaction(prep, custom_instructions).await?;
+        let summary = self
+            .run_prepared_compaction(prep, custom_instructions)
+            .await?;
         Ok(Some(summary))
     }
 
@@ -1208,10 +1358,11 @@ impl AgentSession {
                 self.session.branch_from(target_id)?;
                 // Append BranchSummary on top of target branch
                 let from_id = old_leaf_id.unwrap_or_else(|| "root".to_string());
-                self.session.append_entry(crate::session::SessionEntryKind::BranchSummary {
-                    from_id,
-                    summary: sum.clone(),
-                })?;
+                self.session
+                    .append_entry(crate::session::SessionEntryKind::BranchSummary {
+                        from_id,
+                        summary: sum.clone(),
+                    })?;
                 Some(sum)
             } else {
                 self.session.branch_from(target_id)?;
@@ -1234,7 +1385,8 @@ mod tests {
 
     #[test]
     fn test_queues_and_abort() {
-        let temp_dir = std::env::temp_dir().join(format!("agent_session_q_{}", uuid::Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("agent_session_q_{}", uuid::Uuid::now_v7()));
         let session_mgr = SessionManager::in_memory(&temp_dir);
         let session = AgentSession::new(
             temp_dir.clone(),
@@ -1356,10 +1508,9 @@ mod tests {
                 timestamp: now_ms(),
             }))
             .unwrap();
-            sm.append_message(Message::Assistant(mehh_ai::faux_assistant_message(format!(
-                "prior reply {i}: {}",
-                "reply ".repeat(800)
-            ))))
+            sm.append_message(Message::Assistant(mehh_ai::faux_assistant_message(
+                format!("prior reply {i}: {}", "reply ".repeat(800)),
+            )))
             .unwrap();
         }
 
@@ -1408,16 +1559,19 @@ mod tests {
             }
             _ => panic!("expected assistant message"),
         }
-        assert!(session.session.entries().iter().any(|e| {
-            matches!(e.kind, crate::session::SessionEntryKind::Compaction { .. })
-        }));
+        assert!(session
+            .session
+            .entries()
+            .iter()
+            .any(|e| { matches!(e.kind, crate::session::SessionEntryKind::Compaction { .. }) }));
 
         let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
     async fn navigate_tree_with_summarize_generates_and_appends_branch_summary() {
-        let temp_dir = std::env::temp_dir().join(format!("agent_session_tree_{}", uuid::Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("agent_session_tree_{}", uuid::Uuid::now_v7()));
         let mut session = AgentSession::new(
             temp_dir.clone(),
             faux_model(),
@@ -1438,7 +1592,9 @@ mod tests {
         // Branch A entries: m1, m2
         let _m1 = session
             .session_mut()
-            .append_message(Message::Assistant(mehh_ai::faux_assistant_message("Working on branch A")))
+            .append_message(Message::Assistant(mehh_ai::faux_assistant_message(
+                "Working on branch A",
+            )))
             .unwrap();
         let m2 = session
             .session_mut()
@@ -1478,7 +1634,8 @@ mod tests {
 
     #[tokio::test]
     async fn prompt_content_forwards_user_blocks_with_image_to_agent_loop() {
-        let temp_dir = std::env::temp_dir().join(format!("agent_session_blocks_{}", uuid::Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("agent_session_blocks_{}", uuid::Uuid::now_v7()));
         let faux = Arc::new(mehh_ai::FauxProvider::with_responses(vec![
             mehh_ai::faux_assistant_message("I see the diagram."),
         ]));
@@ -1510,15 +1667,15 @@ mod tests {
         let active = session.session().active_path_entries();
         let first_msg_entry = active.first().unwrap();
         match &first_msg_entry.kind {
-            SessionEntryKind::Message { message: Message::User(u) } => {
-                match &u.content {
-                    UserContent::Blocks(b) => {
-                        assert_eq!(b.len(), 2);
-                        assert!(matches!(b[1], mehh_ai::UserContentBlock::Image(_)));
-                    }
-                    _ => panic!("Expected UserContent::Blocks"),
+            SessionEntryKind::Message {
+                message: Message::User(u),
+            } => match &u.content {
+                UserContent::Blocks(b) => {
+                    assert_eq!(b.len(), 2);
+                    assert!(matches!(b[1], mehh_ai::UserContentBlock::Image(_)));
                 }
-            }
+                _ => panic!("Expected UserContent::Blocks"),
+            },
             _ => panic!("Expected user message entry"),
         }
 
@@ -1527,7 +1684,8 @@ mod tests {
 
     #[test]
     fn test_agent_session_reload_picks_up_new_skill_and_prompt_template_from_disk() {
-        let temp_dir = std::env::temp_dir().join(format!("agent_session_reload_{}", uuid::Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("agent_session_reload_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let mut session = AgentSession::new_with_trust(
@@ -1596,7 +1754,8 @@ mod tests {
 
     #[test]
     fn test_sync_mcp_tools_preserves_codemode_and_catalog_handles() {
-        let temp_dir = std::env::temp_dir().join(format!("agent_session_sync_{}", uuid::Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("agent_session_sync_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let mut session = AgentSession::new_with_trust(
@@ -1640,5 +1799,184 @@ mod tests {
         assert!(Arc::ptr_eq(&orig_catalog, &synced_catalog));
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn prepare_request_replaces_moim_block_instead_of_appending() {
+        let dir = std::env::temp_dir().join(format!("agent_session_moim_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = AgentSession::new_with_trust(
+            dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&dir),
+            Settings::default(),
+            false,
+        );
+        session
+            .todo_state
+            .write()
+            .await
+            .add("first task".to_string());
+
+        let (user, _history, config) = session.prepare_prompt("hello");
+        let hook = config.prepare_request.expect("prepare hook");
+        let mut messages = vec![user];
+        for _ in 0..3 {
+            let ctx = mehh_agent::types::PrepareRequestContext {
+                context: mehh_agent::types::AgentContext {
+                    messages: messages.clone(),
+                    tools: None,
+                },
+                model: faux_model(),
+                thinking_level: None,
+            };
+            let update = hook(ctx, CancellationToken::new()).await.expect("update");
+            messages = update.context.expect("context").messages;
+        }
+        let text = match messages.last().expect("user message") {
+            Message::User(u) => match &u.content {
+                UserContent::Text(t) => t.clone(),
+                _ => panic!("expected text content"),
+            },
+            _ => panic!("expected user message"),
+        };
+        assert_eq!(
+            text.matches("<working_checklist>").count(),
+            1,
+            "moim block duplicated across turns: {text}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cross_provider_worker_uses_worker_key_at_turn_zero() {
+        let dir =
+            std::env::temp_dir().join(format!("agent_session_worker_key_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = AgentSession::new_with_trust(
+            dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&dir),
+            Settings::default(),
+            false,
+        );
+        let (manager, lead_key, worker_provider) = {
+            let mut mgr = session.lead_worker.lock().unwrap();
+            let mut worker = faux_model();
+            worker.provider = "openai".to_string();
+            mgr.worker_model = Some(worker);
+            mgr.set_worker_api_key(Some("worker-value".to_string()));
+            mgr.set_lead_api_key(Some("lead-value".to_string()));
+            (mgr.clone(), mgr.lead_api_key.clone(), "openai".to_string())
+        };
+        assert_eq!(
+            manager.active_api_key().as_deref(),
+            lead_key.as_deref(),
+            "turn zero active key is the lead key"
+        );
+        assert_eq!(
+            super::subagent_api_key(&manager, &lead_key, &worker_provider, "anthropic").as_deref(),
+            Some("worker-value"),
+            "worker tool must never receive the lead key"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn set_model_updates_lead_worker_state() {
+        let dir =
+            std::env::temp_dir().join(format!("agent_session_lead_model_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = AgentSession::new_with_trust(
+            dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&dir),
+            Settings::default(),
+            false,
+        );
+        let mut next = faux_model();
+        next.id = "next-lead".to_string();
+        let next_provider: Arc<dyn LlmProvider> = Arc::new(FauxProvider::new());
+        session.set_model(next.clone(), next_provider.clone());
+        let lw = session.lead_worker.lock().unwrap();
+        assert_eq!(lw.lead_model.id, "next-lead");
+        assert!(Arc::ptr_eq(&lw.lead_provider, &next_provider));
+        drop(lw);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn after_tool_call_records_lead_worker_outcome() {
+        let dir =
+            std::env::temp_dir().join(format!("agent_session_outcome_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = AgentSession::new_with_trust(
+            dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&dir),
+            Settings::default(),
+            false,
+        );
+        let (_user, _history, config) = session.prepare_prompt("hello");
+        let hook = config.after_tool_call.expect("after tool hook");
+        let ctx = mehh_agent::types::AfterToolCallContext {
+            assistant_message: mehh_ai::faux_assistant_message(""),
+            tool_call: mehh_ai::ToolCall {
+                id: "tc1".to_string(),
+                name: "tool".to_string(),
+                arguments: serde_json::Map::new(),
+                arguments_error: None,
+                thought_signature: None,
+            },
+            args: serde_json::Map::new(),
+            result: mehh_agent::AgentToolResult::text("failed"),
+            is_error: true,
+            context: mehh_agent::types::AgentContext {
+                messages: Vec::new(),
+                tools: None,
+            },
+        };
+        hook(ctx, CancellationToken::new()).await;
+        assert_eq!(
+            session.lead_worker.lock().unwrap().consecutive_tool_errors,
+            1
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn zero_lead_turns_starts_on_worker_model() {
+        let dir =
+            std::env::temp_dir().join(format!("agent_session_zero_lead_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = AgentSession::new_with_trust(
+            dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&dir),
+            Settings::default(),
+            false,
+        );
+        {
+            let mut mgr = session.lead_worker.lock().unwrap();
+            let mut worker = faux_model();
+            worker.id = "worker-first".to_string();
+            mgr.worker_model = Some(worker);
+            mgr.worker_provider = Some(Arc::new(FauxProvider::new()));
+            mgr.lead_turns = 0;
+            mgr.set_worker_api_key(Some("worker-value".to_string()));
+        }
+        let (_user, _history, config) = session.prepare_prompt("hello");
+        assert_eq!(config.model.id, "worker-first");
+        assert_eq!(
+            config.stream_options.api_key.as_deref(),
+            Some("worker-value")
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

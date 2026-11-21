@@ -1,15 +1,19 @@
 //! MCP tool adapter exposing MCP tools as `mehh_agent::AgentTool` implementations.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 use async_trait::async_trait;
+use anyhow::Context;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use mehh_ai::{ImageContent, TextContent, ToolResultContentBlock};
 use sha2::{Digest, Sha256};
 use tokio::sync::RwLock;
 
-use crate::client::{McpCallToolResult, McpClient, McpContentBlock, McpToolInfo};
+use crate::client::{
+    McpCallToolResult, McpClient, McpContentBlock, McpRequestOptions, McpToolInfo,
+};
 
 pub type McpOutputSaver = Arc<
     dyn Fn(Vec<u8>, String) -> futures::future::BoxFuture<'static, anyhow::Result<PathBuf>>
@@ -18,15 +22,47 @@ pub type McpOutputSaver = Arc<
 >;
 
 /// Persists raw MCP output or binary blob to a private temporary file.
+fn sanitize_output_ext(raw: &str) -> String {
+    let cleaned: String = raw
+        .trim_start_matches('.')
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(10)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if cleaned.is_empty() {
+        ".bin".to_string()
+    } else {
+        format!(".{cleaned}")
+    }
+}
+
+fn cleanup_old_mcp_outputs(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let Ok(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(24 * 3600)).ok_or(()) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if let Ok(meta) = entry.metadata() {
+            if meta.is_file() && meta.modified().is_ok_and(|m| m < cutoff) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
 pub fn save_mcp_output_file(data: &[u8], ext: &str) -> anyhow::Result<PathBuf> {
     let base_dir = std::env::temp_dir().join("mehh-mcp");
     std::fs::create_dir_all(&base_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
 
-    let clean_ext = if ext.starts_with('.') {
-        ext.to_string()
-    } else {
-        format!(".{ext}")
-    };
+    let clean_ext = sanitize_output_ext(ext);
 
     let filename = format!("mcp-output-{}{clean_ext}", uuid::Uuid::new_v4());
     let file_path = base_dir.join(filename);
@@ -66,6 +102,16 @@ pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 4096;
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 64 * 1024;
 pub const MCP_OUTPUT_MAX_BYTES: usize = 20 * 1024; // 20KB model-facing limit
 pub const MCP_RESOURCE_MAX_BYTES: usize = 100 * 1024; // 100KB cap for resources/images
+
+/// Async wrapper so filesystem work never blocks a Tokio worker thread.
+pub async fn save_mcp_output_file_async(data: Vec<u8>, ext: String) -> anyhow::Result<PathBuf> {
+    tokio::task::spawn_blocking(move || {
+        cleanup_old_mcp_outputs(&std::env::temp_dir().join("mehh-mcp"));
+        save_mcp_output_file(&data, &ext)
+    })
+    .await
+    .context("MCP output save task panicked")?
+}
 
 /// Sanitizes untrusted control characters and caps length on a UTF-8 char boundary.
 pub fn sanitize_mcp_text(raw: &str, max_bytes: usize) -> String {
@@ -220,6 +266,28 @@ pub fn truncate_middle(text: &str, max_bytes: usize) -> Option<String> {
     ))
 }
 
+/// Caps oversized strings inside a `details` payload before it reaches the model.
+fn truncate_details(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(s) => {
+            if let Some(truncated) = truncate_middle(s, MCP_OUTPUT_MAX_BYTES) {
+                *s = truncated;
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                truncate_details(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for item in map.values_mut() {
+                truncate_details(item);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn push_capped_image(
     data: String,
     mime_type: String,
@@ -308,7 +376,7 @@ pub async fn convert_mcp_result_with_saver(
                                     let save_res = if let Some(ref s) = saver {
                                         s(data, ext).await
                                     } else {
-                                        save_mcp_output_file(&data, &ext)
+                                        save_mcp_output_file_async(data, ext).await
                                     };
                                     match save_res {
                                         Ok(p) => {
@@ -350,7 +418,9 @@ pub async fn convert_mcp_result_with_saver(
         let save_res = if let Some(ref s) = saver {
             s(combined_text.as_bytes().to_vec(), ".txt".to_string()).await.ok()
         } else {
-            save_mcp_output_file(combined_text.as_bytes(), ".txt").ok()
+            save_mcp_output_file_async(combined_text.as_bytes().to_vec(), ".txt".to_string())
+                .await
+                .ok()
         };
         let suffix = if let Some(p) = save_res {
             format!("\n\n[Full output: {} (read it with offset/limit)]", p.display())
@@ -484,7 +554,13 @@ impl AgentTool for McpAgentTool {
         let arguments = serde_json::Value::Object(params);
         let progress_cb = on_update.map(|cb| {
             Arc::new(move |prog: crate::client::McpProgressNotification| {
-                let mut msg = format!("Progress: {:.0}%", prog.progress * 100.0);
+                // MCP `progress` is an absolute value; `total` may be absent.
+                let mut msg = match prog.total {
+                    Some(total) if total > 0.0 => {
+                        format!("Progress: {:.0}%", (prog.progress / total) * 100.0)
+                    }
+                    _ => format!("Progress: {}", prog.progress),
+                };
                 if let Some(m) = &prog.message {
                     msg.push_str(&format!(" - {m}"));
                 }
@@ -614,7 +690,11 @@ impl AgentTool for ListMcpResourcesTool {
                 None => serde_json::json!({}),
             };
             let res = client
-                .request("resources/list", Some(req_params), None)
+                .request_with_options(
+                    "resources/list",
+                    Some(req_params),
+                    McpRequestOptions::new().with_cancel(cancel.clone()),
+                )
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -643,27 +723,40 @@ impl AgentTool for ListMcpResourcesTool {
             let mut all_resources = Vec::new();
             let mut errors = Vec::new();
 
-            for (srv, client) in reg {
-                match client.list_resources().await {
-                    Ok(res_list) => {
-                        for r in res_list {
-                            if r.uri.starts_with("ui://") || r.uri.contains("profile=mcp-app") {
-                                continue;
+            let requests = reg.into_iter().map(|(srv, client)| {
+                let cancel = cancel.clone();
+                async move {
+                    let res = client
+                        .request_with_options(
+                            "resources/list",
+                            Some(serde_json::json!({})),
+                            McpRequestOptions::new().with_cancel(cancel),
+                        )
+                        .await;
+                    (srv, res)
+                }
+            });
+            for (srv, outcome) in futures::future::join_all(requests).await {
+                match outcome {
+                    Ok(res) => {
+                        if let Some(arr) = res.get("resources").and_then(|v| v.as_array()) {
+                            for r in arr {
+                                let uri = r.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                                if uri.starts_with("ui://") || uri.contains("profile=mcp-app") {
+                                    continue;
+                                }
+                                all_resources.push(serde_json::json!({
+                                    "server": srv,
+                                    "uri": uri,
+                                    "name": r.get("name").cloned().unwrap_or(serde_json::Value::Null),
+                                    "description": r.get("description").cloned(),
+                                    "mimeType": r.get("mimeType").cloned(),
+                                }));
                             }
-                            all_resources.push(serde_json::json!({
-                                "server": srv,
-                                "uri": r.uri,
-                                "name": r.name,
-                                "description": r.description,
-                                "mimeType": r.mime_type
-                            }));
                         }
                     }
                     Err(e) => {
-                        errors.push(serde_json::json!({
-                            "server": srv,
-                            "error": e.to_string()
-                        }));
+                        errors.push(serde_json::json!({ "server": srv, "error": e.to_string() }));
                     }
                 }
             }
@@ -681,7 +774,11 @@ impl AgentTool for ListMcpResourcesTool {
                 text: output,
                 text_signature: None,
             })],
-            details: Some(result_json),
+            details: Some({
+                let mut details = result_json;
+                truncate_details(&mut details);
+                details
+            }),
             ..Default::default()
         })
     }
@@ -764,7 +861,11 @@ impl AgentTool for ListMcpResourceTemplatesTool {
                 None => serde_json::json!({}),
             };
             let res = client
-                .request("resources/templates/list", Some(req_params), None)
+                .request_with_options(
+                    "resources/templates/list",
+                    Some(req_params),
+                    McpRequestOptions::new().with_cancel(cancel.clone()),
+                )
                 .await
                 .map_err(|e| e.to_string())?;
 
@@ -778,21 +879,34 @@ impl AgentTool for ListMcpResourceTemplatesTool {
             let mut all_templates = Vec::new();
             let mut errors = Vec::new();
 
-            for (srv, client) in reg {
-                match client.list_resource_templates().await {
-                    Ok(tmpl_list) => {
-                        for mut t in tmpl_list {
-                            if let Some(map) = t.as_object_mut() {
-                                map.insert("server".to_string(), serde_json::json!(srv));
+            let requests = reg.into_iter().map(|(srv, client)| {
+                let cancel = cancel.clone();
+                async move {
+                    let res = client
+                        .request_with_options(
+                            "resources/templates/list",
+                            Some(serde_json::json!({})),
+                            McpRequestOptions::new().with_cancel(cancel),
+                        )
+                        .await;
+                    (srv, res)
+                }
+            });
+            for (srv, outcome) in futures::future::join_all(requests).await {
+                match outcome {
+                    Ok(res) => {
+                        if let Some(arr) = res.get("resourceTemplates").and_then(|v| v.as_array()) {
+                            for t in arr {
+                                let mut t = t.clone();
+                                if let Some(map) = t.as_object_mut() {
+                                    map.insert("server".to_string(), serde_json::json!(srv.clone()));
+                                }
+                                all_templates.push(t);
                             }
-                            all_templates.push(t);
                         }
                     }
                     Err(e) => {
-                        errors.push(serde_json::json!({
-                            "server": srv,
-                            "error": e.to_string()
-                        }));
+                        errors.push(serde_json::json!({ "server": srv, "error": e.to_string() }));
                     }
                 }
             }
@@ -810,7 +924,11 @@ impl AgentTool for ListMcpResourceTemplatesTool {
                 text: output,
                 text_signature: None,
             })],
-            details: Some(result_json),
+            details: Some({
+                let mut details = result_json;
+                truncate_details(&mut details);
+                details
+            }),
             ..Default::default()
         })
     }
@@ -894,7 +1012,14 @@ impl AgentTool for ReadMcpResourceTool {
             .ok_or_else(|| format!("MCP server '{server}' not found in registry"))?;
         drop(reg);
 
-        let res = client.read_resource(uri).await.map_err(|e| e.to_string())?;
+        let res = client
+            .request_with_options(
+                "resources/read",
+                Some(serde_json::json!({ "uri": uri })),
+                McpRequestOptions::new().with_cancel(cancel.clone()),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
 
         let mut blocks = Vec::new();
         let mut text_parts = Vec::new();
@@ -941,7 +1066,11 @@ impl AgentTool for ReadMcpResourceTool {
 
         Ok(AgentToolResult {
             content: blocks,
-            details: Some(res),
+            details: Some({
+                let mut details = res;
+                truncate_details(&mut details);
+                details
+            }),
             ..Default::default()
         })
     }
@@ -1189,8 +1318,13 @@ mod tests {
 
         let update_received = Arc::new(AtomicBool::new(false));
         let update_clone = update_received.clone();
-        let on_update: mehh_agent::AgentToolUpdateCallback = Arc::new(move |_res| {
+        let on_update: mehh_agent::AgentToolUpdateCallback = Arc::new(move |res| {
             update_clone.store(true, Ordering::SeqCst);
+            let text = match &res.content[0] {
+                ToolResultContentBlock::Text(t) => t.text.as_str(),
+                _ => panic!("expected text progress update"),
+            };
+            assert!(text.contains("Progress: 50%"), "unexpected progress message: {text}");
         });
 
         let cancel = tokio_util::sync::CancellationToken::new();

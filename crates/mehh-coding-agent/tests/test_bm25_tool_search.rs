@@ -10,11 +10,7 @@ fn test_bm25_ranks_schema_property_matches_higher_than_noise() {
             "properties": { "table_name": { "description": "Target SQL table" } }
         }),
     );
-    catalog.register_test_tool(
-        "unrelated_tool",
-        "Unrelated utility",
-        serde_json::json!({}),
-    );
+    catalog.register_test_tool("unrelated_tool", "Unrelated utility", serde_json::json!({}));
 
     let results = catalog.search("table_name", 5);
     assert!(!results.is_empty(), "expected match on table_name property");

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use ignore::WalkBuilder;
 
 const MAX_WALKED_FILES: usize = 5_000;
-const WALK_CACHE_TTL: Duration = Duration::from_secs(2);
+const WALK_CACHE_TTL: Duration = Duration::from_secs(15);
 
 struct CachedWalkEntry {
     rel_str: String,
@@ -100,8 +100,8 @@ pub fn extract_at_query(line: &str, cursor_col: usize) -> Option<AtFileQuery> {
         let c = chars[i - 1];
         if c == '@' {
             let at_idx = i - 1;
-            let boundary_ok = at_idx == 0
-                || matches!(chars[at_idx - 1], ' ' | '\t' | '(' | '[' | '"' | '\'');
+            let boundary_ok =
+                at_idx == 0 || matches!(chars[at_idx - 1], ' ' | '\t' | '(' | '[' | '"' | '\'');
             if !boundary_ok {
                 return None;
             }
@@ -219,8 +219,7 @@ mod tests {
 
     #[test]
     fn test_complete_file_paths_filters_git_and_matches_prefix() {
-        let dir =
-            std::env::temp_dir().join(format!("mehh_file_comp_{}", uuid::Uuid::now_v7()));
+        let dir = std::env::temp_dir().join(format!("mehh_file_comp_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(dir.join(".git")).unwrap();
         std::fs::create_dir_all(dir.join("src")).unwrap();
         std::fs::write(dir.join(".git").join("config"), "[core]").unwrap();
@@ -229,7 +228,10 @@ mod tests {
         std::fs::write(dir.join("Cargo.toml"), "[package]").unwrap();
 
         let matches = complete_file_paths(&dir, "src/", 10);
-        assert_eq!(matches, vec!["src/lib.rs".to_string(), "src/main.rs".to_string()]);
+        assert_eq!(
+            matches,
+            vec!["src/lib.rs".to_string(), "src/main.rs".to_string()]
+        );
         assert!(!matches.iter().any(|p| p.contains(".git")));
 
         let by_name = complete_file_paths(&dir, "main", 10);

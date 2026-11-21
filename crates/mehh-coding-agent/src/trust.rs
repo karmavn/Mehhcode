@@ -160,10 +160,7 @@ pub fn resolve_project_trust(
 
     let mut answer = String::new();
     io::stdin().read_line(&mut answer)?;
-    let trusted = matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    );
+    let trusted = matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes");
 
     let level = if trusted {
         TrustLevel::Trusted
@@ -260,10 +257,12 @@ mod tests {
         store.set(dir.path(), TrustLevel::Trusted);
         store.save_to(&store_path).unwrap();
 
-        let res = resolve_project_trust_with_override(dir.path(), TrustOverride::NoApprove, false).unwrap();
+        let res = resolve_project_trust_with_override(dir.path(), TrustOverride::NoApprove, false)
+            .unwrap();
         assert!(!res);
 
-        let res = resolve_project_trust_with_override(dir.path(), TrustOverride::Approve, false).unwrap();
+        let res =
+            resolve_project_trust_with_override(dir.path(), TrustOverride::Approve, false).unwrap();
         assert!(res);
 
         let reloaded = TrustStore::load_from(&store_path).unwrap();

@@ -12,6 +12,38 @@ use crate::types::{
     PrepareNextTurnHook, PrepareRequestHook, QueueMode, TransformContextHook,
 };
 
+#[derive(Clone)]
+pub struct CancelHandle {
+    token: Arc<std::sync::RwLock<CancellationToken>>,
+}
+
+impl CancelHandle {
+    fn new() -> Self {
+        Self {
+            token: Arc::new(std::sync::RwLock::new(CancellationToken::new())),
+        }
+    }
+
+    pub fn cancel(&self) {
+        self.token.read().unwrap().cancel();
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.token.read().unwrap().is_cancelled()
+    }
+
+    fn current(&self) -> CancellationToken {
+        self.token.read().unwrap().clone()
+    }
+
+    fn reset_if_cancelled(&self) {
+        let mut guard = self.token.write().unwrap();
+        if guard.is_cancelled() {
+            *guard = CancellationToken::new();
+        }
+    }
+}
+
 pub struct Agent {
     model: Model,
     provider: Arc<dyn LlmProvider>,
@@ -23,7 +55,7 @@ pub struct Agent {
     follow_up_queue: Arc<Mutex<VecDeque<Message>>>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
-    listeners: Vec<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
+    listeners: Vec<(usize, Arc<dyn Fn(AgentEvent) + Send + Sync>)>,
     before_tool_call: Option<BeforeToolCallHook>,
     after_tool_call: Option<AfterToolCallHook>,
     dynamic_tools: Option<DynamicToolsList>,
@@ -32,7 +64,7 @@ pub struct Agent {
     prepare_next_turn: Option<PrepareNextTurnHook>,
     transform_context: Option<TransformContextHook>,
     finish_turn: Option<FinishTurnHook>,
-    cancel: CancellationToken,
+    cancel: CancelHandle,
     state: Arc<std::sync::RwLock<AgentState>>,
 }
 
@@ -69,7 +101,7 @@ impl Agent {
             prepare_next_turn: None,
             transform_context: None,
             finish_turn: None,
-            cancel: CancellationToken::new(),
+            cancel: CancelHandle::new(),
             state: Arc::new(std::sync::RwLock::new(initial_state)),
         }
     }
@@ -213,6 +245,10 @@ impl Agent {
         self.state.read().unwrap().clone()
     }
 
+    pub fn with_state<R>(&self, f: impl FnOnce(&AgentState) -> R) -> R {
+        f(&self.state.read().unwrap())
+    }
+
     pub fn reset(&mut self) {
         self.clear_messages();
         let mut st = self.state.write().unwrap();
@@ -249,8 +285,14 @@ impl Agent {
         self.follow_up_mode
     }
 
-    pub fn subscribe(&mut self, listener: impl Fn(AgentEvent) + Send + Sync + 'static) {
-        self.listeners.push(Arc::new(listener));
+    pub fn subscribe(&mut self, listener: impl Fn(AgentEvent) + Send + Sync + 'static) -> usize {
+        let id = self.listeners.last().map_or(0, |(id, _)| id + 1);
+        self.listeners.push((id, Arc::new(listener)));
+        id
+    }
+
+    pub fn unsubscribe(&mut self, id: usize) {
+        self.listeners.retain(|(candidate, _)| *candidate != id);
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -270,7 +312,7 @@ impl Agent {
         self.follow_up_queue.clone()
     }
 
-    pub fn cancellation_token(&self) -> CancellationToken {
+    pub fn cancellation_token(&self) -> CancelHandle {
         self.cancel.clone()
     }
 
@@ -287,9 +329,15 @@ impl Agent {
     }
 
     pub async fn prompt(&mut self, messages: Vec<Message>) -> Vec<Message> {
-        if self.cancel.is_cancelled() {
-            self.cancel = CancellationToken::new();
-        }
+        self.run_turn(messages).await
+    }
+
+    pub async fn continue_turn(&mut self) -> Vec<Message> {
+        self.run_turn(Vec::new()).await
+    }
+
+    async fn run_turn(&mut self, messages: Vec<Message>) -> Vec<Message> {
+        self.cancel.reset_if_cancelled();
 
         {
             let mut st = self.state.write().unwrap();
@@ -303,40 +351,6 @@ impl Agent {
 
         let new_messages = run_agent_loop(
             messages,
-            self.messages.clone(),
-            config,
-            on_event,
-        )
-        .await;
-
-        {
-            let mut st = self.state.write().unwrap();
-            st.is_streaming = false;
-            st.streaming_message = None;
-            st.pending_tool_calls.clear();
-        }
-
-        self.messages.extend(new_messages.clone());
-        new_messages
-    }
-
-    pub async fn continue_turn(&mut self) -> Vec<Message> {
-        if self.cancel.is_cancelled() {
-            self.cancel = CancellationToken::new();
-        }
-
-        {
-            let mut st = self.state.write().unwrap();
-            st.is_streaming = true;
-            st.streaming_message = None;
-            st.error_message = None;
-        }
-
-        let config = self.build_loop_config();
-        let on_event = self.build_on_event();
-
-        let new_messages = run_agent_loop(
-            Vec::new(),
             self.messages.clone(),
             config,
             on_event,
@@ -373,13 +387,14 @@ impl Agent {
             prepare_next_turn: self.prepare_next_turn.clone(),
             transform_context: self.transform_context.clone(),
             finish_turn: self.finish_turn.clone(),
-            cancel: self.cancel.clone(),
+            cancel: self.cancel.current(),
         }
     }
 
     fn build_on_event(&self) -> Option<Arc<dyn Fn(AgentEvent) + Send + Sync>> {
         let state_lock = self.state.clone();
-        let listeners = self.listeners.clone();
+        let listeners: Vec<Arc<dyn Fn(AgentEvent) + Send + Sync>> =
+            self.listeners.iter().map(|(_, listener)| listener.clone()).collect();
         Some(Arc::new(move |event: AgentEvent| {
             {
                 let mut st = state_lock.write().unwrap();
@@ -958,5 +973,60 @@ mod tests {
         let msgs = agent.prompt_text("test prompt").await;
         assert_eq!(msgs.len(), 2);
         assert!(transform_called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn cancellation_handle_works_after_a_cancelled_turn() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_assistant_message("first"));
+        provider.add_response(faux_assistant_message("second"));
+        let mut agent = Agent::new(faux_model(), provider);
+        let handle = agent.cancellation_token();
+
+        let first = agent.prompt_text("first").await;
+        assert!(matches!(&first[1], Message::Assistant(a) if a.stop_reason == StopReason::Stop));
+
+        handle.cancel();
+
+        let fired = Arc::new(AtomicBool::new(false));
+        let fired_clone = fired.clone();
+        let handle_clone = handle.clone();
+        agent.subscribe(move |event| {
+            if matches!(event, AgentEvent::AgentStart)
+                && !fired_clone.swap(true, Ordering::SeqCst)
+            {
+                handle_clone.cancel();
+            }
+        });
+
+        let second = agent.prompt_text("second").await;
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(
+            !second.iter().any(|m| matches!(m, Message::Assistant(_))),
+            "cancelled turn must not produce a fresh assistant reply"
+        );
+    }
+
+    #[test]
+    fn with_state_exposes_borrowed_state() {
+        let agent = Agent::new(faux_model(), Arc::new(FauxProvider::new()))
+            .with_system_prompt("hello");
+        assert_eq!(agent.with_state(|state| state.system_prompt.len()), 5);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_stops_listener_events() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_assistant_message("hi"));
+        let mut agent = Agent::new(faux_model(), provider);
+        let received = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = received.clone();
+        let id = agent.subscribe(move |_event| {
+            counter.fetch_add(1, Ordering::SeqCst);
+        });
+        agent.unsubscribe(id);
+
+        let _ = agent.prompt_text("hi").await;
+        assert_eq!(received.load(Ordering::SeqCst), 0);
     }
 }

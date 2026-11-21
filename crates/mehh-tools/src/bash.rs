@@ -1,89 +1,30 @@
 use std::path::PathBuf;
+
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-pub(crate) const CHUNK_READ_SIZE: usize = 4096;
-pub(crate) const MAX_STREAMING_PREVIEW_BYTES: usize = 256 * 1024;
-pub(crate) const UPDATE_THROTTLE: std::time::Duration = std::time::Duration::from_millis(100);
-pub(crate) const MAX_OUTPUT_CHARS: usize = 30_000;
-
-pub(crate) const UTF8_OUTPUT_PREFIX: &str =
-    "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n";
-pub(crate) const WINDOWS_POWERSHELL_EXIT_SUFFIX: &str =
-    "\n;\nif ($?) { exit 0 }\nif (($LASTEXITCODE -eq 0) -and (\"$($Error[0].FullyQualifiedErrorId)\" -like \"NativeCommandError*\")) { exit 0 }\nif ($LASTEXITCODE) { exit $LASTEXITCODE } else { exit 1 }";
-
-pub(crate) fn append_rolling(buf: &mut Vec<u8>, chunk: &[u8], cap: usize) {
-    if chunk.len() >= cap {
-        buf.clear();
-        buf.extend_from_slice(&chunk[chunk.len() - cap..]);
-        return;
-    }
-    let overflow = buf.len().saturating_add(chunk.len()).saturating_sub(cap);
-    if overflow > 0 {
-        buf.drain(..overflow);
-    }
-    buf.extend_from_slice(chunk);
-}
-
-pub(crate) fn format_bash_output(bytes: &[u8]) -> String {
-    let combined = String::from_utf8_lossy(bytes);
-    if combined.len() > MAX_OUTPUT_CHARS {
-        let char_count = combined.chars().count();
-        if char_count > MAX_OUTPUT_CHARS {
-            let half = MAX_OUTPUT_CHARS / 2;
-            let head_end = combined
-                .char_indices()
-                .nth(half)
-                .map(|(i, _)| i)
-                .unwrap_or(combined.len());
-            let tail_start = combined
-                .char_indices()
-                .rev()
-                .nth(half - 1)
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            return format!(
-                "{}\n\n... [truncated {} characters] ...\n\n{}",
-                &combined[..head_end],
-                char_count - MAX_OUTPUT_CHARS,
-                &combined[tail_start..]
-            );
-        }
-    }
-    if combined.trim().is_empty() {
-        "(no output)".to_string()
-    } else {
-        combined.into_owned()
-    }
-}
-
-pub(crate) async fn kill_process_tree(child: &mut tokio::process::Child) {
-    #[cfg(windows)]
-    if let Some(pid) = child.id() {
-        let taskkill_bin = std::env::var("SystemRoot")
-            .map(|r| format!("{r}\\System32\\taskkill.exe"))
-            .unwrap_or_else(|_| "taskkill".to_string());
-        let _ = tokio::process::Command::new(taskkill_bin)
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
-    }
-    let _ = child.kill().await;
-    let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
-}
+use crate::core::context::PathPolicy;
+use crate::core::shell::{parse_timeout_ms, run_shell, ShellKind};
 
 #[derive(Debug, Clone)]
 pub struct BashTool {
     pub cwd: PathBuf,
+    pub path_policy: PathPolicy,
 }
 
 impl BashTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            path_policy: PathPolicy::Unrestricted,
+        }
+    }
+
+    pub fn with_path_policy(mut self, policy: PathPolicy) -> Self {
+        self.path_policy = policy;
+        self
     }
 }
 
@@ -94,7 +35,7 @@ impl AgentTool for BashTool {
     }
 
     fn description(&self) -> &str {
-        "Execute a shell command in the current working directory. Returns combined stdout and stderr. Output is truncated if it exceeds 30,000 characters."
+        "Execute a shell command in the current working directory. Returns combined stdout and stderr. Output is truncated if it exceeds 30,000 characters. The timeout parameter is in milliseconds."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -107,7 +48,11 @@ impl AgentTool for BashTool {
                 },
                 "timeout": {
                     "type": "integer",
-                    "description": "Timeout in milliseconds (or seconds if <= 1000, default: 120000 ms)"
+                    "description": "Timeout in milliseconds (default: 120000; alias: timeoutMs; max: 600000)"
+                },
+                "timeoutMs": {
+                    "type": "integer",
+                    "description": "Explicit timeout in milliseconds (alias of timeout)"
                 }
             },
             "required": ["command"]
@@ -137,159 +82,31 @@ impl AgentTool for BashTool {
             .get("command")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter 'command'".to_string())?;
-
-        let timeout_ms = params
-            .get("timeout")
-            .and_then(|v| v.as_u64())
-            .map(|t| if t <= 1000 { t * 1000 } else { t })
-            .unwrap_or(120_000);
-
-        let mut cmd = if cfg!(windows) {
-            let mut c = tokio::process::Command::new("powershell");
-            let full_command = if !command.ends_with('`') {
-                format!("{}{}{}", UTF8_OUTPUT_PREFIX, command, WINDOWS_POWERSHELL_EXIT_SUFFIX)
-            } else {
-                format!("{}{}", UTF8_OUTPUT_PREFIX, command)
-            };
-            c.args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &full_command]);
-            c
+        let timeout_ms = parse_timeout_ms(&params);
+        let kind = if cfg!(windows) {
+            ShellKind::WindowsPowerShellCompat
         } else {
-            let mut c = tokio::process::Command::new("sh");
-            c.args(["-c", command]);
-            c
+            ShellKind::PosixSh
         };
 
-        cmd.current_dir(&self.cwd);
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-        cmd.kill_on_drop(true);
+        let outcome = run_shell(kind, &self.cwd, command, timeout_ms, cancel, on_update).await?;
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("Failed to spawn command: {}", e))?;
-
-        let timeout_duration = std::time::Duration::from_millis(timeout_ms);
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
-
-        let out_handle = child.stdout.take().map(|mut pipe| {
-            let tx_out = tx.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut buf = [0u8; CHUNK_READ_SIZE];
-                while let Ok(n) = pipe.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                    if tx_out.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-            })
-        });
-        let err_handle = child.stderr.take().map(|mut pipe| {
-            let tx_err = tx.clone();
-            tokio::spawn(async move {
-                use tokio::io::AsyncReadExt;
-                let mut buf = [0u8; CHUNK_READ_SIZE];
-                while let Ok(n) = pipe.read(&mut buf).await {
-                    if n == 0 {
-                        break;
-                    }
-                    if tx_err.send(buf[..n].to_vec()).await.is_err() {
-                        break;
-                    }
-                }
-            })
-        });
-        drop(tx);
-
-        let mut captured = Vec::new();
-        let mut last_update = std::time::Instant::now()
-            .checked_sub(UPDATE_THROTTLE)
-            .unwrap_or_else(std::time::Instant::now);
-        let deadline = tokio::time::sleep(timeout_duration);
-        tokio::pin!(deadline);
-
-        let mut exit_status: Option<std::process::ExitStatus> = None;
-        let mut aborted_reason: Option<String> = None;
-        let mut rx_closed = false;
-
-        while !rx_closed || exit_status.is_none() {
-            tokio::select! {
-                _ = cancel.cancelled(), if aborted_reason.is_none() => {
-                    kill_process_tree(&mut child).await;
-                    aborted_reason = Some("Command aborted".to_string());
-                    break;
-                }
-                _ = &mut deadline, if aborted_reason.is_none() => {
-                    kill_process_tree(&mut child).await;
-                    aborted_reason = Some(format!("Command timed out after {}ms", timeout_ms));
-                    break;
-                }
-                maybe_chunk = rx.recv(), if !rx_closed => {
-                    match maybe_chunk {
-                        Some(chunk) => {
-                            append_rolling(&mut captured, &chunk, MAX_STREAMING_PREVIEW_BYTES);
-                            if let Some(cb) = on_update.as_ref() {
-                                if last_update.elapsed() >= UPDATE_THROTTLE {
-                                    cb(AgentToolResult::text(format_bash_output(&captured)));
-                                    last_update = std::time::Instant::now();
-                                }
-                            }
-                        }
-                        None => {
-                            rx_closed = true;
-                        }
-                    }
-                }
-                status_res = child.wait(), if exit_status.is_none() => {
-                    match status_res {
-                        Ok(s) => exit_status = Some(s),
-                        Err(e) => return Err(format!("Failed to wait for command: {}", e)),
-                    }
-                }
-            }
+        if let Some(reason) = outcome.aborted_reason {
+            return Err(if outcome.text == "(no output)" {
+                reason
+            } else {
+                format!("{reason}:\n{}", outcome.text)
+            });
         }
 
-        if let Some(reason) = aborted_reason {
-            let mut drained_any = false;
-            while let Ok(chunk) = rx.try_recv() {
-                append_rolling(&mut captured, &chunk, MAX_STREAMING_PREVIEW_BYTES);
-                drained_any = true;
-            }
-            if drained_any {
-                if let Some(cb) = on_update.as_ref() {
-                    cb(AgentToolResult::text(format_bash_output(&captured)));
-                }
-            }
-            if let Some(h) = out_handle {
-                h.abort();
-            }
-            if let Some(h) = err_handle {
-                h.abort();
-            }
-            let partial = String::from_utf8_lossy(&captured);
-            if partial.trim().is_empty() {
-                return Err(reason);
-            }
-            return Err(format!("{reason}:\n{}", format_bash_output(&captured)));
-        }
-
-        if let Some(h) = out_handle {
-            let _ = h.await;
-        }
-        if let Some(h) = err_handle {
-            let _ = h.await;
-        }
-
-        let status = exit_status.ok_or_else(|| "Command finished without exit status".to_string())?;
-        let formatted_output = format_bash_output(&captured);
-
-        if !status.success() {
-            let code = status.code().unwrap_or(-1);
-            Err(format!("Command exited with code {}:\n{}", code, formatted_output))
-        } else {
-            Ok(AgentToolResult::text(formatted_output))
+        match outcome.exit_status {
+            Some(status) if !status.success() => Err(format!(
+                "Command exited with code {}:\n{}",
+                status.code().unwrap_or(-1),
+                outcome.text
+            )),
+            Some(_) => Ok(AgentToolResult::text(outcome.text)),
+            None => Err("Command finished without exit status".to_string()),
         }
     }
 }

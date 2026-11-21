@@ -62,31 +62,38 @@ pub fn build_azure_openai_url(
 
     let deployment = &model.id;
 
-    // Check AZURE_OPENAI_ENDPOINT
-    if let Ok(endpoint) = std::env::var("AZURE_OPENAI_ENDPOINT") {
-        let trimmed = endpoint.trim_end_matches('/');
-        return format!("{trimmed}/openai/deployments/{deployment}/responses?api-version={api_version}");
-    }
-
-    // Determine resource name
+    // Per-model configuration wins over global environment variables.
     let resource = resource_override
         .map(|s| s.to_string())
-        .or_else(|| std::env::var("AZURE_OPENAI_RESOURCE_NAME").ok())
         .or_else(|| {
             let stripped = model
                 .base_url
                 .trim_start_matches("https://")
                 .trim_start_matches("http://");
-            if let Some((subdomain, _)) = stripped.split_once(".openai.azure.com") {
-                if !subdomain.is_empty() {
-                    return Some(subdomain.to_string());
-                }
-            }
-            None
+            stripped
+                .split_once(".openai.azure.com")
+                .and_then(|(subdomain, _)| (!subdomain.is_empty()).then(|| subdomain.to_string()))
         })
-        .unwrap_or_else(|| "default".to_string());
+        .or_else(|| std::env::var("AZURE_OPENAI_RESOURCE_NAME").ok());
 
-    format!("https://{resource}.openai.azure.com/openai/deployments/{deployment}/responses?api-version={api_version}")
+    if let Some(resource) = resource {
+        return format!("https://{resource}.openai.azure.com/openai/deployments/{deployment}/responses?api-version={api_version}");
+    }
+
+    // Any deliberately configured base URL (proxy, gateway, etc.) is
+    // authoritative; the generic OpenAI fallback is not a real configuration.
+    if !model.base_url.trim().is_empty() && !model.base_url.contains("api.openai.com") {
+        let trimmed = model.base_url.trim_end_matches('/');
+        return format!("{trimmed}/openai/deployments/{deployment}/responses?api-version={api_version}");
+    }
+
+    // Global endpoint is only a fallback when the model has no configuration.
+    if let Ok(endpoint) = std::env::var("AZURE_OPENAI_ENDPOINT") {
+        let trimmed = endpoint.trim_end_matches('/');
+        return format!("{trimmed}/openai/deployments/{deployment}/responses?api-version={api_version}");
+    }
+
+    format!("https://default.openai.azure.com/openai/deployments/{deployment}/responses?api-version={api_version}")
 }
 
 #[async_trait::async_trait]

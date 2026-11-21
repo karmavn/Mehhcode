@@ -60,7 +60,10 @@ async fn test_timeout_cancels_child_tools_before_dropping_them() {
         .with_timeout(Duration::from_millis(300));
 
     let mut params = Map::new();
-    params.insert("prompt".to_string(), Value::String("Hang forever".to_string()));
+    params.insert(
+        "prompt".to_string(),
+        Value::String("Hang forever".to_string()),
+    );
     params.insert("mode".to_string(), Value::String("coding".to_string()));
 
     let start = std::time::Instant::now();
@@ -70,7 +73,11 @@ async fn test_timeout_cancels_child_tools_before_dropping_them() {
         .execute("tc_timeout", params, CancellationToken::new(), None)
         .await
         .expect("timeout must be returned as a result");
-    assert_eq!(res.is_error, Some(true), "timeout result must be flagged as error");
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "timeout result must be flagged as error"
+    );
     let text: String = res
         .content
         .iter()

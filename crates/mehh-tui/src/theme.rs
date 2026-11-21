@@ -1,7 +1,7 @@
 //! Theme definition, parsing, and color utilities for mehh TUI.
 
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Theme color tokens and styling configuration for TUI components.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -20,6 +20,14 @@ pub struct Theme {
     pub text: String,
     pub thinking_text: String,
     pub user_prefix: String,
+    /// Soft background block behind a completed user turn.
+    #[serde(default)]
+    pub user_bg: String,
+    /// Full-width background for added/removed diff lines.
+    #[serde(default)]
+    pub diff_add_bg: String,
+    #[serde(default)]
+    pub diff_del_bg: String,
     pub tool_pending: String,
     pub tool_success: String,
     pub tool_error: String,
@@ -92,7 +100,9 @@ fn resolve_color_value(val: &str, is_bg: bool) -> String {
         "green" => (if is_bg { "\x1b[42m" } else { "\x1b[32m" }).to_string(),
         "yellow" => (if is_bg { "\x1b[43m" } else { "\x1b[33m" }).to_string(),
         "blue" => (if is_bg { "\x1b[44m" } else { "\x1b[34m" }).to_string(),
-        "magenta" | "violet" | "purple" => (if is_bg { "\x1b[45m" } else { "\x1b[35m" }).to_string(),
+        "magenta" | "violet" | "purple" => {
+            (if is_bg { "\x1b[45m" } else { "\x1b[35m" }).to_string()
+        }
         "cyan" => (if is_bg { "\x1b[46m" } else { "\x1b[36m" }).to_string(),
         "white" => (if is_bg { "\x1b[47m" } else { "\x1b[37m" }).to_string(),
         "gray" | "grey" | "muted" => (if is_bg { "\x1b[100m" } else { "\x1b[90m" }).to_string(),
@@ -102,57 +112,64 @@ fn resolve_color_value(val: &str, is_bg: bool) -> String {
 }
 
 impl Theme {
-    /// Built-in dark theme with high-contrast ANSI SGR tokens.
+    /// Built-in dark theme: low-saturation truecolor palette with a warm accent.
+    /// Each token is a complete SGR prefix so components never hardcode colors.
     pub fn dark() -> Self {
         Self {
             name: "dark".to_string(),
-            accent: "\x1b[36m".to_string(),
-            border: "\x1b[34m".to_string(),
-            border_accent: "\x1b[35m".to_string(),
-            border_muted: "\x1b[2m".to_string(),
-            success: "\x1b[32m".to_string(),
-            error: "\x1b[31m".to_string(),
-            warning: "\x1b[33m".to_string(),
-            muted: "\x1b[90m".to_string(),
-            dim: "\x1b[2m".to_string(),
-            text: "\x1b[37m".to_string(),
-            thinking_text: "\x1b[2;3m".to_string(),
-            user_prefix: "\x1b[1;32m".to_string(),
-            tool_pending: "\x1b[33m".to_string(),
-            tool_success: "\x1b[32m".to_string(),
-            tool_error: "\x1b[31m".to_string(),
-            selected_bg: "\x1b[48;2;36;40;60m".to_string(),
-            md_heading: "\x1b[1;36m".to_string(),
-            md_code: "\x1b[33m".to_string(),
-            md_quote: "\x1b[2m".to_string(),
-            md_link: "\x1b[4;34m".to_string(),
+            accent: "\x1b[38;2;217;119;87m".to_string(),
+            border: "\x1b[38;2;58;61;69m".to_string(),
+            border_accent: "\x1b[38;2;217;119;87m".to_string(),
+            border_muted: "\x1b[38;2;42;45;53m".to_string(),
+            success: "\x1b[38;2;74;222;128m".to_string(),
+            error: "\x1b[38;2;248;113;113m".to_string(),
+            warning: "\x1b[38;2;251;191;36m".to_string(),
+            muted: "\x1b[38;2;113;113;122m".to_string(),
+            dim: "\x1b[38;2;82;82;91m".to_string(),
+            text: "\x1b[38;2;228;228;231m".to_string(),
+            thinking_text: "\x1b[3;38;2;113;113;122m".to_string(),
+            user_prefix: "\x1b[1;38;2;217;119;87m".to_string(),
+            user_bg: "\x1b[48;2;35;38;46m".to_string(),
+            diff_add_bg: "\x1b[48;2;22;43;32m".to_string(),
+            diff_del_bg: "\x1b[48;2;45;24;28m".to_string(),
+            tool_pending: "\x1b[38;2;251;191;36m".to_string(),
+            tool_success: "\x1b[38;2;74;222;128m".to_string(),
+            tool_error: "\x1b[38;2;248;113;113m".to_string(),
+            selected_bg: "\x1b[48;2;49;53;64m".to_string(),
+            md_heading: "\x1b[1;38;2;217;119;87m".to_string(),
+            md_code: "\x1b[38;2;167;178;181m".to_string(),
+            md_quote: "\x1b[38;2;113;113;122m".to_string(),
+            md_link: "\x1b[4;38;2;122;162;247m".to_string(),
         }
     }
 
-    /// Built-in light theme.
+    /// Built-in light theme: matching palette tuned for bright terminals.
     pub fn light() -> Self {
         Self {
             name: "light".to_string(),
-            accent: "\x1b[34m".to_string(),
-            border: "\x1b[34m".to_string(),
-            border_accent: "\x1b[35m".to_string(),
-            border_muted: "\x1b[2m".to_string(),
-            success: "\x1b[32m".to_string(),
-            error: "\x1b[31m".to_string(),
-            warning: "\x1b[33m".to_string(),
-            muted: "\x1b[90m".to_string(),
-            dim: "\x1b[2m".to_string(),
-            text: "\x1b[30m".to_string(),
-            thinking_text: "\x1b[2;3m".to_string(),
-            user_prefix: "\x1b[1;32m".to_string(),
-            tool_pending: "\x1b[33m".to_string(),
-            tool_success: "\x1b[32m".to_string(),
-            tool_error: "\x1b[31m".to_string(),
-            selected_bg: "\x1b[48;2;220;230;250m".to_string(),
-            md_heading: "\x1b[1;34m".to_string(),
-            md_code: "\x1b[35m".to_string(),
-            md_quote: "\x1b[2m".to_string(),
-            md_link: "\x1b[4;34m".to_string(),
+            accent: "\x1b[38;2;180;83;9m".to_string(),
+            border: "\x1b[38;2;212;212;216m".to_string(),
+            border_accent: "\x1b[38;2;180;83;9m".to_string(),
+            border_muted: "\x1b[38;2;228;228;231m".to_string(),
+            success: "\x1b[38;2;21;128;61m".to_string(),
+            error: "\x1b[38;2;185;28;28m".to_string(),
+            warning: "\x1b[38;2;161;98;7m".to_string(),
+            muted: "\x1b[38;2;113;113;122m".to_string(),
+            dim: "\x1b[38;2;161;161;170m".to_string(),
+            text: "\x1b[38;2;24;24;27m".to_string(),
+            thinking_text: "\x1b[3;38;2;113;113;122m".to_string(),
+            user_prefix: "\x1b[1;38;2;180;83;9m".to_string(),
+            user_bg: "\x1b[48;2;244;244;245m".to_string(),
+            diff_add_bg: "\x1b[48;2;220;252;231m".to_string(),
+            diff_del_bg: "\x1b[48;2;254;226;226m".to_string(),
+            tool_pending: "\x1b[38;2;161;98;7m".to_string(),
+            tool_success: "\x1b[38;2;21;128;61m".to_string(),
+            tool_error: "\x1b[38;2;185;28;28m".to_string(),
+            selected_bg: "\x1b[48;2;228;228;231m".to_string(),
+            md_heading: "\x1b[1;38;2;180;83;9m".to_string(),
+            md_code: "\x1b[38;2;63;63;70m".to_string(),
+            md_quote: "\x1b[38;2;113;113;122m".to_string(),
+            md_link: "\x1b[4;38;2;29;78;216m".to_string(),
         }
     }
 
@@ -211,7 +228,12 @@ impl Theme {
         } else {
             format!("{name}.json")
         };
-        Some(home.join(".mehh").join("agent").join("themes").join(filename))
+        Some(
+            home.join(".mehh")
+                .join("agent")
+                .join("themes")
+                .join(filename),
+        )
     }
 
     fn apply_json_value(theme: &mut Theme, val: &serde_json::Value) {
@@ -243,26 +265,75 @@ impl Theme {
             Some(resolve_color_value(raw, is_bg))
         };
 
-        if let Some(c) = get_color("accent", "accent", false) { theme.accent = c; }
-        if let Some(c) = get_color("border", "border", false) { theme.border = c; }
-        if let Some(c) = get_color("borderAccent", "border_accent", false) { theme.border_accent = c; }
-        if let Some(c) = get_color("borderMuted", "border_muted", false) { theme.border_muted = c; }
-        if let Some(c) = get_color("success", "success", false) { theme.success = c; }
-        if let Some(c) = get_color("error", "error", false) { theme.error = c; }
-        if let Some(c) = get_color("warning", "warning", false) { theme.warning = c; }
-        if let Some(c) = get_color("muted", "muted", false) { theme.muted = c; }
-        if let Some(c) = get_color("dim", "dim", false) { theme.dim = c; }
-        if let Some(c) = get_color("text", "text", false) { theme.text = c; }
-        if let Some(c) = get_color("thinkingText", "thinking_text", false) { theme.thinking_text = c; }
-        if let Some(c) = get_color("userPrefix", "user_prefix", false) { theme.user_prefix = c; }
-        if let Some(c) = get_color("toolPending", "tool_pending", false) { theme.tool_pending = c; }
-        if let Some(c) = get_color("toolSuccess", "tool_success", false) { theme.tool_success = c; }
-        if let Some(c) = get_color("toolError", "tool_error", false) { theme.tool_error = c; }
-        if let Some(c) = get_color("selectedBg", "selected_bg", true) { theme.selected_bg = c; }
-        if let Some(c) = get_color("mdHeading", "md_heading", false) { theme.md_heading = c; }
-        if let Some(c) = get_color("mdCode", "md_code", false) { theme.md_code = c; }
-        if let Some(c) = get_color("mdQuote", "md_quote", false) { theme.md_quote = c; }
-        if let Some(c) = get_color("mdLink", "md_link", false) { theme.md_link = c; }
+        if let Some(c) = get_color("accent", "accent", false) {
+            theme.accent = c;
+        }
+        if let Some(c) = get_color("border", "border", false) {
+            theme.border = c;
+        }
+        if let Some(c) = get_color("borderAccent", "border_accent", false) {
+            theme.border_accent = c;
+        }
+        if let Some(c) = get_color("borderMuted", "border_muted", false) {
+            theme.border_muted = c;
+        }
+        if let Some(c) = get_color("success", "success", false) {
+            theme.success = c;
+        }
+        if let Some(c) = get_color("error", "error", false) {
+            theme.error = c;
+        }
+        if let Some(c) = get_color("warning", "warning", false) {
+            theme.warning = c;
+        }
+        if let Some(c) = get_color("muted", "muted", false) {
+            theme.muted = c;
+        }
+        if let Some(c) = get_color("dim", "dim", false) {
+            theme.dim = c;
+        }
+        if let Some(c) = get_color("text", "text", false) {
+            theme.text = c;
+        }
+        if let Some(c) = get_color("thinkingText", "thinking_text", false) {
+            theme.thinking_text = c;
+        }
+        if let Some(c) = get_color("userPrefix", "user_prefix", false) {
+            theme.user_prefix = c;
+        }
+        if let Some(c) = get_color("userBg", "user_bg", true) {
+            theme.user_bg = c;
+        }
+        if let Some(c) = get_color("diffAddBg", "diff_add_bg", true) {
+            theme.diff_add_bg = c;
+        }
+        if let Some(c) = get_color("diffDelBg", "diff_del_bg", true) {
+            theme.diff_del_bg = c;
+        }
+        if let Some(c) = get_color("toolPending", "tool_pending", false) {
+            theme.tool_pending = c;
+        }
+        if let Some(c) = get_color("toolSuccess", "tool_success", false) {
+            theme.tool_success = c;
+        }
+        if let Some(c) = get_color("toolError", "tool_error", false) {
+            theme.tool_error = c;
+        }
+        if let Some(c) = get_color("selectedBg", "selected_bg", true) {
+            theme.selected_bg = c;
+        }
+        if let Some(c) = get_color("mdHeading", "md_heading", false) {
+            theme.md_heading = c;
+        }
+        if let Some(c) = get_color("mdCode", "md_code", false) {
+            theme.md_code = c;
+        }
+        if let Some(c) = get_color("mdQuote", "md_quote", false) {
+            theme.md_quote = c;
+        }
+        if let Some(c) = get_color("mdLink", "md_link", false) {
+            theme.md_link = c;
+        }
     }
 
     /// Wrap `text` with `color_code` and reset `\x1b[0m` if `color_code` is non-empty.

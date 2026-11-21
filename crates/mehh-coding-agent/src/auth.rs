@@ -1,14 +1,14 @@
 //! API key resolution across CLI flags, environment variables, and auth.json.
 
-use std::collections::HashMap;
-use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
 use anyhow::Context;
 use mehh_ai::oauth::{
     acquire_file_lock, get_path_lock_mutex, refresh_oauth_credential, CredentialInfo,
     CredentialModifyFn, CredentialStore, FileLockGuard, OAuthProviderKind, StoredCredential,
 };
 use mehh_ai::{env_api_key_name, now_ms};
+use std::collections::HashMap;
+use std::io::ErrorKind;
+use std::path::{Path, PathBuf};
 
 /// Returns default auth path `~/.mehh/agent/auth.json`.
 pub fn default_auth_path() -> anyhow::Result<PathBuf> {
@@ -28,7 +28,9 @@ pub fn default_auth_path() -> anyhow::Result<PathBuf> {
 pub fn oauth_kind_for_provider(provider: &str) -> Option<OAuthProviderKind> {
     match provider.to_lowercase().as_str() {
         "anthropic" => Some(OAuthProviderKind::Anthropic),
-        "openai" | "openai-codex" | "openai-chatgpt" => Some(OAuthProviderKind::OpenAiChatGpt),
+        "openai" | "openai-codex" | "openai-chatgpt" | "openai-responses" => {
+            Some(OAuthProviderKind::OpenAiChatGpt)
+        }
         "github-copilot" => Some(OAuthProviderKind::GitHubCopilot),
         _ => None,
     }
@@ -37,7 +39,7 @@ pub fn oauth_kind_for_provider(provider: &str) -> Option<OAuthProviderKind> {
 /// Helper to resolve environment variable for a provider.
 pub fn resolve_provider_env_var(provider: &str) -> Option<String> {
     let p = provider.to_lowercase();
-    let primary_var = env_api_key_name(provider);
+    let primary_var = env_api_key_name(&p);
     if let Ok(val) = std::env::var(primary_var) {
         let trimmed = val.trim().to_string();
         if !trimmed.is_empty() {
@@ -200,9 +202,12 @@ impl FileCredentialStore {
 impl CredentialStore for FileCredentialStore {
     async fn read(&self, provider_id: &str) -> anyhow::Result<Option<StoredCredential>> {
         let entries = load_auth_entries(Some(&self.path))?;
-        let cred = entries
-            .get(provider_id)
-            .or_else(|| entries.iter().find(|(k, _)| k.eq_ignore_ascii_case(provider_id)).map(|(_, v)| v));
+        let cred = entries.get(provider_id).or_else(|| {
+            entries
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(provider_id))
+                .map(|(_, v)| v)
+        });
         Ok(cred.cloned())
     }
 
@@ -329,10 +334,7 @@ pub fn save_credential(
 
 /// Removes a credential for provider (case-insensitive) from auth file under advisory file lock.
 /// Returns true if an entry was found and removed, false otherwise.
-pub fn remove_credential(
-    provider: &str,
-    auth_file: Option<&Path>,
-) -> anyhow::Result<bool> {
+pub fn remove_credential(provider: &str, auth_file: Option<&Path>) -> anyhow::Result<bool> {
     let path_buf;
     let path = match auth_file {
         Some(p) => p,
@@ -395,9 +397,12 @@ pub fn resolve_api_key(
             return None;
         }
     };
-    let cred = entries
-        .get(provider)
-        .or_else(|| entries.iter().find(|(k, _)| k.eq_ignore_ascii_case(provider)).map(|(_, v)| v))?;
+    let cred = entries.get(provider).or_else(|| {
+        entries
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(provider))
+            .map(|(_, v)| v)
+    })?;
 
     match cred {
         StoredCredential::ApiKey { key, .. } => key.clone(),
@@ -543,7 +548,9 @@ mod tests {
         let entries = load_auth_entries(Some(&auth_file)).unwrap();
         assert_eq!(entries.len(), 1);
         match entries.get("openai").unwrap() {
-            StoredCredential::ApiKey { key, .. } => assert_eq!(key.as_deref(), Some("sk-openai-key")),
+            StoredCredential::ApiKey { key, .. } => {
+                assert_eq!(key.as_deref(), Some("sk-openai-key"))
+            }
             _ => panic!("Expected ApiKey"),
         }
 
@@ -589,10 +596,22 @@ mod tests {
     #[test]
     fn test_env_api_key_name_resolution() {
         assert_eq!(env_api_key_name("mistral"), "MISTRAL_API_KEY");
-        assert_eq!(env_api_key_name("azure-openai-responses"), "AZURE_OPENAI_API_KEY");
-        assert_eq!(oauth_kind_for_provider("anthropic"), Some(OAuthProviderKind::Anthropic));
-        assert_eq!(oauth_kind_for_provider("OpenAI-ChatGPT"), Some(OAuthProviderKind::OpenAiChatGpt));
-        assert_eq!(oauth_kind_for_provider("github-copilot"), Some(OAuthProviderKind::GitHubCopilot));
+        assert_eq!(
+            env_api_key_name("azure-openai-responses"),
+            "AZURE_OPENAI_API_KEY"
+        );
+        assert_eq!(
+            oauth_kind_for_provider("anthropic"),
+            Some(OAuthProviderKind::Anthropic)
+        );
+        assert_eq!(
+            oauth_kind_for_provider("OpenAI-ChatGPT"),
+            Some(OAuthProviderKind::OpenAiChatGpt)
+        );
+        assert_eq!(
+            oauth_kind_for_provider("github-copilot"),
+            Some(OAuthProviderKind::GitHubCopilot)
+        );
         assert_eq!(oauth_kind_for_provider("mistral"), None);
     }
 
@@ -606,8 +625,11 @@ mod tests {
         assert_eq!(resolve_api_key("openai", None, Some(&auth_file)), None);
 
         // A single malformed entry inside valid JSON must also fail closed instead of being dropped.
-        std::fs::write(&auth_file, r#"{"openai": {"type": "api_key", "key": "sk-ok"}, "broken": 123}"#)
-            .unwrap();
+        std::fs::write(
+            &auth_file,
+            r#"{"openai": {"type": "api_key", "key": "sk-ok"}, "broken": 123}"#,
+        )
+        .unwrap();
         assert!(load_auth_entries(Some(&auth_file)).is_err());
     }
 
@@ -626,10 +648,11 @@ mod tests {
 
         let server_task = tokio::spawn(async move {
             for _ in 0..2 {
-                let (mut socket, _) = match tokio::time::timeout(Duration::from_secs(3), listener.accept()).await {
-                    Ok(Ok(pair)) => pair,
-                    _ => break,
-                };
+                let (mut socket, _) =
+                    match tokio::time::timeout(Duration::from_secs(3), listener.accept()).await {
+                        Ok(Ok(pair)) => pair,
+                        _ => break,
+                    };
                 let mut buf = [0u8; 2048];
                 let n = socket.read(&mut buf).await.unwrap_or(0);
                 let req_str = String::from_utf8_lossy(&buf[..n]);
@@ -715,7 +738,11 @@ mod tests {
         assert_eq!(key2, Some("refreshed_access_token_123".to_string()));
 
         // Crucial invariant: only 1 HTTP POST to /token was performed
-        assert_eq!(post_count.load(Ordering::SeqCst), 1, "Expected exactly 1 refresh POST under file lock");
+        assert_eq!(
+            post_count.load(Ordering::SeqCst),
+            1,
+            "Expected exactly 1 refresh POST under file lock"
+        );
 
         let _ = server_task.await;
     }

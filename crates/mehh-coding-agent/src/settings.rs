@@ -1,17 +1,13 @@
 //! User and project settings management.
 
-use std::path::{Path, PathBuf};
 use anyhow::Context;
+use std::path::{Path, PathBuf};
 
 static ATOMIC_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Atomically writes `bytes` to `path` via a unique temp file in the same directory and `rename`.
 /// When `restricted` is true on Unix, creates the temp file with `0o600` permissions.
-pub(crate) fn write_file_atomic(
-    path: &Path,
-    bytes: &[u8],
-    restricted: bool,
-) -> anyhow::Result<()> {
+pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], restricted: bool) -> anyhow::Result<()> {
     let parent = path
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -19,10 +15,7 @@ pub(crate) fn write_file_atomic(
     std::fs::create_dir_all(parent)
         .with_context(|| format!("Failed to create directories for: {}", path.display()))?;
 
-    let file_name = path
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("file");
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("file");
     let pid = std::process::id();
 
     let mut attempt = 0u32;
@@ -61,16 +54,14 @@ pub(crate) fn write_file_atomic(
     drop(file);
     if let Err(e) = write_res {
         let _ = std::fs::remove_file(&tmp_path);
-        return Err(e).with_context(|| {
-            format!("Failed to write temporary file: {}", tmp_path.display())
-        });
+        return Err(e)
+            .with_context(|| format!("Failed to write temporary file: {}", tmp_path.display()));
     }
 
     #[cfg(unix)]
     if restricted {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) =
-            std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
+        if let Err(e) = std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o600))
         {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(e).with_context(|| {
@@ -160,7 +151,8 @@ impl SettingsManager {
             Ok(c) => c,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),
             Err(e) => {
-                return Err(e).with_context(|| format!("Failed to read settings file: {}", path.display()))
+                return Err(e)
+                    .with_context(|| format!("Failed to read settings file: {}", path.display()))
             }
         };
 
@@ -329,7 +321,10 @@ mod tests {
         assert_eq!(merged.follow_up_mode, Some(QueueMode::OneAtATime));
         assert_eq!(merged.tree_filter_mode.as_deref(), Some("all"));
         assert_eq!(merged.hide_thinking_block, Some(true));
-        assert_eq!(merged.permission_mode, Some(crate::tool_inspection::PermissionMode::Auto));
+        assert_eq!(
+            merged.permission_mode,
+            Some(crate::tool_inspection::PermissionMode::Auto)
+        );
         assert_eq!(merged.worker_model.as_deref(), Some("gemini-2.5-flash"));
         assert_eq!(merged.lead_turns, Some(2));
     }
@@ -360,14 +355,24 @@ mod tests {
         let global_path = dir.path().join("global-settings.json");
         let project_path = dir.path().join("project-settings.json");
 
-        std::fs::write(&global_path, r#"{"defaultProvider":"anthropic","autoCompact":true}"#).unwrap();
-        std::fs::write(&project_path, r#"{"defaultProvider":"openai","autoCompact":false}"#).unwrap();
+        std::fs::write(
+            &global_path,
+            r#"{"defaultProvider":"anthropic","autoCompact":true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project_path,
+            r#"{"defaultProvider":"openai","autoCompact":false}"#,
+        )
+        .unwrap();
 
-        let untrusted = SettingsManager::try_load_from_paths(&global_path, &project_path, false).unwrap();
+        let untrusted =
+            SettingsManager::try_load_from_paths(&global_path, &project_path, false).unwrap();
         assert_eq!(untrusted.default_provider.as_deref(), Some("anthropic"));
         assert_eq!(untrusted.auto_compact, Some(true));
 
-        let trusted = SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
+        let trusted =
+            SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
         assert_eq!(trusted.default_provider.as_deref(), Some("openai"));
         assert_eq!(trusted.auto_compact, Some(false));
 
@@ -388,14 +393,22 @@ mod tests {
         // Global has Auto, project also has Auto
         std::fs::write(&global_path, r#"{"permissionMode":"auto"}"#).unwrap();
         std::fs::write(&project_path, r#"{"permissionMode":"auto"}"#).unwrap();
-        let loaded = SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
+        let loaded =
+            SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
         // Since local Auto was neutralized to None, global Auto is preserved!
-        assert_eq!(loaded.permission_mode, Some(crate::tool_inspection::PermissionMode::Auto));
+        assert_eq!(
+            loaded.permission_mode,
+            Some(crate::tool_inspection::PermissionMode::Auto)
+        );
 
         // Global has SmartApprove, project has Auto (trying to escalate)
         std::fs::write(&global_path, r#"{"permissionMode":"smart_approve"}"#).unwrap();
-        let loaded2 = SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
+        let loaded2 =
+            SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
         // Global SmartApprove is preserved, project Auto is neutralized!
-        assert_eq!(loaded2.permission_mode, Some(crate::tool_inspection::PermissionMode::SmartApprove));
+        assert_eq!(
+            loaded2.permission_mode,
+            Some(crate::tool_inspection::PermissionMode::SmartApprove)
+        );
     }
 }

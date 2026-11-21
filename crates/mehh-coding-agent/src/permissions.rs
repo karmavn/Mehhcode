@@ -1,10 +1,10 @@
 //! Persisted tool permission store and granular rule evaluation.
 
-use std::path::{Path, PathBuf};
+use crate::tool_inspection::{InspectionVerdict, ToolInspectionContext};
 use anyhow::{Context, Result};
 use globset::Glob;
 use serde::{Deserialize, Serialize};
-use crate::tool_inspection::{InspectionVerdict, ToolInspectionContext};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,9 +101,8 @@ impl PermissionStore {
         };
 
         let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-        let file: PermissionsFile = serde_json::from_str(clean).with_context(|| {
-            format!("Failed to parse permissions JSON in '{}'", path.display())
-        })?;
+        let file: PermissionsFile = serde_json::from_str(clean)
+            .with_context(|| format!("Failed to parse permissions JSON in '{}'", path.display()))?;
 
         Ok(Some(file.rules))
     }
@@ -135,6 +134,16 @@ impl PermissionStore {
         Ok(())
     }
 
+    /// Appends a rule for the current session only (no disk persistence).
+    pub fn add_session_rule(&mut self, rule: PermissionRule) {
+        self.rules.retain(|r| {
+            !(r.tool_name.eq_ignore_ascii_case(&rule.tool_name)
+                && r.arg_prefix == rule.arg_prefix
+                && r.path_glob == rule.path_glob)
+        });
+        self.rules.push(rule);
+    }
+
     /// Evaluates active rules against the inspection context.
     ///
     /// Specific rules (those with arg_prefix or path_glob, longer prefix, or exact tool names)
@@ -148,34 +157,36 @@ impl PermissionStore {
             }
 
             if let Some(ref pfx) = rule.arg_prefix {
-                let matches_prefix = if let Some(cmd) = ctx.args.get("command").and_then(|v| v.as_str()) {
-                    cmd.trim().starts_with(pfx.trim())
-                } else if let Some(path) = ctx.args.get("path").and_then(|v| v.as_str()) {
-                    let norm_path = path.trim().replace('\\', "/");
-                    let norm_pfx = pfx.trim().replace('\\', "/");
-                    norm_path.starts_with(&norm_pfx) || path.trim().starts_with(pfx.trim())
-                } else {
-                    false
-                };
+                let matches_prefix =
+                    if let Some(cmd) = ctx.args.get("command").and_then(|v| v.as_str()) {
+                        cmd.trim().starts_with(pfx.trim())
+                    } else if let Some(path) = ctx.args.get("path").and_then(|v| v.as_str()) {
+                        let norm_path = path.trim().replace('\\', "/");
+                        let norm_pfx = pfx.trim().replace('\\', "/");
+                        norm_path.starts_with(&norm_pfx) || path.trim().starts_with(pfx.trim())
+                    } else {
+                        false
+                    };
                 if !matches_prefix {
                     continue;
                 }
             }
 
             if let Some(ref glob_pattern) = rule.path_glob {
-                let matches_glob = if let Some(raw_path) = ctx.args.get("path").and_then(|v| v.as_str()) {
-                    let norm_path = raw_path.trim().replace('\\', "/");
-                    if let Ok(glob) = Glob::new(glob_pattern) {
-                        let matcher = glob.compile_matcher();
-                        matcher.is_match(&norm_path)
-                            || matcher.is_match(raw_path)
-                            || matcher.is_match(Path::new(raw_path))
+                let matches_glob =
+                    if let Some(raw_path) = ctx.args.get("path").and_then(|v| v.as_str()) {
+                        let norm_path = raw_path.trim().replace('\\', "/");
+                        if let Ok(glob) = Glob::new(glob_pattern) {
+                            let matcher = glob.compile_matcher();
+                            matcher.is_match(&norm_path)
+                                || matcher.is_match(raw_path)
+                                || matcher.is_match(Path::new(raw_path))
+                        } else {
+                            false
+                        }
                     } else {
                         false
-                    }
-                } else {
-                    false
-                };
+                    };
                 if !matches_glob {
                     continue;
                 }
@@ -200,7 +211,10 @@ impl PermissionStore {
         match rule.action {
             PermissionAction::AlwaysAllow => Some(InspectionVerdict::Allow),
             PermissionAction::AskBefore => Some(InspectionVerdict::RequireApproval {
-                reason: format!("Permission rule requires approval for tool '{}'", ctx.tool_name),
+                reason: format!(
+                    "Permission rule requires approval for tool '{}'",
+                    ctx.tool_name
+                ),
                 preview: ctx
                     .args
                     .get("command")
@@ -222,7 +236,10 @@ mod tests {
     fn make_ctx(tool: &str, command: Option<&str>, path: Option<&str>) -> ToolInspectionContext {
         let mut args = serde_json::Map::new();
         if let Some(cmd) = command {
-            args.insert("command".to_string(), serde_json::Value::String(cmd.to_string()));
+            args.insert(
+                "command".to_string(),
+                serde_json::Value::String(cmd.to_string()),
+            );
         }
         if let Some(p) = path {
             args.insert("path".to_string(), serde_json::Value::String(p.to_string()));
@@ -235,6 +252,20 @@ mod tests {
             cwd: PathBuf::from("."),
             origin: None,
         }
+    }
+
+    #[test]
+    fn session_rule_stays_in_memory() {
+        let path = std::env::temp_dir().join(format!("session_rule_{}", uuid::Uuid::now_v7()));
+        let mut store = PermissionStore::new(Vec::new(), Some(path.clone()));
+        store.add_session_rule(PermissionRule {
+            tool_name: "bash".to_string(),
+            arg_prefix: None,
+            path_glob: None,
+            action: PermissionAction::AlwaysAllow,
+        });
+        assert_eq!(store.rules().len(), 1);
+        assert!(!path.exists(), "session-only rule must not touch disk");
     }
 
     #[test]

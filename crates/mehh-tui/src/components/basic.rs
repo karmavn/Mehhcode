@@ -1,4 +1,5 @@
 use crate::ansi::{truncate_to_width, wrap_text_with_ansi};
+use crate::theme::Theme;
 use crate::tui::Component;
 
 /// Plain or padded text component with ANSI-safe word wrapping.
@@ -160,6 +161,7 @@ pub const BRAILLE_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", 
 pub struct Loader {
     pub label: String,
     pub frame: usize,
+    pub theme: Theme,
 }
 
 impl Loader {
@@ -167,7 +169,13 @@ impl Loader {
         Self {
             label: label.into(),
             frame: 0,
+            theme: Theme::default(),
         }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     pub fn tick(&mut self) {
@@ -178,7 +186,11 @@ impl Loader {
 impl Component for Loader {
     fn render(&self, width: usize) -> Vec<String> {
         let spinner = BRAILLE_FRAMES[self.frame % BRAILLE_FRAMES.len()];
-        let line = format!("\x1b[36m{spinner}\x1b[0m {}", self.label);
+        let line = format!(
+            "{} {}",
+            self.theme.fg(&self.theme.accent, spinner),
+            self.label
+        );
         wrap_text_with_ansi(&line, width)
     }
 }
@@ -213,6 +225,7 @@ pub struct SelectList {
     pub filter: String,
     pub selected: usize,
     pub max_visible: usize,
+    pub theme: Theme,
 }
 
 impl SelectList {
@@ -222,7 +235,13 @@ impl SelectList {
             filter: String::new(),
             selected: 0,
             max_visible: max_visible.max(1),
+            theme: Theme::default(),
         }
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
     }
 
     pub fn set_items(&mut self, items: Vec<SelectItem>) {
@@ -303,7 +322,12 @@ impl Component for SelectList {
     fn render(&self, width: usize) -> Vec<String> {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
-            return vec![truncate_to_width("  No matching items", width, "...", false)];
+            return vec![truncate_to_width(
+                &format!("  {}", self.theme.fg(&self.theme.dim, "No matching items")),
+                width,
+                "...",
+                false,
+            )];
         }
 
         let total = filtered.len();
@@ -320,15 +344,22 @@ impl Component for SelectList {
             let is_selected = actual_idx == selected;
 
             let desc_str = if let Some(ref d) = item.description {
-                format!(" \x1b[2m{d}\x1b[0m")
+                format!(" {}", self.theme.fg(&self.theme.dim, d))
             } else {
                 String::new()
             };
 
             let line = if is_selected {
-                format!("\x1b[36m> \x1b[1m{}\x1b[0m{desc_str}", item.label)
+                format!(
+                    "{} {}{desc_str}",
+                    self.theme.fg(&self.theme.accent, ">"),
+                    self.theme.fg(&self.theme.text, &item.label)
+                )
             } else {
-                format!("  {}{desc_str}", item.label)
+                format!(
+                    "  {}{desc_str}",
+                    self.theme.fg(&self.theme.text, &item.label)
+                )
             };
 
             lines.push(truncate_to_width(&line, width, "...", false));
@@ -375,7 +406,10 @@ mod tests {
         let lines = list.render(30);
         assert!(lines[1].contains('>'));
         assert!(lines[1].contains("Banana"));
-        assert_eq!(list.selected_item().map(|it| it.label.as_str()), Some("Banana"));
+        assert_eq!(
+            list.selected_item().map(|it| it.label.as_str()),
+            Some("Banana")
+        );
     }
 
     #[test]

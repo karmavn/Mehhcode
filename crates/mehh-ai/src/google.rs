@@ -232,6 +232,33 @@ fn normalize_google_tool_call_id(id: &str, model: &Model) -> String {
     }
 }
 
+/// Strips JSON Schema keywords Gemini rejects from a tool parameter schema.
+fn gemini_tool_parameters(value: &serde_json::Value, is_property_map: bool) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (k, v) in map {
+                if !is_property_map
+                    && matches!(
+                        k.as_str(),
+                        "$schema" | "additionalProperties" | "default" | "$defs" | "definitions"
+                    )
+                {
+                    continue;
+                }
+                let child_is_property_map = !is_property_map
+                    && (k == "properties" || k == "patternProperties");
+                out.insert(k.clone(), gemini_tool_parameters(v, child_is_property_map));
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(arr) => serde_json::Value::Array(
+            arr.iter().map(|v| gemini_tool_parameters(v, false)).collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Builds the JSON request payload for Google Generative AI API.
 pub fn build_google_request(
     model: &Model,
@@ -267,7 +294,7 @@ pub fn build_google_request(
         match msg {
             Message::System(_) => {}
             Message::User(u) => {
-                let parts: Vec<serde_json::Value> = match &u.content {
+                let mut parts: Vec<serde_json::Value> = match &u.content {
                     UserContent::Text(text) => {
                         vec![serde_json::json!({ "text": sanitize_surrogates(text) })]
                     }
@@ -289,10 +316,30 @@ pub fn build_google_request(
                         .collect(),
                 };
                 if !parts.is_empty() {
-                    contents.push(serde_json::json!({
-                        "role": "user",
-                        "parts": parts,
-                    }));
+                    // A user message directly after a tool result (e.g. steering)
+                    // must join the same turn: Gemini rejects adjacent user turns.
+                    let mut merged = false;
+                    if let Some(last) = contents.last_mut() {
+                        if last.get("role").and_then(|r| r.as_str()) == Some("user") {
+                            if let Some(existing) =
+                                last.get_mut("parts").and_then(|p| p.as_array_mut())
+                            {
+                                if existing
+                                    .iter()
+                                    .any(|p| p.get("functionResponse").is_some())
+                                {
+                                    existing.extend(std::mem::take(&mut parts));
+                                    merged = true;
+                                }
+                            }
+                        }
+                    }
+                    if !merged {
+                        contents.push(serde_json::json!({
+                            "role": "user",
+                            "parts": parts,
+                        }));
+                    }
                 }
             }
             Message::Assistant(a) => {
@@ -342,7 +389,7 @@ pub fn build_google_request(
                                 "args".to_string(),
                                 serde_json::Value::Object(tc.arguments.clone()),
                             );
-                            if !tc.id.is_empty() {
+                            if requires_tool_call_id(&model.id) && !tc.id.is_empty() {
                                 fc.insert("id".to_string(), serde_json::json!(tc.id));
                             }
                             let mut p = serde_json::Map::new();
@@ -383,20 +430,28 @@ pub fn build_google_request(
                 let mut fr = serde_json::Map::new();
                 fr.insert("name".to_string(), serde_json::json!(tr.tool_name));
                 fr.insert("response".to_string(), response_obj);
-                if !tr.tool_call_id.is_empty() {
+                if requires_tool_call_id(&model.id) && !tr.tool_call_id.is_empty() {
                     fr.insert("id".to_string(), serde_json::json!(tr.tool_call_id));
                 }
 
-                let part = serde_json::json!({
-                    "functionResponse": fr
-                });
+                let mut parts = vec![serde_json::json!({ "functionResponse": fr })];
+                for block in &tr.content {
+                    if let ToolResultContentBlock::Image(img) = block {
+                        parts.push(serde_json::json!({
+                            "inlineData": {
+                                "mimeType": img.mime_type,
+                                "data": img.data,
+                            }
+                        }));
+                    }
+                }
 
                 let mut merged = false;
                 if let Some(last) = contents.last_mut() {
                     if last.get("role").and_then(|r| r.as_str()) == Some("user") {
-                        if let Some(parts) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
-                            if parts.iter().any(|p| p.get("functionResponse").is_some()) {
-                                parts.push(part.clone());
+                        if let Some(existing) = last.get_mut("parts").and_then(|p| p.as_array_mut()) {
+                            if existing.iter().any(|p| p.get("functionResponse").is_some()) {
+                                existing.extend(std::mem::take(&mut parts));
                                 merged = true;
                             }
                         }
@@ -405,7 +460,7 @@ pub fn build_google_request(
                 if !merged {
                     contents.push(serde_json::json!({
                         "role": "user",
-                        "parts": [part],
+                        "parts": parts,
                     }));
                 }
             }
@@ -433,7 +488,7 @@ pub fn build_google_request(
                     serde_json::json!({
                         "name": t.name,
                         "description": t.description,
-                        "parameters": t.parameters,
+                        "parameters": gemini_tool_parameters(&t.parameters, false),
                     })
                 })
                 .collect();
@@ -451,7 +506,13 @@ pub fn build_google_request(
     if let Some(max_tokens) = options.max_tokens {
         gen_config.insert("maxOutputTokens".to_string(), serde_json::json!(max_tokens));
     }
-    if model.reasoning && options.reasoning != Some(ThinkingLevel::Off) {
+    if model.reasoning && options.reasoning == Some(ThinkingLevel::Off) {
+        // Omitting thinkingConfig leaves Gemini 2.5 thinking enabled by default.
+        gen_config.insert(
+            "thinkingConfig".to_string(),
+            serde_json::json!({ "thinkingBudget": 0 }),
+        );
+    } else if model.reasoning {
         let budget = match options.reasoning {
             Some(ThinkingLevel::Minimal) => 128,
             Some(ThinkingLevel::Low) => 2048,
@@ -684,15 +745,21 @@ impl GoogleStreamState {
                                     self.output.content.get_mut(content_index)
                                 {
                                     tc.thinking.push_str(text);
-                                    if thought_sig.is_some() {
-                                        tc.thinking_signature = thought_sig;
-                                    }
                                 }
                                 events.push(AssistantMessageEvent::ThinkingDelta {
                                     content_index,
                                     delta: text.to_string(),
                                     partial: self.output.metadata_clone(),
                                 });
+                            }
+                        }
+                        // Gemini can send the signature in a trailing part whose
+                        // text is empty; never drop it just because text is empty.
+                        if let Some(sig) = thought_sig {
+                            if let Some(AssistantContentBlock::Thinking(tc)) =
+                                self.output.content.get_mut(content_index)
+                            {
+                                tc.thinking_signature = Some(sig);
                             }
                         }
                     } else if let Some(text) = part.get("text").and_then(|v| v.as_str()) {
@@ -735,15 +802,19 @@ impl GoogleStreamState {
                                 self.output.content.get_mut(content_index)
                             {
                                 tc.text.push_str(text);
-                                if thought_sig.is_some() {
-                                    tc.text_signature = thought_sig;
-                                }
                             }
                             events.push(AssistantMessageEvent::TextDelta {
                                 content_index,
                                 delta: text.to_string(),
                                 partial: self.output.metadata_clone(),
                             });
+                        }
+                        if let Some(sig) = thought_sig {
+                            if let Some(AssistantContentBlock::Text(tc)) =
+                                self.output.content.get_mut(content_index)
+                            {
+                                tc.text_signature = Some(sig);
+                            }
                         }
                     } else if let Some(fc) = part.get("functionCall") {
                         if let Some(thinking_idx) = self.active_thinking_index.take() {
@@ -1036,7 +1107,8 @@ mod tests {
         assert_eq!(contents[1]["parts"][0]["text"], "I need to add 10 and 20.");
         assert_eq!(contents[1]["parts"][0]["thoughtSignature"], "sig_think_123");
         assert_eq!(contents[1]["parts"][1]["functionCall"]["name"], "add");
-        assert_eq!(contents[1]["parts"][1]["functionCall"]["id"], "call_add1");
+        // Gemini 2.x does not accept an `id` on functionCall.
+        assert!(contents[1]["parts"][1]["functionCall"]["id"].is_null());
         assert_eq!(contents[1]["parts"][1]["thoughtSignature"], "sig_tool_123");
 
         assert_eq!(contents[2]["role"], "user");

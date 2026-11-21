@@ -14,14 +14,16 @@ use mehh_agent::{
     run_agent_loop, AgentEvent, AgentLoopConfig, AgentLoopTurnUpdate, AgentTool, AgentToolResult,
     AgentToolUpdateCallback, QueueMode,
 };
-use mehh_ai::{now_ms, Context, LlmProvider, Message, Model, StopReason, Usage, UserContent, UserMessage};
+use mehh_ai::{
+    now_ms, Context, LlmProvider, Message, Model, StopReason, Usage, UserContent, UserMessage,
+};
 
 use crate::lead_worker::LeadWorkerManager;
+use crate::subagent_control::{global_control, SubagentControl};
 use crate::subagent_lifecycle::{
     agent_store_dir, classify_failure, derive_state, new_agent_id, new_manifest, write_manifest,
     SubagentEvent, SubagentEventKind, SubagentFailureClass, SubagentManifest, SubagentStatus,
 };
-use crate::subagent_control::{global_control, SubagentControl};
 use crate::tool_inspection::ToolInspectionManager;
 
 /// Maximum nested subagent recursion depth.
@@ -263,7 +265,9 @@ fn prefixed_update(
     let mut upd = SubagentTool::subagent_update(child_id, mode, event);
     if !prefix.is_empty() {
         if let Some(mehh_ai::ToolResultContentBlock::Text(t)) = upd.content.first_mut() {
-            t.text = t.text.replacen("[subagent:", &format!("[subagent:{prefix}"), 1);
+            t.text = t
+                .text
+                .replacen("[subagent:", &format!("[subagent:{prefix}"), 1);
         }
     }
     upd
@@ -469,8 +473,14 @@ impl SubagentTool {
         });
         let text = match event.kind {
             SubagentEventKind::Started => format!("[subagent:{mode}] started"),
-            SubagentEventKind::ToolStarted => format!("[subagent:{mode}] Executing tool {}", event.detail.as_deref().unwrap_or("")),
-            SubagentEventKind::ToolFinished => format!("[subagent:{mode}] Tool {}", event.detail.as_deref().unwrap_or("completed")),
+            SubagentEventKind::ToolStarted => format!(
+                "[subagent:{mode}] Executing tool {}",
+                event.detail.as_deref().unwrap_or("")
+            ),
+            SubagentEventKind::ToolFinished => format!(
+                "[subagent:{mode}] Tool {}",
+                event.detail.as_deref().unwrap_or("completed")
+            ),
             SubagentEventKind::Blocked => format!("[subagent:{mode}] blocked"),
             SubagentEventKind::Finished => format!("[subagent:{mode}] finished"),
             SubagentEventKind::Aborted => format!("[subagent:{mode}] aborted"),
@@ -492,7 +502,8 @@ impl SubagentTool {
         cancel: &CancellationToken,
         on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<String, String> {
-        let (status, failure_class, error, result, terminal_kind, terminal_detail) = match &outcome {
+        let (status, failure_class, error, result, terminal_kind, terminal_detail) = match &outcome
+        {
             Ok(out) => (
                 SubagentStatus::Completed,
                 None,
@@ -545,7 +556,11 @@ impl SubagentTool {
         manifest.events = events.lock().unwrap().clone();
 
         if let Some(ref cb) = on_update {
-            cb(Self::subagent_update(&manifest.agent_id, &manifest.mode, &terminal_event));
+            cb(Self::subagent_update(
+                &manifest.agent_id,
+                &manifest.mode,
+                &terminal_event,
+            ));
         }
 
         // Never discard the run's own outcome: a write failure is appended to
@@ -611,7 +626,12 @@ impl SubagentTool {
             detail: None,
         };
         if let Some(ref cb) = on_update {
-            cb(prefixed_update(&child_agent_id, mode, &started_event, &task_prefix));
+            cb(prefixed_update(
+                &child_agent_id,
+                mode,
+                &started_event,
+                &task_prefix,
+            ));
         }
 
         let mode_owned = mode.to_string();
@@ -688,7 +708,7 @@ impl SubagentTool {
             base_config.model = m.active_model();
             base_config.provider = m.active_provider();
             let active_key = m.active_api_key();
-            base_config.stream_options.api_key=active_key;
+            base_config.stream_options.api_key = active_key;
         }
 
         if let Some(ref lw) = lead_worker {
@@ -730,19 +750,20 @@ impl SubagentTool {
                         cwd: session_cwd,
                         origin: Some(origin_label),
                     };
-                    mgr.inspect_and_authorize(&inspect_ctx, approval_h.as_deref()).await
+                    mgr.inspect_and_authorize(&inspect_ctx, approval_h.as_deref())
+                        .await
                 })
             }));
         }
 
         if lead_worker.is_none() {
             if let Some(ref key) = self.api_key {
-                base_config.stream_options.api_key=Some(key.clone());
+                base_config.stream_options.api_key = Some(key.clone());
             } else if self.model.provider != "faux" && self.model.api != "faux" {
                 if let Ok(Some(key)) =
                     crate::auth::resolve_api_key_async(&self.model.provider, None, None).await
                 {
-                    base_config.stream_options.api_key=Some(key);
+                    base_config.stream_options.api_key = Some(key);
                 }
             }
         } else if base_config.stream_options.api_key.is_none()
@@ -752,7 +773,7 @@ impl SubagentTool {
             if let Ok(Some(key)) =
                 crate::auth::resolve_api_key_async(&base_config.model.provider, None, None).await
             {
-                base_config.stream_options.api_key=Some(key);
+                base_config.stream_options.api_key = Some(key);
             }
         }
 
@@ -1043,7 +1064,12 @@ impl AgentTool for SubagentTool {
         if let Some(tasks_arr) = params.get("tasks").and_then(|v| v.as_array()) {
             let task_prompts: Vec<String> = tasks_arr
                 .iter()
-                .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string))
+                .filter_map(|v| {
+                    v.as_str()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
                 .collect();
 
             if !task_prompts.is_empty() {
@@ -1086,15 +1112,18 @@ impl AgentTool for SubagentTool {
                     };
                     let task_agent_id = new_agent_id();
                     task_ids.push(task_agent_id.clone());
-                    let mut task_manifest_for_task =
-                        new_manifest(task_agent_id.clone(), mode_str.clone(), self.model.id.clone(), now_ms());
+                    let mut task_manifest_for_task = new_manifest(
+                        task_agent_id.clone(),
+                        mode_str.clone(),
+                        self.model.id.clone(),
+                        now_ms(),
+                    );
                     child_manifests.push(task_manifest_for_task.clone());
                     child_statuses.push(SubagentStatus::Running);
                     // Shared with the spawned task so the parent can finalize
                     // the manifest from the child's live event log even when
                     // the child panics before finalizing it itself.
-                    let task_events =
-                        Arc::new(Mutex::new(task_manifest_for_task.events.clone()));
+                    let task_events = Arc::new(Mutex::new(task_manifest_for_task.events.clone()));
                     child_events.push(task_events.clone());
 
                     let task_control = control.clone();
@@ -1204,7 +1233,8 @@ impl AgentTool for SubagentTool {
                 result.structured_content = Some(json!({"tasks": task_meta, "usage": total_usage}));
                 result.usage = Some(total_usage);
                 if let Some(child_manifest) = child_manifests.last() {
-                    let path = agent_store_dir(&self.cwd).join(format!("{}.json", child_manifest.agent_id));
+                    let path = agent_store_dir(&self.cwd)
+                        .join(format!("{}.json", child_manifest.agent_id));
                     // `child_id`/`manifest` above keep pointing at the last
                     // child for compatibility; `children` carries every child
                     // with its own terminal status and manifest path.
@@ -1260,7 +1290,12 @@ impl AgentTool for SubagentTool {
         let control = self.control();
         let _permit = control.acquire().await;
         let handle = control.register(new_agent_id(), mode.to_string(), cancel.child_token());
-        let mut manifest = new_manifest(handle.agent_id.clone(), mode.to_string(), self.model.id.clone(), now_ms());
+        let mut manifest = new_manifest(
+            handle.agent_id.clone(),
+            mode.to_string(),
+            self.model.id.clone(),
+            now_ms(),
+        );
         // Shared event log: finalize copies it back into the manifest, and the
         // parent can read it even if the child task dies unexpectedly.
         let events = Arc::new(Mutex::new(manifest.events.clone()));
@@ -1301,7 +1336,12 @@ impl AgentTool for SubagentTool {
         // ToolResult. `Err(String)` is reserved for preconditions that can
         // never produce a manifest (depth limit, missing prompt).
         let (result_text, is_error, handoff, usage) = match outcome {
-            Ok(o) => (o.result_text(), false, Some(o.metadata_json()), Some(o.usage.clone())),
+            Ok(o) => (
+                o.result_text(),
+                false,
+                Some(o.metadata_json()),
+                Some(o.usage.clone()),
+            ),
             Err(err) => (err, true, None, None),
         };
         let mut result = AgentToolResult::text(result_text);
@@ -1337,14 +1377,24 @@ mod tests {
         let mut tools: Vec<Arc<dyn AgentTool>> = mehh_tools::create_coding_tools(cwd.clone());
         tools.push(stale);
 
-        let sub = SubagentTool::new(cwd.clone(), faux_model(), faux.clone(), None, tools.clone(), 0);
+        let sub = SubagentTool::new(
+            cwd.clone(),
+            faux_model(),
+            faux.clone(),
+            None,
+            tools.clone(),
+            0,
+        );
         let corrected = sub.depth_corrected_tools(tools.clone());
         let nested = corrected
             .iter()
             .find(|t| t.name() == "subagent")
             .expect("depth-0 child may expose one nesting level");
         let mut params = Map::new();
-        params.insert("prompt".to_string(), Value::String("nested task".to_string()));
+        params.insert(
+            "prompt".to_string(),
+            Value::String("nested task".to_string()),
+        );
         let res = nested
             .execute("tc_nested", params, CancellationToken::new(), None)
             .await
@@ -1430,11 +1480,24 @@ mod tests {
 
         let cwd = std::env::temp_dir();
         let tools = mehh_tools::create_coding_tools(cwd.clone());
-        let sub = SubagentTool::new(cwd.clone(), faux_model(), faux.clone(), None, tools.clone(), 0);
-        assert!(sub.filter_tools_for_mode("research").iter().all(|t| matches!(t.name(), "read" | "grep" | "find" | "ls" | "analyze")));
+        let sub = SubagentTool::new(
+            cwd.clone(),
+            faux_model(),
+            faux.clone(),
+            None,
+            tools.clone(),
+            0,
+        );
+        assert!(sub
+            .filter_tools_for_mode("research")
+            .iter()
+            .all(|t| matches!(t.name(), "read" | "grep" | "find" | "ls" | "analyze")));
 
         let mut params = Map::new();
-        params.insert("prompt".to_string(), Value::String("Inspect crates".to_string()));
+        params.insert(
+            "prompt".to_string(),
+            Value::String("Inspect crates".to_string()),
+        );
         let res = sub
             .execute("tc_sub_1", params.clone(), CancellationToken::new(), None)
             .await
@@ -1550,10 +1613,19 @@ mod tests {
                 child.get("manifest").and_then(|v| v.as_str()).is_some(),
                 "each child carries its own manifest path"
             );
-            assert!(statuses.insert(id, status).is_none(), "child ids are unique");
+            assert!(
+                statuses.insert(id, status).is_none(),
+                "child ids are unique"
+            );
         }
-        let failed = statuses.iter().filter(|(_, s)| s.as_str() == "failed").count();
-        let completed = statuses.iter().filter(|(_, s)| s.as_str() == "completed").count();
+        let failed = statuses
+            .iter()
+            .filter(|(_, s)| s.as_str() == "failed")
+            .count();
+        let completed = statuses
+            .iter()
+            .filter(|(_, s)| s.as_str() == "completed")
+            .count();
         assert_eq!(failed, 1, "the FAIL task is failed: {statuses:?}");
         assert_eq!(completed, 2, "both OK tasks are completed: {statuses:?}");
     }

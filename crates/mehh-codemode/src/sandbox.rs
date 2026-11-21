@@ -80,6 +80,34 @@ impl From<mehh_ai::Model> for ModelSummary {
     }
 }
 
+/// Rust-side validation of image outputs. The JS prelude performs the same
+/// checks, but user code can monkeypatch its built-ins, so this is authoritative.
+fn validate_image_payload(data: &str, mime: &str) -> Result<(), String> {
+    if data.is_empty() || data.len() % 4 != 0 {
+        return Err("invalid image output: data is not valid base64".to_string());
+    }
+    let trimmed = data.trim_end_matches('=');
+    if data.len() - trimmed.len() > 2
+        || trimmed.is_empty()
+        || !trimmed
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+    {
+        return Err("invalid image output: data is not valid base64".to_string());
+    }
+    let expected_prefix = match mime {
+        "image/png" => "iVBORw0KGg",
+        "image/jpeg" => "/9j/",
+        "image/gif" => "R0lGOD",
+        "image/webp" => "UklG",
+        _ => return Err(format!("unsupported output image type: {mime}")),
+    };
+    if !data.starts_with(expected_prefix) {
+        return Err(format!("image data does not match declared type {mime}"));
+    }
+    Ok(())
+}
+
 pub fn to_identifier(name: &str) -> String {
     let mut result = String::new();
     for (i, ch) in name.chars().enumerate() {
@@ -472,6 +500,9 @@ fn run_codemode_blocking(
     };
 
     rt.set_memory_limit(config.memory_limit_bytes);
+    // Bound the native stack so deep JS recursion raises InternalError instead
+    // of aborting the whole process from a spawn_blocking worker thread.
+    rt.set_max_stack_size(512 * 1024);
 
     let deadline = Instant::now() + config.timeout;
     let cancel_check = cancel.clone();
@@ -494,6 +525,15 @@ fn run_codemode_blocking(
     let items = Arc::new(Mutex::new(Vec::new()));
     let total_chars = Arc::new(AtomicUsize::new(0));
     let total_items = Arc::new(AtomicUsize::new(0));
+    let store_bytes = Arc::new(AtomicUsize::new(0));
+    {
+        let guard = kv_store.lock().unwrap();
+        let total: usize = guard
+            .iter()
+            .map(|(k, v)| k.len() + serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+            .sum();
+        store_bytes.store(total, Ordering::Relaxed);
+    }
     let exited = Arc::new(AtomicBool::new(false));
 
     context.with(|ctx| {
@@ -637,6 +677,9 @@ fn run_codemode_blocking(
         let host_image = match rquickjs::Function::new(
             ctx.clone(),
             move |data: String, mime: String| -> String {
+                if let Err(err) = validate_image_payload(&data, &mime) {
+                    return err;
+                }
                 let new_chars = total_chars_image.load(Ordering::Relaxed) + data.len();
                 let new_items = total_items_image.load(Ordering::Relaxed) + 1;
                 if new_chars > max_chars || new_items > max_items {
@@ -672,12 +715,21 @@ fn run_codemode_blocking(
 
         // 5. __host_store
         let kv_store_set = kv_store.clone();
+        let store_bytes_host = store_bytes.clone();
         let host_store = match rquickjs::Function::new(
             ctx.clone(),
             move |key: String, val_json: String| -> String {
                 let mut map = kv_store_set.lock().unwrap();
                 if val_json == "__UNDEFINED__" {
-                    map.remove(&key);
+                    if let Some(old) = map.remove(&key) {
+                        let old_bytes = key.len()
+                            + serde_json::to_string(&old).map(|s| s.len()).unwrap_or(0);
+                        store_bytes_host.try_update(
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                            |v| Some(v.saturating_sub(old_bytes)),
+                        ).ok();
+                    }
                     return String::new();
                 }
                 if val_json.len() > 256 * 1024 {
@@ -687,20 +739,21 @@ fn run_codemode_blocking(
                     Ok(v) => v,
                     Err(e) => return format!("store('{key}') invalid JSON: {e}"),
                 };
-                let current_total: usize = map
-                    .iter()
-                    .filter(|(k, _)| k.as_str() != key.as_str())
-                    .map(|(k, v)| {
-                        k.len()
-                            + serde_json::to_string(v)
-                                .map(|s| s.len())
-                                .unwrap_or(0)
-                    })
-                    .sum();
-                let new_total = current_total + key.len() + val_json.len();
+                let old_bytes = map
+                    .get(&key)
+                    .and_then(|v| serde_json::to_string(v).ok())
+                    .map(|s| key.len() + s.len())
+                    .unwrap_or(0);
+                // Use one canonical representation for both old and new sizes;
+                // raw JSON whitespace would make the running total drift.
+                let canonical = serde_json::to_string(&val).unwrap_or_else(|_| val_json.clone());
+                let new_bytes = key.len() + canonical.len();
+                let current = store_bytes_host.load(Ordering::Relaxed);
+                let new_total = current.saturating_sub(old_bytes).saturating_add(new_bytes);
                 if new_total > 1024 * 1024 {
                     return "store is full: stored values would exceed 1MB limit".to_string();
                 }
+                store_bytes_host.store(new_total, Ordering::Relaxed);
                 map.insert(key, val);
                 String::new()
             },
@@ -1101,12 +1154,22 @@ fn run_codemode_blocking(
         }
 
         // Setup prelude
+        let mut used_js_names = std::collections::HashSet::new();
         let tools_meta: Vec<ToolMeta> = tool_defs
             .iter()
-            .map(|t| ToolMeta {
-                name: t.name.clone(),
-                js_name: to_identifier(&t.name),
-                description: t.description.clone(),
+            .map(|t| {
+                let base = to_identifier(&t.name);
+                let mut js_name = base.clone();
+                let mut suffix = 2;
+                while !used_js_names.insert(js_name.clone()) {
+                    js_name = format!("{base}_{suffix}");
+                    suffix += 1;
+                }
+                ToolMeta {
+                    name: t.name.clone(),
+                    js_name,
+                    description: t.description.clone(),
+                }
             })
             .collect();
         let tools_meta_json =
@@ -1189,14 +1252,8 @@ fn run_codemode_blocking(
                     items: std::mem::take(&mut *items.lock().unwrap()),
                 };
             }
-            if exited.load(Ordering::SeqCst) {
-                return CodemodeResult {
-                    ok: true,
-                    value: None,
-                    error: None,
-                    items: std::mem::take(&mut *items.lock().unwrap()),
-                };
-            }
+            // Do not short-circuit on `exited` before reading the promise result:
+            // a script that catches __EXIT__ and returns a value must keep it.
 
             match promise.state() {
                 rquickjs::promise::PromiseState::Resolved => {

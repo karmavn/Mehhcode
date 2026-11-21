@@ -1,9 +1,9 @@
 //! Runtime tool governance pipeline: security inspection, permission modes, and repetition breakers.
 
-use std::path::{Path, PathBuf};
 use async_trait::async_trait;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
 /// Result of inspecting a candidate tool call before execution.
@@ -17,9 +17,7 @@ pub enum InspectionVerdict {
         preview: Option<String>,
     },
     /// Tool call is blocked due to security or policy constraint.
-    Deny {
-        reason: String,
-    },
+    Deny { reason: String },
 }
 
 /// Active permission mode controlling tool execution governance.
@@ -75,13 +73,25 @@ pub trait ToolInspector: Send + Sync {
 
 /// Dangerous shell patterns matched by `SecurityInspector`.
 static DANGEROUS_SHELL_PATTERNS: &[(&str, &str)] = &[
-    (r"(?i)\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(/|~|\$HOME)", "Recursive root or home directory deletion"),
+    (
+        r"(?i)\brm\s+(-[a-zA-Z]*f[a-zA-Z]*\s+)?(/|~|\$HOME)",
+        "Recursive root or home directory deletion",
+    ),
     (r"(?i)\bmkfs(\.\w+)?\b", "Filesystem creation"),
     (r"(?i)\bdd\s+if=.*of=/dev/", "Raw block device write"),
     (r":\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:", "Fork bomb"),
-    (r"(?i)(curl|wget)\s+.*\|\s*(sh|bash|zsh)", "Piping web download directly to shell interpreter"),
-    (r"(?i)(\.ssh/id_|\.mehh/agent/auth\.json)", "Accessing private keys or auth credentials"),
-    (r"(?i)(Invoke-Expression|iex)\s*(\(New-Object\s+Net\.WebClient|\(Invoke-WebRequest)", "PowerShell remote script execution"),
+    (
+        r"(?i)(curl|wget)\s+.*\|\s*(sh|bash|zsh)",
+        "Piping web download directly to shell interpreter",
+    ),
+    (
+        r"(?i)(\.ssh/id_|\.mehh/agent/auth\.json)",
+        "Accessing private keys or auth credentials",
+    ),
+    (
+        r"(?i)(Invoke-Expression|iex)\s*(\(New-Object\s+Net\.WebClient|\(Invoke-WebRequest)",
+        "PowerShell remote script execution",
+    ),
 ];
 
 /// Normalizes path for boundary and security checks.
@@ -111,7 +121,12 @@ fn normalize_path_for_check(base: &Path, target: &str) -> PathBuf {
     let collapsed: PathBuf = components.into_iter().collect();
     #[cfg(windows)]
     {
-        PathBuf::from(collapsed.to_string_lossy().to_ascii_lowercase().replace('/', "\\"))
+        PathBuf::from(
+            collapsed
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .replace('/', "\\"),
+        )
     }
     #[cfg(not(windows))]
     {
@@ -132,7 +147,9 @@ impl SecurityInspector {
                 compiled.push((re, desc));
             }
         }
-        Self { compiled_patterns: compiled }
+        Self {
+            compiled_patterns: compiled,
+        }
     }
 }
 
@@ -205,7 +222,10 @@ impl PermissionInspector {
         Self::new_with_store(mode, crate::permissions::PermissionStore::default())
     }
 
-    pub fn new_with_store(mode: PermissionMode, store: crate::permissions::PermissionStore) -> Self {
+    pub fn new_with_store(
+        mode: PermissionMode,
+        store: crate::permissions::PermissionStore,
+    ) -> Self {
         let safe_cmd_patterns = &[
             r"^(git\s+(status|diff|log|show|branch|rev-parse))",
             r"^(cargo\s+(check|clippy|test|tree|version))",
@@ -244,7 +264,12 @@ impl PermissionInspector {
     fn is_safe_shell_command(&self, cmd: &str) -> bool {
         let trimmed = cmd.trim();
         // Check for shell chaining or output redirection that could mutate
-        if trimmed.contains('>') || trimmed.contains(">>") || trimmed.contains('|') || trimmed.contains(';') || trimmed.contains("&&") {
+        if trimmed.contains('>')
+            || trimmed.contains(">>")
+            || trimmed.contains('|')
+            || trimmed.contains(';')
+            || trimmed.contains("&&")
+        {
             return false;
         }
         self.safe_commands.iter().any(|re| re.is_match(trimmed))
@@ -266,7 +291,10 @@ impl ToolInspector for PermissionInspector {
         match self.mode {
             PermissionMode::Auto => InspectionVerdict::Allow,
             PermissionMode::Chat => {
-                if ctx.is_read_only == Some(true) || ctx.tool_name == "todo" || ctx.tool_name == "tool_search" {
+                if ctx.is_read_only == Some(true)
+                    || ctx.tool_name == "todo"
+                    || ctx.tool_name == "tool_search"
+                {
                     InspectionVerdict::Allow
                 } else {
                     InspectionVerdict::Deny {
@@ -274,15 +302,24 @@ impl ToolInspector for PermissionInspector {
                     }
                 }
             }
-            PermissionMode::Approve => {
-                InspectionVerdict::RequireApproval {
-                    reason: format!("Mode 'approve' requires confirmation for tool '{}'", ctx.tool_name),
-                    preview: ctx.args.get("command").or_else(|| ctx.args.get("path")).and_then(|v| v.as_str()).map(str::to_string),
-                }
-            }
+            PermissionMode::Approve => InspectionVerdict::RequireApproval {
+                reason: format!(
+                    "Mode 'approve' requires confirmation for tool '{}'",
+                    ctx.tool_name
+                ),
+                preview: ctx
+                    .args
+                    .get("command")
+                    .or_else(|| ctx.args.get("path"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+            },
             PermissionMode::SmartApprove => {
                 // Read-only tools proceed automatically
-                if ctx.is_read_only == Some(true) || ctx.tool_name == "todo" || ctx.tool_name == "tool_search" {
+                if ctx.is_read_only == Some(true)
+                    || ctx.tool_name == "todo"
+                    || ctx.tool_name == "tool_search"
+                {
                     return InspectionVerdict::Allow;
                 }
 
@@ -301,9 +338,16 @@ impl ToolInspector for PermissionInspector {
 
                 // File mutations require approval
                 if matches!(ctx.tool_name.as_str(), "edit" | "write" | "undo_edit") {
-                    let path_str = ctx.args.get("path").and_then(|v| v.as_str()).unwrap_or("(unknown)");
+                    let path_str = ctx
+                        .args
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown)");
                     return InspectionVerdict::RequireApproval {
-                        reason: format!("Tool '{}' on '{}' requires approval", ctx.tool_name, path_str),
+                        reason: format!(
+                            "Tool '{}' on '{}' requires approval",
+                            ctx.tool_name, path_str
+                        ),
                         preview: Some(path_str.to_string()),
                     };
                 }
@@ -358,7 +402,11 @@ impl ToolInspector for RepetitionInspector {
     }
 
     async fn inspect(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
-        let key = format!("{}:{}", ctx.tool_name, serde_json::to_string(&ctx.args).unwrap_or_default());
+        let key = format!(
+            "{}:{}",
+            ctx.tool_name,
+            serde_json::to_string(&ctx.args).unwrap_or_default()
+        );
         let mut st = self.state.lock().await;
         // Scope repetition tracking per origin so parallel subagents doing
         // legitimate identical reads do not trip each other's breaker.
@@ -417,9 +465,21 @@ impl ToolInspectionManager {
         }
     }
 
-    pub async fn add_permission_rule(&self, rule: crate::permissions::PermissionRule) -> anyhow::Result<()> {
+    pub async fn add_permission_rule(
+        &self,
+        rule: crate::permissions::PermissionRule,
+    ) -> anyhow::Result<()> {
         let mut perm = self.permission.lock().await;
         perm.store_mut().add_rule(rule)
+    }
+
+    /// Adds a rule to the in-memory store for this session only.
+    pub async fn add_session_permission_rule(&self, rule: crate::permissions::PermissionRule) {
+        self.permission
+            .lock()
+            .await
+            .store_mut()
+            .add_session_rule(rule);
     }
 
     pub async fn set_mode(&self, mode: PermissionMode) {

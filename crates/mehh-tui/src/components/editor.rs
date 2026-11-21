@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crate::ansi::wrap_text_with_ansi;
 use crate::components::basic::{SelectItem, SelectList};
 use crate::keys::{Keybindings, TuiAction};
+use crate::theme::Theme;
 use crate::tui::{Component, CURSOR_MARKER};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -313,6 +314,7 @@ pub struct Editor {
     pub autocomplete_replace_start: Option<usize>,
     pub prompt_prefix: String,
     pub placeholder: String,
+    pub theme: Theme,
     pastes: HashMap<usize, String>,
     paste_counter: usize,
 }
@@ -338,6 +340,7 @@ impl Editor {
             autocomplete_replace_start: None,
             prompt_prefix: "> ".to_string(),
             placeholder: String::new(),
+            theme: Theme::default(),
             pastes: HashMap::new(),
             paste_counter: 0,
         }
@@ -351,6 +354,36 @@ impl Editor {
     pub fn with_placeholder(mut self, placeholder: impl Into<String>) -> Self {
         self.placeholder = placeholder.into();
         self
+    }
+
+    pub fn with_theme(mut self, theme: Theme) -> Self {
+        self.theme = theme;
+        self
+    }
+
+    /// Colorize collapsed paste tokens so they read as one atomic chip.
+    fn colorize_paste_markers(&self, line: &str) -> String {
+        if !line.contains("[paste #") {
+            return line.to_string();
+        }
+        let mut out = String::new();
+        let mut rest = line;
+        while let Some(pos) = rest.find("[paste #") {
+            out.push_str(&rest[..pos]);
+            let tail = &rest[pos..];
+            match tail.find(']') {
+                Some(end) => {
+                    out.push_str(&self.theme.fg(&self.theme.accent, &tail[..=end]));
+                    rest = &tail[end + 1..];
+                }
+                None => {
+                    out.push_str(tail);
+                    rest = "";
+                }
+            }
+        }
+        out.push_str(rest);
+        out
     }
 
     pub fn is_empty(&self) -> bool {
@@ -390,7 +423,10 @@ impl Editor {
             if let Some(end_bracket) = after.find(']') {
                 let marker_body = &after[..end_bracket];
                 // parse ID before space or end
-                let id_str: String = marker_body.chars().take_while(|c| c.is_ascii_digit()).collect();
+                let id_str: String = marker_body
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect();
                 if let Ok(id) = id_str.parse::<usize>() {
                     if let Some(payload) = self.pastes.get(&id) {
                         output.push_str(payload);
@@ -423,7 +459,8 @@ impl Editor {
     }
 
     pub fn push_undo(&mut self) {
-        self.undo_stack.push((self.lines.clone(), self.cursor_row, self.cursor_col));
+        self.undo_stack
+            .push((self.lines.clone(), self.cursor_row, self.cursor_col));
         if self.undo_stack.len() > 100 {
             self.undo_stack.remove(0);
         }
@@ -485,17 +522,13 @@ impl Editor {
     }
 
     pub fn set_autocomplete(&mut self, items: Vec<SelectItem>) {
-        self.autocomplete = Some(SelectList::new(items, 5));
+        self.autocomplete = Some(SelectList::new(items, 5).with_theme(self.theme.clone()));
         self.autocomplete_replace_start = None;
     }
 
     /// Sets autocomplete items that replace `[replace_start..cursor_col]` on the active line.
-    pub fn set_autocomplete_replacing(
-        &mut self,
-        items: Vec<SelectItem>,
-        replace_start: usize,
-    ) {
-        self.autocomplete = Some(SelectList::new(items, 5));
+    pub fn set_autocomplete_replacing(&mut self, items: Vec<SelectItem>, replace_start: usize) {
+        self.autocomplete = Some(SelectList::new(items, 5).with_theme(self.theme.clone()));
         self.autocomplete_replace_start = Some(replace_start);
     }
 
@@ -631,10 +664,7 @@ impl Editor {
     }
 
     fn insert_yanked_text(&mut self, text: &str) {
-        let lines: Vec<&str> = text
-            .split('\n')
-            .map(|s| s.trim_end_matches('\r'))
-            .collect();
+        let lines: Vec<&str> = text.split('\n').map(|s| s.trim_end_matches('\r')).collect();
         if lines.is_empty() {
             return;
         }
@@ -701,8 +731,10 @@ impl Editor {
 
             let drain_count = yank_lines.len();
             let merged = format!("{before_yank}{after_cursor}");
-            self.lines
-                .splice(start_line..start_line + drain_count, std::iter::once(merged));
+            self.lines.splice(
+                start_line..start_line + drain_count,
+                std::iter::once(merged),
+            );
             self.cursor_row = start_line;
             self.cursor_col = start_col;
         }
@@ -867,7 +899,9 @@ impl Editor {
             self.last_action = Some(EditorLastAction::Other);
             if self.cursor_row > 0 {
                 self.cursor_row -= 1;
-                self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].chars().count());
+                self.cursor_col = self
+                    .cursor_col
+                    .min(self.lines[self.cursor_row].chars().count());
                 return EditorOutput::None;
             } else {
                 self.history_prev();
@@ -879,7 +913,9 @@ impl Editor {
             self.last_action = Some(EditorLastAction::Other);
             if self.cursor_row + 1 < self.lines.len() {
                 self.cursor_row += 1;
-                self.cursor_col = self.cursor_col.min(self.lines[self.cursor_row].chars().count());
+                self.cursor_col = self
+                    .cursor_col
+                    .min(self.lines[self.cursor_row].chars().count());
                 return EditorOutput::None;
             } else {
                 self.history_next();
@@ -1048,25 +1084,23 @@ impl Component for Editor {
 
         if self.is_empty() && !self.placeholder.is_empty() {
             let line = format!(
-                "{}{CURSOR_MARKER}\x1b[2m{}\x1b[0m",
-                self.prompt_prefix, self.placeholder
+                "{}{CURSOR_MARKER}{}",
+                self.prompt_prefix,
+                self.theme.fg(&self.theme.dim, &self.placeholder)
             );
             for w in wrap_text_with_ansi(&line, width) {
                 result.push(w);
             }
         } else {
             for (row, line_str) in self.lines.iter().enumerate() {
-                let pref = if row == 0 {
-                    &self.prompt_prefix
-                } else {
-                    "  "
-                };
+                let pref = if row == 0 { &self.prompt_prefix } else { "  " };
                 let formatted = if row == self.cursor_row {
                     let (b, a) = split_char_at(line_str, self.cursor_col);
                     format!("{pref}{b}{CURSOR_MARKER}{a}")
                 } else {
                     format!("{pref}{line_str}")
                 };
+                let formatted = self.colorize_paste_markers(&formatted);
 
                 for w in wrap_text_with_ansi(&formatted, width) {
                     result.push(w);
@@ -1103,10 +1137,7 @@ mod tests {
         editor.set_text("check @src/ma");
         assert_eq!(editor.cursor_col, 13);
 
-        editor.set_autocomplete_replacing(
-            vec![SelectItem::new("@src/main.rs ", "src/main.rs")],
-            6,
-        );
+        editor.set_autocomplete_replacing(vec![SelectItem::new("@src/main.rs ", "src/main.rs")], 6);
         let kb = Keybindings::default_bindings();
         let out = editor.handle_editor_key("tab", &kb);
         assert!(matches!(out, EditorOutput::Changed(_)));

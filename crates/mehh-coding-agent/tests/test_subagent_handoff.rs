@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use mehh_agent::AgentTool;
-use mehh_ai::{faux_assistant_message, faux_model, faux_tool_call, faux_tool_call_message, FauxProvider};
+use mehh_ai::{
+    faux_assistant_message, faux_model, faux_tool_call, faux_tool_call_message, FauxProvider,
+};
 use mehh_coding_agent::subagent::SubagentTool;
 use serde_json::{json, Map, Value};
 use tokio_util::sync::CancellationToken;
@@ -34,7 +36,10 @@ async fn test_max_turns_tool_only_final_gets_finalization_summary() {
     let sub = SubagentTool::new(cwd, faux_model(), faux.clone(), None, tools, 0);
 
     let mut params = Map::new();
-    params.insert("prompt".to_string(), Value::String("Inspect the directory".to_string()));
+    params.insert(
+        "prompt".to_string(),
+        Value::String("Inspect the directory".to_string()),
+    );
     params.insert("mode".to_string(), Value::String("research".to_string()));
     params.insert("max_turns".to_string(), json!(1));
 
@@ -52,11 +57,19 @@ async fn test_max_turns_tool_only_final_gets_finalization_summary() {
     let requests = faux.recorded_requests();
     assert_eq!(requests.len(), 2, "expected loop turn + finalization call");
     assert!(
-        requests[1].context.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true),
+        requests[1]
+            .context
+            .tools
+            .as_ref()
+            .map(|t| t.is_empty())
+            .unwrap_or(true),
         "finalization call must have no tools"
     );
 
-    let sc = res.structured_content.as_ref().expect("structured handoff metadata");
+    let sc = res
+        .structured_content
+        .as_ref()
+        .expect("structured handoff metadata");
     assert_eq!(sc["status"], "budget_exhausted");
     assert_eq!(sc["turns_used"], 2, "loop turn + finalization turn");
 }
@@ -77,7 +90,10 @@ async fn test_soft_landing_note_injected_two_turns_before_budget() {
     let tools = mehh_tools::create_coding_tools(cwd.clone());
     let sub = SubagentTool::new(cwd, faux_model(), faux.clone(), None, tools, 0);
     let mut params = Map::new();
-    params.insert("prompt".to_string(), Value::String("Research task".to_string()));
+    params.insert(
+        "prompt".to_string(),
+        Value::String("Research task".to_string()),
+    );
     params.insert("max_turns".to_string(), json!(4));
 
     sub.execute("tc_soft", params, CancellationToken::new(), None)
@@ -97,7 +113,9 @@ async fn test_soft_landing_note_injected_two_turns_before_budget() {
         })
         .collect();
     assert!(
-        turn3_texts.iter().any(|t| t.contains("2 assistant turns left")),
+        turn3_texts
+            .iter()
+            .any(|t| t.contains("2 assistant turns left")),
         "expected soft-landing note before turn 3, got user texts: {turn3_texts:?}"
     );
 }
@@ -113,14 +131,20 @@ async fn test_completed_subagent_reports_usage_and_turns() {
         cache_read: 10,
         cache_write: 5,
         total_tokens: 165,
-        cost: mehh_ai::UsageCost { total: 0.01, ..Default::default() },
+        cost: mehh_ai::UsageCost {
+            total: 0.01,
+            ..Default::default()
+        },
     };
     faux.add_response(answer);
 
     let tools = mehh_tools::create_coding_tools(cwd.clone());
     let sub = SubagentTool::new(cwd, faux_model(), faux, None, tools, 0);
     let mut params = Map::new();
-    params.insert("prompt".to_string(), Value::String("Find the answer".to_string()));
+    params.insert(
+        "prompt".to_string(),
+        Value::String("Find the answer".to_string()),
+    );
 
     let res = sub
         .execute("tc_usage", params, CancellationToken::new(), None)
@@ -131,7 +155,10 @@ async fn test_completed_subagent_reports_usage_and_turns() {
     assert_eq!(usage.input, 100);
     assert_eq!(usage.output, 50);
     assert_eq!(usage.total_tokens, 165);
-    let sc = res.structured_content.as_ref().expect("structured handoff metadata");
+    let sc = res
+        .structured_content
+        .as_ref()
+        .expect("structured handoff metadata");
     assert_eq!(sc["status"], "completed");
     assert_eq!(sc["turns_used"], 1);
     assert_eq!(sc["usage"]["input"], 100);
@@ -143,7 +170,10 @@ async fn test_coding_subagent_reports_files_touched() {
     let dir = std::env::temp_dir().join(format!(
         "mehh_subagent_touch_{}_{}",
         std::process::id(),
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let target = dir.join("created.txt");
@@ -160,14 +190,20 @@ async fn test_coding_subagent_reports_files_touched() {
     let tools = mehh_tools::create_coding_tools(dir.clone());
     let sub = SubagentTool::new(dir.clone(), faux_model(), faux, None, tools, 0);
     let mut params = Map::new();
-    params.insert("prompt".to_string(), Value::String("Create a file".to_string()));
+    params.insert(
+        "prompt".to_string(),
+        Value::String("Create a file".to_string()),
+    );
     params.insert("mode".to_string(), Value::String("coding".to_string()));
 
     let res = sub
         .execute("tc_touch", params, CancellationToken::new(), None)
         .await
         .unwrap();
-    let sc = res.structured_content.as_ref().expect("structured handoff metadata");
+    let sc = res
+        .structured_content
+        .as_ref()
+        .expect("structured handoff metadata");
     let touched = sc["files_touched"].as_array().expect("files_touched array");
     assert_eq!(touched.len(), 1);
     assert_eq!(touched[0].as_str().unwrap(), target_str);

@@ -1,16 +1,14 @@
 //! Automatic branch summarization for session tree navigation.
 
-use std::collections::{BTreeSet, HashSet};
 use anyhow::{anyhow, Result};
+use std::collections::{BTreeSet, HashSet};
 use tokio_util::sync::CancellationToken;
 
-use mehh_ai::{
-    Context, LlmProvider, Message, Model, UserContent, UserMessage,
-};
 use crate::compaction::{
     estimate_message_tokens, serialize_conversation, SUMMARIZATION_SYSTEM_PROMPT,
 };
 use crate::session::{SessionEntry, SessionEntryKind, SessionManager};
+use mehh_ai::{Context, LlmProvider, Message, Model, UserContent, UserMessage};
 
 pub const BRANCH_SUMMARY_PREAMBLE: &str = r#"The user explored a different conversation branch before returning here.
 Summary of that exploration:
@@ -126,10 +124,7 @@ pub fn collect_entries_for_branch_summary(
 }
 
 /// Prepares branch entries into messages, trims to token budget, and extracts read/modified file paths.
-pub fn prepare_branch_entries(
-    entries: &[SessionEntry],
-    token_budget: usize,
-) -> BranchPreparation {
+pub fn prepare_branch_entries(entries: &[SessionEntry], token_budget: usize) -> BranchPreparation {
     let mut read_files_set = BTreeSet::new();
     let mut modified_files_set = BTreeSet::new();
 
@@ -190,7 +185,7 @@ pub fn prepare_branch_entries(
             ) && total_tokens < (token_budget * 9 / 10)
             {
                 for msg in entry_msgs.into_iter().rev() {
-                    messages.insert(0, msg);
+                    messages.push(msg);
                 }
                 total_tokens += entry_tokens;
             }
@@ -198,10 +193,11 @@ pub fn prepare_branch_entries(
         }
 
         for msg in entry_msgs.into_iter().rev() {
-            messages.insert(0, msg);
+            messages.push(msg);
         }
         total_tokens += entry_tokens;
     }
+    messages.reverse();
 
     let read_files: Vec<String> = read_files_set
         .into_iter()
@@ -270,10 +266,16 @@ pub async fn generate_branch_summary(
     let mut stream = provider.stream(model, &context, &stream_opts, cancel);
     let final_msg = stream.collect_final_message().await?;
 
-    if matches!(final_msg.stop_reason, mehh_ai::StopReason::Error | mehh_ai::StopReason::Aborted) {
-        let err = final_msg
-            .error_message
-            .unwrap_or_else(|| format!("Branch summarization stopped with {:?}", final_msg.stop_reason));
+    if matches!(
+        final_msg.stop_reason,
+        mehh_ai::StopReason::Error | mehh_ai::StopReason::Aborted
+    ) {
+        let err = final_msg.error_message.unwrap_or_else(|| {
+            format!(
+                "Branch summarization stopped with {:?}",
+                final_msg.stop_reason
+            )
+        });
         return Err(anyhow!("Branch summarization model stream failed: {err}"));
     }
 
@@ -322,7 +324,9 @@ mod tests {
 
         // Common ancestor m1
         let m1 = session
-            .append_message(Message::Assistant(mehh_ai::faux_assistant_message("Working on task")))
+            .append_message(Message::Assistant(mehh_ai::faux_assistant_message(
+                "Working on task",
+            )))
             .unwrap();
 
         // Branch A (old branch): m2 -> m3
@@ -333,7 +337,9 @@ mod tests {
             }))
             .unwrap();
         let m3 = session
-            .append_message(Message::Assistant(mehh_ai::faux_assistant_message("Branch A step 2 done")))
+            .append_message(Message::Assistant(mehh_ai::faux_assistant_message(
+                "Branch A step 2 done",
+            )))
             .unwrap();
 
         // Switch to m1 and create Branch B (target): m4
@@ -374,24 +380,26 @@ mod tests {
 
         // Entry 2: Assistant reading foo.rs and modifying bar.rs
         let mut ast = mehh_ai::faux_assistant_message("Reading and editing");
-        ast.content.push(mehh_ai::AssistantContentBlock::ToolCall(ToolCall {
-            id: "c1".to_string(),
-            name: "read".to_string(),
-            arguments: [("path".to_string(), serde_json::json!("src/foo.rs"))]
-                .into_iter()
-                .collect(),
-            arguments_error: None,
-            thought_signature: None,
-        }));
-        ast.content.push(mehh_ai::AssistantContentBlock::ToolCall(ToolCall {
-            id: "c2".to_string(),
-            name: "edit".to_string(),
-            arguments: [("path".to_string(), serde_json::json!("src/bar.rs"))]
-                .into_iter()
-                .collect(),
-            arguments_error: None,
-            thought_signature: None,
-        }));
+        ast.content
+            .push(mehh_ai::AssistantContentBlock::ToolCall(ToolCall {
+                id: "c1".to_string(),
+                name: "read".to_string(),
+                arguments: [("path".to_string(), serde_json::json!("src/foo.rs"))]
+                    .into_iter()
+                    .collect(),
+                arguments_error: None,
+                thought_signature: None,
+            }));
+        ast.content
+            .push(mehh_ai::AssistantContentBlock::ToolCall(ToolCall {
+                id: "c2".to_string(),
+                name: "edit".to_string(),
+                arguments: [("path".to_string(), serde_json::json!("src/bar.rs"))]
+                    .into_iter()
+                    .collect(),
+                arguments_error: None,
+                thought_signature: None,
+            }));
         entries.push(SessionEntry {
             id: "e2".to_string(),
             parent_id: Some("e1".to_string()),

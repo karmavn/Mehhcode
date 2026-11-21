@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback}; // AgentTool: execute() is a trait method
 use mehh_ai::{
     faux_assistant_message, faux_model, faux_tool_call, faux_tool_call_message, AssistantMessage,
@@ -6,6 +5,7 @@ use mehh_ai::{
 };
 use mehh_coding_agent::subagent::SubagentTool;
 use mehh_coding_agent::subagent_lifecycle::{agent_store_dir, new_manifest, write_manifest};
+use std::sync::Arc;
 
 struct HangingProvider;
 
@@ -25,12 +25,17 @@ impl mehh_ai::LlmProvider for HangingProvider {
 }
 
 fn manifest_files(cwd: &std::path::Path) -> Vec<std::path::PathBuf> {
-    std::fs::read_dir(agent_store_dir(cwd)).unwrap()
-        .map(|e| e.unwrap().path()).collect()
+    std::fs::read_dir(agent_store_dir(cwd))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .collect()
 }
 
 /// Collects every structured update the tool emits through `on_update`.
-fn update_collector() -> (Arc<std::sync::Mutex<Vec<AgentToolResult>>>, AgentToolUpdateCallback) {
+fn update_collector() -> (
+    Arc<std::sync::Mutex<Vec<AgentToolResult>>>,
+    AgentToolUpdateCallback,
+) {
     let updates = Arc::new(std::sync::Mutex::new(Vec::new()));
     let cb: AgentToolUpdateCallback = {
         let updates = updates.clone();
@@ -62,7 +67,10 @@ fn assert_failure_result_carries_manifest(
         Some(true),
         "domain failure must surface as an is_error result, not Err(String)"
     );
-    let details = res.details.as_ref().expect("failure result must carry details");
+    let details = res
+        .details
+        .as_ref()
+        .expect("failure result must carry details");
     let payload = &details["subagent"];
     let manifest_path = &store_files[0];
     assert_eq!(
@@ -70,7 +78,10 @@ fn assert_failure_result_carries_manifest(
         Some(manifest_path.to_string_lossy().as_ref()),
         "payload must name the manifest on disk"
     );
-    assert_eq!(payload["status"], "failed", "payload must carry the terminal status");
+    assert_eq!(
+        payload["status"], "failed",
+        "payload must carry the terminal status"
+    );
     let agent_id = manifest_path.file_stem().unwrap().to_str().unwrap();
     assert_eq!(payload["child_id"].as_str(), Some(agent_id));
 
@@ -94,9 +105,22 @@ async fn successful_child_writes_completed_manifest() {
     let sub = SubagentTool::new(dir.clone(), faux_model(), faux, None, vec![], 0);
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
-    let res = sub.execute("tc1", params, tokio_util::sync::CancellationToken::new(), None).await.unwrap();
-    let details = res.details.expect("result must carry structured subagent details");
-    assert_eq!(details["subagent"]["status"], "completed", "success payload must carry terminal status");
+    let res = sub
+        .execute(
+            "tc1",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+    let details = res
+        .details
+        .expect("result must carry structured subagent details");
+    assert_eq!(
+        details["subagent"]["status"], "completed",
+        "success payload must carry terminal status"
+    );
 
     let files = manifest_files(&dir);
     assert_eq!(files.len(), 1);
@@ -105,23 +129,43 @@ async fn successful_child_writes_completed_manifest() {
         Some(files[0].to_string_lossy().as_ref()),
         "success payload must name the manifest on disk"
     );
-    let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
     assert_eq!(m["status"], "completed");
     assert!(m["completed_at_ms"].is_number());
     assert_eq!(m["events"][0]["kind"], "started");
-    assert!(m["events"].as_array().unwrap().iter().any(|e| e["kind"] == "finished"));
+    assert!(m["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "finished"));
     std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[tokio::test]
 async fn timeout_writes_terminal_timed_out_manifest() {
     let dir = std::env::temp_dir().join(format!("mehh_sub_to_{}", uuid::Uuid::now_v7()));
-    let sub = SubagentTool::new(dir.clone(), faux_model(), Arc::new(HangingProvider), None, vec![], 0);
+    let sub = SubagentTool::new(
+        dir.clone(),
+        faux_model(),
+        Arc::new(HangingProvider),
+        None,
+        vec![],
+        0,
+    );
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
     params.insert("timeout_secs".into(), serde_json::json!(1));
     let (updates, cb) = update_collector();
-    let res = sub.execute("tc2", params, tokio_util::sync::CancellationToken::new(), Some(cb)).await.unwrap();
+    let res = sub
+        .execute(
+            "tc2",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            Some(cb),
+        )
+        .await
+        .unwrap();
     assert!(
         result_text(&res).contains("timed out"),
         "timeout must stay in the result text, got: {:?}",
@@ -129,11 +173,16 @@ async fn timeout_writes_terminal_timed_out_manifest() {
     );
 
     let files = manifest_files(&dir);
-    let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
     assert_eq!(m["status"], "failed");
     assert_eq!(m["failure_class"], "timeout");
     assert!(m["completed_at_ms"].is_number());
-    assert!(m["events"].as_array().unwrap().iter().any(|e| e["kind"] == "timed_out"));
+    assert!(m["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "timed_out"));
     assert_failure_result_carries_manifest(&res, &updates, &files, "timed_out");
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -141,7 +190,14 @@ async fn timeout_writes_terminal_timed_out_manifest() {
 #[tokio::test]
 async fn abort_writes_aborted_manifest_with_completed_at_ms() {
     let dir = std::env::temp_dir().join(format!("mehh_sub_ab_{}", uuid::Uuid::now_v7()));
-    let sub = SubagentTool::new(dir.clone(), faux_model(), Arc::new(HangingProvider), None, vec![], 0);
+    let sub = SubagentTool::new(
+        dir.clone(),
+        faux_model(),
+        Arc::new(HangingProvider),
+        None,
+        vec![],
+        0,
+    );
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
     params.insert("timeout_secs".into(), serde_json::json!(30));
@@ -151,16 +207,28 @@ async fn abort_writes_aborted_manifest_with_completed_at_ms() {
     let task = tokio::spawn(async move { sub.execute("tc3", params, task_cancel, Some(cb)).await });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     cancel.cancel();
-    let res = tokio::time::timeout(std::time::Duration::from_secs(2), task).await.unwrap().unwrap().unwrap();
+    let res = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     let text = result_text(&res);
-    assert!(text.contains("aborted") || text.contains("Aborted"), "unexpected: {text}");
+    assert!(
+        text.contains("aborted") || text.contains("Aborted"),
+        "unexpected: {text}"
+    );
 
     let files = manifest_files(&dir);
-    let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
     assert_eq!(m["status"], "failed");
     assert_eq!(m["failure_class"], "aborted");
     assert!(m["completed_at_ms"].is_number());
-    assert!(m["events"].as_array().unwrap().iter().any(|e| e["kind"] == "aborted"));
+    assert!(m["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["kind"] == "aborted"));
     assert_failure_result_carries_manifest(&res, &updates, &files, "aborted");
     std::fs::remove_dir_all(dir).unwrap();
 }
@@ -183,15 +251,31 @@ impl mehh_ai::LlmProvider for PanickingProvider {
 #[tokio::test]
 async fn timeout_secs_is_clamped_to_schema_minimum() {
     let dir = std::env::temp_dir().join(format!("mehh_sub_clamp_{}", uuid::Uuid::now_v7()));
-    let sub = SubagentTool::new(dir.clone(), faux_model(), Arc::new(HangingProvider), None, vec![], 0);
+    let sub = SubagentTool::new(
+        dir.clone(),
+        faux_model(),
+        Arc::new(HangingProvider),
+        None,
+        vec![],
+        0,
+    );
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
     params.insert("timeout_secs".into(), serde_json::json!(0));
     let res = sub
-        .execute("tc_clamp", params, tokio_util::sync::CancellationToken::new(), None)
+        .execute(
+            "tc_clamp",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(res.is_error, Some(true), "timeout must be an is_error result");
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "timeout must be an is_error result"
+    );
     let text = result_text(&res);
     assert!(text.contains("timed out after 1s"), "unexpected: {text}");
     std::fs::remove_dir_all(dir).unwrap();
@@ -217,14 +301,24 @@ async fn generic_failure_finalizes_with_aborted_terminal_event() {
     params.insert("prompt".into(), serde_json::json!("hi"));
     let (updates, cb) = update_collector();
     let res = sub
-        .execute("tc_gen", params, tokio_util::sync::CancellationToken::new(), Some(cb))
+        .execute(
+            "tc_gen",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            Some(cb),
+        )
         .await
         .unwrap();
-    assert_eq!(res.is_error, Some(true), "model failure must be an is_error result");
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "model failure must be an is_error result"
+    );
     assert!(result_text(&res).contains("boom"));
 
     let files = manifest_files(&dir);
-    let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
     assert_eq!(m["status"], "failed");
     assert_eq!(
         m["events"].as_array().unwrap().iter().last().unwrap()["kind"],
@@ -237,19 +331,36 @@ async fn generic_failure_finalizes_with_aborted_terminal_event() {
 #[tokio::test]
 async fn batch_join_error_manifest_retains_started_event() {
     let dir = std::env::temp_dir().join(format!("mehh_sub_join_{}", uuid::Uuid::now_v7()));
-    let sub = SubagentTool::new(dir.clone(), faux_model(), Arc::new(PanickingProvider), None, vec![], 0);
+    let sub = SubagentTool::new(
+        dir.clone(),
+        faux_model(),
+        Arc::new(PanickingProvider),
+        None,
+        vec![],
+        0,
+    );
     let mut params = serde_json::Map::new();
     params.insert("tasks".into(), serde_json::json!(["do work"]));
     let res = sub
-        .execute("tc_join", params, tokio_util::sync::CancellationToken::new(), None)
+        .execute(
+            "tc_join",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
         .await
         .unwrap();
-    assert_eq!(res.is_error, Some(true), "a panicked batch child must mark the batch as failed");
+    assert_eq!(
+        res.is_error,
+        Some(true),
+        "a panicked batch child must mark the batch as failed"
+    );
     let details = res.details.expect("batch details must be set");
     assert_eq!(details["subagent"]["status"], "failed");
     let files = manifest_files(&dir);
     assert_eq!(files.len(), 1);
-    let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
     assert_eq!(m["status"], "failed");
     assert_eq!(m["events"][0]["kind"], "started");
     assert_eq!(
@@ -268,7 +379,12 @@ async fn batch_result_details_status_is_terminal() {
     let mut params = serde_json::Map::new();
     params.insert("tasks".into(), serde_json::json!(["do work"]));
     let res = sub
-        .execute("tc_bstat", params, tokio_util::sync::CancellationToken::new(), None)
+        .execute(
+            "tc_bstat",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
         .await
         .unwrap();
     let details = res.details.expect("batch details must be set");
@@ -299,11 +415,19 @@ async fn mixed_batch_details_status_is_aggregate_failed() {
     let mut params = serde_json::Map::new();
     params.insert("tasks".into(), serde_json::json!(["task one", "task two"]));
     let res = sub
-        .execute("tc_mixed", params, tokio_util::sync::CancellationToken::new(), None)
+        .execute(
+            "tc_mixed",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
         .await
         .unwrap();
     let text = result_text(&res);
-    assert!(text.contains("ok"), "successful child output must be reported, got: {text}");
+    assert!(
+        text.contains("ok"),
+        "successful child output must be reported, got: {text}"
+    );
     assert!(
         text.contains("child blew up"),
         "failed child error must be reported, got: {text}"
@@ -375,7 +499,12 @@ async fn panicking_child_manifest_retains_started_and_tool_started_events() {
     // coding mode keeps custom tools; research mode would filter `boom` out.
     params.insert("mode".into(), serde_json::json!("coding"));
     let res = sub
-        .execute("tc_ptool", params, tokio_util::sync::CancellationToken::new(), None)
+        .execute(
+            "tc_ptool",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
         .await
         .unwrap();
 
@@ -384,7 +513,8 @@ async fn panicking_child_manifest_retains_started_and_tool_started_events() {
 
     let files = manifest_files(&dir);
     assert_eq!(files.len(), 1);
-    let m: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
+    let m: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&files[0]).unwrap()).unwrap();
     assert_eq!(m["status"], "failed");
     let kinds: Vec<&str> = m["events"]
         .as_array()
@@ -416,7 +546,12 @@ async fn manifest_write_failure_is_surfaced() {
     let mut params = serde_json::Map::new();
     params.insert("prompt".into(), serde_json::json!("hi"));
     let res = sub
-        .execute("tc_wfail", params, tokio_util::sync::CancellationToken::new(), None)
+        .execute(
+            "tc_wfail",
+            params,
+            tokio_util::sync::CancellationToken::new(),
+            None,
+        )
         .await
         .unwrap();
     let _ = std::fs::remove_file(&bad_cwd);
@@ -431,7 +566,10 @@ async fn manifest_write_failure_is_surfaced() {
         "error must name the write failure, got: {text}"
     );
     assert!(
-        res.details.as_ref().and_then(|d| d.get("subagent")).is_some(),
+        res.details
+            .as_ref()
+            .and_then(|d| d.get("subagent"))
+            .is_some(),
         "failure result must keep details.subagent"
     );
 }

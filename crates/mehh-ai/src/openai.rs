@@ -221,15 +221,20 @@ fn normalize_openai_tool_call_id(id: &str, model: &Model) -> String {
         return format!("{prefix}_{hash_prefix}");
     }
 
-    if model.provider == "openai" {
-        if id.chars().count() > 40 {
-            id.chars().take(40).collect()
-        } else {
-            id.to_string()
-        }
-    } else {
-        id.to_string()
+    // Every provider routing through the OpenAI Completions schema enforces
+    // the same 40-character id limit, not just `provider == "openai"`.
+    let needs_trim = matches!(
+        model.provider.as_str(),
+        "openai" | "openrouter" | "github-copilot" | "azure" | "azure-openai-responses"
+    );
+    if needs_trim && id.chars().count() > 40 {
+        let hash = crate::transform_messages::short_hash(id);
+        let hash_prefix: String = hash.chars().take(8).collect();
+        let keep = 40usize.saturating_sub(hash_prefix.chars().count() + 1).max(1);
+        let prefix: String = id.chars().take(keep).collect();
+        return format!("{prefix}_{hash_prefix}");
     }
+    id.to_string()
 }
 
 pub fn build_openai_request(
@@ -346,6 +351,7 @@ pub fn build_openai_request(
             }
             Message::ToolResult(tr) => {
                 let mut text_content = String::new();
+                let mut image_parts: Vec<serde_json::Value> = Vec::new();
                 for block in &tr.content {
                     match block {
                         ToolResultContentBlock::Text(tc) => {
@@ -354,13 +360,29 @@ pub fn build_openai_request(
                             }
                             text_content.push_str(&sanitize_surrogates(&tc.text));
                         }
-                        ToolResultContentBlock::Image(_) => {}
+                        ToolResultContentBlock::Image(img) => {
+                            image_parts.push(serde_json::json!({
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": format!("data:{};base64,{}", img.mime_type, img.data)
+                                }
+                            }));
+                        }
                     }
                 }
+                let content = if image_parts.is_empty() {
+                    serde_json::Value::String(text_content)
+                } else {
+                    let mut parts = vec![serde_json::json!({
+                        "type": "text", "text": text_content
+                    })];
+                    parts.extend(image_parts);
+                    serde_json::Value::Array(parts)
+                };
                 messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": tr.tool_call_id,
-                    "content": text_content,
+                    "content": content,
                 }));
             }
         }
@@ -370,10 +392,17 @@ pub fn build_openai_request(
     req_map.insert("model".to_string(), serde_json::json!(model.id));
     req_map.insert("messages".to_string(), serde_json::Value::Array(messages));
     req_map.insert("stream".to_string(), serde_json::json!(true));
-    req_map.insert(
-        "stream_options".to_string(),
-        serde_json::json!({ "include_usage": true }),
-    );
+    if model
+        .compat
+        .as_ref()
+        .and_then(|c| c.include_usage)
+        .unwrap_or(true)
+    {
+        req_map.insert(
+            "stream_options".to_string(),
+            serde_json::json!({ "include_usage": true }),
+        );
+    }
 
     if let Some(tools) = &context.tools {
         if !tools.is_empty() {
@@ -529,8 +558,16 @@ impl OpenAiStreamState {
         }
 
         if let Some(usage) = json.get("usage") {
+            let cached = usage
+                .get("prompt_tokens_details")
+                .and_then(|d| d.get("cached_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            self.output.usage.cache_read = cached;
+            // OpenAI's prompt_tokens already includes cached_tokens. Bill the
+            // non-cached portion at the input rate to avoid double counting.
             if let Some(prompt) = usage.get("prompt_tokens").and_then(|v| v.as_u64()) {
-                self.output.usage.input = prompt;
+                self.output.usage.input = prompt.saturating_sub(cached);
             }
             if let Some(comp) = usage.get("completion_tokens").and_then(|v| v.as_u64()) {
                 self.output.usage.output = comp;
@@ -539,14 +576,7 @@ impl OpenAiStreamState {
                 self.output.usage.total_tokens = total;
             } else {
                 self.output.usage.total_tokens =
-                    self.output.usage.input + self.output.usage.output;
-            }
-            if let Some(cached) = usage
-                .get("prompt_tokens_details")
-                .and_then(|d| d.get("cached_tokens"))
-                .and_then(|v| v.as_u64())
-            {
-                self.output.usage.cache_read = cached;
+                    self.output.usage.input + self.output.usage.output + cached;
             }
             self.output.usage.calculate_cost(&self.model.cost);
         }
@@ -789,7 +819,7 @@ impl OpenAiStreamState {
                             out.push(AssistantMessageEvent::ToolCallDelta {
                                 content_index,
                                 delta: args_delta,
-                                partial: self.output.clone(),
+                                partial: self.output.metadata_clone_with_block(content_index),
                             });
                         }
                     }
@@ -1199,7 +1229,8 @@ mod tests {
 
         assert_eq!(result.response_id.as_deref(), Some("chatcmpl-test01"));
         assert_eq!(result.stop_reason, StopReason::ToolUse);
-        assert_eq!(result.usage.input, 55);
+        // prompt_tokens (55) includes 10 cached tokens; only 45 are billed as input.
+        assert_eq!(result.usage.input, 45);
         assert_eq!(result.usage.output, 28);
         assert_eq!(result.usage.total_tokens, 83);
         assert_eq!(result.usage.cache_read, 10);
@@ -1308,10 +1339,10 @@ mod tests {
 
         // Prior to fix, &id[..40] panicked with: byte index 40 is not a char boundary; it is inside '🦀'
         let normalized = normalize_openai_tool_call_id(&foreign_id, &model);
+        // Long ids are truncated to 40 chars with a hash suffix to avoid collisions.
         assert_eq!(normalized.chars().count(), 40);
-        let mut expected = "a".repeat(39);
-        expected.push('🦀');
-        assert_eq!(normalized, expected);
+        assert!(normalized.starts_with(&"a".repeat(30)));
+        assert!(normalized.contains('_'));
     }
 
     #[test]

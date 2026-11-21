@@ -1,5 +1,6 @@
 pub mod analyze;
 pub mod bash;
+pub mod core;
 pub mod edit;
 pub mod file_mutation_queue;
 pub mod find;
@@ -57,31 +58,85 @@ pub fn create_all_tools(cwd: PathBuf) -> Vec<Arc<dyn AgentTool>> {
     ]
 }
 
+const ALL_TOOL_NAMES: &[&str] = &[
+    "read", "write", "edit", "undo_edit", "bash", "grep", "find", "ls", "analyze", "powershell",
+];
+
+/// Build only the requested tools and reject unknown names instead of silently
+/// ignoring typos. PowerShell is opt-in when no explicit include list is given.
 pub fn select_coding_tools(
     cwd: PathBuf,
     include: Option<&[String]>,
     exclude: &[String],
 ) -> anyhow::Result<Vec<Arc<dyn AgentTool>>> {
-    let all = create_all_tools(cwd);
-    let mut selected = Vec::new();
-    let exclude_set: std::collections::HashSet<&str> = exclude.iter().map(|s| s.as_str()).collect();
-
-    for tool in all {
-        let name = tool.name();
-        if exclude_set.contains(name) {
-            continue;
-        }
-        if let Some(inc) = include {
-            if inc.iter().any(|s| s == name) {
-                selected.push(tool);
-            }
-        } else {
-            // Default 7 tools if include is None (powershell is opt-in)
-            if name != "powershell" {
-                selected.push(tool);
-            }
+    for name in include.into_iter().flatten().chain(exclude.iter()) {
+        if !ALL_TOOL_NAMES.contains(&name.as_str()) {
+            anyhow::bail!(
+                "Unknown tool name '{}'. Available tools: {}",
+                name,
+                ALL_TOOL_NAMES.join(", ")
+            );
         }
     }
+
+    let mut requested: std::collections::HashSet<String> = match include {
+        Some(names) => names.iter().cloned().collect(),
+        None => ALL_TOOL_NAMES
+            .iter()
+            .filter(|name| **name != "powershell")
+            .map(|name| (*name).to_string())
+            .collect(),
+    };
+    for name in exclude {
+        requested.remove(name);
+    }
+
+    let undo_store = Arc::new(EditUndoStore::new());
+    let mut selected: Vec<Arc<dyn AgentTool>> = Vec::with_capacity(requested.len());
+    let wants = |name: &str| requested.contains(name);
+
+    if wants("read") {
+        selected.push(Arc::new(ReadTool::new(cwd.clone())));
+    }
+    if wants("write") {
+        selected.push(Arc::new(
+            WriteTool::new(cwd.clone()).with_undo_store(undo_store.clone()),
+        ));
+    }
+    if wants("edit") {
+        selected.push(Arc::new(
+            EditTool::new(cwd.clone()).with_undo_store(undo_store.clone()),
+        ));
+    }
+    if wants("undo_edit") {
+        selected.push(Arc::new(UndoEditTool::new(cwd.clone(), undo_store)));
+    }
+    if wants("bash") {
+        selected.push(Arc::new(BashTool::new(cwd.clone())));
+    }
+    if wants("grep") {
+        selected.push(Arc::new(GrepTool::new(cwd.clone())));
+    }
+    if wants("find") {
+        selected.push(Arc::new(FindTool::new(cwd.clone())));
+    }
+    if wants("ls") {
+        selected.push(Arc::new(LsTool::new(cwd.clone())));
+    }
+    if wants("powershell") {
+        selected.push(Arc::new(PowerShellTool::new(cwd.clone())));
+    }
+    if wants("analyze") {
+        selected.push(Arc::new(AnalyzeTool::new(cwd)));
+    }
+
+    // Keep a stable order regardless of include ordering.
+    selected.sort_by_key(|tool| {
+        ALL_TOOL_NAMES
+            .iter()
+            .position(|name| *name == tool.name())
+            .unwrap_or(usize::MAX)
+    });
     Ok(selected)
 }
 

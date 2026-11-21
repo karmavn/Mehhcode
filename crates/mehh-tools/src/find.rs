@@ -1,30 +1,37 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::context::{self, PathPolicy};
+
 #[derive(Debug, Clone)]
 pub struct FindTool {
     pub cwd: PathBuf,
+    pub path_policy: PathPolicy,
 }
 
 impl FindTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self {
+            cwd,
+            path_policy: PathPolicy::Unrestricted,
+        }
     }
 
-    fn resolve_path(&self, p: &str) -> PathBuf {
-        let path = Path::new(p);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.cwd.join(path)
-        }
+    pub fn with_path_policy(mut self, policy: PathPolicy) -> Self {
+        self.path_policy = policy;
+        self
+    }
+
+    fn resolve_path(&self, p: &str) -> Result<PathBuf, String> {
+        context::resolve_path(&self.cwd, &self.path_policy, p)
     }
 }
 
 const FIND_MAX_OUTPUT_BYTES: usize = 100 * 1024;
+const FIND_MAX_RESULTS: usize = 5_000;
 
 #[async_trait]
 impl AgentTool for FindTool {
@@ -80,7 +87,8 @@ impl AgentTool for FindTool {
             .get("pattern")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter 'pattern'".to_string())?
-            .to_string();
+            // globset treats '\' as an escape; accept Windows-style separators.
+            .replace('\\', "/");
 
         let search_path_str = params
             .get("path")
@@ -94,7 +102,7 @@ impl AgentTool for FindTool {
             .unwrap_or(200)
             .max(1) as usize;
 
-        let search_path = self.resolve_path(&search_path_str);
+        let search_path = self.resolve_path(&search_path_str)?;
         let cancel_clone = cancel.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -104,7 +112,7 @@ impl AgentTool for FindTool {
 
             let has_glob_magic = pattern_str.chars().any(|c| matches!(c, '*' | '?' | '[' | '{'));
 
-            let pat = if !pattern_str.contains('/') && !pattern_str.contains('\\') {
+            let pat = if !pattern_str.contains('/') {
                 format!("**/{}", pattern_str)
             } else {
                 pattern_str.clone()
@@ -123,11 +131,15 @@ impl AgentTool for FindTool {
             let mut walker = ignore::WalkBuilder::new(&search_path);
             walker.hidden(false);
             walker.git_ignore(true);
+            // Apply .gitignore even when there is no .git directory.
+            walker.require_git(false);
+            walker.sort_by_file_name(|a, b| a.cmp(b));
             walker.filter_entry(|e| e.file_name().to_str() != Some(".git"));
 
             let mut results = Vec::new();
             let mut total_bytes = 0usize;
             let mut byte_cap_reached = false;
+            let mut result_cap_reached = false;
             let pat_lower = if !has_glob_magic {
                 Some(pattern_str.to_lowercase())
             } else {
@@ -152,10 +164,10 @@ impl AgentTool for FindTool {
                 let rel_path = file_path
                     .strip_prefix(&search_path)
                     .unwrap_or(file_path);
-                let mut rel_str = rel_path.to_string_lossy().replace('\\', "/");
-                let is_dir = entry.file_type().is_some_and(|ft| ft.is_dir());
-                if is_dir && !rel_str.ends_with('/') {
-                    rel_str.push('/');
+                let rel_str = rel_path.to_string_lossy().replace('\\', "/");
+                // This tool finds files; directories are not results.
+                if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                    continue;
                 }
 
                 let file_name = file_path
@@ -181,16 +193,11 @@ impl AgentTool for FindTool {
                 }
 
                 if matched {
-                    let add_bytes = rel_str.len().saturating_add(1);
-                    if total_bytes.saturating_add(add_bytes) > FIND_MAX_OUTPUT_BYTES {
-                        byte_cap_reached = true;
+                    if results.len() >= FIND_MAX_RESULTS {
+                        result_cap_reached = true;
                         break;
                     }
-                    total_bytes += add_bytes;
                     results.push(rel_str);
-                    if results.len() >= limit {
-                        break;
-                    }
                 }
             }
 
@@ -198,15 +205,33 @@ impl AgentTool for FindTool {
                 return Ok(AgentToolResult::text("No files found"));
             }
 
+            // Sort before limiting: OS walk order is not stable, and truncating
+            // first would make results differ between runs.
             results.sort_by_cached_key(|a| a.to_lowercase());
+            results.truncate(limit);
 
-            let mut output = results.join("\n");
+            let mut selected: Vec<String> = Vec::with_capacity(results.len());
+            for rel_str in results {
+                let add_bytes = rel_str.len().saturating_add(1);
+                if total_bytes.saturating_add(add_bytes) > FIND_MAX_OUTPUT_BYTES {
+                    byte_cap_reached = true;
+                    break;
+                }
+                total_bytes += add_bytes;
+                selected.push(rel_str);
+            }
+
+            let mut output = selected.join("\n");
             if byte_cap_reached {
                 output.push_str(&format!(
                     "\n\n[Output truncated at {} byte limit]",
                     FIND_MAX_OUTPUT_BYTES
                 ));
-            } else if results.len() >= limit {
+            } else if result_cap_reached {
+                output.push_str(&format!(
+                    "\n\n[Stopped after {FIND_MAX_RESULTS} results]"
+                ));
+            } else if selected.len() >= limit {
                 output.push_str(&format!("\n\n[Reached limit of {} results]", limit));
             }
 

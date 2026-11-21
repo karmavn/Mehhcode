@@ -1,9 +1,9 @@
-use std::sync::Arc;
 use mehh_ai::faux_model;
 use mehh_coding_agent::agent_session::AgentSession;
 use mehh_coding_agent::session::SessionManager;
 use mehh_coding_agent::settings::Settings;
 use mehh_coding_agent::tool_inspection::PermissionMode;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn test_subagent_tool_inherits_inspection_manager_from_agent_session() {
@@ -46,7 +46,10 @@ async fn test_subagent_tool_inherits_inspection_manager_from_agent_session() {
     assert_eq!(subagent_any.name(), "subagent");
 
     // Also verify session's inspection_manager mode is Chat
-    assert_eq!(session.inspection_manager.mode().await, PermissionMode::Chat);
+    assert_eq!(
+        session.inspection_manager.mode().await,
+        PermissionMode::Chat
+    );
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }

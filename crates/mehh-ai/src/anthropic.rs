@@ -47,11 +47,7 @@ impl LlmProvider for AnthropicProvider {
         tokio::spawn(async move {
             let is_oauth = options.api_key.as_deref().map(is_oauth_token).unwrap_or(false);
             let body = build_anthropic_request(&model, &context, &options, is_oauth);
-            let url = if model.base_url.ends_with("/messages") {
-                model.base_url.clone()
-            } else {
-                format!("{}/messages", model.base_url.trim_end_matches('/'))
-            };
+            let url = anthropic_messages_url(&model.base_url);
 
             let resp = match send_with_retry(
                 || {
@@ -140,7 +136,11 @@ impl LlmProvider for AnthropicProvider {
                                 for ev in &events {
                                     state.process_event_into(ev, &mut batch);
                                 }
+                                let done = state.done;
                                 sender.send_batch(batch).await;
+                                if done {
+                                    break;
+                                }
                             }
                             Ok(Some(Err(e))) => {
                                 state.mark_error(e.to_string());
@@ -180,6 +180,19 @@ impl LlmProvider for AnthropicProvider {
         });
 
         stream
+    }
+}
+
+/// Builds the Messages API endpoint from a base URL, ensuring the `/v1/messages` path.
+fn anthropic_messages_url(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.contains("/messages") {
+        return base.to_string();
+    }
+    if base.ends_with("/v1") {
+        format!("{base}/messages")
+    } else {
+        format!("{base}/v1/messages")
     }
 }
 
@@ -308,16 +321,6 @@ pub fn resolve_anthropic_beta_headers(
             }
         }
     }
-    if let Some(conf) = configured {
-        let mut unique: Vec<&str> = Vec::new();
-        for p in conf.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            if !unique.contains(&p) {
-                unique.push(p);
-            }
-        }
-        return unique.join(",");
-    }
-
     let mut features: Vec<String> = Vec::new();
     if is_oauth {
         features.push("claude-code-20250219".to_string());
@@ -333,6 +336,16 @@ pub fn resolve_anthropic_beta_headers(
     if model.compat.as_ref().and_then(|c| c.supports_mid_convo_effort) == Some(true) {
         features.push("mid-conversation-output-config-2026-07-01".to_string());
         features.push("thinking-binding-controls-2026-08-01".to_string());
+    }
+
+    // User-supplied beta headers are additive: they must never drop the
+    // OAuth and thinking features required for the request to work.
+    if let Some(conf) = configured {
+        for p in conf.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            if !features.iter().any(|f| f == p) {
+                features.push(p.to_string());
+            }
+        }
     }
 
     let mut unique_features = Vec::new();
@@ -619,13 +632,17 @@ pub fn build_anthropic_request(
         }
     }
 
+    // OAuth requests have a strict limit of four cache breakpoints. Spend
+    // them on the system prompt only, never on the last tool/user message.
     if let Some(cc) = &cache_control {
-        if let Some(last_msg) = messages.last_mut() {
-            if last_msg.get("role").and_then(|r| r.as_str()) == Some("user") {
-                if let Some(content_arr) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
-                    if let Some(last_block) = content_arr.last_mut() {
-                        if let Some(obj) = last_block.as_object_mut() {
-                            obj.insert("cache_control".to_string(), cc.clone());
+        if !is_oauth {
+            if let Some(last_msg) = messages.last_mut() {
+                if last_msg.get("role").and_then(|r| r.as_str()) == Some("user") {
+                    if let Some(content_arr) = last_msg.get_mut("content").and_then(|c| c.as_array_mut()) {
+                        if let Some(last_block) = content_arr.last_mut() {
+                            if let Some(obj) = last_block.as_object_mut() {
+                                obj.insert("cache_control".to_string(), cc.clone());
+                            }
                         }
                     }
                 }
@@ -644,12 +661,9 @@ pub fn build_anthropic_request(
             "type": "text",
             "text": "You are Claude Code, Anthropic's official CLI for Claude.",
         });
-        if let Some(cc) = &cache_control {
-            identity_block
-                .as_object_mut()
-                .unwrap()
-                .insert("cache_control".to_string(), cc.clone());
-        }
+        // Never put a breakpoint on the short identity block: it cannot reach
+        // the 1024-token minimum cache threshold. If it is the only system
+        // block, there is nothing worth caching here.
         sys_blocks.push(identity_block);
 
         if !system_text.is_empty() {
@@ -683,11 +697,12 @@ pub fn build_anthropic_request(
         req_map.insert("system".to_string(), serde_json::json!(system_text));
     }
 
-    let tool_cache_control = if model
-        .compat
-        .as_ref()
-        .and_then(|c| c.supports_cache_control_on_tools)
-        .unwrap_or(true)
+    let tool_cache_control = if !is_oauth
+        && model
+            .compat
+            .as_ref()
+            .and_then(|c| c.supports_cache_control_on_tools)
+            .unwrap_or(true)
     {
         cache_control.clone()
     } else {
@@ -782,16 +797,25 @@ pub fn build_anthropic_request(
             let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
             req_map.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         } else {
-            let (adj_max_tokens, adj_budget) = adjust_max_tokens_for_thinking(
+            let (mut adj_max_tokens, adj_budget) = adjust_max_tokens_for_thinking(
                 options.max_tokens,
                 model.max_tokens,
                 reasoning_level,
                 options.thinking_budgets.as_ref(),
             );
-            let final_budget = options
+            let mut final_budget = options
                 .thinking_budget_tokens
                 .unwrap_or(adj_budget)
-                .max(1024);
+                .max(MIN_ANSWER_TOKENS);
+            // Anthropic rejects budget_tokens >= max_tokens. Keep at least one
+            // token of answer room, raising max_tokens if the floor forces it.
+            if final_budget >= adj_max_tokens {
+                final_budget = adj_max_tokens.saturating_sub(1);
+            }
+            if final_budget < MIN_ANSWER_TOKENS {
+                final_budget = MIN_ANSWER_TOKENS;
+                adj_max_tokens = MIN_ANSWER_TOKENS + 1;
+            }
 
             req_map.insert("max_tokens".to_string(), serde_json::json!(adj_max_tokens));
 
@@ -1145,7 +1169,7 @@ impl AnthropicStreamState {
                                 out.push(AssistantMessageEvent::ToolCallDelta {
                                     content_index,
                                     delta: partial_json,
-                                    partial: self.output.clone(),
+                                    partial: self.output.metadata_clone_with_block(content_index),
                                 });
                             }
                         }
@@ -1396,6 +1420,22 @@ pub fn process_anthropic_sse_events(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn messages_url_always_targets_v1_messages() {
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            anthropic_messages_url("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com/v1/messages"
+        );
+    }
 
     fn test_model() -> Model {
         Model {

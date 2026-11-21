@@ -223,7 +223,10 @@ mod tests {
         // that hid the real status from consumers reading derived_state.
         assert_eq!(derive_state(&SubagentStatus::Failed, None), "failed");
         assert_eq!(
-            derive_state(&SubagentStatus::Failed, Some(&SubagentFailureClass::Timeout)),
+            derive_state(
+                &SubagentStatus::Failed,
+                Some(&SubagentFailureClass::Timeout)
+            ),
             "timeout"
         );
         assert_eq!(derive_state(&SubagentStatus::Running, None), "working");
@@ -276,7 +279,9 @@ mod tests {
             use std::os::unix::ffi::OsStringExt;
             std::ffi::OsString::from_vec(b"mehh-\xFF-store".to_vec())
         };
-        std::env::temp_dir().join(format!("mehh_store_{}", uuid::Uuid::now_v7())).join(component)
+        std::env::temp_dir()
+            .join(format!("mehh_store_{}", uuid::Uuid::now_v7()))
+            .join(component)
     }
 
     #[test]

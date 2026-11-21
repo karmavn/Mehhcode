@@ -206,6 +206,11 @@ pub fn build_mistral_request(
                     asst_map.insert("tool_calls".to_string(), serde_json::Value::Array(tc_json));
                 }
 
+                // Mistral rejects an assistant message with neither content nor tool_calls.
+                if !asst_map.contains_key("content") && !asst_map.contains_key("tool_calls") {
+                    asst_map.insert("content".to_string(), serde_json::json!(""));
+                }
+
                 messages.push(serde_json::Value::Object(asst_map));
             }
             Message::ToolResult(tr) => {
@@ -219,11 +224,30 @@ pub fn build_mistral_request(
                     .collect::<Vec<_>>()
                     .join("\n");
 
+                let images: Vec<serde_json::Value> = tr
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ToolResultContentBlock::Image(img) => Some(serde_json::json!({
+                            "type": "image_url",
+                            "image_url": { "url": format!("data:{};base64,{}", img.mime_type, img.data) }
+                        })),
+                        _ => None,
+                    })
+                    .collect();
+                let content = if images.is_empty() {
+                    serde_json::Value::String(text)
+                } else {
+                    let mut parts = vec![serde_json::json!({ "type": "text", "text": text })];
+                    parts.extend(images);
+                    serde_json::Value::Array(parts)
+                };
+
                 messages.push(serde_json::json!({
                     "role": "tool",
                     "tool_call_id": tr.tool_call_id,
                     "name": tr.tool_name,
-                    "content": text,
+                    "content": content,
                 }));
             }
         }
@@ -630,6 +654,18 @@ impl MistralStreamState {
                 }
 
                 if let Some(in_progress) = self.active_tool_calls.get_mut(&idx) {
+                    // Some proxies emit id and name in separate SSE chunks.
+                    if let Some(name) = name_opt {
+                        if !name.is_empty() {
+                            if let Some(AssistantContentBlock::ToolCall(tc)) =
+                                self.output.content.get_mut(in_progress.content_index)
+                            {
+                                if tc.name.is_empty() {
+                                    tc.name = name.to_string();
+                                }
+                            }
+                        }
+                    }
                     if let Some(args_delta) = args_opt {
                         if !args_delta.is_empty() {
                             in_progress.raw_args.push_str(args_delta);

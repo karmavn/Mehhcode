@@ -1,8 +1,8 @@
 //! Prompt template discovery, argument parsing, and parameter substitution.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 use crate::skills::parse_frontmatter;
 
@@ -206,13 +206,16 @@ fn load_templates_from_dir(dir: &Path, out: &mut Vec<PromptTemplate>) {
 
                     if let Ok(raw) = std::fs::read_to_string(&path) {
                         let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-    let (fm, body) = parse_frontmatter(clean);
+                        let (fm, body) = parse_frontmatter(clean);
                         let body_trimmed = body.trim();
 
                         let description = if let Some(desc) = fm.get("description") {
                             desc.clone()
                         } else {
-                            let first_line = body_trimmed.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                            let first_line = body_trimmed
+                                .lines()
+                                .find(|l| !l.trim().is_empty())
+                                .unwrap_or("");
                             let mut d = first_line.chars().take(60).collect::<String>();
                             if first_line.chars().count() > 60 {
                                 d.push_str("...");
@@ -329,7 +332,10 @@ mod tests {
         let missing_fallback = substitute_args("Check ${3:-my_fallback}", &["one".to_string()]);
         assert_eq!(missing_fallback, "Check my_fallback");
 
-        let slice_rest = substitute_args("Rest: ${@:2}", &["a".to_string(), "b".to_string(), "c".to_string()]);
+        let slice_rest = substitute_args(
+            "Rest: ${@:2}",
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+        );
         assert_eq!(slice_rest, "Rest: b c");
     }
 

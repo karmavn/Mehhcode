@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use async_trait::async_trait;
 use mehh_agent::{tool_to_definition, AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
-use mehh_ai::{ImageContent, TextContent, ToolDefinition, ToolResultContentBlock};
+use mehh_ai::{ImageContent, TextContent, ToolCall, ToolDefinition, ToolResultContentBlock};
 use tokio_util::sync::CancellationToken;
 
 use crate::sandbox::{
@@ -82,6 +82,8 @@ impl CodemodeTool {
 }
 
 const CODEMODE_MAX_OUTPUT_BYTES: usize = 40_000;
+const CODEMODE_MAX_IMAGES: usize = 4;
+const CODEMODE_MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 
 fn truncate_codemode_output(text: &str) -> String {
     if text.len() <= CODEMODE_MAX_OUTPUT_BYTES {
@@ -157,6 +159,8 @@ impl AgentTool for CodemodeTool {
         let tool_call_prefix = tool_call_id.to_string();
         let cancel_executor = cancel.clone();
         let interceptor = self.interceptor.clone();
+        let executor_defs = tool_defs.clone();
+        let call_seq = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let executor: SandboxToolExecutor = Arc::new(move |tool_name: &str, args: serde_json::Value| {
             let tools = tools.clone();
@@ -164,6 +168,8 @@ impl AgentTool for CodemodeTool {
             let prefix = tool_call_prefix.clone();
             let cancel = cancel_executor.clone();
             let interceptor = interceptor.clone();
+            let tool_defs = executor_defs.clone();
+            let call_seq = call_seq.clone();
 
             Box::pin(async move {
                 let matching = tools.iter().find(|t| {
@@ -176,31 +182,71 @@ impl AgentTool for CodemodeTool {
 
                 let params_map = match args {
                     serde_json::Value::Object(m) => m,
-                    _ => serde_json::Map::new(),
+                    _ => return Err("arguments must be an object".to_string()),
                 };
 
-                if let Some(ref intercept) = interceptor {
-                    intercept(&name_str, &params_map).await?;
-                }
-
-                let nested_call_id = format!("{prefix}/{name_str}");
-                let tool_res = tool.execute(&nested_call_id, params_map, cancel, None).await?;
-
-                if let Some(details) = tool_res.details {
-                    return Ok(details);
-                }
-
-                let text = tool_res
-                    .content
+                let def = tool_defs
                     .iter()
-                    .filter_map(|c| match c {
-                        ToolResultContentBlock::Text(t) => Some(t.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                    .find(|d| d.name == name_str || to_identifier(&d.name) == name_str)
+                    .ok_or_else(|| format!("No schema for tool '{name_str}'"))?;
+                let seq = call_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let nested_call_id = format!("{prefix}/{name_str}#{seq}");
+                let tool_call = ToolCall {
+                    id: nested_call_id.clone(),
+                    name: name_str.clone(),
+                    arguments: params_map,
+                    arguments_error: None,
+                    thought_signature: None,
+                };
+                let validated = mehh_ai::validation::validate_tool_arguments(def, &tool_call)?;
 
-                Ok(serde_json::Value::String(text))
+                if let Some(ref intercept) = interceptor {
+                    intercept(&name_str, &validated).await?;
+                }
+
+                let tool_res = tool
+                    .execute(&nested_call_id, validated, cancel, None)
+                    .await?;
+
+                let mut text_parts = Vec::new();
+                let mut images = Vec::new();
+                for c in &tool_res.content {
+                    match c {
+                        ToolResultContentBlock::Text(t) => text_parts.push(t.text.clone()),
+                        ToolResultContentBlock::Image(img) => {
+                            images.push(serde_json::json!({
+                                "mimeType": img.mime_type,
+                                "data": img.data
+                            }));
+                        }
+                    }
+                }
+                let text = text_parts.join("\n");
+
+                if tool_res.is_error.unwrap_or(false) {
+                    return Err(format!("Tool '{name_str}' reported an error: {text}"));
+                }
+
+                // Preserve a plain string for the common case, but never drop
+                // `details`/`structured_content` or tool-produced images.
+                if tool_res.details.is_none()
+                    && tool_res.structured_content.is_none()
+                    && images.is_empty()
+                {
+                    return Ok(serde_json::Value::String(text));
+                }
+                let mut obj = serde_json::Map::new();
+                obj.insert("content".to_string(), serde_json::Value::String(text));
+                if !images.is_empty() {
+                    obj.insert("images".to_string(), serde_json::Value::Array(images));
+                }
+                if let Some(details) = tool_res.details {
+                    obj.insert("details".to_string(), details);
+                }
+                if let Some(sc) = tool_res.structured_content {
+                    obj.insert("structuredContent".to_string(), sc);
+                }
+                Ok(serde_json::Value::Object(obj))
             })
         });
 
@@ -216,6 +262,7 @@ impl AgentTool for CodemodeTool {
 
         let mut content: Vec<ToolResultContentBlock> = Vec::new();
         let mut text_lines: Vec<String> = Vec::new();
+        let mut image_count = 0usize;
 
         for item in &res.items {
             match item {
@@ -226,6 +273,19 @@ impl AgentTool for CodemodeTool {
                     text_lines.push(format!("[{level}] {text}"));
                 }
                 CodemodeOutputItem::Image { data, mime_type } => {
+                    if !matches!(
+                        mime_type.as_str(),
+                        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+                    ) {
+                        return Err(format!("Unsupported output image type: {mime_type}"));
+                    }
+                    if data.len() > CODEMODE_MAX_IMAGE_BYTES {
+                        return Err("Output image exceeds the 2 MiB limit".to_string());
+                    }
+                    image_count += 1;
+                    if image_count > CODEMODE_MAX_IMAGES {
+                        return Err("Too many output images (maximum 4)".to_string());
+                    }
                     content.push(ToolResultContentBlock::Image(ImageContent {
                         data: data.clone(),
                         mime_type: mime_type.clone(),

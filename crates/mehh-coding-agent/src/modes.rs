@@ -1,9 +1,9 @@
 //! Non-interactive and interactive execution modes for CLI and script execution.
 
+use anyhow::Result;
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use anyhow::Result;
 
 use mehh_agent::AgentEvent;
 use mehh_ai::{AssistantMessageEvent, Message, StopReason};
@@ -100,11 +100,9 @@ pub async fn run_print_mode_content(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mehh_ai::{
-        faux_model, now_ms, AssistantMessage, FauxProvider, TextContent, Usage,
-    };
     use crate::session::SessionManager;
     use crate::settings::Settings;
+    use mehh_ai::{faux_model, now_ms, AssistantMessage, FauxProvider, TextContent, Usage};
 
     #[tokio::test]
     async fn test_run_print_mode_propagates_provider_error() {

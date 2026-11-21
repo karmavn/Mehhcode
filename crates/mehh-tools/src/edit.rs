@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
@@ -6,11 +6,17 @@ use mehh_ai::{TextContent, ToolResultContentBlock};
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
+use crate::core::context::{self, PathPolicy};
+use crate::core::fs::atomic_write;
+use crate::core::output::truncate_head;
 use crate::undo_edit::{EditUndoStore, FileSnapshot};
+
+const MAX_DIFF_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EditTool {
     pub cwd: PathBuf,
+    pub path_policy: PathPolicy,
     pub undo_store: Option<Arc<EditUndoStore>>,
 }
 
@@ -18,6 +24,7 @@ impl EditTool {
     pub fn new(cwd: PathBuf) -> Self {
         Self {
             cwd,
+            path_policy: PathPolicy::Unrestricted,
             undo_store: None,
         }
     }
@@ -27,13 +34,13 @@ impl EditTool {
         self
     }
 
-    fn resolve_path(&self, p: &str) -> PathBuf {
-        let path = Path::new(p);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.cwd.join(path)
-        }
+    pub fn with_path_policy(mut self, policy: PathPolicy) -> Self {
+        self.path_policy = policy;
+        self
+    }
+
+    fn resolve_path(&self, p: &str) -> Result<PathBuf, String> {
+        context::resolve_path(&self.cwd, &self.path_policy, p)
     }
 }
 
@@ -75,24 +82,49 @@ fn apply_replacements_to_original(original: &str, replacements: &[MatchedEdit]) 
         offset + crlf_before
     };
 
+    // Find the terminator of the line containing `offset`, ignoring newline
+    // bytes inside string/char literals. A plain `find('\n')` can pick up the
+    // CRLF inside `let s = "\r\n";` and wrongly rewrite new_text to CRLF.
     let get_line_ending_at = |content: &str, offset: usize| -> &'static str {
-        let after = &content[offset..];
-        if let Some(lf_pos) = after.find('\n') {
-            let abs_lf = offset + lf_pos;
-            if abs_lf > 0 && content.as_bytes()[abs_lf - 1] == b'\r' {
-                return "\r\n";
-            } else {
-                return "\n";
+        let line_start = content[..offset].rfind('\n').map_or(0, |pos| pos + 1);
+        let bytes = content.as_bytes();
+        let mut i = line_start;
+        let mut quote: Option<u8> = None;
+        let mut escaped = false;
+
+        while i < bytes.len() {
+            let byte = bytes[i];
+            if let Some(q) = quote {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == q {
+                    quote = None;
+                }
+                i += 1;
+                continue;
+            }
+            match byte {
+                b'"' | b'\'' => {
+                    quote = Some(byte);
+                    i += 1;
+                }
+                b'\n' => {
+                    return if i > line_start && bytes[i - 1] == b'\r' {
+                        "\r\n"
+                    } else {
+                        "\n"
+                    };
+                }
+                _ => i += 1,
             }
         }
-        if let Some(lf_pos) = content[..offset].rfind('\n') {
-            if lf_pos > 0 && content.as_bytes()[lf_pos - 1] == b'\r' {
-                return "\r\n";
-            } else {
-                return "\n";
-            }
-        }
-        if content.contains("\r\n") {
+
+        // Last line has no terminator: use the file's dominant style.
+        let crlf_count = content.matches("\r\n").count();
+        let lf_count = content.matches('\n').count();
+        if crlf_count > 0 && crlf_count == lf_count {
             "\r\n"
         } else {
             "\n"
@@ -117,6 +149,17 @@ fn apply_replacements_to_original(original: &str, replacements: &[MatchedEdit]) 
     parts
 }
 
+fn required_string<'a>(
+    value: &'a serde_json::Value,
+    aliases: &[&str],
+    label: &str,
+) -> Result<&'a str, String> {
+    aliases
+        .iter()
+        .find_map(|key| value.get(*key).and_then(|v| v.as_str()))
+        .ok_or_else(|| format!("{label} must be a string"))
+}
+
 fn parse_edits(params: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<SingleEdit>, String> {
     let mut edits = Vec::new();
 
@@ -124,47 +167,52 @@ fn parse_edits(params: &serde_json::Map<String, serde_json::Value>) -> Result<Ve
         let items: Vec<serde_json::Value> = if let Some(arr) = edits_val.as_array() {
             arr.clone()
         } else if let Some(s) = edits_val.as_str() {
-            serde_json::from_str(s).unwrap_or_default()
+            serde_json::from_str(s)
+                .map_err(|e| format!("Failed to parse 'edits' JSON string: {e}"))?
         } else {
-            Vec::new()
+            return Err("Parameter 'edits' must be an array or a JSON string".to_string());
         };
 
-        for item in items {
-            let old_text = item
-                .get("oldText")
-                .or_else(|| item.get("old_text"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let new_text = item
-                .get("newText")
-                .or_else(|| item.get("new_text"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            edits.push(SingleEdit { old_text, new_text });
+        for (i, item) in items.iter().enumerate() {
+            if !item.is_object() {
+                return Err(format!("edits[{i}] must be an object"));
+            }
+            let old_text = required_string(
+                item,
+                &["oldText", "old_text", "old_string"],
+                &format!("edits[{i}].oldText"),
+            )?;
+            let new_text = required_string(
+                item,
+                &["newText", "new_text", "new_string"],
+                &format!("edits[{i}].newText"),
+            )?;
+            edits.push(SingleEdit {
+                old_text: old_text.to_string(),
+                new_text: new_text.to_string(),
+            });
         }
     }
 
     if edits.is_empty() {
-        let old_text = params
+        let old = params
             .get("oldText")
             .or_else(|| params.get("old_text"))
             .or_else(|| params.get("old_string"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        let new_text = params
+            .and_then(|v| v.as_str());
+        let new = params
             .get("newText")
             .or_else(|| params.get("new_text"))
             .or_else(|| params.get("new_string"))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
+            .and_then(|v| v.as_str());
 
-        if let (Some(old), Some(new)) = (old_text, new_text) {
+        if let (Some(old), Some(new)) = (old, new) {
             edits.push(SingleEdit {
-                old_text: old,
-                new_text: new,
+                old_text: old.to_string(),
+                new_text: new.to_string(),
             });
+        } else if old.is_some() || new.is_some() {
+            return Err("Both 'oldText' and 'newText' are required for a single edit".to_string());
         }
     }
 
@@ -412,9 +460,14 @@ impl AgentTool for EditTool {
 
         let edits = parse_edits(&params)?;
 
-        let full_path = self.resolve_path(path_str);
+        let full_path = self.resolve_path(path_str)?;
         let undo_store = self.undo_store.clone();
+        let cancel_inner = cancel.clone();
         with_file_mutation_queue(&full_path, async {
+            // The queue await may have been waiting while the caller cancelled.
+            if cancel_inner.is_cancelled() {
+                return Err("Tool execution cancelled".to_string());
+            }
             if !full_path.exists() {
                 return Err(format!("File not found: {}", path_str));
             }
@@ -510,6 +563,10 @@ impl AgentTool for EditTool {
             };
             let final_content = format!("{bom}{final_body}");
 
+            atomic_write(&full_path, final_content.as_bytes()).await?;
+
+            // Record undo history only after the write actually succeeded;
+            // otherwise a failed write would leave a phantom snapshot.
             if let Some(ref store) = undo_store {
                 let timestamp_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -524,15 +581,16 @@ impl AgentTool for EditTool {
                 );
             }
 
-            tokio::fs::write(&full_path, final_content.as_bytes())
-                .await
-                .map_err(|e| format!("Failed to write {}: {}", path_str, e))?;
-
             let diff = similar::TextDiff::from_lines(&raw_content, &final_content)
                 .unified_diff()
                 .context_radius(3)
                 .header(path_str, path_str)
                 .to_string();
+            let diff = truncate_head(
+                &diff,
+                MAX_DIFF_BYTES,
+                "\n... [diff truncated]",
+            );
 
             let details = json!({
                 "diff": diff,

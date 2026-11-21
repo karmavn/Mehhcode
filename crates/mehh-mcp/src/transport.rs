@@ -27,6 +27,10 @@ pub trait McpTransport: Send + Sync {
     /// Receives the next JSON-RPC message, or None if the transport has closed.
     async fn recv(&self) -> Option<anyhow::Result<JsonRpcMessage>>;
 
+    /// Notifies the transport of the negotiated MCP protocol version so that
+    /// protocol-specific headers can be attached to subsequent requests.
+    async fn on_protocol_negotiated(&self, _version: &str) {}
+
     /// Closes the transport and cleans up associated resources.
     async fn close(&self) -> anyhow::Result<()>;
 }
@@ -40,6 +44,7 @@ pub struct InMemoryTransport {
     sender: mpsc::Sender<JsonRpcMessage>,
     receiver: Mutex<mpsc::Receiver<JsonRpcMessage>>,
     closed: AtomicBool,
+    closed_token: tokio_util::sync::CancellationToken,
 }
 
 impl InMemoryTransport {
@@ -52,11 +57,13 @@ impl InMemoryTransport {
             sender: tx2,
             receiver: Mutex::new(rx1),
             closed: AtomicBool::new(false),
+            closed_token: tokio_util::sync::CancellationToken::new(),
         };
         let t2 = Self {
             sender: tx1,
             receiver: Mutex::new(rx2),
             closed: AtomicBool::new(false),
+            closed_token: tokio_util::sync::CancellationToken::new(),
         };
         (t1, t2)
     }
@@ -79,11 +86,15 @@ impl McpTransport for InMemoryTransport {
             return None;
         }
         let mut rx = self.receiver.lock().await;
-        rx.recv().await.map(Ok)
+        tokio::select! {
+            msg = rx.recv() => msg.map(Ok),
+            _ = self.closed_token.cancelled() => None,
+        }
     }
 
     async fn close(&self) -> anyhow::Result<()> {
         self.closed.store(true, Ordering::SeqCst);
+        self.closed_token.cancel();
         Ok(())
     }
 }
@@ -327,8 +338,14 @@ impl McpTransport for StdioTransport {
         {
             let mut child_guard = self.child.lock().await;
             if let Some(mut child) = child_guard.take() {
-                let _ = child.start_kill();
-                let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                // Give the process a short grace period to exit after stdin EOF.
+                if tokio::time::timeout(Duration::from_millis(500), child.wait())
+                    .await
+                    .is_err()
+                {
+                    let _ = child.start_kill();
+                    let _ = tokio::time::timeout(Duration::from_secs(2), child.wait()).await;
+                }
             }
         }
         Ok(())
@@ -368,6 +385,7 @@ pub struct StreamableHttpTransport {
     incoming_rx: Mutex<mpsc::Receiver<anyhow::Result<JsonRpcMessage>>>,
     sse_tasks: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     closed: AtomicBool,
+    closed_token: tokio_util::sync::CancellationToken,
 }
 
 impl StreamableHttpTransport {
@@ -376,8 +394,10 @@ impl StreamableHttpTransport {
         let (tx, rx) = mpsc::channel(256);
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(std::sync::Arc::new(crate::oauth::SafeDnsResolver))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .expect("failed to build hardened MCP HTTP transport client");
         Self {
             client,
             url: url.into(),
@@ -389,6 +409,7 @@ impl StreamableHttpTransport {
             incoming_rx: Mutex::new(rx),
             sse_tasks: Arc::new(Mutex::new(Vec::new())),
             closed: AtomicBool::new(false),
+            closed_token: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -412,6 +433,10 @@ impl StreamableHttpTransport {
 
 #[async_trait]
 impl McpTransport for StreamableHttpTransport {
+    async fn on_protocol_negotiated(&self, version: &str) {
+        self.set_protocol_version(version).await;
+    }
+
     async fn send(&self, msg: JsonRpcMessage) -> anyhow::Result<()> {
         if self.closed.load(Ordering::SeqCst) {
             anyhow::bail!("Streamable HTTP transport is closed");
@@ -427,6 +452,9 @@ impl McpTransport for StreamableHttpTransport {
                 .header("Content-Type", "application/json");
 
             for (k, v) in &self.headers {
+                if token.is_some() && k.eq_ignore_ascii_case("authorization") {
+                    continue;
+                }
                 req = req.header(k, v);
             }
             if let Some(t) = token {
@@ -460,7 +488,7 @@ impl McpTransport for StreamableHttpTransport {
                     .headers()
                     .get("www-authenticate")
                     .and_then(|v| v.to_str().ok());
-                if let Ok(true) = auth.on_unauthorized(www_auth).await {
+                if let Ok(true) = auth.on_unauthorized(token.as_deref(), www_auth).await {
                     let new_token = auth.bearer_token().await.ok().flatten();
                     let mut retry_req = build_req(new_token.as_deref());
                     if let Some(sid) = self.session_id.read().await.as_ref() {
@@ -493,6 +521,10 @@ impl McpTransport for StreamableHttpTransport {
         }
 
         let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND && self.session_id.read().await.is_some() {
+            *self.session_id.write().await = None;
+            anyhow::bail!("MCP session expired (HTTP 404); re-initialize the session");
+        }
         if !status.is_success() {
             let err_bytes = read_limited_body(resp, MAX_HTTP_ERROR_BYTES)
                 .await
@@ -590,11 +622,15 @@ impl McpTransport for StreamableHttpTransport {
             return None;
         }
         let mut rx = self.incoming_rx.lock().await;
-        rx.recv().await
+        tokio::select! {
+            msg = rx.recv() => msg,
+            _ = self.closed_token.cancelled() => None,
+        }
     }
 
     async fn close(&self) -> anyhow::Result<()> {
         self.closed.store(true, Ordering::SeqCst);
+        self.closed_token.cancel();
         {
             let mut tasks = self.sse_tasks.lock().await;
             for handle in tasks.drain(..) {

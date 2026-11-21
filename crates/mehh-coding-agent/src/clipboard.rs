@@ -116,7 +116,11 @@ pub fn copy_to_clipboard(text: &str) -> Result<()> {
         return Ok(());
     }
 
-    let _ = emit_osc52(text);
+    if !emit_osc52(text) {
+        return Err(anyhow::anyhow!(
+            "OSC 52 clipboard write failed (stdout is not a terminal or payload too large)"
+        ));
+    }
     Ok(())
 }
 

@@ -1,8 +1,8 @@
 //! Skill discovery, frontmatter parsing, prompt formatting, and invocation expansion.
 
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use serde::{Deserialize, Serialize};
 
 /// Skill definition loaded from a `SKILL.md` markdown file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -254,12 +254,18 @@ disable-model-invocation: true
 Use Clippy and avoid unnecessary allocations.
 "#;
         let (fm, body) = parse_frontmatter(doc);
-        assert_eq!(fm.get("name").map(|s| s.as_str()), Some("rust-best-practices"));
+        assert_eq!(
+            fm.get("name").map(|s| s.as_str()),
+            Some("rust-best-practices")
+        );
         assert_eq!(
             fm.get("description").map(|s| s.as_str()),
             Some("Guidelines for high performance Rust code")
         );
-        assert_eq!(fm.get("disable-model-invocation").map(|s| s.as_str()), Some("true"));
+        assert_eq!(
+            fm.get("disable-model-invocation").map(|s| s.as_str()),
+            Some("true")
+        );
         assert!(body.contains("# Rust Best Practices"));
     }
 

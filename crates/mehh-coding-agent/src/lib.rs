@@ -6,8 +6,10 @@ pub mod auth;
 pub mod branch_summarization;
 pub mod clipboard;
 pub mod compaction;
+pub mod file_args;
 pub mod file_complete;
 pub mod interactive;
+pub mod lead_worker;
 pub mod mcp_manager;
 pub mod models_config;
 pub mod modes;
@@ -20,7 +22,6 @@ pub mod skills;
 pub mod subagent;
 pub mod subagent_control;
 pub mod subagent_lifecycle;
-pub mod lead_worker;
 pub mod system_prompt;
 pub mod todo;
 pub mod tool_inspection;
@@ -32,6 +33,7 @@ pub use auth::*;
 pub use branch_summarization::*;
 pub use clipboard::*;
 pub use compaction::*;
+pub use file_args::*;
 pub use file_complete::*;
 pub use interactive::*;
 pub use lead_worker::*;
@@ -314,7 +316,8 @@ mod tests {
         assert_eq!(discovered.len(), 1);
         assert!(discovered[0].1.contains("Follow standard protocols."));
 
-        let prompt = build_system_prompt(&sub_dir, None, Some("Custom addendum"), &["read", "write"]);
+        let prompt =
+            build_system_prompt(&sub_dir, None, Some("Custom addendum"), &["read", "write"]);
         assert!(prompt.contains("<tools>"));
         assert!(prompt.contains("- read"));
         assert!(prompt.contains("- write"));

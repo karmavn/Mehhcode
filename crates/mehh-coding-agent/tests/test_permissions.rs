@@ -1,6 +1,6 @@
-use std::path::PathBuf;
 use mehh_coding_agent::permissions::{PermissionAction, PermissionRule, PermissionStore};
 use mehh_coding_agent::tool_inspection::{InspectionVerdict, ToolInspectionContext};
+use std::path::PathBuf;
 
 #[test]
 fn test_permission_store_evaluates_exact_and_prefix_rules() {
@@ -36,7 +36,7 @@ fn test_permission_store_evaluates_exact_and_prefix_rules() {
         args: args1,
         is_read_only: Some(false),
         cwd: PathBuf::from("."),
-    origin: None,
+        origin: None,
     };
     assert_eq!(store.evaluate(&ctx1), Some(InspectionVerdict::Allow));
 
@@ -49,9 +49,12 @@ fn test_permission_store_evaluates_exact_and_prefix_rules() {
         args: args2,
         is_read_only: Some(false),
         cwd: PathBuf::from("."),
-    origin: None,
+        origin: None,
     };
-    assert!(matches!(store.evaluate(&ctx2), Some(InspectionVerdict::Deny { .. })));
+    assert!(matches!(
+        store.evaluate(&ctx2),
+        Some(InspectionVerdict::Deny { .. })
+    ));
 
     // Test edit on .rs -> AskBefore
     let mut args3 = serde_json::Map::new();
@@ -62,9 +65,12 @@ fn test_permission_store_evaluates_exact_and_prefix_rules() {
         args: args3,
         is_read_only: Some(false),
         cwd: PathBuf::from("."),
-    origin: None,
+        origin: None,
     };
-    assert!(matches!(store.evaluate(&ctx3), Some(InspectionVerdict::RequireApproval { .. })));
+    assert!(matches!(
+        store.evaluate(&ctx3),
+        Some(InspectionVerdict::RequireApproval { .. })
+    ));
 
     // Test unmatching tool -> None (falls through)
     let ctx4 = ToolInspectionContext {
@@ -73,7 +79,7 @@ fn test_permission_store_evaluates_exact_and_prefix_rules() {
         args: serde_json::Map::new(),
         is_read_only: Some(true),
         cwd: PathBuf::from("."),
-    origin: None,
+        origin: None,
     };
     assert_eq!(store.evaluate(&ctx4), None);
 }

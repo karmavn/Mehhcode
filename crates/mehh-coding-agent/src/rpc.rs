@@ -1,9 +1,9 @@
 //! Headless RPC protocol for embedding the coding agent over asynchronous stdin/stdout or duplex streams.
 
+use anyhow::Result;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
-use anyhow::Result;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
@@ -127,11 +127,7 @@ pub fn format_rpc_event(event: &AgentEvent) -> serde_json::Value {
 
 /// Runs the agent session in RPC mode, reading JSONL commands from `reader` and writing
 /// streamed events and command responses to `writer`.
-pub async fn run_rpc_mode<R, W>(
-    session: &mut AgentSession,
-    mut reader: R,
-    writer: W,
-) -> Result<()>
+pub async fn run_rpc_mode<R, W>(session: &mut AgentSession, mut reader: R, writer: W) -> Result<()>
 where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -242,15 +238,14 @@ where
                     Ok(new_messages) => {
                         let stop_err = new_messages.iter().rev().find_map(|m| match m {
                             Message::Assistant(a)
-                                if matches!(a.stop_reason, StopReason::Error | StopReason::Aborted) =>
+                                if matches!(
+                                    a.stop_reason,
+                                    StopReason::Error | StopReason::Aborted
+                                ) =>
                             {
-                                Some(
-                                    a.error_message
-                                        .clone()
-                                        .unwrap_or_else(|| {
-                                            format!("Agent stopped with {:?}", a.stop_reason)
-                                        }),
-                                )
+                                Some(a.error_message.clone().unwrap_or_else(|| {
+                                    format!("Agent stopped with {:?}", a.stop_reason)
+                                }))
                             }
                             _ => None,
                         });
@@ -273,7 +268,9 @@ where
                     "sessionFile": session.session().file_path().map(|p| p.to_string_lossy().to_string()),
                     "messageCount": session.session().entries().len(),
                 });
-                output.send_success(id, "get_state", Some(state_data)).await?;
+                output
+                    .send_success(id, "get_state", Some(state_data))
+                    .await?;
             }
             "set_model" => {
                 let provider = val.get("provider").and_then(|v| v.as_str()).unwrap_or("");
@@ -313,9 +310,8 @@ where
 
                 let resolved_key = if model.provider != "faux" && model.api != "faux" {
                     match crate::auth::resolve_api_key_async(&model.provider, None, None).await {
-                        Ok(key) => key.or_else(|| {
-                            reg.provider_api_key(&model.provider).map(str::to_string)
-                        }),
+                        Ok(key) => key
+                            .or_else(|| reg.provider_api_key(&model.provider).map(str::to_string)),
                         Err(e) => {
                             output
                                 .send_error(
@@ -331,7 +327,8 @@ where
                     None
                 };
 
-                let provider_changed = !session.model.provider.eq_ignore_ascii_case(&model.provider);
+                let provider_changed =
+                    !session.model.provider.eq_ignore_ascii_case(&model.provider);
                 let prov = AgentSession::default_provider_for_model(&model);
                 session.set_model(model.clone(), prov);
                 if let Some(key) = resolved_key {
@@ -483,7 +480,11 @@ where
                     })
                     .collect();
                 output
-                    .send_success(id, "subagent_list", Some(serde_json::json!({ "agents": agents })))
+                    .send_success(
+                        id,
+                        "subagent_list",
+                        Some(serde_json::json!({ "agents": agents })),
+                    )
                     .await?;
             }
             "subagent_steer" => {
@@ -525,22 +526,20 @@ where
                 session.clear_queues();
                 output.send_success(id, "clear_queue", None).await?;
             }
-            "cycle_model" => {
-                match session.cycle_model() {
-                    Ok(Some(m)) => {
-                        let _ = session.ensure_api_key(None).await;
-                        output
-                            .send_success(id, "cycle_model", Some(serde_json::to_value(&m)?))
-                            .await?;
-                    }
-                    Ok(None) => {
-                        output.send_success(id, "cycle_model", None).await?;
-                    }
-                    Err(e) => {
-                        output.send_error(id, "cycle_model", &e.to_string()).await?;
-                    }
+            "cycle_model" => match session.cycle_model() {
+                Ok(Some(m)) => {
+                    let _ = session.ensure_api_key(None).await;
+                    output
+                        .send_success(id, "cycle_model", Some(serde_json::to_value(&m)?))
+                        .await?;
                 }
-            }
+                Ok(None) => {
+                    output.send_success(id, "cycle_model", None).await?;
+                }
+                Err(e) => {
+                    output.send_error(id, "cycle_model", &e.to_string()).await?;
+                }
+            },
             "bash" => {
                 let command = val.get("command").and_then(|v| v.as_str()).unwrap_or("");
                 let cancel = CancellationToken::new();
@@ -577,7 +576,8 @@ where
                             .await?;
                     }
                     Err(e) => {
-                        if e.contains("Command aborted") || e.contains("Missing required parameter") {
+                        if e.contains("Command aborted") || e.contains("Missing required parameter")
+                        {
                             output.send_error(id, "bash", &e).await?;
                         } else {
                             output
@@ -608,7 +608,11 @@ where
                         let new_id = forked.session_id().to_string();
                         session.session = forked;
                         output
-                            .send_success(id, "fork", Some(serde_json::json!({ "sessionId": new_id })))
+                            .send_success(
+                                id,
+                                "fork",
+                                Some(serde_json::json!({ "sessionId": new_id })),
+                            )
                             .await?;
                     }
                     Err(e) => {
@@ -616,20 +620,22 @@ where
                     }
                 }
             }
-            "clone" => {
-                match session.session().clone_at_leaf() {
-                    Ok(cloned) => {
-                        let new_id = cloned.session_id().to_string();
-                        session.session = cloned;
-                        output
-                            .send_success(id, "clone", Some(serde_json::json!({ "sessionId": new_id })))
-                            .await?;
-                    }
-                    Err(e) => {
-                        output.send_error(id, "clone", &e.to_string()).await?;
-                    }
+            "clone" => match session.session().clone_at_leaf() {
+                Ok(cloned) => {
+                    let new_id = cloned.session_id().to_string();
+                    session.session = cloned;
+                    output
+                        .send_success(
+                            id,
+                            "clone",
+                            Some(serde_json::json!({ "sessionId": new_id })),
+                        )
+                        .await?;
                 }
-            }
+                Err(e) => {
+                    output.send_error(id, "clone", &e.to_string()).await?;
+                }
+            },
             "switch_session" => {
                 let session_path = val
                     .get("sessionPath")
@@ -652,7 +658,9 @@ where
                                     .await?;
                             }
                             Err(e) => {
-                                output.send_error(id, "switch_session", &e.to_string()).await?;
+                                output
+                                    .send_error(id, "switch_session", &e.to_string())
+                                    .await?;
                             }
                         }
                     }
@@ -689,7 +697,9 @@ where
                             output.send_success(id, "set_session_name", None).await?;
                         }
                         Err(e) => {
-                            output.send_error(id, "set_session_name", &e.to_string()).await?;
+                            output
+                                .send_error(id, "set_session_name", &e.to_string())
+                                .await?;
                         }
                     },
                     None => {
@@ -744,8 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_rpc_mode_lifecycle() {
-        let temp_dir =
-            std::env::temp_dir().join(format!("mehh_rpc_test_{}", Uuid::now_v7()));
+        let temp_dir = std::env::temp_dir().join(format!("mehh_rpc_test_{}", Uuid::now_v7()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
         let faux = FauxProvider::new();
@@ -901,20 +910,22 @@ mod tests {
         let temp_dir = std::env::temp_dir().join(format!("mehh_rpc_err_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&temp_dir).unwrap();
 
-        let faux = Arc::new(FauxProvider::with_responses(vec![mehh_ai::AssistantMessage {
-            content: vec![mehh_ai::AssistantContentBlock::Text(mehh_ai::TextContent {
-                text: String::new(),
-                text_signature: None,
-            })],
-            api: "faux".to_string(),
-            provider: "faux".to_string(),
-            model: "faux-model".to_string(),
-            response_id: None,
-            usage: mehh_ai::Usage::default(),
-            stop_reason: StopReason::Error,
-            error_message: Some("upstream rpc error".to_string()),
-            timestamp: mehh_ai::now_ms(),
-        }]));
+        let faux = Arc::new(FauxProvider::with_responses(vec![
+            mehh_ai::AssistantMessage {
+                content: vec![mehh_ai::AssistantContentBlock::Text(mehh_ai::TextContent {
+                    text: String::new(),
+                    text_signature: None,
+                })],
+                api: "faux".to_string(),
+                provider: "faux".to_string(),
+                model: "faux-model".to_string(),
+                response_id: None,
+                usage: mehh_ai::Usage::default(),
+                stop_reason: StopReason::Error,
+                error_message: Some("upstream rpc error".to_string()),
+                timestamp: mehh_ai::now_ms(),
+            },
+        ]));
 
         let mut session = AgentSession::new(
             temp_dir.clone(),
@@ -931,7 +942,12 @@ mod tests {
         let mut reader = tokio::io::BufReader::new(client_read);
 
         let rpc_handle = tokio::spawn(async move {
-            run_rpc_mode(&mut session, tokio::io::BufReader::new(server_read), server_write).await
+            run_rpc_mode(
+                &mut session,
+                tokio::io::BufReader::new(server_read),
+                server_write,
+            )
+            .await
         });
 
         let mut line = String::new();
@@ -980,7 +996,10 @@ mod tests {
             {
                 assert_eq!(ev["id"], "p1");
                 assert_eq!(ev["success"], false);
-                assert!(ev["error"].as_str().unwrap_or("").contains("upstream rpc error"));
+                assert!(ev["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("upstream rpc error"));
                 prompt_err_seen = true;
                 break;
             }
@@ -994,7 +1013,8 @@ mod tests {
 
     #[tokio::test]
     async fn rpc_queue_session_tree_and_bash_commands() {
-        let temp_dir = std::env::temp_dir().join(format!("mehh_rpc_commands_{}", uuid::Uuid::now_v7()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("mehh_rpc_commands_{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&temp_dir).unwrap();
         let mut session = AgentSession::new(
             temp_dir.clone(),
@@ -1036,7 +1056,11 @@ mod tests {
                 if ev.get("type").and_then(|v| v.as_str()) == Some("response")
                     && ev.get("command").and_then(|v| v.as_str()) == Some(expected_cmd)
                 {
-                    assert_eq!(ev["success"], true, "Expected success for {expected_cmd}: {:?}", ev);
+                    assert_eq!(
+                        ev["success"], true,
+                        "Expected success for {expected_cmd}: {:?}",
+                        ev
+                    );
                     return ev;
                 }
             }
@@ -1048,7 +1072,8 @@ mod tests {
             &mut reader,
             serde_json::json!({ "id": "1", "type": "steer", "message": "steering msg" }),
             "steer",
-        ).await;
+        )
+        .await;
 
         // 2. follow_up
         send_and_expect(
@@ -1056,7 +1081,8 @@ mod tests {
             &mut reader,
             serde_json::json!({ "id": "2", "type": "follow_up", "message": "follow up msg" }),
             "follow_up",
-        ).await;
+        )
+        .await;
 
         // 3. clear_queue
         send_and_expect(
@@ -1064,7 +1090,8 @@ mod tests {
             &mut reader,
             serde_json::json!({ "id": "3", "type": "clear_queue" }),
             "clear_queue",
-        ).await;
+        )
+        .await;
 
         // 4. cycle_model
         send_and_expect(
@@ -1072,7 +1099,8 @@ mod tests {
             &mut reader,
             serde_json::json!({ "id": "4", "type": "cycle_model" }),
             "cycle_model",
-        ).await;
+        )
+        .await;
 
         // 5. set_session_name
         send_and_expect(
@@ -1088,7 +1116,8 @@ mod tests {
             &mut reader,
             serde_json::json!({ "id": "6", "type": "get_tree" }),
             "get_tree",
-        ).await;
+        )
+        .await;
         assert!(tree_resp["data"]["tree"].is_array());
 
         // 7. clone
@@ -1097,7 +1126,8 @@ mod tests {
             &mut reader,
             serde_json::json!({ "id": "7", "type": "clone" }),
             "clone",
-        ).await;
+        )
+        .await;
 
         // 8. fork
         send_and_expect(
@@ -1105,17 +1135,26 @@ mod tests {
             &mut reader,
             serde_json::json!({ "id": "8", "type": "fork" }),
             "fork",
-        ).await;
+        )
+        .await;
 
         // 9. bash
-        let echo_cmd = if cfg!(windows) { "Write-Output 'hello_rpc'" } else { "echo 'hello_rpc'" };
+        let echo_cmd = if cfg!(windows) {
+            "Write-Output 'hello_rpc'"
+        } else {
+            "echo 'hello_rpc'"
+        };
         let bash_resp = send_and_expect(
             &mut writer,
             &mut reader,
             serde_json::json!({ "id": "9", "type": "bash", "command": echo_cmd }),
             "bash",
-        ).await;
-        assert!(bash_resp["data"]["output"].as_str().unwrap().contains("hello_rpc"));
+        )
+        .await;
+        assert!(bash_resp["data"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("hello_rpc"));
 
         // 9b. bash non-zero exit code resolves with isError: true instead of RPC error
         let fail_cmd = "exit 1";
@@ -1124,9 +1163,13 @@ mod tests {
             &mut reader,
             serde_json::json!({ "id": "9b", "type": "bash", "command": fail_cmd }),
             "bash",
-        ).await;
+        )
+        .await;
         assert_eq!(fail_resp["data"]["isError"], true);
-        assert!(fail_resp["data"]["output"].as_str().unwrap().contains("Command exited with code 1"));
+        assert!(fail_resp["data"]["output"]
+            .as_str()
+            .unwrap()
+            .contains("Command exited with code 1"));
 
         // 10. abort_bash
         send_and_expect(
@@ -1134,7 +1177,8 @@ mod tests {
             &mut reader,
             serde_json::json!({ "id": "10", "type": "abort_bash" }),
             "abort_bash",
-        ).await;
+        )
+        .await;
 
         // 11. switch_session
         let session_file = temp_dir.join("switched_session.jsonl");

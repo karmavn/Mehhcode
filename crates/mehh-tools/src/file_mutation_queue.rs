@@ -1,10 +1,18 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tokio::sync::Mutex as TokioMutex;
 
-static QUEUES: std::sync::LazyLock<Mutex<HashMap<String, Arc<TokioMutex<()>>>>> =
+type QueueMap = HashMap<String, Weak<TokioMutex<()>>>;
+
+static QUEUES: std::sync::LazyLock<Mutex<QueueMap>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// A poisoned queue map must not abort the process during cleanup; the data
+/// inside is only a lock registry, so recovering the inner value is safe.
+fn lock_queues() -> MutexGuard<'static, QueueMap> {
+    QUEUES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
@@ -61,7 +69,8 @@ pub fn get_mutation_queue_key(file_path: &Path) -> String {
         normalized = normalized[4..].to_string();
     }
 
-    if cfg!(windows) {
+    // macOS APFS is case-insensitive by default, like Windows NTFS.
+    if cfg!(any(windows, target_os = "macos")) {
         normalized.to_ascii_lowercase()
     } else {
         normalized
@@ -70,17 +79,16 @@ pub fn get_mutation_queue_key(file_path: &Path) -> String {
 
 struct QueueCleanupGuard {
     key: String,
-    #[allow(dead_code)]
-    lock: Arc<TokioMutex<()>>,
 }
 
 impl Drop for QueueCleanupGuard {
     fn drop(&mut self) {
-        let mut map = QUEUES.lock().unwrap();
-        if let Some(entry) = map.get(&self.key) {
-            if Arc::strong_count(entry) <= 2 {
-                map.remove(&self.key);
-            }
+        let mut map = lock_queues();
+        if map
+            .get(&self.key)
+            .is_some_and(|weak| weak.strong_count() == 0)
+        {
+            map.remove(&self.key);
         }
     }
 }
@@ -89,23 +97,33 @@ pub async fn with_file_mutation_queue<Fut, T>(file_path: &Path, future: Fut) -> 
 where
     Fut: std::future::Future<Output = T>,
 {
-    let key = get_mutation_queue_key(file_path);
+    // canonicalize() hits the filesystem; keep it off the Tokio worker.
+    let key = {
+        let path = file_path.to_path_buf();
+        match tokio::task::spawn_blocking(move || get_mutation_queue_key(&path)).await {
+            Ok(key) => key,
+            Err(_) => get_mutation_queue_key(file_path),
+        }
+    };
+
+    // Declared before `lock` so unwinding drops lock (and its guard) first.
+    let cleanup = QueueCleanupGuard { key: key.clone() };
     let lock = {
-        let mut map = QUEUES.lock().unwrap();
-        map.entry(key.clone())
-            .or_insert_with(|| Arc::new(TokioMutex::new(())))
-            .clone()
+        let mut map = lock_queues();
+        match map.get(&key).and_then(Weak::upgrade) {
+            Some(existing) => existing,
+            None => {
+                let created = Arc::new(TokioMutex::new(()));
+                map.insert(key.clone(), Arc::downgrade(&created));
+                created
+            }
+        }
     };
 
-    let cleanup = QueueCleanupGuard {
-        key,
-        lock: lock.clone(),
-    };
-    drop(lock);
-
-    let guard = cleanup.lock.lock().await;
+    let guard = lock.lock().await;
     let result = future.await;
     drop(guard);
+    drop(lock);
     drop(cleanup);
     result
 }
