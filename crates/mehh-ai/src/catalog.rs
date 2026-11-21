@@ -534,6 +534,141 @@ pub fn builtin_models() -> Vec<Model> {
             ..Default::default()
         },
 
+        // 9b. OpenRouter free models (openai-completions, cost = 0)
+        Model {
+            id: "nvidia/nemotron-3-ultra-550b-a55b:free".to_string(),
+            name: "Nemotron 3 Ultra 550B (OpenRouter, free)".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            reasoning: true,
+            input: vec!["text".to_string()],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 1_000_000,
+            max_tokens: 65_536,
+            headers: None,
+            ..Default::default()
+        },
+        Model {
+            id: "nvidia/nemotron-3.5-lightning:free".to_string(),
+            name: "Nemotron 3.5 Lightning (OpenRouter, free)".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            reasoning: true,
+            input: vec!["text".to_string()],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 1_000_000,
+            max_tokens: 65_536,
+            headers: None,
+            ..Default::default()
+        },
+        Model {
+            id: "nvidia/nemotron-3.5-super-vl:free".to_string(),
+            name: "Nemotron 3.5 Super VL (OpenRouter, free)".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string(), "image".to_string()],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 1_000_000,
+            max_tokens: 65_536,
+            headers: None,
+            ..Default::default()
+        },
+        Model {
+            id: "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free".to_string(),
+            name: "Nemotron 3 Nano Omni 30B Reasoning (OpenRouter, free)".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            reasoning: true,
+            input: vec!["text".to_string(), "image".to_string()],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 256_000,
+            max_tokens: 65_536,
+            headers: None,
+            ..Default::default()
+        },
+        Model {
+            id: "google/gemma-4-31b-it:free".to_string(),
+            name: "Gemma 4 31B IT (OpenRouter, free)".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string(), "image".to_string()],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 262_144,
+            max_tokens: 32_768,
+            headers: None,
+            ..Default::default()
+        },
+        Model {
+            id: "inclusionai/ling-3.2-flash:free".to_string(),
+            name: "Ling 3.2 Flash (OpenRouter, free)".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            reasoning: true,
+            input: vec!["text".to_string(), "image".to_string()],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 1_048_576,
+            max_tokens: 65_536,
+            headers: None,
+            ..Default::default()
+        },
+        Model {
+            id: "openrouter/free".to_string(),
+            name: "OpenRouter Free Router".to_string(),
+            api: "openai-completions".to_string(),
+            provider: "openrouter".to_string(),
+            base_url: "https://openrouter.ai/api/v1".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string(), "image".to_string()],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 200_000,
+            max_tokens: 32_768,
+            headers: None,
+            ..Default::default()
+        },
+
         // 10. Groq models (openai-completions)
         Model {
             id: "llama-3.3-70b-versatile".to_string(),
@@ -951,5 +1086,26 @@ mod tests {
         assert_eq!(default_base_url("groq"), Some("https://api.groq.com/openai/v1"));
         assert_eq!(default_base_url("deepseek"), Some("https://api.deepseek.com/v1"));
         assert_eq!(default_base_url("unknown"), None);
+    }
+
+    #[test]
+    fn test_openrouter_free_models_are_cataloged_and_cost_zero() {
+        let free_ids = [
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            "nvidia/nemotron-3.5-lightning:free",
+            "nvidia/nemotron-3.5-super-vl:free",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",
+            "google/gemma-4-31b-it:free",
+            "inclusionai/ling-3.2-flash:free",
+            "openrouter/free",
+        ];
+        for id in free_ids {
+            let m = resolve_model("openrouter", Some(id))
+                .unwrap_or_else(|| panic!("missing free OpenRouter model: {id}"));
+            assert_eq!(m.provider, "openrouter");
+            assert_eq!(m.api, "openai-completions");
+            assert_eq!(m.cost.input, 0.0, "{id} must be free on input");
+            assert_eq!(m.cost.output, 0.0, "{id} must be free on output");
+        }
     }
 }

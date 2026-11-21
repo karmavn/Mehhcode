@@ -539,9 +539,12 @@ pub async fn compact_with_provider(
         .saturating_mul(3)
         .max(4096);
     if serialized_conv.chars().count() > budget_chars {
-        if let Some((byte_end, _)) = serialized_conv.char_indices().nth(budget_chars) {
-            serialized_conv.truncate(byte_end);
-            serialized_conv.push_str("\n\n[... older history truncated for summarization]");
+        // Keep the newest tail: a chronological transcript truncated at the head
+        // would drop the most recent context while claiming to drop the oldest.
+        if let Some((byte_start, _)) = serialized_conv.char_indices().rev().nth(budget_chars - 1) {
+            let newest = serialized_conv[byte_start..].to_string();
+            serialized_conv =
+                format!("[... older history truncated for summarization]\n\n{newest}");
         }
     }
 
@@ -800,6 +803,50 @@ mod tests {
             "summarization prompt grew to {} chars",
             text.len()
         );
+    }
+
+    #[tokio::test]
+    async fn compact_with_provider_keeps_newest_history_when_clamped() {
+        let mut model = make_test_model();
+        model.context_window = 4096;
+        let prep = CompactionPreparation {
+            first_kept_entry_id: "e2".to_string(),
+            messages_to_summarize: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text(format!("OLDEST_MARKER{}", "x".repeat(6_000))),
+                    timestamp: now_ms(),
+                }),
+                Message::User(UserMessage {
+                    content: UserContent::Text("NEWEST_MARKER".to_string()),
+                    timestamp: now_ms(),
+                }),
+            ],
+            turn_prefix_messages: Vec::new(),
+            tokens_before: 50_000,
+            previous_summary: None,
+            read_files: Vec::new(),
+            modified_files: Vec::new(),
+        };
+        let faux = FauxProvider::new();
+        faux.add_response(mehh_ai::faux_assistant_message("## Goal\nSmall summary"));
+        compact_with_provider(&prep, &model, &faux, None, None, CancellationToken::new())
+            .await
+            .unwrap();
+        let requests = faux.recorded_requests();
+        let text = match &requests.last().expect("compaction request recorded").context.messages[0]
+        {
+            Message::User(u) => match &u.content {
+                UserContent::Text(t) => t.clone(),
+                _ => panic!("expected text prompt"),
+            },
+            _ => panic!("expected user prompt"),
+        };
+        assert!(text.contains("NEWEST_MARKER"), "newest history must be kept");
+        assert!(
+            !text.contains("OLDEST_MARKER"),
+            "oldest history must be dropped when clamping"
+        );
+        assert!(text.contains("older history truncated for summarization"));
     }
 
     #[test]

@@ -117,3 +117,87 @@ Verified via `& target\release\mehh.exe --list-models` joined with `\n` and hash
 
 - **No web/browser/database runtime**: This repository is a native Rust CLI/TUI workspace; Lighthouse, Core Web Vitals (LCP, TBT, CLS), bundle JS sizes, and SQL `EXPLAIN ANALYZE` do not apply and were not measured.
 - **No per-function microbenchmarks**: `criterion` / `cargo bench` harnesses were not added; algorithmic improvements (IDF precalculation, zero-allocation line streaming, single-pass bigram extraction, borrowed session deserialization) are verified by code inspection, compilation, and test suite execution.
+
+---
+
+## 8. Subagent scope (2026-11-21)
+
+### Scope and stack
+
+Audited the whole subagent subsystem, not the whole workspace: `subagent.rs`, `subagent_control.rs`, `subagent_lifecycle.rs`, `lead_worker.rs`, the `subagent_*` RPC arms in `rpc.rs`, child-row rendering in `interactive.rs`, tool wiring in `agent_session.rs`, and all ten `tests/test_subagent_*.rs` targets. This is a native Rust CLI/TUI: no browser, web server, JS bundle, or SQL database is involved, so the web-only items in the 31-point scorecard stay N/A. The dominant subagent cost is LLM tokens plus credential I/O, not DOM or network payload size.
+
+### Measurement
+
+`measure_subagent.ps1` (new) runs unchanged before and after: a warm `cargo test --no-run`, then each of the ten subagent integration targets with one test thread. It records per-target wall time, the Rust test summary, and a SHA-256 of all test names and outcomes as a behavior fingerprint.
+
+- Machine: `DESKTOP-DC42MTS`, 2 CPUs, `cargo 1.100.0`, `rustc 1.100.0`.
+- Raw data: `measurements/subagent_baseline.json`, `measurements/subagent_after.json`, `measurements/subagent_after_final.json` (the last one was run against the final source).
+- Wall times are noisy because several agent sessions shared the same Cargo target lock; the in-test `finished in` values are the more stable signal, though they also vary with machine load between runs.
+
+| Target | Baseline `finished in` | After (final) `finished in` |
+| --- | --- | --- |
+| test_subagent_batch | 0.23s | 1.45s |
+| test_subagent_cancel | 0.32s | 1.10s |
+| test_subagent_control | 2.37s | 4.26s |
+| test_subagent_governance | 0.09s | 0.79s |
+| test_subagent_handoff | 0.06s | 1.07s |
+| test_subagent_lead_worker | 1.00s | 1.20s |
+| test_subagent_lifecycle | 12.70s | 13.81s |
+| test_subagent_multimode | 0.35s | 0.01s |
+| test_subagent_rpc | 0.25s | 0.23s |
+| test_subagent_scratchpad | 0.02s | 0.01s |
+
+All ten targets: identical pass counts before and after. Fingerprint `164155aa1f68b7540e51d1f76919646b0bc2461b1c30b1a1c9714f97ab68056c` matches exactly across three runs. Machine load increased between the baseline and final runs (the final run is slower on most targets), so no wall-clock speedup is claimed here; the wins are allocation and credential-I/O reductions in production paths that the faux-provider tests do not exercise.
+
+### Changes made
+
+All in `crates/mehh-coding-agent/src/subagent.rs`:
+
+1. **Shared credential cache** (`api_key_cache` on `SubagentTool`, `resolved_api_key()`): sibling children in one batch resolve a provider credential once instead of once per child. `resolve_api_key_async` reads `auth.json` under an advisory lock and can refresh OAuth tokens, so a 4-child batch previously performed 4 reads/refresh-lock attempts. Failures are deliberately not cached, preserving the original retry behavior. New test `resolved_api_key_reuses_cached_credential` guards the cache-hit path.
+2. **Force-finalize consumes the message history** instead of cloning it before the extra summary call. The vector has no later use in that branch, so this removes one full-history allocation per budget-exhausted child.
+3. **Single event-log lock** in `finalize_subagent_run`: two separate `lock()` calls became one scoped lock, also ensuring the mutex is released before the update callback and manifest write.
+
+### Scorecard (subagent-relevant items)
+
+| # | Item | Verdict | Evidence | Impact |
+| --- | --- | --- | --- | --- |
+| 1 | Skeleton loaders | N/A | Terminal TUI; subagent progress is text rows, not web layout | L |
+| 2 | Optimistic UI | N/A | No server roundtrip to roll back | L |
+| 3 | Stream responses | Pass | Child loops stream through `run_agent_loop`; progress forwarded via `on_update` | H |
+| 4-5 | Responsive/lazy images | N/A | No image assets | L |
+| 6 | Unused dependencies | Pass | No dependency added by this change | L |
+| 7-10 | JS split / scripts / fonts / SSR | N/A | Native Rust binary | L |
+| 11 | Unnecessary re-renders | Pass | TUI renders on an 80ms tick (`interactive.rs:3197`), not per subagent event; child rows capped at 8 | M |
+| 12 | Virtualize long lists | Recommend | `state.items` transcript is unbounded; subagent child rows already capped at 8 | L |
+| 13 | Debounce / cancel stale | Pass | TUI update fan-out is tick-batched; subagent steering uses `QueueMode::OneAtATime` | M |
+| 14 | Deduplicate API calls | Fixed | Shared `api_key_cache` removes N credential resolutions per batch | M |
+| 15 | Bound unbounded results | Needs decision | `tasks` array has no `maxItems` and no total-task cap in `execute()` | M |
+| 16 | Parallel independent work | Pass | `tokio::spawn` fan-out, 4 permits for read-only modes, 1 for coding, shared global budget | H |
+| 17 | Timeouts / retries | Pass | 180s child budget, 1..180s clamp, 60s finalize budget, provider-level backoff | H |
+| 18-20 | Compression / CDN / browser cache | N/A | CLI client, no HTTP server or static assets | L |
+| 21 | Background jobs | Pass | Subagent children already run as background tokio tasks | M |
+| 22 | N+1 work | Fixed | Per-child credential resolution removed; one manifest write per child remains by design | M |
+| 23-25 | Database items | N/A | No database | L |
+| 26 | Cache rarely-changing data | Fixed | Credential cache plus `OnceLock` process-wide control registry | M |
+| 27-28 | Region / load balancing | N/A | Single local process | L |
+| 29 | OpenTelemetry tracing | Needs decision | `tracing` exists, no exporter; see prior report section 4 | L |
+| 30 | Real-user monitoring | Needs decision | No telemetry service; opt-in decision for a local CLI | L |
+| 31 | Slow devices/networks | N/A | Desktop terminal app | L |
+
+### Items needing your decision
+
+1. **Cap the `tasks` array.** `parameters_schema()` sets no `maxItems` and `execute()` spawns one task per entry. Adding a hard cap changes the tool contract (an error for oversized batches), so it was not applied. Options: (a) reject batches above e.g. 16 tasks with a clear error; (b) keep unlimited totals but spawn in chunks of 4/1 so only the running children hold manifests and tool clones, preserving every result and its order. Option (b) is behavior-preserving except for mid-run `subagent_list` visibility.
+2. **Telemetry** (unchanged from the prior report): local `tracing` only, or an opt-in OTLP/Sentry exporter.
+
+### Verification
+
+- `cargo test -p mehh-coding-agent --offline --lib subagent` - 15 passed, 0 failed (includes the new cache test).
+- `cargo test -p mehh-coding-agent --offline --test test_subagent_*` (via `measure_subagent.ps1`) - all ten targets pass, identical fingerprint.
+- `cargo clippy -p mehh-coding-agent --offline --tests` - no new warnings from the edited code. With `-D warnings` the build fails on pre-existing issues in `mehh-ai` (`anthropic.rs:660` unused `mut`, `oauth.rs:717` `let_underscore_future`), which are outside this subagent scope and were left untouched.
+
+### What I could not measure or got wrong
+
+- No real LLM provider was used, so the credential-cache win is derived from the code path (N credential reads/locks to 1 for a batch), not observed in a production run. The faux provider skips credential resolution entirely.
+- No `criterion` microbenchmark was added; removing a full-history clone is an allocation argument, not a measured delta at these test sizes.
+- Cargo wall times were inflated by concurrent sessions holding the build lock; only the in-test `finished in` values are comparable.
+- This section was appended to the existing report; the earlier workspace-wide audit (sections 1-7) was left intact.

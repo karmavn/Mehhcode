@@ -14,6 +14,17 @@ pub struct ProcessedPromptArgs {
 const MAX_TEXT_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_IMAGE_FILE_BYTES: u64 = 20 * 1024 * 1024;
 
+/// Escapes a path for use inside a double-quoted XML attribute so a file name
+/// cannot break out of the `<file name="…">` tag.
+fn escape_xml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('\'', "&apos;")
+}
+
 /// Reads each `@path` argument into a text block or a base64 image block.
 /// Non-`@` arguments are joined into the text prompt verbatim.
 pub fn process_file_arguments(cwd: &Path, args: &[String]) -> Result<ProcessedPromptArgs> {
@@ -76,7 +87,10 @@ pub fn process_file_arguments(cwd: &Path, args: &[String]) -> Result<ProcessedPr
                     }
                     let raw = String::from_utf8_lossy(&bytes);
                     let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-                    let tag = format!("<file name=\"{path_str}\">\n{clean}\n</file>");
+                    let tag = format!(
+                        "<file name=\"{}\">\n{clean}\n</file>",
+                        escape_xml_attribute(path_str)
+                    );
                     text_parts.push(tag);
                     continue;
                 }
@@ -97,4 +111,17 @@ pub fn process_file_arguments(cwd: &Path, args: &[String]) -> Result<ProcessedPr
     }
 
     Ok(ProcessedPromptArgs { text, blocks })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape_xml_attribute;
+
+    #[test]
+    fn escape_xml_attribute_neutralizes_markup_characters() {
+        assert_eq!(
+            escape_xml_attribute("a\"b&c<d>'e"),
+            "a&quot;b&amp;c&lt;d&gt;&apos;e"
+        );
+    }
 }

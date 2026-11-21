@@ -1,6 +1,7 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use clap::Parser;
 use mehh_ai::{
     catalog, faux, LlmProvider, Model, ModelCost, ThinkingLevel,
@@ -13,7 +14,7 @@ use mehh_coding_agent::{
     AgentSession, McpManager, OutputMode, SessionManager, SessionSummary, Settings,
     SettingsManager,
 };
-use tokio::io::AsyncReadExt;
+use tokio::io::AsyncBufReadExt;
 
 #[derive(clap::Parser, Debug, Clone, PartialEq, Eq)]
 #[command(name = "mehh", version, about = "mehh coding agent CLI")]
@@ -991,6 +992,33 @@ async fn main() -> anyhow::Result<()> {
     run_res
 }
 
+/// Reads piped stdin. When a prompt argument is present, stdin is supplementary,
+/// so an idle pipe must not block the run forever; an idle window of 500ms is
+/// enough to decide there is nothing to append. Without a prompt, stdin is the
+/// prompt itself, so wait for EOF as before.
+async fn read_piped_stdin(supplementary: bool) -> anyhow::Result<String> {
+    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut bytes = Vec::new();
+    loop {
+        let fill = reader.fill_buf();
+        let buf = if supplementary {
+            match tokio::time::timeout(Duration::from_millis(500), fill).await {
+                Ok(result) => result?,
+                Err(_) => break,
+            }
+        } else {
+            fill.await?
+        };
+        if buf.is_empty() {
+            break;
+        }
+        let len = buf.len();
+        bytes.extend_from_slice(buf);
+        reader.consume(len);
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 async fn run_print_flow(
     agent_session: &mut AgentSession,
     args: &CliArgs,
@@ -1009,8 +1037,7 @@ async fn run_print_flow(
     // Piped stdin is added to the prompt argument, never discarded. For
     // example `git diff | mehh -p "review"` must include both pieces.
     if !io::stdin().is_terminal() {
-        let mut stdin_input = String::new();
-        tokio::io::stdin().read_to_string(&mut stdin_input).await?;
+        let stdin_input = read_piped_stdin(args.prompt.is_empty()).await?;
         let piped = stdin_input.trim_start_matches('\u{feff}');
         if !piped.trim().is_empty() {
             if !prompt_text.trim().is_empty() {
