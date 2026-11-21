@@ -1,7 +1,7 @@
 //! Shared child registry, global concurrency budget, and per-child control.
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 
 use mehh_ai::{now_ms, Message, UserContent, UserMessage};
 use tokio::sync::Semaphore;
@@ -63,7 +63,7 @@ impl SubagentControl {
     ) -> SubagentHandle {
         let started_ms = now_ms();
         let steering_queue = Arc::new(Mutex::new(VecDeque::new()));
-        self.children.lock().unwrap().insert(
+        self.children.lock().unwrap_or_else(PoisonError::into_inner).insert(
             agent_id.clone(),
             SubagentHandle {
                 agent_id: agent_id.clone(),
@@ -84,12 +84,12 @@ impl SubagentControl {
 
     /// Removes a child from the registry (called on every exit path).
     pub fn unregister(&self, agent_id: &str) {
-        self.children.lock().unwrap().remove(agent_id);
+        self.children.lock().unwrap_or_else(PoisonError::into_inner).remove(agent_id);
     }
 
     /// Returns summaries for all registered children.
     pub fn list(&self) -> Vec<SubagentSummary> {
-        let children = self.children.lock().unwrap();
+        let children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
         let now = now_ms();
         children
             .values()
@@ -103,7 +103,7 @@ impl SubagentControl {
 
     /// Queues a steering user message for a child; false for unknown ids.
     pub fn steer(&self, agent_id: &str, text: &str) -> bool {
-        let mut children = self.children.lock().unwrap();
+        let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(handle) = children.get_mut(agent_id) {
             handle
                 .steering_queue
@@ -121,7 +121,7 @@ impl SubagentControl {
 
     /// Cancels only the given child's token and removes the handle; false for unknown ids.
     pub fn kill(&self, agent_id: &str) -> bool {
-        let mut children = self.children.lock().unwrap();
+        let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(handle) = children.remove(agent_id) {
             handle.cancel.cancel();
             true
@@ -149,4 +149,27 @@ pub fn global_control() -> &'static Arc<SubagentControl> {
             GLOBAL_DEFAULT_MAX_CONCURRENT_SUBAGENTS,
         ))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_recovers_from_a_poisoned_child_lock() {
+        let control = SubagentControl::new(2);
+        let victim = Arc::clone(&control.children);
+        let _ = std::thread::spawn(move || {
+            let _guard = victim.lock().unwrap_or_else(PoisonError::into_inner);
+            panic!("poison the registry");
+        })
+        .join();
+
+        let handle = control.register("sub-p".into(), "coding".into(), CancellationToken::new());
+        assert_eq!(handle.agent_id, "sub-p");
+        assert_eq!(control.list().len(), 1);
+        assert!(control.steer("sub-p", "hello"));
+        assert!(control.kill("sub-p"));
+        assert!(control.list().is_empty());
+    }
 }

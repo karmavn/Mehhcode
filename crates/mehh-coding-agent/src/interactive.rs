@@ -673,7 +673,9 @@ fn refresh_settings_selector(state: &mut InteractiveState, settings: &Settings) 
     if let Some(sel) = state.selector.as_mut() {
         sel.list.set_items(settings_selector_items(settings));
         sel.list.selected = prev.min(sel.list.items.len().saturating_sub(1));
+        let filter = sel.list.filter.clone();
         let mut detail = build_settings_list(settings);
+        detail.set_filter(&filter);
         detail.selected = sel.list.selected;
         sel.settings_list = Some(detail);
     }
@@ -1894,14 +1896,7 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                         .unwrap_or("")
                         .to_string();
                     for item in state.items.iter_mut().rev() {
-                        if let TranscriptItem::Subagent {
-                            id,
-                            status,
-                            is_error,
-                            children,
-                            ..
-                        } = item
-                        {
+                        if let TranscriptItem::Subagent { id, children, .. } = item {
                             if id != tool_call_id {
                                 continue;
                             }
@@ -1969,13 +1964,28 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                                         children[i].detail = children[i].status.clone();
                                     }
                                 }
-                                "finished" => {
-                                    *status = "completed".to_string();
-                                    *is_error = false;
-                                }
-                                "aborted" | "timed_out" => {
-                                    *status = "failed".to_string();
-                                    *is_error = true;
+                                "finished" | "aborted" | "timed_out" => {
+                                    // A child reaching a terminal state changes only its own
+                                    // row. The card's aggregate status is finalized once, on
+                                    // ToolExecutionEnd, so an early failure is not cleared by
+                                    // a sibling finishing later.
+                                    let (row_status, row_detail) = match event_kind {
+                                        "finished" => ("completed", "completed"),
+                                        "aborted" => ("failed", "aborted"),
+                                        _ => ("failed", "timed_out"),
+                                    };
+                                    match children.iter_mut().find(|r| r.child_id == child_id) {
+                                        Some(row) => {
+                                            row.status = row_status.to_string();
+                                            row.detail = row_detail.to_string();
+                                        }
+                                        None => children.push(SubagentChildRow {
+                                            child_id: child_id.to_string(),
+                                            label: "child".to_string(),
+                                            status: row_status.to_string(),
+                                            detail: row_detail.to_string(),
+                                        }),
+                                    }
                                 }
                                 _ => {}
                             }
@@ -2286,17 +2296,18 @@ pub fn render_interactive_frame(
     }
 
     // Prompt dock: a thin two-line frame keeps the input visually anchored.
-    // Re-theme the cloned view so `/theme` applies to autocomplete and paste chips instantly.
+    // Re-theme the cloned view in both branches so `/theme` applies instantly,
+    // including to autocomplete and paste chips, even while a picker is open.
+    let mut themed_editor = editor.clone();
+    themed_editor.theme = theme.clone();
+    if let Some(ac) = themed_editor.autocomplete.as_mut() {
+        ac.theme = theme.clone();
+    }
     if state.selector.is_none() {
-        let mut themed_editor = editor.clone();
-        themed_editor.theme = theme.clone();
-        if let Some(ac) = themed_editor.autocomplete.as_mut() {
-            ac.theme = theme.clone();
-        }
         let dock = BorderedBox::new(Box::new(themed_editor)).with_style(BorderStyle::Rounded);
         bottom_lines.extend(dock.render(width));
     } else {
-        bottom_lines.extend(editor.render(width));
+        bottom_lines.extend(themed_editor.render(width));
     }
 
     // 4. Transcript
@@ -2797,15 +2808,68 @@ async fn drain_agent_signals_async(
     next_running
 }
 
+/// Splits a submitted TUI prompt into arguments. Quotes group text so
+/// `@"path with spaces"` stays one token, and newlines survive the round trip
+/// through `process_file_arguments` (which rejoins args with spaces).
+fn split_prompt_args(text: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut has_token = false;
+    let mut chars = text.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if let Some(q) = quote {
+            if ch == q {
+                quote = None;
+            } else {
+                current.push(ch);
+            }
+            has_token = true;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                has_token = true;
+            }
+            '\n' | '\r' => {
+                if ch == '\r' && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                if has_token {
+                    args.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+                args.push("\n".to_string());
+            }
+            c if c.is_whitespace() => {
+                if has_token {
+                    args.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_token = true;
+            }
+        }
+    }
+    if has_token {
+        args.push(current);
+    }
+    args
+}
+
 /// Expands `@path` tokens in a submitted TUI prompt into file/image blocks.
 fn expand_prompt_with_files(
     cwd: &Path,
     text: &str,
 ) -> anyhow::Result<(String, Vec<UserContentBlock>)> {
-    if !text.split_whitespace().any(|token| token.starts_with('@')) {
+    let args = split_prompt_args(text);
+    if !args.iter().any(|token| token.starts_with('@')) {
         return Ok((text.to_string(), Vec::new()));
     }
-    let args: Vec<String> = text.split_whitespace().map(str::to_string).collect();
     let processed = crate::process_file_arguments(cwd, &args)?;
     Ok((processed.text, processed.blocks))
 }
@@ -3019,10 +3083,10 @@ fn start_turn(
 
 /// Refreshes the slash command autocomplete popup for the current editor text.
 ///
-/// The editor inserts the item label at the cursor, so the label carries only the
-/// suffix that completes the typed prefix. A prefix that already spells a command
-/// exactly leaves the popup closed, so `Enter` submits the command instead of
-/// completing it a second time.
+/// The popup displays the full command in the label while the id carries the text
+/// inserted at the cursor, matching the file-completion path. A prefix that already
+/// spells a command exactly leaves the popup closed, so `Enter` submits the command
+/// instead of completing it a second time.
 fn update_autocomplete_with_cwd(editor: &mut Editor, current_text: &str, cwd: &Path) {
     if current_text.starts_with('/') && !current_text.contains(' ') {
         let commands = builtin_slash_commands();
@@ -4118,6 +4182,56 @@ mod tests {
     }
 
     #[test]
+    fn test_subagent_terminal_events_update_only_the_matching_child_row() {
+        let mut state = make_test_state();
+        let tool_id = "tc_sub_batch".to_string();
+        apply_agent_event(
+            &mut state,
+            &AgentEvent::ToolExecutionStart {
+                tool_call_id: tool_id.clone(),
+                tool_name: "subagent".to_string(),
+                args: serde_json::Map::new(),
+            },
+        );
+
+        let child_update = |id: &str, kind: &str| AgentEvent::ToolExecutionUpdate {
+            tool_call_id: tool_id.clone(),
+            tool_name: "subagent".to_string(),
+            args: serde_json::Map::new(),
+            partial_result: mehh_agent::AgentToolResult {
+                details: Some(serde_json::json!({"subagent": {
+                    "child_id": id, "mode": "coding", "event_kind": kind, "detail": ""
+                }})),
+                ..Default::default()
+            },
+        };
+
+        apply_agent_event(&mut state, &child_update("c1", "started"));
+        apply_agent_event(&mut state, &child_update("c2", "started"));
+        // c2 fails first; the group must stay running until ToolExecutionEnd.
+        apply_agent_event(&mut state, &child_update("c2", "aborted"));
+        // c1 finishing later must not clear c2's failure nor close the group.
+        apply_agent_event(&mut state, &child_update("c1", "finished"));
+
+        match state.items.last().unwrap() {
+            TranscriptItem::Subagent {
+                status,
+                is_error,
+                children,
+                ..
+            } => {
+                assert_eq!(status, "running", "group closes only on ToolExecutionEnd");
+                assert!(!is_error, "group error is final only on ToolExecutionEnd");
+                let c1 = children.iter().find(|r| r.child_id == "c1").unwrap();
+                let c2 = children.iter().find(|r| r.child_id == "c2").unwrap();
+                assert_eq!(c1.status, "completed");
+                assert_eq!(c2.status, "failed");
+            }
+            _ => panic!("expected subagent group"),
+        }
+    }
+
+    #[test]
     fn test_render_interactive_frame() {
         let session = make_test_session();
         let mut state = make_test_state();
@@ -4249,7 +4363,8 @@ mod tests {
         assert_eq!(ac.items[0].id, "/mcp");
         assert_eq!(editor.autocomplete_replace_start, Some(0));
 
-        editor.handle_key("enter");
+        let kb = Keybindings::default_bindings();
+        let _ = editor.handle_editor_key("enter", &kb);
         assert_eq!(editor.text(), "/mcp");
     }
 
@@ -4262,16 +4377,22 @@ mod tests {
             list: SelectList::new(settings_selector_items(&settings), 8),
             settings_list: Some(build_settings_list(&settings)),
         });
+        state.selector.as_mut().unwrap().list.set_filter("the");
         state.selector.as_mut().unwrap().list.selected = 3;
 
         refresh_settings_selector(&mut state, &settings);
 
         let sel = state.selector.as_ref().unwrap();
         assert_eq!(sel.list.selected, 3, "list cursor must stay on the toggled row");
+        assert_eq!(sel.list.filter, "the", "the active filter must survive a toggle");
         assert_eq!(
             sel.settings_list.as_ref().unwrap().selected,
             3,
             "detail pane must follow the same row"
+        );
+        assert_eq!(
+            sel.settings_list.as_ref().unwrap().filter, "the",
+            "detail pane must keep the same filter"
         );
     }
 
@@ -4711,6 +4832,30 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_expand_prompt_with_files_supports_quoted_paths_and_line_breaks() {
+        let dir = temp_dir("mehh_tui_quoted_file_arg");
+        std::fs::write(dir.join("notes with spaces.txt"), "spaced body").unwrap();
+        std::fs::write(dir.join("short.txt"), "short body").unwrap();
+
+        let (text, blocks) =
+            expand_prompt_with_files(&dir, "summarize @\"notes with spaces.txt\"").unwrap();
+        assert!(
+            text.contains("<file name=\"notes with spaces.txt\">"),
+            "quoted paths with spaces must expand as one argument"
+        );
+        assert!(text.contains("spaced body"));
+        assert!(
+            blocks
+                .iter()
+                .any(|b| matches!(b, UserContentBlock::Text(t) if t.text.contains("spaced body"))),
+            "the quoted file must reach the user content blocks"
+        );
+
+        let (text, _) = expand_prompt_with_files(&dir, "first line\nsecond @short.txt").unwrap();
+        assert!(text.contains('\n'), "line breaks must survive expansion");
+    }
+
     #[tokio::test]
     async fn test_follow_up_slash_keeps_full_text() {
         let mut session = make_test_session();
@@ -4785,7 +4930,7 @@ mod tests {
     }
 
     #[test]
-    fn test_update_autocomplete_offers_only_the_missing_suffix() {
+    fn test_update_autocomplete_offers_full_commands() {
         let mut editor = Editor::new();
         editor.set_text("/t");
         update_autocomplete_with_cwd(&mut editor, "/t", Path::new("."));
@@ -4796,12 +4941,12 @@ mod tests {
             .find(|i| i.id == "/theme")
             .expect("/theme offered");
         assert_eq!(
-            theme.label, "heme",
-            "the label must be the suffix, not the command"
+            theme.label, "/theme",
+            "the popup must show the full command, not its suffix"
         );
 
-        // Applying the completion yields the full command exactly once.
-        editor.set_autocomplete(vec![theme.clone()]);
+        // Applying the completion replaces the typed prefix with the full command.
+        editor.set_autocomplete_replacing(vec![theme.clone()], 0);
         let kb = Keybindings::default_bindings();
         let _ = editor.handle_editor_key("enter", &kb);
         assert_eq!(editor.text(), "/theme");

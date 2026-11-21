@@ -3,16 +3,17 @@
 use anyhow::Result;
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 
 use mehh_agent::{AgentEvent, AgentTool};
-use mehh_ai::{Message, StopReason, ThinkingLevel};
+use mehh_ai::{now_ms, Message, StopReason, ThinkingLevel, UserContent, UserMessage};
 
 use crate::agent_session::AgentSession;
 use crate::session::SessionManager;
+use crate::subagent_control::SubagentControl;
 
 /// Serializes and sends JSONL responses and events to the writer.
 struct RpcOutput<W> {
@@ -125,6 +126,90 @@ pub fn format_rpc_event(event: &AgentEvent) -> serde_json::Value {
     }
 }
 
+/// Commands that can be answered without borrowing `AgentSession` mutably.
+/// Returns true when the command was handled; false means it must be queued
+/// until the current prompt finishes.
+async fn handle_concurrent_command<W>(
+    val: &serde_json::Value,
+    output: &RpcOutput<W>,
+    sub_control: &Arc<SubagentControl>,
+    steering_queue: &Arc<StdMutex<VecDeque<Message>>>,
+    follow_queue: &Arc<StdMutex<VecDeque<Message>>>,
+    cancel_slot: &Arc<StdMutex<Option<CancellationToken>>>,
+) -> Result<bool>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let id = val.get("id").and_then(|v| v.as_str());
+    let cmd = match val.get("type").and_then(|v| v.as_str()) {
+        Some(cmd) => cmd,
+        None => return Ok(false),
+    };
+    let text = || {
+        val.get("message")
+            .or_else(|| val.get("text"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
+
+    match cmd {
+        "abort" => {
+            if let Some(tok) = cancel_slot.lock().unwrap().take() {
+                tok.cancel();
+            }
+            output.send_success(id, "abort", None).await?;
+        }
+        "steer" | "follow_up" => {
+            let queue = if cmd == "steer" {
+                steering_queue
+            } else {
+                follow_queue
+            };
+            queue.lock().unwrap().push_back(Message::User(UserMessage {
+                content: UserContent::Text(text().to_string()),
+                timestamp: now_ms(),
+            }));
+            output.send_success(id, cmd, None).await?;
+        }
+        "subagent_list" => {
+            let agents: Vec<serde_json::Value> = sub_control
+                .list()
+                .into_iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "agent_id": s.agent_id,
+                        "mode": s.mode,
+                        "elapsed_ms": s.elapsed_ms,
+                    })
+                })
+                .collect();
+            output
+                .send_success(id, "subagent_list", Some(serde_json::json!({ "agents": agents })))
+                .await?;
+        }
+        "subagent_steer" => {
+            let ok = match (val.get("agent_id").and_then(|v| v.as_str()), text()) {
+                (Some(agent_id), msg) if !msg.trim().is_empty() => sub_control.steer(agent_id, msg),
+                _ => false,
+            };
+            output
+                .send_success(id, "subagent_steer", Some(serde_json::json!({ "ok": ok })))
+                .await?;
+        }
+        "subagent_kill" => {
+            let ok = val
+                .get("agent_id")
+                .and_then(|v| v.as_str())
+                .map_or(false, |agent_id| sub_control.kill(agent_id));
+            output
+                .send_success(id, "subagent_kill", Some(serde_json::json!({ "ok": ok })))
+                .await?;
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
 /// Runs the agent session in RPC mode, reading JSONL commands from `reader` and writing
 /// streamed events and command responses to `writer`.
 pub async fn run_rpc_mode<R, W>(session: &mut AgentSession, mut reader: R, writer: W) -> Result<()>
@@ -192,6 +277,9 @@ where
                 });
 
                 let cancel_slot = session.active_cancel_slot();
+                let sub_control = session.subagent_control();
+                let steering_queue = session.steering_queue();
+                let follow_queue = session.follow_up_queue();
                 let prompt_res = {
                     let prompt_fut = session.prompt(message, Some(on_event));
                     tokio::pin!(prompt_fut);
@@ -213,12 +301,16 @@ where
                                             continue;
                                         }
                                         if let Ok(cval) = serde_json::from_str::<serde_json::Value>(&conc_trimmed) {
-                                            if cval.get("type").and_then(|v| v.as_str()) == Some("abort") {
-                                                let cid = cval.get("id").and_then(|v| v.as_str());
-                                                if let Some(tok) = cancel_slot.lock().unwrap().take() {
-                                                    tok.cancel();
-                                                }
-                                                output.send_success(cid, "abort", None).await?;
+                                            if handle_concurrent_command(
+                                                &cval,
+                                                &output,
+                                                &sub_control,
+                                                &steering_queue,
+                                                &follow_queue,
+                                                &cancel_slot,
+                                            )
+                                            .await?
+                                            {
                                                 continue;
                                             }
                                         }
@@ -728,9 +820,65 @@ mod tests {
     use uuid::Uuid;
 
     use mehh_ai::{
-        now_ms, AssistantContentBlock, AssistantMessage, FauxProvider, Model, ModelCost,
-        StopReason, TextContent, Usage,
+        create_event_stream, now_ms, AssistantContentBlock, AssistantEventStream,
+        AssistantMessage, AssistantMessageEvent, Context, FauxProvider, LlmProvider, Model,
+        ModelCost, StopReason, StreamOptions, TextContent, Usage,
     };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Model provider that blocks until the test releases it, so commands can
+    /// be sent while a prompt is demonstrably still in flight.
+    struct GatedProvider {
+        started: tokio::sync::watch::Sender<bool>,
+        release: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for GatedProvider {
+        fn stream(
+            &self,
+            model: &Model,
+            _context: &Context,
+            _options: &StreamOptions,
+            cancel: CancellationToken,
+        ) -> AssistantEventStream {
+            let (sender, stream) = create_event_stream();
+            let started = self.started.clone();
+            let release = self.release.clone();
+            let model = model.clone();
+            tokio::spawn(async move {
+                let _ = started.send(true);
+                while !release.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                    if cancel.is_cancelled() {
+                        return;
+                    }
+                }
+                let msg = AssistantMessage {
+                    content: vec![AssistantContentBlock::Text(TextContent {
+                        text: "done".into(),
+                        text_signature: None,
+                    })],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: now_ms(),
+                };
+                sender.push(AssistantMessageEvent::Start {
+                    partial: msg.clone(),
+                });
+                sender.push(AssistantMessageEvent::Done {
+                    reason: StopReason::Stop,
+                    message: msg,
+                });
+            });
+            stream
+        }
+    }
 
     use crate::session::SessionManager;
     use crate::settings::Settings;
@@ -902,6 +1050,73 @@ mod tests {
         let res = rpc_handle.await.unwrap();
         assert!(res.is_ok());
 
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn subagent_list_responds_while_prompt_is_still_running() {
+        let temp_dir = std::env::temp_dir().join(format!("mehh_rpc_busy_{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let (started_tx, mut started_rx) = tokio::sync::watch::channel(false);
+        let release = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(GatedProvider {
+            started: started_tx,
+            release: release.clone(),
+        });
+        let session_mgr = SessionManager::in_memory(temp_dir.clone());
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            make_test_model(),
+            provider,
+            session_mgr,
+            Settings::default(),
+        );
+
+        let (client_write, server_read) = tokio::io::duplex(8192);
+        let (server_write, client_read) = tokio::io::duplex(8192);
+        let mut client_writer = client_write;
+        let mut client_reader = BufReader::new(client_read);
+        let rpc_handle = tokio::spawn(async move {
+            run_rpc_mode(&mut session, BufReader::new(server_read), server_write).await
+        });
+
+        client_writer
+            .write_all(b"{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"slow\"}\n")
+            .await
+            .unwrap();
+        client_writer.flush().await.unwrap();
+        while !*started_rx.borrow() {
+            started_rx.changed().await.unwrap();
+        }
+
+        client_writer
+            .write_all(b"{\"id\":\"q1\",\"type\":\"subagent_list\"}\n")
+            .await
+            .unwrap();
+        client_writer.flush().await.unwrap();
+
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let mut line = String::new();
+                if client_reader.read_line(&mut line).await.unwrap() == 0 {
+                    return None;
+                }
+                let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if value["id"] == "q1" {
+                    return Some(value);
+                }
+            }
+        })
+        .await
+        .expect("subagent_list must be answered while the prompt is in flight")
+        .expect("RPC stream closed unexpectedly");
+        assert_eq!(answered["command"], "subagent_list");
+        assert_eq!(answered["success"], true);
+
+        release.store(true, Ordering::SeqCst);
+        drop(client_writer);
+        let _ = rpc_handle.await;
         let _ = std::fs::remove_dir_all(temp_dir);
     }
 

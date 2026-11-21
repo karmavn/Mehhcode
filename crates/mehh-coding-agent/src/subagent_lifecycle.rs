@@ -119,6 +119,21 @@ pub fn new_manifest(
     }
 }
 
+/// True when `word` appears as a whole word, not as part of a longer word.
+fn contains_word(text: &str, word: &str) -> bool {
+    text.match_indices(word).any(|(idx, _)| {
+        let before_ok = text[..idx]
+            .chars()
+            .next_back()
+            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+        let after_ok = text[idx + word.len()..]
+            .chars()
+            .next()
+            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+        before_ok && after_ok
+    })
+}
+
 /// Maps an error string to a coarse failure class.
 pub fn classify_failure(error: &str) -> SubagentFailureClass {
     let lower = error.to_lowercase();
@@ -128,7 +143,7 @@ pub fn classify_failure(error: &str) -> SubagentFailureClass {
         SubagentFailureClass::Aborted
     } else if lower.contains("compile") || lower.contains("build failed") {
         SubagentFailureClass::Compile
-    } else if lower.contains("test") {
+    } else if contains_word(&lower, "test") {
         SubagentFailureClass::Test
     } else if lower.contains("tool runtime") || lower.contains("tool failed") {
         SubagentFailureClass::ToolRuntime
@@ -215,6 +230,20 @@ mod tests {
             SubagentFailureClass::Timeout
         );
         assert_eq!(classify_failure("no idea"), SubagentFailureClass::Infra);
+    }
+
+    #[test]
+    fn classify_failure_does_not_match_test_inside_unrelated_words() {
+        // `contains("test")` also matched "latest", "fastest", "contest",
+        // "attest", so unrelated infrastructure errors were labeled as Test.
+        for error in ["latest artifact", "fastest route", "contest entry", "attest record"] {
+            assert_eq!(
+                classify_failure(error),
+                SubagentFailureClass::Infra,
+                "unexpected class for {error}"
+            );
+        }
+        assert_eq!(classify_failure("test failed"), SubagentFailureClass::Test);
     }
 
     #[test]

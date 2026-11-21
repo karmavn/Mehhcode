@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -56,6 +56,19 @@ impl Drop for CancelOnDrop {
     }
 }
 
+/// Removes a child from the registry on every exit path, including a dropped
+/// future that never reaches its explicit unregister call.
+struct RegistrationGuard {
+    control: Arc<SubagentControl>,
+    agent_id: String,
+}
+
+impl Drop for RegistrationGuard {
+    fn drop(&mut self) {
+        self.control.unregister(&self.agent_id);
+    }
+}
+
 /// Instruction injected when the turn budget ends without a concluding text answer.
 const FINALIZE_PROMPT: &str = "Your turn budget is exhausted and you must not call any more tools. Based only on the evidence already gathered above, write the final answer now: a concise summary of findings or changes, with exact file paths. If nothing was completed, state what was attempted and what remains.";
 
@@ -101,6 +114,54 @@ impl ChildOutcome {
 
     fn result_text(&self) -> String {
         format!("{}\n\n{}", self.summary, self.status_line())
+    }
+}
+
+/// Typed failure of one child run. Keeping the cause in the variant (instead
+/// of matching substrings later) prevents a child tool's "timed out" message
+/// from being recorded as the subagent's own deadline expiry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChildRunError {
+    TimedOut,
+    Aborted,
+    ModelError(String),
+    ToolFailure(String),
+    Panic(String),
+    ManifestWrite(String),
+    NoResponse,
+}
+
+impl ChildRunError {
+    fn failure_class(&self) -> SubagentFailureClass {
+        match self {
+            Self::TimedOut => SubagentFailureClass::Timeout,
+            Self::Aborted => SubagentFailureClass::Aborted,
+            Self::ToolFailure(_) => SubagentFailureClass::ToolRuntime,
+            Self::Panic(_) | Self::ManifestWrite(_) => SubagentFailureClass::Infra,
+            Self::ModelError(msg) => classify_failure(msg),
+            Self::NoResponse => SubagentFailureClass::Infra,
+        }
+    }
+
+    fn terminal_kind(&self) -> SubagentEventKind {
+        match self {
+            Self::TimedOut => SubagentEventKind::TimedOut,
+            _ => SubagentEventKind::Aborted,
+        }
+    }
+}
+
+impl std::fmt::Display for ChildRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TimedOut => write!(f, "Subagent timed out"),
+            Self::Aborted => write!(f, "Subagent execution was aborted"),
+            Self::ModelError(msg)
+            | Self::ToolFailure(msg)
+            | Self::Panic(msg)
+            | Self::ManifestWrite(msg) => write!(f, "{msg}"),
+            Self::NoResponse => write!(f, "Subagent produced no assistant response"),
+        }
     }
 }
 
@@ -290,6 +351,9 @@ pub struct SubagentTool {
     pub scratchpad: Option<Scratchpad>,
     /// Default wall-clock budget for one child run (loop + cleanup grace).
     pub timeout: Duration,
+    /// Credential cache shared by every child in one call tree, so a batch
+    /// performs one credential-file read / OAuth refresh instead of one per child.
+    pub api_key_cache: Arc<Mutex<HashMap<String, Option<String>>>>,
 }
 
 impl SubagentTool {
@@ -314,6 +378,7 @@ impl SubagentTool {
             lead_worker: None,
             scratchpad: None,
             timeout: Duration::from_secs(SUBAGENT_TIMEOUT_SECS),
+            api_key_cache: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -353,6 +418,27 @@ impl SubagentTool {
         self.control
             .clone()
             .unwrap_or_else(|| Arc::clone(global_control()))
+    }
+
+    /// Resolves one provider credential per call tree. Batch children share
+    /// the cache, so a fan-out performs one credential read / OAuth refresh
+    /// instead of one per child. Failures stay uncached so the retry behavior
+    /// of the original per-child path is preserved.
+    async fn resolved_api_key(&self, provider: &str) -> Option<String> {
+        if let Some(cached) = self.api_key_cache.lock().unwrap_or_else(PoisonError::into_inner).get(provider) {
+            return cached.clone();
+        }
+        let key = crate::auth::resolve_api_key_async(provider, None, None)
+            .await
+            .ok()
+            .flatten();
+        if key.is_some() {
+            self.api_key_cache
+                .lock()
+                .unwrap()
+                .insert(provider.to_string(), key.clone());
+        }
+        key
     }
 
     /// Parameter schema defining modes and parallel batch tasks.
@@ -455,6 +541,7 @@ impl SubagentTool {
                     lead_worker: self.lead_worker.clone(),
                     scratchpad: self.scratchpad.clone(),
                     timeout: self.timeout,
+                    api_key_cache: self.api_key_cache.clone(),
                 }) as Arc<dyn AgentTool>)
             })
             .collect()
@@ -498,9 +585,10 @@ impl SubagentTool {
         cwd: &Path,
         manifest: &mut SubagentManifest,
         events: &Mutex<Vec<SubagentEvent>>,
-        outcome: Result<String, String>,
+        outcome: Result<String, ChildRunError>,
         cancel: &CancellationToken,
         on_update: Option<AgentToolUpdateCallback>,
+        prefix: &str,
     ) -> Result<String, String> {
         let (status, failure_class, error, result, terminal_kind, terminal_detail) = match &outcome
         {
@@ -516,25 +604,22 @@ impl SubagentTool {
                 let cancelled = cancel.is_cancelled();
                 let failure_class = if cancelled {
                     SubagentFailureClass::Aborted
-                } else if e.contains("timed out") {
-                    SubagentFailureClass::Timeout
-                } else if e.contains("aborted") || e.contains("panicked") {
-                    SubagentFailureClass::Aborted
                 } else {
-                    classify_failure(e)
+                    e.failure_class()
                 };
-                let terminal_kind = if failure_class == SubagentFailureClass::Timeout {
-                    SubagentEventKind::TimedOut
-                } else {
+                let terminal_kind = if cancelled {
                     SubagentEventKind::Aborted
+                } else {
+                    e.terminal_kind()
                 };
+                let detail = e.to_string();
                 (
                     SubagentStatus::Failed,
                     Some(failure_class),
-                    Some(e.clone()),
+                    Some(detail.clone()),
                     None,
                     terminal_kind,
-                    Some(e.clone()),
+                    Some(detail),
                 )
             }
         };
@@ -552,22 +637,26 @@ impl SubagentTool {
             at_ms: now_ms(),
             detail: terminal_detail,
         };
-        events.lock().unwrap().push(terminal_event.clone());
-        manifest.events = events.lock().unwrap().clone();
+        {
+            let mut event_log = events.lock().unwrap_or_else(PoisonError::into_inner);
+            event_log.push(terminal_event.clone());
+            manifest.events = event_log.clone();
+        }
 
         if let Some(ref cb) = on_update {
-            cb(Self::subagent_update(
+            cb(prefixed_update(
                 &manifest.agent_id,
                 &manifest.mode,
                 &terminal_event,
+                prefix,
             ));
         }
 
         // Never discard the run's own outcome: a write failure is appended to
         // it so the caller sees both the real result and the persistence gap.
         match write_manifest(&agent_store_dir(cwd), manifest) {
-            Ok(_) => outcome,
-            Err(write_err) => Err(match outcome {
+            Ok(_) => outcome.map_err(|e| e.to_string()),
+            Err(write_err) => Err(match &outcome {
                 Ok(_) => format!("subagent run completed but manifest write failed: {write_err}"),
                 Err(original) => format!("{original}; manifest write failed: {write_err}"),
             }),
@@ -581,7 +670,7 @@ impl SubagentTool {
         on_update: Option<AgentToolUpdateCallback>,
         manifest: &mut SubagentManifest,
         events: Arc<Mutex<Vec<SubagentEvent>>>,
-    ) -> Result<ChildOutcome, String> {
+    ) -> Result<ChildOutcome, ChildRunError> {
         let ChildRunParams {
             prompt: task_prompt,
             mode,
@@ -652,7 +741,7 @@ impl SubagentTool {
                         at_ms: now_ms(),
                         detail: Some(tool_name),
                     };
-                    events.lock().unwrap().push(ev.clone());
+                    events.lock().unwrap_or_else(PoisonError::into_inner).push(ev.clone());
                     if let Some(ref cb) = on_update {
                         cb(prefixed_update(&agent_id, &mode_str, &ev, &prefix));
                     }
@@ -664,7 +753,7 @@ impl SubagentTool {
                         at_ms: now_ms(),
                         detail: Some(status.to_string()),
                     };
-                    events.lock().unwrap().push(ev.clone());
+                    events.lock().unwrap_or_else(PoisonError::into_inner).push(ev.clone());
                     if let Some(ref cb) = on_update {
                         cb(prefixed_update(&agent_id, &mode_str, &ev, &prefix));
                     }
@@ -682,7 +771,7 @@ impl SubagentTool {
         // coding = template lead_turns; model_tier overrides the mode default.
         let lead_worker: Option<Arc<Mutex<LeadWorkerManager>>> =
             self.lead_worker.as_ref().map(|template| {
-                let mut m = template.lock().unwrap().clone();
+                let mut m = template.lock().unwrap_or_else(PoisonError::into_inner).clone();
                 m.reset_for_new_prompt();
                 match model_tier {
                     Some("lead") => {
@@ -704,7 +793,7 @@ impl SubagentTool {
                 Arc::new(Mutex::new(m))
             });
         if let Some(ref lw) = lead_worker {
-            let m = lw.lock().unwrap();
+            let m = lw.lock().unwrap_or_else(PoisonError::into_inner);
             base_config.model = m.active_model();
             base_config.provider = m.active_provider();
             let active_key = m.active_api_key();
@@ -716,7 +805,7 @@ impl SubagentTool {
             base_config.after_tool_call = Some(Arc::new(move |after_ctx, _cancel| {
                 let lw = lw.clone();
                 Box::pin(async move {
-                    lw.lock().unwrap().record_tool_outcome(after_ctx.is_error);
+                    lw.lock().unwrap_or_else(PoisonError::into_inner).record_tool_outcome(after_ctx.is_error);
                     mehh_agent::AfterToolCallResult::default()
                 })
             }));
@@ -760,9 +849,7 @@ impl SubagentTool {
             if let Some(ref key) = self.api_key {
                 base_config.stream_options.api_key = Some(key.clone());
             } else if self.model.provider != "faux" && self.model.api != "faux" {
-                if let Ok(Some(key)) =
-                    crate::auth::resolve_api_key_async(&self.model.provider, None, None).await
-                {
+                if let Some(key) = self.resolved_api_key(&self.model.provider).await {
                     base_config.stream_options.api_key = Some(key);
                 }
             }
@@ -770,9 +857,7 @@ impl SubagentTool {
             && base_config.model.provider != "faux"
             && base_config.model.api != "faux"
         {
-            if let Ok(Some(key)) =
-                crate::auth::resolve_api_key_async(&base_config.model.provider, None, None).await
-            {
+            if let Some(key) = self.resolved_api_key(&base_config.model.provider).await {
                 base_config.stream_options.api_key = Some(key);
             }
         }
@@ -787,7 +872,7 @@ impl SubagentTool {
             timestamp: now_ms(),
         });
 
-        let outcome: Result<ChildOutcome, String> = async {
+        let outcome: Result<ChildOutcome, ChildRunError> = async {
             let child_cancel = cancel.child_token();
             let _cancel_guard = CancelOnDrop(child_cancel.clone());
             base_config.cancel = child_cancel.clone();
@@ -802,7 +887,7 @@ impl SubagentTool {
             loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(format!("Subagent timed out after {timeout:?}"));
+                    return Err(ChildRunError::TimedOut);
                 }
                 let attempt_budget = max_turns.saturating_sub(turns_used).max(1);
                 let mut config = base_config.clone();
@@ -826,31 +911,62 @@ impl SubagentTool {
                                 })]);
                             }
                             if let Some(ref lw) = lw_hook {
-                                let mut m = lw.lock().unwrap();
-                                let is_empty_assistant = turn_ctx.assistant_message.content.is_empty();
-                                let repetition_detected = turn_ctx.tool_results.iter().any(|tr| {
-                                    tr.is_error
-                                        && tr.content.iter().any(|b| match b {
-                                            mehh_ai::ToolResultContentBlock::Text(t) => {
-                                                t.text.contains("Repeated identical tool call")
-                                            }
-                                            _ => false,
-                                        })
-                                });
-                                m.record_turn_outcome(
-                                    turn_ctx.assistant_message.stop_reason,
-                                    is_empty_assistant || repetition_detected,
-                                );
-                                if m.is_active() {
-                                    let next_model = m.active_model();
-                                    if next_model.id != turn_ctx.assistant_message.model
-                                        || next_model.provider != turn_ctx.assistant_message.provider
-                                    {
-                                        let next_key = m.active_api_key();
-                                        update.model = Some(next_model);
-                                        update.provider = Some(m.active_provider());
-                                        update.api_key=Some(next_key);
+                                let switch: Option<
+                                    (mehh_ai::Model, Arc<dyn LlmProvider>, Option<String>),
+                                > = {
+                                    // The guard ends with this block so the
+                                    // future stays `Send` across the credential
+                                    // await below.
+                                    let mut m = lw.lock().unwrap_or_else(PoisonError::into_inner);
+                                    let is_empty_assistant =
+                                        turn_ctx.assistant_message.content.is_empty();
+                                    let repetition_detected =
+                                        turn_ctx.tool_results.iter().any(|tr| {
+                                            tr.is_error
+                                                && tr.content.iter().any(|b| match b {
+                                                    mehh_ai::ToolResultContentBlock::Text(t) => {
+                                                        t.text.contains("Repeated identical tool call")
+                                                    }
+                                                    _ => false,
+                                                })
+                                        });
+                                    m.record_turn_outcome(
+                                        turn_ctx.assistant_message.stop_reason,
+                                        is_empty_assistant || repetition_detected,
+                                    );
+                                    if m.is_active() {
+                                        let next_model = m.active_model();
+                                        if next_model.id != turn_ctx.assistant_message.model
+                                            || next_model.provider
+                                                != turn_ctx.assistant_message.provider
+                                        {
+                                            Some((
+                                                next_model,
+                                                m.active_provider(),
+                                                m.active_api_key(),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
                                     }
+                                };
+                                if let Some((next_model, next_provider, active_key)) = switch {
+                                    let next_key = match active_key {
+                                        Some(key) => Some(key),
+                                        None => crate::auth::resolve_api_key_async(
+                                            &next_model.provider,
+                                            None,
+                                            None,
+                                        )
+                                        .await
+                                        .ok()
+                                        .flatten(),
+                                    };
+                                    update.model = Some(next_model);
+                                    update.provider = Some(next_provider);
+                                    update.api_key = Some(next_key);
                                 }
                             }
                             if update.messages.is_some() || update.model.is_some() {
@@ -874,12 +990,12 @@ impl SubagentTool {
                         // drop after the grace period if the loop fails to unwind.
                         child_cancel.cancel();
                         let _ = tokio::time::timeout(SUBAGENT_CANCEL_GRACE, &mut loop_fut).await;
-                        return Err(format!("Subagent timed out after {timeout:?}"));
+                        return Err(ChildRunError::TimedOut);
                     }
                     _ = cancel.cancelled() => {
                         child_cancel.cancel();
                         let _ = tokio::time::timeout(SUBAGENT_KILL_GRACE, &mut loop_fut).await;
-                        return Err("Subagent execution was aborted".to_string());
+                        return Err(ChildRunError::Aborted);
                     }
                 };
 
@@ -901,13 +1017,32 @@ impl SubagentTool {
                         // for a bounded window, continuing from the same evidence.
                         let mut rescued = false;
                         if let Some(ref lw) = lead_worker {
-                            let mut m = lw.lock().unwrap();
-                            m.record_turn_outcome(StopReason::Error, false);
-                            if m.lead_rescue_remaining > 0 && turns_used < max_turns {
-                                let rescue_key = m.active_api_key();
-                                base_config.model = m.active_model();
-                                base_config.provider = m.active_provider();
-                                base_config.stream_options.api_key=rescue_key;
+                            let rescue_target = {
+                                let mut m = lw.lock().unwrap_or_else(PoisonError::into_inner);
+                                // Capture the role of the turn that actually failed BEFORE
+                                // recording its outcome: a failing Lead turn is not a Worker
+                                // escalation and must never hand the run back to itself.
+                                let was_worker = m.should_use_worker();
+                                m.record_turn_outcome(StopReason::Error, false);
+                                if was_worker
+                                    && (m.lead_rescue_remaining > 0 || m.locked_to_lead)
+                                    && turns_used < max_turns
+                                {
+                                    Some((m.active_model(), m.active_provider(), m.active_api_key()))
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some((next_model, next_provider, active_key)) = rescue_target {
+                                // A different provider may have no key on the manager
+                                // (auth.json/OAuth only); resolve it before using it.
+                                let rescue_key = match active_key {
+                                    Some(key) => Some(key),
+                                    None => self.resolved_api_key(&next_model.provider).await,
+                                };
+                                base_config.model = next_model;
+                                base_config.provider = next_provider;
+                                base_config.stream_options.api_key = rescue_key;
                                 rescued = true;
                             }
                         }
@@ -919,13 +1054,14 @@ impl SubagentTool {
                             })];
                             continue;
                         }
-                        return Err(a
-                            .error_message
-                            .clone()
-                            .unwrap_or_else(|| "Subagent model call failed".to_string()));
+                        return Err(ChildRunError::ModelError(
+                            a.error_message
+                                .clone()
+                                .unwrap_or_else(|| "Subagent model call failed".to_string()),
+                        ));
                     }
                     Some(a) if a.stop_reason == StopReason::Aborted => {
-                        return Err("Subagent execution was aborted".to_string());
+                        return Err(ChildRunError::Aborted);
                     }
                     _ => break,
                 }
@@ -952,7 +1088,8 @@ impl SubagentTool {
                     }
                     // Force-finalize: the budget ended on a tool-call-only message.
                     // One extra LLM call with no tools must produce a usable summary.
-                    let mut fin_messages = all_messages.clone();
+                    // The history is consumed here; nothing after this point needs it.
+                    let mut fin_messages = all_messages;
                     fin_messages.push(Message::User(UserMessage {
                         content: UserContent::Text(FINALIZE_PROMPT.to_string()),
                         timestamp: now_ms(),
@@ -992,7 +1129,7 @@ impl SubagentTool {
                         files_touched,
                     })
                 }
-                None => Err("Subagent produced no assistant response".to_string()),
+                None => Err(ChildRunError::NoResponse),
             }
         }
         .await;
@@ -1008,7 +1145,9 @@ impl SubagentTool {
             text_outcome,
             &cancel,
             on_update,
-        )?;
+            &task_prefix,
+        )
+        .map_err(ChildRunError::ManifestWrite)?;
         outcome
     }
 }
@@ -1074,6 +1213,10 @@ impl AgentTool for SubagentTool {
 
             if !task_prompts.is_empty() {
                 let control = self.control();
+                // Detached batch tasks must die with the caller's future, not
+                // keep running after the tool call has been cancelled or dropped.
+                let batch_cancel = cancel.child_token();
+                let _batch_cancel_guard = CancelOnDrop(batch_cancel.clone());
                 // Coding tasks share one working tree: run them one at a time
                 // to avoid file/build-lock conflicts. Read-only modes fan out.
                 let local_permits = if mode == "coding" { 1 } else { 4 };
@@ -1091,7 +1234,7 @@ impl AgentTool for SubagentTool {
 
                 for (idx, task_p) in task_prompts.iter().enumerate() {
                     let task_p = task_p.clone();
-                    let cancel_token = cancel.clone();
+                    let cancel_token = batch_cancel.clone();
                     let on_update_child = on_update.clone();
                     let mode_str = mode.to_string();
                     let custom_sys_owned = custom_sys.map(str::to_string);
@@ -1109,6 +1252,7 @@ impl AgentTool for SubagentTool {
                         lead_worker: self.lead_worker.clone(),
                         scratchpad: Some(batch_pad.clone()),
                         timeout: self.timeout,
+                        api_key_cache: self.api_key_cache.clone(),
                     };
                     let task_agent_id = new_agent_id();
                     task_ids.push(task_agent_id.clone());
@@ -1129,13 +1273,25 @@ impl AgentTool for SubagentTool {
                     let task_control = control.clone();
                     let batch_sem = batch_semaphore.clone();
                     handles.push(tokio::spawn(async move {
-                        let _local_permit = batch_sem.acquire().await.map_err(|e| e.to_string())?;
-                        let _permit = task_control.acquire().await;
+                        let _local_permit = tokio::select! {
+                            _ = cancel_token.cancelled() => return Err(ChildRunError::Aborted),
+                            permit = batch_sem.acquire() => {
+                                permit.map_err(|e| ChildRunError::ToolFailure(e.to_string()))?
+                            }
+                        };
+                        let _permit = tokio::select! {
+                            _ = cancel_token.cancelled() => return Err(ChildRunError::Aborted),
+                            permit = task_control.acquire() => permit,
+                        };
                         let handle = task_control.register(
-                            task_agent_id,
+                            task_agent_id.clone(),
                             mode_str.clone(),
                             cancel_token.child_token(),
                         );
+                        let _registration = RegistrationGuard {
+                            control: task_control.clone(),
+                            agent_id: task_agent_id,
+                        };
                         if let Some(ref cb) = on_update_child {
                             cb(AgentToolResult::text(format!(
                                 "[subagent:#{}:{mode_str}] Starting task",
@@ -1160,7 +1316,6 @@ impl AgentTool for SubagentTool {
                                 task_events,
                             )
                             .await;
-                        task_control.unregister(&handle.agent_id);
                         res
                     }));
                 }
@@ -1183,7 +1338,7 @@ impl AgentTool for SubagentTool {
                         Ok(Err(e)) => {
                             child_statuses[idx] = SubagentStatus::Failed;
                             report.push_str(&format!("Error: {}", e));
-                            task_meta.push(json!({"task": idx + 1, "status": "error", "error": e}));
+                            task_meta.push(json!({"task": idx + 1, "status": "error", "error": e.to_string()}));
                             any_failed = true;
                             all_completed = false;
                         }
@@ -1201,9 +1356,10 @@ impl AgentTool for SubagentTool {
                                 &self.cwd,
                                 &mut child_manifest,
                                 &shared_events,
-                                Err(format!("subagent task panicked: {join_err}")),
+                                Err(ChildRunError::Panic(join_err.to_string())),
                                 &cancel,
                                 None,
+                                &format!("#{}:", idx + 1),
                             ) {
                                 report.push_str(&format!("Error: {}", e));
                             }
@@ -1285,11 +1441,19 @@ impl AgentTool for SubagentTool {
             lead_worker: self.lead_worker.clone(),
             scratchpad: self.scratchpad.clone(),
             timeout: self.timeout,
+            api_key_cache: self.api_key_cache.clone(),
         };
 
         let control = self.control();
-        let _permit = control.acquire().await;
+        let _permit = tokio::select! {
+            _ = cancel.cancelled() => return Err("Subagent execution was aborted".to_string()),
+            permit = control.acquire() => permit,
+        };
         let handle = control.register(new_agent_id(), mode.to_string(), cancel.child_token());
+        let _registration = RegistrationGuard {
+            control: control.clone(),
+            agent_id: handle.agent_id.clone(),
+        };
         let mut manifest = new_manifest(
             handle.agent_id.clone(),
             mode.to_string(),
@@ -1317,7 +1481,6 @@ impl AgentTool for SubagentTool {
                 events,
             )
             .await;
-        control.unregister(&handle.agent_id);
 
         let path = agent_store_dir(&self.cwd).join(format!("{}.json", manifest.agent_id));
         let details = json!({
@@ -1342,7 +1505,7 @@ impl AgentTool for SubagentTool {
                 Some(o.metadata_json()),
                 Some(o.usage.clone()),
             ),
-            Err(err) => (err, true, None, None),
+            Err(err) => (err.to_string(), true, None, None),
         };
         let mut result = AgentToolResult::text(result_text);
         if is_error {
@@ -1359,6 +1522,28 @@ impl AgentTool for SubagentTool {
 mod tests {
     use super::*;
     use mehh_ai::{faux_assistant_message, faux_model, FauxProvider};
+
+    #[tokio::test]
+    async fn resolved_api_key_reuses_cached_credential() {
+        let cwd = std::env::temp_dir();
+        let sub = SubagentTool::new(
+            cwd,
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            None,
+            Vec::new(),
+            0,
+        );
+        sub.api_key_cache
+            .lock()
+            .unwrap()
+            .insert("anthropic".to_string(), Some("cached-key".to_string()));
+        assert_eq!(
+            sub.resolved_api_key("anthropic").await.as_deref(),
+            Some("cached-key"),
+            "a batch sibling must reuse the resolved credential instead of reading it again"
+        );
+    }
 
     #[tokio::test]
     async fn test_nested_subagent_tool_is_rebuilt_at_child_depth() {
@@ -1419,6 +1604,311 @@ mod tests {
         assert!(corrected_deep.iter().all(|t| t.name() != "subagent"));
     }
 
+    #[tokio::test]
+    async fn lead_failure_during_rescue_does_not_trigger_another_rescue() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let faux = Arc::new(FauxProvider::new());
+        for _ in 0..8 {
+            let counter = calls.clone();
+            faux.add_handler(
+                move |model: &mehh_ai::Model,
+                      _context: &mehh_ai::Context,
+                      _options: &mehh_ai::StreamOptions| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut msg = faux_assistant_message(&format!("failed on {}", model.id));
+                    msg.stop_reason = StopReason::Error;
+                    msg.error_message = Some(format!("simulated {} failure", model.id));
+                    msg
+                },
+            );
+        }
+
+        let mut mgr = LeadWorkerManager::new_for_test("lead-model", "worker-model", 0);
+        // Lead/Worker routing replaces the tool's provider, so both roles must
+        // point at the faux provider that records the calls.
+        mgr.lead_provider = faux.clone();
+        mgr.worker_provider = Some(faux.clone());
+        let cwd = std::env::temp_dir();
+        let sub = SubagentTool::new(
+            cwd.clone(),
+            faux_model(),
+            faux,
+            None,
+            mehh_tools::create_coding_tools(cwd),
+            0,
+        )
+        .with_lead_worker(Arc::new(Mutex::new(mgr)));
+
+        let mut params = Map::new();
+        params.insert("prompt".into(), Value::String("do work".into()));
+        params.insert("mode".into(), Value::String("coding".into()));
+        params.insert("max_turns".into(), Value::from(6));
+        let result = sub
+            .execute("tc_rescue", params, CancellationToken::new(), None)
+            .await
+            .expect("the tool reports failures through AgentToolResult.is_error");
+        assert_eq!(result.is_error, Some(true), "the run must fail");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "one Worker failure plus one Lead rescue only; got {:?}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn rescue_resolves_the_lead_key_when_providers_differ() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let lead_keys: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let faux = Arc::new(FauxProvider::new());
+        for _ in 0..4 {
+            let calls = calls.clone();
+            let lead_keys = lead_keys.clone();
+            faux.add_handler(
+                move |model: &mehh_ai::Model,
+                      _context: &mehh_ai::Context,
+                      options: &mehh_ai::StreamOptions| {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    if model.id == "lead-model" {
+                        lead_keys.lock().unwrap_or_else(PoisonError::into_inner).push(options.api_key.clone());
+                        faux_assistant_message("lead recovered")
+                    } else {
+                        let mut msg = faux_assistant_message(&format!("worker failed {n}"));
+                        msg.stop_reason = StopReason::Error;
+                        msg.error_message = Some("simulated worker failure".into());
+                        msg
+                    }
+                },
+            );
+        }
+
+        let mut mgr = LeadWorkerManager::new_for_test("lead-model", "worker-model", 0);
+        mgr.lead_model.provider = "lead-provider".into();
+        mgr.worker_model.as_mut().unwrap().provider = "worker-provider".into();
+        mgr.lead_provider = faux.clone();
+        mgr.worker_provider = Some(faux.clone());
+        // The Lead credential lives only in the shared cache, not on the manager.
+        assert_eq!(mgr.lead_api_key, None);
+
+        let cwd = std::env::temp_dir();
+        let sub = SubagentTool::new(
+            cwd.clone(),
+            faux_model(),
+            faux,
+            None,
+            mehh_tools::create_coding_tools(cwd),
+            0,
+        )
+        .with_lead_worker(Arc::new(Mutex::new(mgr)));
+        sub.api_key_cache.lock().unwrap_or_else(PoisonError::into_inner).insert(
+            "lead-provider".to_string(),
+            Some("lead-cached-key".to_string()),
+        );
+
+        let mut params = Map::new();
+        params.insert("prompt".into(), Value::String("do work".into()));
+        params.insert("mode".into(), Value::String("coding".into()));
+        let result = sub
+            .execute("tc_key", params, CancellationToken::new(), None)
+            .await
+            .expect("the Lead rescue must complete");
+
+        assert_ne!(result.is_error, Some(true), "the Lead rescue must succeed");
+        assert_eq!(
+            lead_keys.lock().unwrap_or_else(PoisonError::into_inner).as_slice(),
+            &[Some("lead-cached-key".to_string())],
+            "switching to the Lead provider must resolve its cached credential"
+        );
+    }
+
+    #[derive(Default)]
+    struct PendingProvider {
+        senders: std::sync::Mutex<Vec<mehh_ai::AssistantEventSender>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for PendingProvider {
+        fn stream(
+            &self,
+            _model: &mehh_ai::Model,
+            _context: &mehh_ai::Context,
+            _options: &mehh_ai::StreamOptions,
+            _cancel: CancellationToken,
+        ) -> mehh_ai::AssistantEventStream {
+            let (sender, stream) = mehh_ai::create_event_stream();
+            self.senders.lock().unwrap().push(sender);
+            stream
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_run_does_not_wait_for_a_concurrency_permit() {
+        let control = Arc::new(SubagentControl::new(0));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let cwd = std::env::temp_dir();
+        let sub = SubagentTool::new(
+            cwd.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            None,
+            mehh_tools::create_coding_tools(cwd),
+            0,
+        )
+        .with_control(control);
+        let mut params = Map::new();
+        params.insert("prompt".into(), Value::String("never start".into()));
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            sub.execute("tc_cancel", params, cancel, None),
+        )
+        .await
+        .expect("a cancelled run must not block waiting for a permit");
+        assert!(result.is_err(), "the cancelled run must fail fast: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_run_unregisters_its_child() {
+        let control = Arc::new(SubagentControl::new(2));
+        let cwd = std::env::temp_dir();
+        let sub = SubagentTool::new(
+            cwd.clone(),
+            faux_model(),
+            Arc::new(PendingProvider::default()),
+            None,
+            mehh_tools::create_coding_tools(cwd),
+            0,
+        )
+        .with_control(control.clone());
+        let mut params = Map::new();
+        params.insert("prompt".into(), Value::String("never finish".into()));
+
+        let task = tokio::spawn(async move {
+            sub.execute("tc_drop", params, CancellationToken::new(), None)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while control.list().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the child must be registered while its run is in flight");
+        assert_eq!(control.list().len(), 1);
+
+        task.abort();
+        let _ = task.await;
+        assert!(
+            control.list().is_empty(),
+            "a dropped execute() future must not leak a child handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_cache_stays_usable_after_a_poisoned_lock() {
+        let cwd = std::env::temp_dir();
+        let sub = SubagentTool::new(
+            cwd,
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            None,
+            Vec::new(),
+            0,
+        );
+        sub.api_key_cache
+            .lock()
+            .unwrap()
+            .insert("anthropic".into(), Some("cached-key".into()));
+        let victim = sub.api_key_cache.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = victim.lock().unwrap_or_else(PoisonError::into_inner);
+            panic!("poison the credential cache");
+        })
+        .join();
+        assert_eq!(
+            sub.resolved_api_key("anthropic").await.as_deref(),
+            Some("cached-key")
+        );
+    }
+
+    #[test]
+    fn finalize_terminal_event_keeps_the_batch_task_prefix() {
+        let dir = std::env::temp_dir().join(format!("mehh_fin_prefix_{}", uuid::Uuid::now_v7()));
+        let mut manifest = new_manifest("sub-prefix".into(), "coding".into(), "m".into(), 1000);
+        let events = Mutex::new(manifest.events.clone());
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let on_update: AgentToolUpdateCallback = Arc::new(move |result| {
+            if let Some(mehh_ai::ToolResultContentBlock::Text(t)) = result.content.first() {
+                sink.lock().unwrap_or_else(PoisonError::into_inner).push(t.text.clone());
+            }
+        });
+        SubagentTool::finalize_subagent_run(
+            &dir,
+            &mut manifest,
+            &events,
+            Ok("done".into()),
+            &CancellationToken::new(),
+            Some(on_update),
+            "#2:",
+        )
+        .unwrap();
+        assert!(
+            seen.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .first()
+                .is_some_and(|text| text.starts_with("[subagent:#2:")),
+            "the terminal event must keep the batch task prefix: {seen:?}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn finalize_classifies_typed_timeout_but_not_a_tool_timeout_message() {
+        let dir = std::env::temp_dir().join(format!("mehh_fin_typed_{}", uuid::Uuid::now_v7()));
+        let mut manifest = new_manifest("sub-typed".into(), "research".into(), "m".into(), 1000);
+        let events = Mutex::new(manifest.events.clone());
+        let cancel = CancellationToken::new();
+        let err = SubagentTool::finalize_subagent_run(
+            &dir,
+            &mut manifest,
+            &events,
+            Err(ChildRunError::ToolFailure("bash timed out after 5s".into())),
+            &cancel,
+            None,
+            "",
+        )
+        .unwrap_err();
+        assert_eq!(manifest.failure_class, Some(SubagentFailureClass::ToolRuntime));
+        assert!(
+            err.contains("bash timed out"),
+            "the original tool error must survive: {err}"
+        );
+
+        let mut manifest2 = new_manifest("sub-typed-2".into(), "research".into(), "m".into(), 1000);
+        let events2 = Mutex::new(manifest2.events.clone());
+        let _ = SubagentTool::finalize_subagent_run(
+            &dir,
+            &mut manifest2,
+            &events2,
+            Err(ChildRunError::TimedOut),
+            &cancel,
+            None,
+            "",
+        );
+        assert_eq!(manifest2.failure_class, Some(SubagentFailureClass::Timeout));
+        assert_eq!(
+            manifest2.events.last().unwrap().kind,
+            SubagentEventKind::TimedOut
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn finalize_subagent_run_keeps_original_error_when_manifest_write_fails() {
         let bad_cwd = std::env::temp_dir().join(format!("mehh_fin_bad_{}", uuid::Uuid::now_v7()));
@@ -1430,9 +1920,10 @@ mod tests {
             &bad_cwd,
             &mut manifest,
             &events,
-            Err("child exploded".to_string()),
+            Err(ChildRunError::ModelError("child exploded".into())),
             &cancel,
             None,
+            "",
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&bad_cwd);
@@ -1460,6 +1951,7 @@ mod tests {
             Ok("done".to_string()),
             &cancel,
             None,
+            "",
         )
         .unwrap_err();
         let _ = std::fs::remove_file(&bad_cwd);
