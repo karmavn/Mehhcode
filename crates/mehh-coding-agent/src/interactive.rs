@@ -56,6 +56,7 @@ pub enum TranscriptItem {
         args_summary: String,
         output_preview: Vec<String>,
         diff: Option<String>,
+        duration_ms: Option<u64>,
     },
     /// Nested subagent tool call with its per-child progress rows.
     Subagent {
@@ -87,7 +88,204 @@ pub struct Selector {
     pub settings_list: Option<SettingsList>,
 }
 
-type MarkdownCache = HashMap<(usize, usize), (String, String, Vec<String>)>;
+type TranscriptCache = HashMap<
+    (usize, usize, u8, usize, u64),
+    (String, TranscriptItem, Vec<String>),
+>;
+
+fn anchored_scroll_offset(anchor: usize, growth: usize, offset: usize) -> usize {
+    if offset == 0 {
+        0
+    } else {
+        anchor.saturating_add(growth)
+    }
+}
+
+fn scrollbar_char(row: usize, visible: usize, total: usize, offset: usize) -> char {
+    if visible == 0 || total <= visible {
+        return '│';
+    }
+    let max_scroll = total - visible;
+    let thumb_row = 1 + offset.min(max_scroll) * visible.saturating_sub(2) / max_scroll.max(1);
+    if row == thumb_row {
+        '┃'
+    } else {
+        '│'
+    }
+}
+
+fn cap_preview_lines(preview: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = preview.lines().collect();
+    if lines.len() <= max_lines {
+        return preview.to_string();
+    }
+    let hidden = lines.len() - max_lines;
+    let mut out = lines[..max_lines].join("\n");
+    out.push_str(&format!("\n… (+{hidden} more lines)"));
+    out
+}
+
+fn tool_duration_label(duration_ms: Option<u64>) -> String {
+    match duration_ms {
+        Some(ms) => format!(" {ms}ms"),
+        None => String::new(),
+    }
+}
+
+fn diff_visible_lines(diff: &str) -> (Vec<&str>, usize) {
+    let all: Vec<&str> = diff.lines().collect();
+    let hidden = all.len().saturating_sub(24);
+    (all.into_iter().take(24).collect(), hidden)
+}
+
+fn thinking_preview(
+    thinking: &str,
+    expanded: bool,
+    busy: bool,
+    elapsed_ms: Option<u64>,
+) -> String {
+    let lines: Vec<&str> = thinking.lines().collect();
+    if expanded {
+        return thinking.to_string();
+    }
+    let count = lines.len();
+    if busy {
+        let tail = lines
+            .iter()
+            .rev()
+            .take(3)
+            .rev()
+            .copied()
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("⠋ Thinking ({count} lines)...\n{tail}")
+    } else {
+        let secs = elapsed_ms.unwrap_or(0) as f64 / 1000.0;
+        format!("▸ Thought for {secs:.1}s ({count} lines · Ctrl+T to expand)")
+    }
+}
+
+fn compact_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else if n < 1_000_000 {
+        format!("{:.1}k", n as f64 / 1_000.0)
+    } else {
+        format!("{:.1}m", n as f64 / 1_000_000.0)
+    }
+}
+
+fn compact_path(path: &Path, max_len: usize) -> String {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    if raw.chars().count() <= max_len {
+        return raw;
+    }
+    let parts: Vec<&str> = raw.split('/').filter(|p| !p.is_empty()).collect();
+    let tail = parts
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .copied()
+        .collect::<Vec<_>>()
+        .join("/");
+    let compact = format!("~/.../{tail}");
+    if compact.chars().count() <= max_len {
+        compact
+    } else {
+        let keep = max_len.saturating_sub(3);
+        let tail: String = raw.chars().rev().take(keep).collect::<Vec<_>>().into_iter().rev().collect();
+        format!("...{tail}")
+    }
+}
+
+fn left_right(left: String, right: String, width: usize) -> String {
+    let right_w = mehh_tui::visible_width(&right);
+    let left_w = width.saturating_sub(right_w);
+    let left = truncate_to_width(&left, left_w, "...", false);
+    let pad = width.saturating_sub(mehh_tui::visible_width(&left) + right_w);
+    format!("{left}{}{right}", " ".repeat(pad))
+}
+
+fn ctx_bar(pct: u64, theme: &Theme) -> String {
+    let filled = (pct * 8 / 100).min(8) as usize;
+    let color = if pct >= 85 {
+        &theme.error
+    } else if pct >= 70 {
+        &theme.warning
+    } else {
+        &theme.accent
+    };
+    let mut out = theme.fg(color, &"█".repeat(filled));
+    out.push_str(&theme.fg(&theme.border_muted, &"░".repeat(8 - filled)));
+    out
+}
+
+fn permission_badge(mode: Option<crate::tool_inspection::PermissionMode>, theme: &Theme) -> String {
+    use crate::tool_inspection::PermissionMode;
+    let (text, color) = match mode.unwrap_or_default() {
+        PermissionMode::Auto => ("[auto]", &theme.warning),
+        PermissionMode::SmartApprove => ("[smart]", &theme.accent),
+        PermissionMode::Approve => ("[approve]", &theme.accent),
+        PermissionMode::Chat => ("[chat]", &theme.dim),
+    };
+    theme.fg(color, text)
+}
+
+fn elapsed_label(started: Option<std::time::Instant>, now: std::time::Instant) -> String {
+    match started {
+        Some(s) => format!("{:.1}s", now.saturating_duration_since(s).as_secs_f64()),
+        None => String::new(),
+    }
+}
+
+fn render_user_turn(text: &str, width: usize, theme: &Theme) -> Vec<String> {
+    let inner = width.saturating_sub(4);
+    wrap_text_with_ansi(text, inner)
+        .into_iter()
+        .map(|line| {
+            let body_w = mehh_tui::visible_width(&line);
+            let padding = " ".repeat(width.saturating_sub(1 + body_w));
+            format!(
+                "{prefix}▌{reset}{bg}{color}{line}{padding}{reset}",
+                prefix = theme.user_prefix,
+                reset = "\x1b[0m",
+                bg = theme.user_bg,
+                color = theme.text,
+            )
+        })
+        .collect()
+}
+
+fn status_icon(status: &str, is_error: bool, frame: usize, theme: &Theme) -> String {
+    if is_error || status == "failed" {
+        theme.fg(&theme.tool_error, "✗")
+    } else if status == "completed" {
+        theme.fg(&theme.tool_success, "✓")
+    } else if status == "blocked" {
+        theme.fg(&theme.tool_pending, "◌")
+    } else {
+        let frames = mehh_tui::BRAILLE_FRAMES;
+        theme.fg(&theme.tool_pending, frames[frame % frames.len()])
+    }
+}
+
+fn search_bar_text(filter: &str, shown: usize, total: usize, theme: &Theme) -> String {
+    if filter.is_empty() {
+        theme.fg(&theme.dim, &format!("  / Type to filter... ({shown}/{total})"))
+    } else {
+        theme.fg(&theme.accent, &format!("  Search: {filter} ({shown}/{total})"))
+    }
+}
+
+fn scroll_pill_text(offset: usize, max_scroll: usize, new_lines: usize) -> String {
+    let pct = if max_scroll == 0 {
+        100
+    } else {
+        offset.min(max_scroll) * 100 / max_scroll
+    };
+    format!("↑ Paused at {pct}% · +{new_lines} new lines · End to jump")
+}
 
 /// Context for an active tool approval request awaiting user decision.
 pub struct PendingApproval {
@@ -157,6 +355,12 @@ pub struct InteractiveState {
     pub keybindings: Keybindings,
     pub scroll_offset: usize,
     pub last_max_scroll: AtomicUsize,
+    pub(crate) prev_transcript_len: AtomicUsize,
+    pub(crate) scroll_anchor: AtomicUsize,
+    pub(crate) turn_started_at: Mutex<Option<std::time::Instant>>,
+    pub(crate) turn_completed_at: Mutex<Option<std::time::Instant>>,
+    pub(crate) thinking_expanded: bool,
+    pub(crate) thinking_elapsed: Mutex<std::collections::HashMap<usize, u64>>,
     pub last_prompt_text: Option<String>,
     pub overflow_retried: bool,
     pub turn_start_idx: Option<usize>,
@@ -165,7 +369,8 @@ pub struct InteractiveState {
     pub settings_file: Option<PathBuf>,
     /// File that credentials are written to. `None` uses the default auth file.
     pub auth_file: Option<PathBuf>,
-    markdown_cache: Mutex<MarkdownCache>,
+    transcript_cache: Mutex<TranscriptCache>,
+    cached_ctx_tokens: Mutex<Option<u64>>,
 }
 
 impl InteractiveState {
@@ -185,14 +390,29 @@ impl InteractiveState {
             keybindings: Keybindings::default_bindings(),
             scroll_offset: 0,
             last_max_scroll: AtomicUsize::new(0),
+            prev_transcript_len: AtomicUsize::new(0),
+            scroll_anchor: AtomicUsize::new(0),
+            turn_started_at: Mutex::new(None),
+            turn_completed_at: Mutex::new(None),
+            thinking_expanded: false,
+            thinking_elapsed: Mutex::new(std::collections::HashMap::new()),
             last_prompt_text: None,
             overflow_retried: false,
             turn_start_idx: None,
             last_turn_error: None,
             settings_file: None,
             auth_file: None,
-            markdown_cache: Mutex::new(HashMap::new()),
+            transcript_cache: Mutex::new(HashMap::new()),
+            cached_ctx_tokens: Mutex::new(None),
         }
+    }
+
+    pub(crate) fn invalidate_context_tokens(&self) {
+        let mut guard = self
+            .cached_ctx_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = None;
     }
 }
 
@@ -490,6 +710,7 @@ fn message_to_transcript_item(message: &Message) -> TranscriptItem {
                 .and_then(|d| d.get("diff"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string),
+            duration_ms: tr.duration_ms,
         },
         Message::System(s) => TranscriptItem::System(s.content.clone()),
     }
@@ -604,22 +825,14 @@ fn build_settings_list(settings: &Settings) -> SettingsList {
             "steering mode",
             queue_mode_label(settings.steering_mode.unwrap_or_default()),
         )
-        .with_values(vec![
-            "none".to_string(),
-            "all".to_string(),
-            "one_at_a_time".to_string(),
-        ])
+        .with_values(vec!["one-at-a-time".to_string(), "all".to_string()])
         .with_description("Steering mode for tool execution and prompts"),
         SettingItem::new(
             "follow_up_mode",
             "follow-up mode",
             queue_mode_label(settings.follow_up_mode.unwrap_or_default()),
         )
-        .with_values(vec![
-            "none".to_string(),
-            "all".to_string(),
-            "one_at_a_time".to_string(),
-        ])
+        .with_values(vec!["one-at-a-time".to_string(), "all".to_string()])
         .with_description("Follow-up queue mode"),
         SettingItem::new(
             "default_thinking_level",
@@ -690,6 +903,8 @@ fn update_selector_filter(selector: &mut Selector, key: &str) -> bool {
             return true;
         }
         filter
+    } else if key == " " && selector.kind != SelectorKind::Settings {
+        format!("{}{}", selector.list.filter, " ")
     } else if key.chars().count() == 1
         && key.chars().all(|c| !c.is_control() && !c.is_whitespace())
     {
@@ -987,6 +1202,7 @@ Keybindings:
             SlashCommandOutcome::Handled
         }
         "/new" => {
+            state.invalidate_context_tokens();
             session.clear_queues();
             match session.session_mut().new_session() {
                 Ok(()) => {
@@ -1004,6 +1220,7 @@ Keybindings:
             SlashCommandOutcome::Handled
         }
         "/compact" => {
+            state.invalidate_context_tokens();
             let custom_instructions = if let Some(first_arg) = arg {
                 let rest_idx = trimmed.find(first_arg).unwrap_or(trimmed.len());
                 let rest = trimmed[rest_idx..].trim();
@@ -1102,6 +1319,7 @@ Keybindings:
                         )));
                     } else {
                         let theme = Theme::load(Some(name));
+                        state.invalidate_context_tokens();
                         state.theme = theme.clone();
                         session.settings.theme = Some(name.to_string());
                         match persist_settings(
@@ -1286,6 +1504,7 @@ Keybindings:
             SlashCommandOutcome::Handled
         }
         "/tree" => {
+            state.invalidate_context_tokens();
             match arg {
                 Some(arg_str) => {
                     let parts = full_arg.unwrap_or(arg_str).split_whitespace();
@@ -1401,6 +1620,7 @@ Keybindings:
             SlashCommandOutcome::Handled
         }
         "/resume" => {
+            state.invalidate_context_tokens();
             match crate::session::list_sessions(&session.cwd) {
                 Ok(sessions) => {
                     if sessions.is_empty() {
@@ -1674,6 +1894,7 @@ Keybindings:
             SlashCommandOutcome::Handled
         }
         "/import" => {
+            state.invalidate_context_tokens();
             match full_arg {
                 Some(file_path_str) => {
                     let path = PathBuf::from(file_path_str.trim());
@@ -1815,6 +2036,7 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
             _ => {}
         },
         AgentEvent::MessageEnd { message } => {
+            state.invalidate_context_tokens();
             if let Message::Assistant(a) = message {
                 state.total_input_tokens += a.usage.input;
                 state.total_output_tokens += a.usage.output;
@@ -1872,6 +2094,7 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                 args_summary,
                 output_preview: Vec::new(),
                 diff: None,
+                duration_ms: None,
             });
         }
         AgentEvent::ToolExecutionUpdate {
@@ -2031,6 +2254,7 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
             tool_name,
             is_error,
             result,
+            duration_ms,
             ..
         } => {
             state.status = None;
@@ -2063,10 +2287,12 @@ pub fn apply_agent_event(state: &mut InteractiveState, event: &AgentEvent) {
                     is_error: err,
                     diff,
                     output_preview,
+                    duration_ms: stored_duration,
                     ..
                 } = item
                 {
                     if id == tool_call_id {
+                        *stored_duration = *duration_ms;
                         *status = if *is_error {
                             "failed".to_string()
                         } else {
@@ -2113,7 +2339,7 @@ pub fn render_interactive_frame(
     let theme = &state.theme;
 
     // 1. Header — a welcome card replaces the status strip on an empty session.
-    let header_lines: Vec<String> = if state.items.is_empty() {
+    let header_lines: Vec<String> = if state.items.is_empty() && editor.autocomplete.is_none() {
         let cwd_str = session.cwd.to_string_lossy();
         let rule = "─".repeat(width.saturating_sub(4).max(1));
         vec![
@@ -2124,8 +2350,9 @@ pub fn render_interactive_frame(
                 env!("CARGO_PKG_VERSION")
             ),
             format!(
-                "  {} {}",
+                "  {} {} {}",
                 theme.fg(&theme.text, &session.model.name),
+                permission_badge(session.settings.permission_mode, theme),
                 theme.fg(&theme.dim, &format!("· {cwd_str}"))
             ),
             String::new(),
@@ -2140,19 +2367,19 @@ pub fn render_interactive_frame(
         .collect()
     } else {
         let short_id: String = session.session().session_id().chars().take(8).collect();
-        let cwd_str = session.cwd.to_string_lossy();
-        let header_text = format!(
-            "{} {} {} {} {} {} {} {} {}",
+        let left = format!(
+            "{} {} {} {}",
             theme.fg(&theme.accent, "mehh"),
-            theme.fg(&theme.dim, "|"),
             theme.fg(&theme.text, &session.model.name),
             theme.fg(&theme.dim, &format!("({})", session.model.provider)),
-            theme.fg(&theme.dim, "|"),
-            theme.fg(&theme.dim, "session:"),
-            theme.fg(&theme.warning, &short_id),
-            theme.fg(&theme.dim, "|"),
-            theme.fg(&theme.dim, &cwd_str),
+            permission_badge(session.settings.permission_mode, theme),
         );
+        let right = format!(
+            "session: {} · {}",
+            theme.fg(&theme.warning, &short_id),
+            compact_path(&session.cwd, 18)
+        );
+        let header_text = left_right(left, right, width);
         let sep_line = theme.fg(&theme.border_muted, &"─".repeat(width));
         vec![
             truncate_to_width(&header_text, width, "...", false),
@@ -2165,31 +2392,50 @@ pub fn render_interactive_frame(
         .thinking_level()
         .map(thinking_level_label)
         .unwrap_or("off");
-    let ctx_tokens =
-        crate::compaction::estimate_context_tokens(&session.session().build_context_messages())
-            as u64;
+    let ctx_tokens = {
+        let mut guard = state
+            .cached_ctx_tokens
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(cached) = *guard {
+            cached
+        } else {
+            let fresh = crate::compaction::estimate_context_tokens(
+                &session.session().build_context_messages(),
+            ) as u64;
+            *guard = Some(fresh);
+            fresh
+        }
+    };
     let ctx_pct = ctx_tokens
         .saturating_mul(100)
         .checked_div(session.model.context_window.max(1) as u64)
         .unwrap_or(0)
         .min(999);
-    let ctx_color = if ctx_pct >= 85 {
+    // The header already carries provider/model; the footer keeps live metrics only.
+    let ctx_display_color = if ctx_pct >= 85 {
         &theme.error
     } else if ctx_pct >= 70 {
         &theme.warning
     } else {
         &theme.dim
     };
-    // The header already carries provider/model; the footer keeps live metrics only.
-    let footer_base = format!(
-        "thinking: {} • tokens: {} in / {} out • cost: ${:.4}",
-        thinking_str, state.total_input_tokens, state.total_output_tokens, state.total_cost
+    let left = format!(
+        "thinking: {} · ctx {} {}",
+        thinking_str,
+        theme.fg(ctx_display_color, &format!("{ctx_pct}%")),
+        ctx_bar(ctx_pct, theme)
     );
-    let footer_text = format!(
-        "{}  {}  {}",
-        theme.fg(&theme.dim, &footer_base),
-        theme.fg(ctx_color, &format!("ctx {}%", ctx_pct)),
-        theme.fg(&theme.dim, "/help")
+    let right = format!(
+        "{} in / {} out · ${:.4} · /help",
+        compact_count(state.total_input_tokens),
+        compact_count(state.total_output_tokens),
+        state.total_cost
+    );
+    let footer_text = left_right(
+        theme.fg(&theme.dim, &left),
+        theme.fg(&theme.dim, &right),
+        width,
     );
     let footer_lines = vec![truncate_to_width(&footer_text, width, "...", false)];
 
@@ -2204,6 +2450,11 @@ pub fn render_interactive_frame(
             SelectorKind::Login => "Select Provider (Enter to confirm, Esc to cancel)",
             SelectorKind::ToolApproval => "Tool Approval Required (y/Enter: allow once, a: allow session, A: always allow, n/Esc: deny)",
         };
+        let selector_border = if selector.kind == SelectorKind::ToolApproval {
+            &theme.warning
+        } else {
+            &theme.border_accent
+        };
         let component: Box<dyn Component> = if selector.kind == SelectorKind::Settings {
             if let Some(ref sl) = selector.settings_list {
                 Box::new(sl.clone().with_theme(theme.clone()))
@@ -2213,14 +2464,13 @@ pub fn render_interactive_frame(
         } else {
             Box::new(selector.list.clone().with_theme(theme.clone()))
         };
-        if !selector.list.filter.is_empty() {
-            bottom_lines.push(truncate_to_width(
-                &theme.fg(&theme.accent, &format!("  Search: {}", selector.list.filter)),
-                width,
-                "...",
-                false,
-            ));
-        }
+        let search_text = search_bar_text(
+            &selector.list.filter,
+            selector.list.filtered_indices().len(),
+            selector.list.items.len(),
+            theme,
+        );
+        bottom_lines.push(truncate_to_width(&search_text, width, "...", false));
         if selector.kind == SelectorKind::ToolApproval {
             if let Some(ref pending) = state.pending_approval {
                 let mut detail = format!(
@@ -2230,26 +2480,40 @@ pub fn render_interactive_frame(
                     theme.fg(&theme.muted, &pending.reason)
                 );
                 if let Some(ref preview) = pending.preview {
-                    detail.push_str(preview);
+                    let wrapped: Vec<String> = preview
+                        .lines()
+                        .flat_map(|line| wrap_text_with_ansi(line, width.saturating_sub(4)))
+                        .collect();
+                    let preview_budget = height.saturating_sub(18).clamp(1, 6);
+                    detail.push_str(&cap_preview_lines(&wrapped.join("\n"), preview_budget));
                 }
                 let panel = BorderedBox::new(Box::new(Text::new(detail)))
                     .with_title("Command preview · verify before approving")
-                    .with_style(BorderStyle::Rounded);
+                    .with_style(BorderStyle::Rounded)
+                    .with_border_color(selector_border)
+                    .with_title_color(&theme.warning);
                 bottom_lines.extend(panel.render(width));
             }
         }
         let boxed = BorderedBox::new(component)
             .with_title(title)
-            .with_style(BorderStyle::Rounded);
+            .with_style(BorderStyle::Rounded)
+            .with_border_color(selector_border)
+            .with_title_color(&theme.text);
         bottom_lines.extend(boxed.render(width));
     }
 
     if state.is_busy {
         let spinner = mehh_tui::BRAILLE_FRAMES[state.loader.frame % mehh_tui::BRAILLE_FRAMES.len()];
+        let now = std::time::Instant::now();
+        let started = *state.turn_started_at.lock().unwrap_or_else(|e| e.into_inner());
+        let completed = *state.turn_completed_at.lock().unwrap_or_else(|e| e.into_inner());
+        let elapsed = elapsed_label(started.or(completed), completed.unwrap_or(now));
         let loader_line = format!(
-            "{} {}",
+            "{} {} {} · Esc to cancel",
             theme.fg(&theme.accent, spinner),
-            theme.fg(&theme.text, &state.loader.label)
+            theme.fg(&theme.text, &state.loader.label),
+            theme.fg(&theme.dim, &elapsed)
         );
         let mut loader_lines = wrap_text_with_ansi(&loader_line, width);
         if let Some(ref st) = state.status {
@@ -2261,19 +2525,6 @@ pub fn render_interactive_frame(
             ));
         }
         bottom_lines.extend(loader_lines);
-    }
-
-    if state.scroll_offset > 0 {
-        let pill = format!(
-            "↑ Viewing history (-{} lines) · Ctrl+End to bottom",
-            state.scroll_offset
-        );
-        bottom_lines.push(truncate_to_width(
-            &theme.fg(&theme.warning, &pill),
-            width,
-            "...",
-            false,
-        ));
     }
 
     // Queue counters are pills: print only the queues that actually hold messages.
@@ -2304,7 +2555,39 @@ pub fn render_interactive_frame(
         ac.theme = theme.clone();
     }
     if state.selector.is_none() {
-        let dock = BorderedBox::new(Box::new(themed_editor)).with_style(BorderStyle::Rounded);
+        let max_lines = (height / 3).clamp(3, 8);
+        themed_editor.max_lines = max_lines;
+        let ac_lines = themed_editor.render_autocomplete(width.saturating_sub(2));
+        if !ac_lines.is_empty() {
+            let panel = BorderedBox::new(Box::new(mehh_tui::RawLines { lines: ac_lines }))
+                .with_title("Suggestions")
+                .with_style(BorderStyle::Single)
+                .with_border_color(theme.border_accent.as_str())
+                .with_title_color(theme.text.as_str());
+            bottom_lines.extend(panel.render(width));
+        }
+        let mut dock_title = if state.is_busy {
+            "Steer (Enter) · Follow-up (Alt+Enter) · Cancel (Esc)".to_string()
+        } else {
+            "Prompt".to_string()
+        };
+        if themed_editor.lines.len() > 1 {
+            dock_title.push_str(&format!(
+                " · Ln {}/{}",
+                themed_editor.cursor_row + 1,
+                themed_editor.lines.len()
+            ));
+        }
+        let dock_border = if state.is_busy {
+            theme.warning.as_str()
+        } else {
+            theme.border.as_str()
+        };
+        let dock = BorderedBox::new(Box::new(themed_editor))
+            .with_style(BorderStyle::Single)
+            .with_border_color(dock_border)
+            .with_title_color(theme.text.as_str())
+            .with_title(dock_title);
         bottom_lines.extend(dock.render(width));
     } else {
         bottom_lines.extend(themed_editor.render(width));
@@ -2313,54 +2596,84 @@ pub fn render_interactive_frame(
     // 4. Transcript
     let hide_thinking = session.settings.hide_thinking_block.unwrap_or(false);
     let mut transcript_lines = Vec::with_capacity(state.items.len().saturating_mul(4).max(64));
-    let mut md_cache = state
-        .markdown_cache
+    let mut cache = state
+        .transcript_cache
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    if md_cache.len() > state.items.len().saturating_mul(2).saturating_add(16) {
-        md_cache.clear();
+    if cache.len() > state.items.len().saturating_mul(2).saturating_add(16) {
+        cache.clear();
     }
     for (item_idx, item) in state.items.iter().enumerate() {
         // Breathing room between turns; the transcript is a timeline, not a log dump.
         if item_idx > 0 {
             transcript_lines.push(String::new());
         }
+        let needs_frame = match item {
+            TranscriptItem::ToolCall { status, .. }
+            | TranscriptItem::Subagent { status, .. } => status == "running",
+            _ => false,
+        };
+        let thinking_elapsed_opt = state
+            .thinking_elapsed
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&item_idx)
+            .copied();
+        let thinking_elapsed = thinking_elapsed_opt.unwrap_or(0);
+        let flags = (hide_thinking as u8)
+            | ((state.thinking_expanded as u8) << 1)
+            | (((state.is_busy && item_idx + 1 == state.items.len()) as u8) << 2);
+        let key = (
+            item_idx,
+            width,
+            flags,
+            if needs_frame { state.loader.frame } else { 0 },
+            thinking_elapsed,
+        );
+        if let Some((cached_theme, cached_item, cached_lines)) = cache.get(&key) {
+            if cached_theme == &theme.name && cached_item == item {
+                transcript_lines.extend(cached_lines.iter().cloned());
+                continue;
+            }
+        }
+        let render_start = transcript_lines.len();
         match item {
             TranscriptItem::User(text) => {
-                let marker = format!("❯ {text}");
-                let pad = width.saturating_sub(mehh_tui::visible_width(&marker) + 1);
-                let formatted = format!(
-                    "{bg} {prefix}❯{reset}{bg}{color} {body}{padding}{reset}",
-                    bg = theme.user_bg,
-                    prefix = theme.user_prefix,
-                    reset = "\x1b[0m",
-                    color = theme.text,
-                    body = text,
-                    padding = " ".repeat(pad),
-                );
-                for line in wrap_text_with_ansi(&formatted, width) {
-                    transcript_lines.push(format!("{line}\x1b[0m"));
-                }
+                transcript_lines.extend(render_user_turn(text, width, theme));
             }
             TranscriptItem::Assistant { thinking, text } => {
                 if !thinking.is_empty() && !hide_thinking {
-                    let formatted =
-                        theme.fg(&theme.thinking_text, &format!("thinking: {thinking}"));
+                    let started = *state
+                        .turn_started_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let completed = *state
+                        .turn_completed_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let elapsed_ms = match (started, completed) {
+                        (Some(s), None) => Some(s.elapsed().as_millis() as u64),
+                        (Some(s), Some(c)) => {
+                            Some(c.saturating_duration_since(s).as_millis() as u64)
+                        }
+                        (None, _) => None,
+                    };
+                    let is_current = state.is_busy && item_idx + 1 == state.items.len();
+                    let elapsed_ms = thinking_elapsed_opt.or(elapsed_ms);
+                    let preview = thinking_preview(
+                        thinking,
+                        state.thinking_expanded,
+                        is_current,
+                        elapsed_ms,
+                    );
+                    let formatted = theme.fg(&theme.thinking_text, &preview);
                     transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
                 }
                 if !text.is_empty() {
-                    let key = (item_idx, width);
-                    if let Some((cached_theme, cached_src, cached_lines)) = md_cache.get(&key) {
-                        if cached_theme == &theme.name && cached_src == text {
-                            transcript_lines.extend(cached_lines.iter().cloned());
-                            continue;
-                        }
-                    }
                     let rendered = MarkdownView::new(text)
                         .with_theme(theme.clone())
                         .render(width);
-                    transcript_lines.extend(rendered.iter().cloned());
-                    md_cache.insert(key, (theme.name.clone(), text.clone(), rendered));
+                    transcript_lines.extend(rendered);
                 }
             }
             TranscriptItem::ToolCall {
@@ -2371,14 +2684,9 @@ pub fn render_interactive_frame(
                 args_summary,
                 output_preview,
                 diff,
+                duration_ms,
             } => {
-                let sym = if *is_error || status == "failed" {
-                    theme.fg(&theme.tool_error, "✗")
-                } else if status == "completed" {
-                    theme.fg(&theme.tool_success, "✓")
-                } else {
-                    theme.fg(&theme.tool_pending, "⚙")
-                };
+                let sym = status_icon(status, *is_error, state.loader.frame, theme);
                 let summary_part = if !args_summary.is_empty() {
                     format!(" {}", theme.fg(&theme.accent, args_summary))
                 } else {
@@ -2389,8 +2697,9 @@ pub fn render_interactive_frame(
                 } else {
                     format!(" {}", theme.fg(&theme.dim, status))
                 };
+                let duration_part = tool_duration_label(*duration_ms);
                 let formatted = format!(
-                    "  {sym} {}{summary_part}{status_part}",
+                    "  {sym} {}{summary_part}{status_part}{duration_part}",
                     theme.fg(&theme.text, name)
                 );
                 transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
@@ -2401,7 +2710,8 @@ pub fn render_interactive_frame(
                 }
 
                 if let Some(diff_str) = diff {
-                    for line in diff_str.lines().take(24) {
+                    let (visible, hidden) = diff_visible_lines(diff_str);
+                    for line in visible {
                         let (color, bg): (&str, &str) =
                             if line.starts_with('+') && !line.starts_with("+++") {
                                 (theme.tool_success.as_str(), theme.diff_add_bg.as_str())
@@ -2417,6 +2727,15 @@ pub fn render_interactive_frame(
                             transcript_lines.push(format!("{wrapped}\x1b[0m"));
                         }
                     }
+                    if hidden > 0 {
+                        transcript_lines.push(format!(
+                            "    {}",
+                            theme.fg(
+                                &theme.dim,
+                                &format!("… (+{hidden} more lines)")
+                            )
+                        ));
+                    }
                 }
             }
             TranscriptItem::Subagent {
@@ -2426,13 +2745,7 @@ pub fn render_interactive_frame(
                 is_error,
                 children,
             } => {
-                let sym = if *is_error || status == "failed" {
-                    theme.fg(&theme.tool_error, "✗")
-                } else if status == "completed" {
-                    theme.fg(&theme.tool_success, "✓")
-                } else {
-                    theme.fg(&theme.tool_pending, "⚙")
-                };
+                let sym = status_icon(status, *is_error, state.loader.frame, theme);
                 let formatted = format!(
                     "  {sym} subagent {} {}",
                     theme.fg(&theme.accent, mode),
@@ -2441,13 +2754,8 @@ pub fn render_interactive_frame(
                 transcript_lines.extend(wrap_text_with_ansi(&formatted, width));
 
                 for row in children {
-                    let row_sym = if row.status == "failed" {
-                        theme.fg(&theme.tool_error, "✗")
-                    } else if row.status == "completed" {
-                        theme.fg(&theme.tool_success, "✓")
-                    } else {
-                        theme.fg(&theme.tool_pending, "⚙")
-                    };
+                    let row_sym =
+                        status_icon(&row.status, false, state.loader.frame, theme);
                     let mut row_line =
                         format!("    {row_sym} {}", theme.fg(&theme.text, &row.label));
                     if row.label != row.status && !row.status.is_empty() {
@@ -2468,6 +2776,56 @@ pub fn render_interactive_frame(
                 }
             }
         }
+        let rendered: Vec<String> = transcript_lines[render_start..].to_vec();
+        cache.insert(key, (theme.name.clone(), item.clone(), rendered));
+    }
+
+    let prev_len = state.prev_transcript_len.load(Ordering::Relaxed);
+    let growth = transcript_lines.len().saturating_sub(prev_len);
+    state
+        .prev_transcript_len
+        .store(transcript_lines.len(), Ordering::Relaxed);
+    let anchor = anchored_scroll_offset(
+        state.scroll_anchor.load(Ordering::Relaxed),
+        growth,
+        state.scroll_offset,
+    );
+    state.scroll_anchor.store(anchor, Ordering::Relaxed);
+    let anchored = state.scroll_offset.saturating_add(anchor);
+
+    if state.scroll_offset > 0 {
+        let pill_height = 1usize;
+        let pre_height = height.saturating_sub(
+            header_lines.len() + footer_lines.len() + bottom_lines.len() + pill_height,
+        );
+        let max_scroll = transcript_lines.len().saturating_sub(pre_height);
+        state.last_max_scroll.store(max_scroll, Ordering::Relaxed);
+        let pill = scroll_pill_text(anchored.min(max_scroll), max_scroll, anchor);
+        bottom_lines.push(truncate_to_width(
+            &theme.fg(&theme.warning, &pill),
+            width,
+            "...",
+            false,
+        ));
+    }
+
+    // Keep the assembled frame within the terminal height: drop optional panel
+    // rows from the front while preserving the dock at the end and approval actions.
+    let bottom_budget = height
+        .saturating_sub(header_lines.len() + footer_lines.len() + 1)
+        .max(1);
+    if bottom_lines.len() > bottom_budget {
+        let mut excess = bottom_lines.len() - bottom_budget;
+        let mut idx = 0;
+        while excess > 0 && idx < bottom_lines.len().saturating_sub(3) {
+            let line = &bottom_lines[idx];
+            if line.contains("Allow") || line.contains("Deny") || line.contains("Suggestions") {
+                idx += 1;
+                continue;
+            }
+            bottom_lines.remove(idx);
+            excess -= 1;
+        }
     }
 
     // 5. Fit transcript into remaining vertical space
@@ -2480,14 +2838,29 @@ pub fn render_interactive_frame(
     } else if transcript_lines.len() > available_height {
         let max_scroll = transcript_lines.len() - available_height;
         state.last_max_scroll.store(max_scroll, Ordering::Relaxed);
-        let offset = state.scroll_offset.min(max_scroll);
+        let offset = anchored.min(max_scroll);
         let end = transcript_lines.len() - offset;
         let start = end.saturating_sub(available_height);
         transcript_lines[start..end].to_vec()
     } else {
         state.last_max_scroll.store(0, Ordering::Relaxed);
-        transcript_lines
+        transcript_lines.clone()
     };
+
+    if transcript_lines.len() > available_height && width > 0 {
+        let shown = visible_transcript.len();
+        for (row, line) in visible_transcript.iter_mut().enumerate() {
+            let base = truncate_to_width(line, width.saturating_sub(1), "...", false);
+            let marker = scrollbar_char(row, shown, transcript_lines.len(), anchored);
+            let marker_s = marker.to_string();
+            let colored = if marker == '┃' {
+                theme.fg(&theme.accent, &marker_s)
+            } else {
+                theme.fg(&theme.border_muted, &marker_s)
+            };
+            *line = format!("{base}{colored}");
+        }
+    }
 
     // Anchor the prompt dock and footer to the bottom row. Without this pad the
     // editor sits directly under the header and drifts down with every message.
@@ -2540,15 +2913,21 @@ fn apply_agent_signal(
         AgentSignal::ToolApprovalRequest(pending) => {
             // The reason and full preview live in their own panel; never hide them
             // inside a list row where truncate_to_width would cut the command.
+            let allow_color = state.theme.success.clone();
+            let deny_color = state.theme.error.clone();
             let items = vec![
                 SelectItem::new("allow_once", "Allow once (y/Enter)")
-                    .with_description("Approve this tool call once"),
+                    .with_description("Approve this tool call once")
+                    .with_label_color(allow_color.clone()),
                 SelectItem::new("allow_session", "Allow for session (a)")
-                    .with_description("Auto-approve this tool until session ends"),
-                SelectItem::new("always_allow", "Always allow (A)").with_description(
-                    "Persist always-allow rule to ~/.mehh/agent/permissions.json",
-                ),
-                SelectItem::new("deny", "Deny (n/Esc)").with_description("Block this tool call"),
+                    .with_description("Auto-approve this tool until session ends")
+                    .with_label_color(allow_color.clone()),
+                SelectItem::new("always_allow", "Always allow (A)")
+                    .with_description("Persist always-allow rule to ~/.mehh/agent/permissions.json")
+                    .with_label_color(allow_color),
+                SelectItem::new("deny", "Deny (n/Esc)")
+                    .with_description("Block this tool call")
+                    .with_label_color(deny_color),
             ];
             state.pending_approval = Some(pending);
             state.selector = Some(Selector {
@@ -3138,12 +3517,9 @@ fn update_autocomplete_with_cwd(editor: &mut Editor, current_text: &str, cwd: &P
 
 /// Renders the current frame to the terminal.
 ///
-/// The whole frame is rewritten from the top-left of the screen on every update.
-/// The differential renderer in `mehh-tui` assumes the cursor still sits on the
-/// last line of the previous frame, but it also moves the hardware cursor onto
-/// the input row, so each update would land one line too high and the frame
-/// would drift down the screen. Redrawing from a known position keeps the
-/// header, the transcript, the input and the footer on their own rows.
+/// `TuiRenderer` positions changed rows absolutely, so only changed rows are
+/// rewritten. `reset()` is reserved for a resize, where the previous frame's
+/// geometry is no longer a valid baseline.
 fn render_now(
     state: &InteractiveState,
     editor: &Editor,
@@ -3154,15 +3530,9 @@ fn render_now(
     let (c, r) = terminal.size();
     let lines = render_interactive_frame(state, editor, session, c as usize, r as usize);
 
-    // Home the cursor, forget the previous frame and redraw everything.
-    let _ = terminal.write("\x1b[H");
-    renderer.reset();
-    // The software cursor marks the input position; the hardware cursor would
-    // be moved to the wrong column by the renderer.
+    // The renderer positions changed rows absolutely, so no homing or reset is
+    // needed here. A software cursor marks the input position.
     let _ = renderer.render_frame(&mut *terminal, lines, false);
-    // Clear the rows the previous frame used below the current one.
-    let _ = terminal.write("\x1b[J");
-    let _ = terminal.flush();
 }
 
 /// Runs the full interactive TUI mode loop.
@@ -3173,10 +3543,7 @@ pub async fn run_interactive_mode(
     codemode_enabled: bool,
 ) -> anyhow::Result<()> {
     let mut terminal = CrosstermTerminal::new()?;
-    // The software cursor marks the input position, so the terminal's own cursor
-    // is hidden for the lifetime of the session.
-    let _ = terminal.write("\x1b[?25l");
-    let _ = terminal.flush();
+    // CrosstermTerminal hides the hardware cursor and enters the alternate screen.
     let mut renderer = TuiRenderer::new();
     let mut state = InteractiveState::new(mcp_summaries.to_vec(), &session.settings);
     let mut editor = Editor::new()
@@ -3215,6 +3582,7 @@ pub async fn run_interactive_mode(
                 let Some(evt) = evt else { break 'outer; };
                 match evt {
                     Event::Resize(_new_cols, _new_rows) => {
+                        renderer.reset();
                         render_now(&state, &editor, session, &mut terminal, &mut renderer);
                     }
                     Event::Mouse(mouse) => match mouse.kind {
@@ -3262,6 +3630,11 @@ pub async fn run_interactive_mode(
                             turn_running = running;
                         }
                         if let Some(key_str) = normalize_crossterm_key(key_event) {
+                            if key_str == "ctrl+t" {
+                                state.thinking_expanded = !state.thinking_expanded;
+                                render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                                continue 'outer;
+                            }
                             // 1. Selector overlay handling
                             if state.selector.is_some() {
                                 if state.selector.as_ref().map(|s| s.kind) == Some(SelectorKind::ToolApproval) {
@@ -3309,6 +3682,16 @@ pub async fn run_interactive_mode(
                                                 sel.list.move_down();
                                             }
                                         }
+                                        "pageup" => {
+                                            if let Some(sel) = state.selector.as_mut() {
+                                                sel.list.page_up();
+                                            }
+                                        }
+                                        "pagedown" => {
+                                            if let Some(sel) = state.selector.as_mut() {
+                                                sel.list.page_down();
+                                            }
+                                        }
                                         _ => {}
                                     }
 
@@ -3316,25 +3699,37 @@ pub async fn run_interactive_mode(
                                         state.selector = None;
                                         if let Some(pending) = state.pending_approval.take() {
                                             if persist_rule || session_rule {
-                                                let arg_prefix = pending.args.get("command").and_then(|v| v.as_str()).map(|cmd| {
-                                                    cmd.split_whitespace().take(2).collect::<Vec<_>>().join(" ")
-                                                });
-                                                let rule = crate::permissions::PermissionRule {
-                                                    tool_name: pending.tool_name.clone(),
-                                                    arg_prefix,
-                                                    path_glob: None,
-                                                    action: crate::permissions::PermissionAction::AlwaysAllow,
-                                                };
-                                                if persist_rule {
-                                                    let _ = session.inspection_manager.add_permission_rule(rule).await;
+                                                let arg_prefix = pending
+                                                    .args
+                                                    .get("command")
+                                                    .and_then(|v| v.as_str())
+                                                    .and_then(mehh_execpolicy::safe_rule_prefix);
+                                                if mehh_execpolicy::is_shell_tool(&pending.tool_name)
+                                                    && arg_prefix.is_none()
+                                                {
+                                                    // An empty prefix would allow every command for
+                                                    // this shell. Refuse instead of widening policy.
+                                                    state.items.push(TranscriptItem::System(
+                                                        "No rule saved: command is compound or too broad to allow safely".to_string(),
+                                                    ));
                                                 } else {
-                                                    session.inspection_manager.add_session_permission_rule(rule).await;
+                                                    let rule = crate::permissions::PermissionRule {
+                                                        tool_name: pending.tool_name.clone(),
+                                                        arg_prefix,
+                                                        path_glob: None,
+                                                        action: crate::permissions::PermissionAction::AlwaysAllow,
+                                                    };
+                                                    if persist_rule {
+                                                        let _ = session.inspection_manager.add_permission_rule(rule).await;
+                                                    } else {
+                                                        session.inspection_manager.add_session_permission_rule(rule).await;
+                                                    }
+                                                    let scope = if persist_rule { "Rule" } else { "Session rule" };
+                                                    state.items.push(TranscriptItem::System(format!(
+                                                        "{scope} added: always allow tool '{}'",
+                                                        pending.tool_name
+                                                    )));
                                                 }
-                                                let scope = if persist_rule { "Rule" } else { "Session rule" };
-                                                state.items.push(TranscriptItem::System(format!(
-                                                    "{scope} added: always allow tool '{}'",
-                                                    pending.tool_name
-                                                )));
                                             }
                                             let _ = pending.reply_tx.send(allowed);
                                         }
@@ -3474,6 +3869,22 @@ pub async fn run_interactive_mode(
                                             sel.list.move_down();
                                             if let Some(ref mut sl) = sel.settings_list {
                                                 sl.move_down();
+                                            }
+                                        }
+                                    }
+                                    "pageup" => {
+                                        if let Some(sel) = state.selector.as_mut() {
+                                            sel.list.page_up();
+                                            if let Some(ref mut sl) = sel.settings_list {
+                                                sl.page_up();
+                                            }
+                                        }
+                                    }
+                                    "pagedown" => {
+                                        if let Some(sel) = state.selector.as_mut() {
+                                            sel.list.page_down();
+                                            if let Some(ref mut sl) = sel.settings_list {
+                                                sl.page_down();
                                             }
                                         }
                                     }
@@ -3641,6 +4052,8 @@ pub async fn run_interactive_mode(
                                             state.overflow_retried = false;
                                             state.is_busy = true;
                                             state.status = Some("Preparing turn...".to_string());
+                                            *state.turn_started_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+                                            *state.turn_completed_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
                                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
                                             start_turn_preparation(
                                                 session,
@@ -3670,10 +4083,23 @@ pub async fn run_interactive_mode(
                 match handle_agent_signal_async(sig, session, &mut state, &agent_tx).await {
                     SignalOutcome::TurnEnded => {
                         turn_running = false;
+                        let finished = std::time::Instant::now();
+                        *state.turn_completed_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(finished);
+                        if let (Some(started), Some(idx)) = (
+                            *state.turn_started_at.lock().unwrap_or_else(|e| e.into_inner()),
+                            state.items.iter().rposition(|it| matches!(it, TranscriptItem::Assistant { .. })),
+                        ) {
+                            state.thinking_elapsed.lock().unwrap_or_else(|e| e.into_inner()).insert(
+                                idx,
+                                finished.saturating_duration_since(started).as_millis() as u64,
+                            );
+                        }
                         render_now(&state, &editor, session, &mut terminal, &mut renderer);
                     }
                     SignalOutcome::RetryStarted => {
                         turn_running = true;
+                        *state.turn_started_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
+                        *state.turn_completed_at.lock().unwrap_or_else(|e| e.into_inner()) = None;
                         render_now(&state, &editor, session, &mut terminal, &mut renderer);
                     }
                     SignalOutcome::Continuing => {
@@ -3692,7 +4118,6 @@ pub async fn run_interactive_mode(
         }
     }
 
-    let _ = terminal.write("\x1b[?25h");
     let _ = terminal.write("\n");
     let _ = terminal.flush();
     Ok(())
@@ -3907,6 +4332,7 @@ mod tests {
                 args_summary: String::new(),
                 output_preview: Vec::new(),
                 diff: None,
+                duration_ms: None,
             }
         );
 
@@ -3932,6 +4358,7 @@ mod tests {
                 args_summary: String::new(),
                 output_preview: Vec::new(),
                 diff: None,
+                duration_ms: None,
             }
         );
 
@@ -4058,7 +4485,7 @@ mod tests {
         let plain = mehh_tui::strip_ansi(&frame);
         assert!(plain.contains("subagent"), "header must name the tool");
         assert!(
-            plain.contains("⚙ tool: running read"),
+            plain.contains("tool: running read"),
             "child row must render label, status and detail: {plain}"
         );
     }
@@ -4250,6 +4677,7 @@ mod tests {
             args_summary: String::new(),
             output_preview: Vec::new(),
             diff: None,
+            duration_ms: None,
         });
         state
             .items
@@ -4418,6 +4846,7 @@ mod tests {
             args_summary: String::new(),
             output_preview: Vec::new(),
             diff: None,
+            duration_ms: None,
         });
         let editor = Editor::new();
         let plain = mehh_tui::strip_ansi(
@@ -4482,6 +4911,7 @@ mod tests {
             args_summary: String::new(),
             output_preview: Vec::new(),
             diff: None,
+            duration_ms: None,
         });
         state.items.push(TranscriptItem::System("note".to_string()));
 
@@ -4554,12 +4984,12 @@ mod tests {
 
         let editor = Editor::new();
         let visible = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
-        assert!(visible.contains("secret reasoning"));
+        assert!(visible.contains("Thought for") || visible.contains("Thinking"));
         assert!(visible.contains("visible answer"));
 
         session.settings.hide_thinking_block = Some(true);
         let hidden = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
-        assert!(!hidden.contains("secret reasoning"));
+        assert!(!hidden.contains("Thought for") && !hidden.contains("Thinking"));
         assert!(hidden.contains("visible answer"));
     }
 
@@ -4694,6 +5124,387 @@ mod tests {
                 .trim_end()
                 .to_string()
         }
+    }
+
+    #[test]
+    fn scroll_anchor_persists_across_frames() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        for i in 0..20 {
+            let text = if i == 18 {
+                "ANCHOR_MARKER".to_string()
+            } else {
+                format!("line {i}")
+            };
+            state.items.push(TranscriptItem::System(text));
+        }
+        let editor = Editor::new();
+        let _ = render_interactive_frame(&state, &editor, &session, 60, 15);
+        state.scroll_offset = 1;
+        let row_of = |frame: &[String]| -> Option<usize> {
+            frame.iter().position(|l| l.contains("ANCHOR_MARKER"))
+        };
+        let a = render_interactive_frame(&state, &editor, &session, 60, 15);
+        let r1 = row_of(&a);
+        assert!(r1.is_some(), "marker must be visible initially: {a:?}");
+        state.items.push(TranscriptItem::System("extra 1".into()));
+        state.items.push(TranscriptItem::System("extra 2".into()));
+        let b = render_interactive_frame(&state, &editor, &session, 60, 15);
+        assert_eq!(r1, row_of(&b), "marker moved after a streaming burst");
+        let c = render_interactive_frame(&state, &editor, &session, 60, 15);
+        assert_eq!(r1, row_of(&c), "marker moved on the next tick");
+        let pill = c.iter().find(|l| l.contains("Paused at")).unwrap();
+        assert!(pill.contains("+4 new lines"), "cumulative count lost: {pill}");
+    }
+
+    #[test]
+    fn stacked_panels_fit_60x20() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        for i in 0..20 {
+            state.items.push(TranscriptItem::System(format!("line {i}")));
+        }
+        state.is_busy = true;
+        state.scroll_offset = 2;
+        session.steer("queued steering message");
+        let mut editor = Editor::new().with_placeholder("Type a message...");
+        editor.set_text(&"long ".repeat(100));
+        editor.set_autocomplete(
+            (0..5)
+                .map(|i| SelectItem::new(format!("f{i}"), format!("file {i}")))
+                .collect(),
+        );
+        let frame = render_interactive_frame(&state, &editor, &session, 60, 20);
+        assert!(frame.len() <= 20, "frame overflowed 20 rows: {}", frame.len());
+        let plain = mehh_tui::strip_ansi(&frame.join("\n"));
+        assert!(plain.contains("/help"), "footer pushed off-screen: {plain}");
+    }
+
+    #[test]
+    fn autocomplete_fits_60x20_when_empty() {
+        let session = make_test_session();
+        let state = make_test_state();
+        let mut editor = Editor::new().with_placeholder("Type a message...");
+        editor.set_text(&"long ".repeat(100));
+        editor.set_autocomplete(
+            (0..5)
+                .map(|i| SelectItem::new(format!("f{i}"), format!("file {i}")))
+                .collect(),
+        );
+        let frame = render_interactive_frame(&state, &editor, &session, 60, 20);
+        assert!(frame.len() <= 20, "frame overflowed 20 rows: {}", frame.len());
+        let plain = mehh_tui::strip_ansi(&frame.join("\n"));
+        assert!(plain.contains("/help"), "footer pushed off-screen: {plain}");
+        assert!(plain.contains("Suggestions"), "{plain}");
+    }
+
+    #[test]
+    fn completed_thinking_keeps_elapsed() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        let now = std::time::Instant::now();
+        *state.turn_started_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(now - std::time::Duration::from_millis(4200));
+        *state.turn_completed_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+        state.items.push(TranscriptItem::Assistant {
+            thinking: "reasoning".to_string(),
+            text: String::new(),
+        });
+        let frame = render_interactive_frame(&state, &Editor::new(), &session, 80, 24);
+        let plain = mehh_tui::strip_ansi(&frame.join("\n"));
+        assert!(plain.contains("4.2s"), "elapsed lost: {plain}");
+    }
+
+    #[test]
+    fn historical_thinking_keeps_its_own_elapsed() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        for _ in 0..2 {
+            state.items.push(TranscriptItem::Assistant {
+                thinking: "reasoning".to_string(),
+                text: String::new(),
+            });
+        }
+        state
+            .thinking_elapsed
+            .lock()
+            .unwrap()
+            .insert(0, 2000);
+        let frame = render_interactive_frame(&state, &Editor::new(), &session, 80, 24);
+        let plain = mehh_tui::strip_ansi(&frame.join("\n"));
+        assert_eq!(plain.matches("2.0s").count(), 1, "{plain}");
+    }
+
+    #[test]
+    fn only_active_thinking_shows_spinner() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        for _ in 0..2 {
+            state.items.push(TranscriptItem::Assistant {
+                thinking: "alpha\nbeta\ngamma\ndelta".to_string(),
+                text: String::new(),
+            });
+        }
+        state.is_busy = true;
+        let frame = render_interactive_frame(&state, &Editor::new(), &session, 80, 24);
+        let plain = mehh_tui::strip_ansi(&frame.join("\n"));
+        assert_eq!(plain.matches("Thinking (").count(), 1, "{plain}");
+        assert_eq!(plain.matches("Thought for").count(), 1, "{plain}");
+    }
+
+    #[test]
+    fn transcript_cache_includes_render_time_flags() {
+        let mut session = make_test_session();
+        let mut state = make_test_state();
+        state.items.push(TranscriptItem::Assistant {
+            thinking: "alpha\nbeta\ngamma\ndelta".to_string(),
+            text: String::new(),
+        });
+        let editor = Editor::new();
+        let collapsed = render_interactive_frame(&state, &editor, &session, 80, 24);
+        state.thinking_expanded = true;
+        let expanded = render_interactive_frame(&state, &editor, &session, 80, 24);
+        assert_ne!(collapsed, expanded, "Ctrl+T must change the rendered frame");
+        state.thinking_expanded = false;
+        session.settings.hide_thinking_block = Some(true);
+        let hidden = render_interactive_frame(&state, &editor, &session, 80, 24);
+        assert_ne!(expanded, hidden, "hide_thinking must change the rendered frame");
+        session.settings.hide_thinking_block = Some(false);
+        state.is_busy = true;
+        let busy = render_interactive_frame(&state, &editor, &session, 80, 24);
+        assert_ne!(hidden, busy, "busy flag must change the rendered frame");
+    }
+
+    #[test]
+    fn tool_approval_fits_60x20_with_long_preview() {
+        let session = make_test_session();
+        let mut state = make_test_state();
+        let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+        let preview = (0..300)
+            .map(|i| format!("cargo test case {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        state.pending_approval = Some(PendingApproval {
+            tool_name: "bash".to_string(),
+            args: serde_json::Map::new(),
+            reason: "Verify before approving this very long command preview".to_string(),
+            preview: Some(preview),
+            reply_tx,
+        });
+        state.selector = Some(Selector {
+            kind: SelectorKind::ToolApproval,
+            list: SelectList::new(
+                vec![
+                    SelectItem::new("allow_once", "Allow once (y/Enter)"),
+                    SelectItem::new("allow_session", "Allow for session (a)"),
+                    SelectItem::new("always_allow", "Always allow (A)"),
+                    SelectItem::new("deny", "Deny (n/Esc)"),
+                ],
+                6,
+            ),
+            settings_list: None,
+        });
+        let editor = Editor::new();
+        let frame = render_interactive_frame(&state, &editor, &session, 60, 20);
+        assert!(frame.len() <= 20, "frame overflowed 20 rows: {}", frame.len());
+        let plain = mehh_tui::strip_ansi(&frame.join("\n"));
+        assert!(plain.contains("Allow once"), "{plain}");
+        assert!(plain.contains("Allow for session"), "{plain}");
+        assert!(plain.contains("Always allow"), "{plain}");
+        assert!(plain.contains("Deny"), "{plain}");
+        assert!(plain.contains("/help"), "footer pushed off-screen: {plain}");
+    }
+
+    #[test]
+    fn tool_duration_label_formats_ms() {
+        assert_eq!(super::tool_duration_label(None), "");
+        assert_eq!(super::tool_duration_label(Some(18)), " 18ms");
+    }
+
+    #[test]
+    fn diff_truncation_reports_hidden_lines() {
+        let diff = (0..30)
+            .map(|i| format!("+line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (shown, hidden) = super::diff_visible_lines(&diff);
+        assert_eq!(shown.len(), 24);
+        assert_eq!(hidden, 6);
+    }
+
+    #[test]
+    fn thinking_preview_shows_last_three_lines_when_busy() {
+        let text = (1..=8)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let s = super::thinking_preview(&text, false, true, None);
+        assert!(s.contains("line 8") && s.contains("line 6"));
+        assert!(!s.contains("line 1"));
+        assert!(s.contains("Thinking (8 lines)"));
+    }
+
+    #[test]
+    fn context_formatting_helpers() {
+        assert_eq!(super::compact_count(12_432), "12.4k");
+        assert_eq!(super::compact_count(999), "999");
+        assert!(
+            super::ctx_bar(72, &mehh_tui::Theme::dark())
+                .matches('█')
+                .count()
+                >= 5
+        );
+    }
+
+    #[test]
+    fn left_right_layout_aligns_right_edge() {
+        let line = super::left_right("left".into(), "right".into(), 40);
+        assert_eq!(mehh_tui::visible_width(&line), 40);
+        assert!(line.ends_with("right"));
+    }
+
+    #[test]
+    fn compact_path_keeps_final_folder() {
+        let p = std::path::Path::new("C:/Users/Admin/Projects/mehh-code");
+        let s = super::compact_path(p, 24);
+        assert!(s.contains("mehh-code"), "{s}");
+        assert!(s.contains("..."), "{s}");
+    }
+
+    #[test]
+    fn compact_path_counts_characters_not_bytes() {
+        let p = std::path::Path::new("C:/Users/Admin/项目/меhh-код");
+        for max_len in [12, 18, 24] {
+            let s = super::compact_path(p, max_len);
+            assert!(s.chars().count() <= max_len, "{s} is longer than {max_len}");
+        }
+    }
+
+    #[test]
+    fn elapsed_label_formats_seconds() {
+        let now = std::time::Instant::now();
+        let s = super::elapsed_label(
+            Some(now - std::time::Duration::from_millis(3400)),
+            now,
+        );
+        assert!(s.contains("3.4s"), "{s}");
+    }
+
+    #[test]
+    fn user_turn_paints_every_wrapped_line_full_width() {
+        let text = "alpha beta gamma delta epsilon zeta eta theta iota kappa";
+        let lines = super::render_user_turn(text, 20, &mehh_tui::Theme::dark());
+        assert!(lines.len() > 1, "must wrap: {lines:?}");
+        assert!(
+            lines
+                .iter()
+                .all(|l| mehh_tui::visible_width(l) == 20),
+            "{lines:?}"
+        );
+        assert!(lines
+            .iter()
+            .all(|l| l.contains("\x1b[48;2;35;38;46m")));
+    }
+
+    #[test]
+    fn status_icon_uses_monospace_glyphs() {
+        let t = mehh_tui::Theme::dark();
+        assert!(super::status_icon("running", false, 0, &t).contains('⠋'));
+        assert!(super::status_icon("completed", false, 0, &t).contains('✓'));
+        assert!(super::status_icon("failed", true, 0, &t).contains('✗'));
+        assert!(super::status_icon("blocked", false, 0, &t).contains('◌'));
+    }
+
+    #[test]
+    fn filter_accepts_space_except_for_settings() {
+        let mut model = Selector {
+            kind: SelectorKind::Model,
+            list: mehh_tui::SelectList::new(vec![], 5),
+            settings_list: None,
+        };
+        assert!(super::update_selector_filter(&mut model, " "));
+        assert_eq!(model.list.filter, " ");
+        let mut settings = Selector {
+            kind: SelectorKind::Settings,
+            list: mehh_tui::SelectList::new(vec![], 5),
+            settings_list: None,
+        };
+        assert!(!super::update_selector_filter(&mut settings, " "));
+    }
+
+    #[test]
+    fn queue_mode_values_match_enum() {
+        let settings = crate::settings::Settings::default();
+        let list = super::build_settings_list(&settings);
+        let item = list.items.iter().find(|i| i.id == "steering_mode").unwrap();
+        assert_eq!(
+            item.values,
+            vec!["one-at-a-time".to_string(), "all".to_string()]
+        );
+    }
+
+    #[test]
+    fn cap_preview_lines_preserves_action_rows() {
+        let preview = (0..300)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let capped = super::cap_preview_lines(&preview, 6);
+        assert_eq!(capped.lines().count(), 7);
+        assert!(capped.contains("+294 more lines"), "{capped}");
+    }
+
+    #[test]
+    fn anchored_scroll_offset_accumulates_across_frames() {
+        assert_eq!(super::anchored_scroll_offset(0, 12, 5), 12);
+        assert_eq!(super::anchored_scroll_offset(12, 0, 5), 12);
+        assert_eq!(super::anchored_scroll_offset(12, 3, 0), 0);
+    }
+
+    #[test]
+    fn scrollbar_char_marks_thumb_and_track() {
+        assert_eq!(super::scrollbar_char(1, 10, 100, 0), '┃');
+        assert_eq!(super::scrollbar_char(5, 10, 100, 0), '│');
+    }
+
+    #[test]
+    fn scroll_pill_reports_pct_and_new_lines() {
+        assert!(super::scroll_pill_text(32, 100, 12).contains("+12 new lines"));
+        assert!(super::scroll_pill_text(32, 100, 12).contains("32%"));
+    }
+
+    #[test]
+    fn context_token_cache_invalidates_on_message_end() {
+        let state = make_test_state();
+        *state.cached_ctx_tokens.lock().unwrap() = Some(4242);
+        state.invalidate_context_tokens();
+        assert!(state.cached_ctx_tokens.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn render_interactive_frame_is_deterministic_at_60x20() {
+        let session = make_test_session();
+        let state = make_test_state();
+        let editor = Editor::new().with_placeholder("Type a message...");
+        let a = render_interactive_frame(&state, &editor, &session, 60, 20);
+        let b = render_interactive_frame(&state, &editor, &session, 60, 20);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn render_now_keeps_renderer_state_and_does_not_home() {
+        let session = make_test_session();
+        let state = make_test_state();
+        let editor = Editor::new().with_placeholder("Type a message...");
+        let mut term = mehh_tui::MockTerminal::new(80, 24);
+        let mut renderer = TuiRenderer::new();
+
+        render_now(&state, &editor, &session, &mut term, &mut renderer);
+        term.clear_output();
+        render_now(&state, &editor, &session, &mut term, &mut renderer);
+        let out = term.full_output();
+        assert!(!out.contains("\x1b[H"), "no home: {out:?}");
+        assert!(!out.contains("\x1b[J"), "no clear-below: {out:?}");
+        assert!(!renderer.previous_lines.is_empty(), "renderer keeps baseline");
     }
 
     #[test]

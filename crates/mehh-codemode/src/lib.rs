@@ -55,7 +55,7 @@ mod tests {
     }
 
     fn dummy_executor() -> SandboxToolExecutor {
-        Arc::new(|_name: &str, _args: serde_json::Value| -> BoxFuture<'static, Result<serde_json::Value, String>> {
+        Arc::new(|_name: &str, _args: serde_json::Value, _cancel: tokio_util::sync::CancellationToken| -> BoxFuture<'static, Result<serde_json::Value, String>> {
             Box::pin(async { Err("dummy executor".to_string()) })
         })
     }
@@ -107,7 +107,7 @@ mod tests {
         let tool_def = tool_to_definition(echo_tool.as_ref());
         let tool_clone = echo_tool.clone();
 
-        let executor: SandboxToolExecutor = Arc::new(move |_name: &str, args: serde_json::Value| {
+        let executor: SandboxToolExecutor = Arc::new(move |_name: &str, args: serde_json::Value, _cancel: tokio_util::sync::CancellationToken| {
             let tool = tool_clone.clone();
             Box::pin(async move {
                 let params = match args {
@@ -551,7 +551,7 @@ mod tests {
         assert_eq!(probe_val.get("hasHostLog").and_then(|v| v.as_bool()), Some(false));
 
         // 2. Verify cancellation interrupts a slow nested host tool call promptly.
-        let slow_executor: SandboxToolExecutor = Arc::new(move |_name, _args| {
+        let slow_executor: SandboxToolExecutor = Arc::new(move |_name, _args, _cancel| {
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_secs(5)).await;
                 Ok(serde_json::Value::String("done".to_string()))
@@ -581,5 +581,103 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "Cancelled nested tool took too long: {elapsed:?}"
         );
+    }
+
+    // 10. exit() is uncatchable: a user try/catch cannot turn it into a value.
+    #[tokio::test]
+    async fn test_exit_is_uncatchable() {
+        let result = run_codemode(
+            r#"try { exit(); } catch (e) { return 999; } return 1;"#,
+            &[],
+            dummy_executor(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &CodemodeConfig::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.ok, "exit should be a clean exit: {:?}", result.error);
+        assert_eq!(result.value, None, "catch must not swallow exit()");
+    }
+
+    // 11. Tool-call budget is enforced per script.
+    #[tokio::test]
+    async fn test_tool_call_limit() {
+        let echo = Arc::new(MockEchoTool);
+        let def = tool_to_definition(echo.as_ref());
+        let executor: SandboxToolExecutor = Arc::new(|_name, _args, _cancel| {
+            Box::pin(async { Ok(serde_json::Value::String("ok".to_string())) })
+        });
+        let config = CodemodeConfig {
+            max_tool_calls: 1,
+            ..Default::default()
+        };
+        let result = run_codemode(
+            r#"await tools.echo({msg:"a"}); await tools.echo({msg:"b"}); return 1;"#,
+            std::slice::from_ref(&def),
+            executor,
+            Arc::new(Mutex::new(HashMap::new())),
+            &config,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!result.ok, "second tool call must be rejected");
+        let err = result.error.unwrap_or_default();
+        assert!(err.contains("tool-call limit"), "unexpected error: {err}");
+    }
+
+    // 12. WebP validation checks RIFF....WEBP, not just the RIFF prefix.
+    #[tokio::test]
+    async fn test_webp_magic_rejects_wav_payload() {
+        let result = run_codemode(
+            r#"image("data:image/webp;base64,UklGRiQAAABXQVZFZm10IA==");"#,
+            &[],
+            dummy_executor(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &CodemodeConfig::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!result.ok, "WAV bytes declared as WebP must be rejected");
+        let err = result.error.unwrap_or_default();
+        assert!(
+            err.contains("does not match declared type"),
+            "unexpected error: {err}"
+        );
+    }
+
+    // 13. A `})()` sequence cannot escape the async wrapper.
+    #[tokio::test]
+    async fn test_wrapper_escape_is_syntax_error() {
+        let result = run_codemode(
+            r#"})(); (async () => { return 7; })(); (async () => {"#,
+            &[],
+            dummy_executor(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &CodemodeConfig::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!result.ok, "escaped wrapper must not execute");
+    }
+
+    // 14. exit() after an await must still be a clean exit, not a pending-promise error.
+    #[tokio::test]
+    async fn test_exit_after_await_is_clean_exit() {
+        let echo = Arc::new(MockEchoTool);
+        let def = tool_to_definition(echo.as_ref());
+        let executor: SandboxToolExecutor = Arc::new(|_name, _args, _cancel| {
+            Box::pin(async { Ok(serde_json::Value::String("ok".to_string())) })
+        });
+        let result = run_codemode(
+            r#"await tools.echo({ msg: "x" }); exit();"#,
+            std::slice::from_ref(&def),
+            executor,
+            Arc::new(Mutex::new(HashMap::new())),
+            &CodemodeConfig::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(result.ok, "exit after await must be clean: {:?}", result.error);
+        assert_eq!(result.value, None, "exit after await must not return a value");
     }
 }

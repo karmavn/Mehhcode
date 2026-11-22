@@ -11,6 +11,7 @@ mehh-tools = { workspace = true }
 mehh-tui = { workspace = true }
 mehh-mcp = { workspace = true }
 mehh-codemode = { workspace = true }
+mehh-execpolicy = { workspace = true }
 crossterm = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

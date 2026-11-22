@@ -85,6 +85,9 @@ pub struct AgentSession {
     codemode_tool: Option<Arc<mehh_codemode::CodemodeTool>>,
     pub inspection_manager: Arc<crate::tool_inspection::ToolInspectionManager>,
     pub approval_handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
+    /// Shared with the codemode interceptor so `set_approval_handler` takes
+    /// effect without recreating the sandbox tool.
+    approval_handler_slot: Arc<RwLock<Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>>>,
     pub todo_state: Arc<tokio::sync::RwLock<crate::todo::TodoState>>,
     pub lead_worker: Arc<Mutex<crate::lead_worker::LeadWorkerManager>>,
     pub subagent_control: Arc<SubagentControl>,
@@ -251,6 +254,7 @@ impl AgentSession {
             codemode_tool: None,
             inspection_manager,
             approval_handler: None,
+            approval_handler_slot: Arc::new(RwLock::new(None)),
             todo_state,
             lead_worker,
             subagent_control,
@@ -383,6 +387,7 @@ impl AgentSession {
         handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
     ) {
         self.approval_handler = handler;
+        *self.approval_handler_slot.write().unwrap() = self.approval_handler.clone();
         self.refresh_subagent_tool();
     }
 
@@ -484,27 +489,40 @@ impl AgentSession {
         tools: Vec<Arc<dyn AgentTool>>,
     ) -> Arc<mehh_codemode::CodemodeTool> {
         let inspection_mgr = self.inspection_manager.clone();
-        let approval_h = self.approval_handler.clone();
+        let approval_slot = self.approval_handler_slot.clone();
         let session_cwd = self.cwd.clone();
-        let tools_clone = tools.clone();
+
+        let mut codemode = mehh_codemode::CodemodeTool::new(tools);
+        // Read the live tool list on every call: `replace_tools` must be able to
+        // refresh `is_read_only` without rebuilding the interceptor.
+        let live_tools = codemode.tools_handle();
         let interceptor: mehh_codemode::ToolCallInterceptor = Arc::new(move |name, args| {
             let inspection_mgr = inspection_mgr.clone();
-            let approval_h = approval_h.clone();
+            let approval_slot = approval_slot.clone();
             let session_cwd = session_cwd.clone();
+            let live_tools = live_tools.clone();
             let name_str = name.to_string();
             let args_map = args.clone();
-            let is_read_only = tools_clone
-                .iter()
-                .find(|t| t.name() == name_str)
-                .and_then(|t| t.is_read_only());
             Box::pin(async move {
+                let is_read_only = live_tools
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .find(|t| t.name() == name_str)
+                    .and_then(|t| t.is_read_only());
+                // Approval may be installed after the tool was created (TUI
+                // calls set_approval_handler on session startup).
+                let approval_h = approval_slot
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let inspect_ctx = crate::tool_inspection::ToolInspectionContext {
-                    tool_call_id: format!("codemode/{}", name_str),
+                    tool_call_id: format!("codemode/{name_str}"),
                     tool_name: name_str,
                     args: args_map,
                     is_read_only,
                     cwd: session_cwd,
-                    origin: None,
+                    origin: Some("codemode".to_string()),
                 };
                 let res = inspection_mgr
                     .inspect_and_authorize(&inspect_ctx, approval_h.as_deref())
@@ -519,7 +537,8 @@ impl AgentSession {
             })
         });
 
-        Arc::new(mehh_codemode::CodemodeTool::new(tools).with_interceptor(interceptor))
+        codemode.set_interceptor(Some(interceptor));
+        Arc::new(codemode)
     }
 
     /// Synchronizes updated MCP tools into the session, updating deferred catalog and codemode bindings in-place.

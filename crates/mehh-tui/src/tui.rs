@@ -28,6 +28,8 @@ impl CrosstermTerminal {
         crossterm::terminal::enable_raw_mode()?;
         let _ = crossterm::execute!(
             std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::cursor::Hide,
             crossterm::event::EnableBracketedPaste,
             crossterm::event::EnableMouseCapture
         );
@@ -43,7 +45,9 @@ impl Drop for CrosstermTerminal {
             let _ = crossterm::execute!(
                 std::io::stdout(),
                 crossterm::event::DisableMouseCapture,
-                crossterm::event::DisableBracketedPaste
+                crossterm::event::DisableBracketedPaste,
+                crossterm::cursor::Show,
+                crossterm::terminal::LeaveAlternateScreen
             );
             let _ = crossterm::terminal::disable_raw_mode();
         }
@@ -174,7 +178,6 @@ pub fn composite_tui_line(
 pub struct TuiRenderer {
     pub previous_lines: Vec<String>,
     pub previous_width: usize,
-    pub cursor_row: usize,
 }
 
 impl TuiRenderer {
@@ -182,14 +185,12 @@ impl TuiRenderer {
         Self {
             previous_lines: Vec::new(),
             previous_width: 0,
-            cursor_row: 0,
         }
     }
 
     pub fn reset(&mut self) {
         self.previous_lines.clear();
         self.previous_width = 0;
-        self.cursor_row = 0;
     }
 
     pub fn render_frame(
@@ -233,9 +234,8 @@ impl TuiRenderer {
         let mut out = String::new();
         out.push_str("\x1b[?2026h"); // Synchronized output begin
 
-        let mut final_cursor_row;
-
         if full_redraw {
+            out.push_str("\x1b[H");
             out.push('\r');
             for (i, line) in lines.iter().enumerate() {
                 out.push_str("\x1b[2K");
@@ -244,74 +244,32 @@ impl TuiRenderer {
                     out.push_str("\r\n");
                 }
             }
-            final_cursor_row = lines.len().saturating_sub(1);
+            if self.previous_lines.len() > lines.len() {
+                out.push_str(&format!("\x1b[{};1H\x1b[J", lines.len() + 1));
+            } else {
+                out.push_str("\x1b[J");
+            }
         } else {
             let max_len = lines.len().max(self.previous_lines.len());
-            let mut first_changed = None;
-            let mut last_changed = None;
-
             for i in 0..max_len {
                 let old_l = self.previous_lines.get(i).map(|s| s.as_str()).unwrap_or("");
                 let new_l = lines.get(i).map(|s| s.as_str()).unwrap_or("");
                 if old_l != new_l {
-                    if first_changed.is_none() {
-                        first_changed = Some(i);
+                    if let Some(line) = lines.get(i) {
+                        out.push_str(&format!("\x1b[{};1H\x1b[2K{line}", i + 1));
                     }
-                    last_changed = Some(i);
                 }
             }
-
-            if let (Some(first), Some(last)) = (first_changed, last_changed) {
-                let diff = first as isize - self.cursor_row as isize;
-                if diff < 0 {
-                    out.push_str(&format!("\x1b[{}A", -diff));
-                } else if diff > 0 {
-                    out.push_str(&format!("\x1b[{}B", diff));
-                }
-                out.push('\r');
-
-                let render_end = last.min(lines.len().saturating_sub(1));
-                for (i, line) in lines.iter().enumerate().take(render_end + 1).skip(first) {
-                    if i > first {
-                        out.push_str("\r\n");
-                    }
-                    out.push_str("\x1b[2K");
-                    out.push_str(line);
-                }
-                final_cursor_row = render_end;
-
-                if self.previous_lines.len() > lines.len() {
-                    if render_end < lines.len().saturating_sub(1) {
-                        let move_down = lines.len() - 1 - render_end;
-                        out.push_str(&format!("\x1b[{move_down}B"));
-                        final_cursor_row = lines.len() - 1;
-                    }
-                    let extra = self.previous_lines.len() - lines.len();
-                    for _ in 0..extra {
-                        out.push_str("\r\n\x1b[2K");
-                    }
-                    out.push_str(&format!("\x1b[{extra}A"));
-                }
-            } else {
-                final_cursor_row = self.cursor_row;
+            if self.previous_lines.len() > lines.len() {
+                out.push_str(&format!("\x1b[{};1H\x1b[J", lines.len() + 1));
             }
         }
 
-        // Position hardware cursor if tracked
+        // Position hardware cursor if tracked.
         if show_hardware_cursor {
             if let Some((target_row, target_col)) = cursor_pos {
                 let target_row = target_row.min(lines.len().saturating_sub(1));
-                let diff = target_row as isize - final_cursor_row as isize;
-                if diff < 0 {
-                    out.push_str(&format!("\x1b[{}A", -diff));
-                } else if diff > 0 {
-                    out.push_str(&format!("\x1b[{}B", diff));
-                }
-                out.push('\r');
-                if target_col > 0 {
-                    out.push_str(&format!("\x1b[{}C", target_col));
-                }
-                final_cursor_row = target_row;
+                out.push_str(&format!("\x1b[{};{}H", target_row + 1, target_col + 1));
             }
         }
 
@@ -322,7 +280,6 @@ impl TuiRenderer {
 
         self.previous_lines = lines;
         self.previous_width = width;
-        self.cursor_row = final_cursor_row;
 
         Ok(())
     }
@@ -331,6 +288,93 @@ impl TuiRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn full_redraw_erases_stale_rows() {
+        let mut term = MockTerminal::new(40, 6);
+        let mut renderer = TuiRenderer::new();
+        renderer
+            .render_frame(
+                &mut term,
+                (0..6).map(|i| format!("old {i}")).collect(),
+                false,
+            )
+            .unwrap();
+        renderer.reset();
+        term.clear_output();
+        renderer
+            .render_frame(&mut term, vec!["new".into()], false)
+            .unwrap();
+        assert!(
+            term.full_output().contains("\x1b[J"),
+            "full redraw must clear stale rows: {:?}",
+            term.full_output()
+        );
+    }
+
+    #[test]
+    fn full_redraw_homes_cursor() {
+        let mut term = MockTerminal::new(40, 3);
+        let mut renderer = TuiRenderer::new();
+        renderer
+            .render_frame(&mut term, vec!["a".into()], false)
+            .unwrap();
+        let out = term.full_output();
+        assert!(
+            out.contains("\x1b[?2026h\x1b[H"),
+            "full redraw must home before writing rows: {out:?}"
+        );
+    }
+
+    #[test]
+    fn differential_render_uses_absolute_rows() {
+        let mut term = MockTerminal::new(40, 3);
+        let mut renderer = TuiRenderer::new();
+        renderer
+            .render_frame(
+                &mut term,
+                vec!["a".into(), "b".into(), "c".into()],
+                false,
+            )
+            .unwrap();
+        term.clear_output();
+        renderer
+            .render_frame(
+                &mut term,
+                vec!["a".into(), "B".into(), "c".into()],
+                false,
+            )
+            .unwrap();
+        let out = term.full_output();
+        assert!(
+            out.contains("\x1b[2;1H\x1b[2KB"),
+            "absolute row positioning: {out:?}"
+        );
+        assert!(!out.contains("\x1b[1A"), "no relative up move: {out:?}");
+        assert!(!out.contains("\x1b[1B"), "no relative down move: {out:?}");
+    }
+
+    #[test]
+    fn shorter_frame_erases_stale_rows() {
+        let mut term = MockTerminal::new(40, 3);
+        let mut renderer = TuiRenderer::new();
+        renderer
+            .render_frame(
+                &mut term,
+                vec!["a".into(), "b".into(), "c".into()],
+                false,
+            )
+            .unwrap();
+        term.clear_output();
+        renderer
+            .render_frame(&mut term, vec!["x".into()], false)
+            .unwrap();
+        let out = term.full_output();
+        assert!(
+            out.contains("\x1b[2;1H\x1b[J"),
+            "erase stale rows: {out:?}"
+        );
+    }
 
     #[test]
     fn test_differential_render_cursor_position_when_partial_lines_change() {
@@ -357,11 +401,11 @@ mod tests {
         renderer.render_frame(&mut term, frame2, true).unwrap();
         let out = term.full_output();
 
-        // If cursor is at bottom (row 3) after re-rendering line0..line3, moving to line0 takes 3A.
-        // But if renderer stops after line0, it should either advance to row 3 before moving 3A, or move 1A from row 1.
-        // It must NOT emit an overshoot movement (e.g. moving up 3 from row 1).
+        // With absolute row positioning the renderer writes the changed row directly
+        // and then places the hardware cursor at the marker; no relative 3A overshoot.
         assert!(out.contains("line0_new"));
-        assert!(!out.contains("\x1b[3A\r\x1b[2Kline0_new\r\n\x1b[3A"), "Out contained bad overshoot cursor move: {out:?}");
+        assert!(out.contains("\x1b[1;1H\x1b[2Kline0_new"), "changed row must use absolute positioning: {out:?}");
+        assert!(!out.contains("\x1b[3A"), "no relative overshoot: {out:?}");
     }
 }
 

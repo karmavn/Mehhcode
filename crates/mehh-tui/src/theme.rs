@@ -23,6 +23,9 @@ pub struct Theme {
     /// Soft background block behind a completed user turn.
     #[serde(default)]
     pub user_bg: String,
+    /// Raised surface for modals, code blocks, and inline code.
+    #[serde(default)]
+    pub surface_elevated: String,
     /// Full-width background for added/removed diff lines.
     #[serde(default)]
     pub diff_add_bg: String,
@@ -124,12 +127,13 @@ impl Theme {
             success: "\x1b[38;2;74;222;128m".to_string(),
             error: "\x1b[38;2;248;113;113m".to_string(),
             warning: "\x1b[38;2;251;191;36m".to_string(),
-            muted: "\x1b[38;2;113;113;122m".to_string(),
-            dim: "\x1b[38;2;82;82;91m".to_string(),
+            muted: "\x1b[38;2;161;161;170m".to_string(),
+            dim: "\x1b[38;2;142;142;152m".to_string(),
             text: "\x1b[38;2;228;228;231m".to_string(),
             thinking_text: "\x1b[3;38;2;113;113;122m".to_string(),
             user_prefix: "\x1b[1;38;2;217;119;87m".to_string(),
             user_bg: "\x1b[48;2;35;38;46m".to_string(),
+            surface_elevated: "\x1b[48;2;30;32;40m".to_string(),
             diff_add_bg: "\x1b[48;2;22;43;32m".to_string(),
             diff_del_bg: "\x1b[48;2;45;24;28m".to_string(),
             tool_pending: "\x1b[38;2;251;191;36m".to_string(),
@@ -155,11 +159,12 @@ impl Theme {
             error: "\x1b[38;2;185;28;28m".to_string(),
             warning: "\x1b[38;2;161;98;7m".to_string(),
             muted: "\x1b[38;2;113;113;122m".to_string(),
-            dim: "\x1b[38;2;161;161;170m".to_string(),
+            dim: "\x1b[38;2;100;100;110m".to_string(),
             text: "\x1b[38;2;24;24;27m".to_string(),
             thinking_text: "\x1b[3;38;2;113;113;122m".to_string(),
             user_prefix: "\x1b[1;38;2;180;83;9m".to_string(),
             user_bg: "\x1b[48;2;244;244;245m".to_string(),
+            surface_elevated: "\x1b[48;2;244;244;245m".to_string(),
             diff_add_bg: "\x1b[48;2;220;252;231m".to_string(),
             diff_del_bg: "\x1b[48;2;254;226;226m".to_string(),
             tool_pending: "\x1b[38;2;161;98;7m".to_string(),
@@ -322,6 +327,9 @@ impl Theme {
         if let Some(c) = get_color("selectedBg", "selected_bg", true) {
             theme.selected_bg = c;
         }
+        if let Some(c) = get_color("surfaceElevated", "surface_elevated", true) {
+            theme.surface_elevated = c;
+        }
         if let Some(c) = get_color("mdHeading", "md_heading", false) {
             theme.md_heading = c;
         }
@@ -352,5 +360,30 @@ impl Theme {
         } else {
             format!("{color_code}{text}\x1b[0m")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contrast_tokens_match_spec() {
+        assert_eq!(Theme::dark().dim, "\x1b[38;2;142;142;152m");
+        assert_eq!(Theme::dark().muted, "\x1b[38;2;161;161;170m");
+        assert_eq!(Theme::light().dim, "\x1b[38;2;100;100;110m");
+        assert_eq!(Theme::dark().surface_elevated, "\x1b[48;2;30;32;40m");
+        assert_eq!(Theme::light().surface_elevated, "\x1b[48;2;244;244;245m");
+    }
+
+    #[test]
+    fn custom_theme_without_surface_elevated_loads() {
+        let tmp = std::env::temp_dir().join(format!("mehh-theme-test-{}.json", std::process::id()));
+        std::fs::write(&tmp, r##"{"name":"custom","colors":{"dim":"#123456"}}"##).unwrap();
+        let t = Theme::load(Some(tmp.to_str().unwrap()));
+        assert_eq!(t.name, "custom");
+        assert_eq!(t.dim, "\x1b[38;2;18;52;86m");
+        assert_eq!(t.surface_elevated, Theme::dark().surface_elevated);
+        let _ = std::fs::remove_file(tmp);
     }
 }

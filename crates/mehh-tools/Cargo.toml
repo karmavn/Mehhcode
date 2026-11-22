@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 mehh-ai = { workspace = true }
 mehh-agent = { workspace = true }
+mehh-sandbox = { workspace = true }
 anyhow = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

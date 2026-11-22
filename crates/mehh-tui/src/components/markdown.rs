@@ -67,6 +67,49 @@ fn format_markdown_table(
         return Vec::new();
     }
 
+    if max_width < 3 {
+        return rows
+            .iter()
+            .map(|row| {
+                crate::ansi::truncate_to_width(
+                    &row.join(" "),
+                    max_width,
+                    "…",
+                    false,
+                )
+            })
+            .collect();
+    }
+
+    let overhead = col_count * 3 + 1;
+    if max_width <= overhead {
+        let cols = col_count.min(max_width.saturating_sub(1) / 2).max(1);
+        let compact_border = |left: char, mid: char, right: char| {
+            let mut s = format!("{border_color}{left}");
+            for i in 0..cols {
+                s.push('─');
+                s.push(if i + 1 == cols { right } else { mid });
+            }
+            s.push_str("\x1b[0m");
+            s
+        };
+        let mut out = vec![compact_border('┌', '┬', '┐')];
+        for (r_idx, row) in rows.iter().enumerate() {
+            let mut line = format!("{border_color}│\x1b[0m");
+            for c in 0..cols {
+                let cell = row.get(c).map(String::as_str).unwrap_or("");
+                line.push(cell.chars().next().unwrap_or(' '));
+                line.push_str(&format!("{border_color}│\x1b[0m"));
+            }
+            out.push(line);
+            if has_header && r_idx == 0 {
+                out.push(compact_border('├', '┼', '┤'));
+            }
+        }
+        out.push(compact_border('└', '┴', '┘'));
+        return out;
+    }
+
     let mut col_widths = vec![3usize; col_count];
     for row in rows {
         for (c, cell) in row.iter().enumerate() {
@@ -74,7 +117,6 @@ fn format_markdown_table(
         }
     }
 
-    let overhead = col_count * 3 + 1;
     if max_width > overhead {
         let avail_cells = max_width - overhead;
         while col_widths.iter().sum::<usize>() > avail_cells {
@@ -93,9 +135,19 @@ fn format_markdown_table(
         col_widths.fill(1);
     }
 
-    let mut lines = Vec::new();
+    let border = |left: char, mid: char, right: char| {
+        let mut s = format!("{border_color}{left}");
+        for (i, &w) in col_widths.iter().enumerate() {
+            s.push_str(&"─".repeat(w + 2));
+            s.push(if i + 1 == col_widths.len() { right } else { mid });
+        }
+        s.push_str("\x1b[0m");
+        s
+    };
+
+    let mut lines = vec![border('┌', '┬', '┐')];
     for (r_idx, row) in rows.iter().enumerate() {
-        let mut line = format!("{border_color}|\x1b[0m");
+        let mut line = format!("{border_color}│\x1b[0m");
         for (c_idx, &col_w) in col_widths.iter().enumerate() {
             let cell = row.get(c_idx).map(String::as_str).unwrap_or("");
             let formatted = crate::ansi::truncate_to_width(cell, col_w, "…", true);
@@ -107,20 +159,15 @@ fn format_markdown_table(
             } else {
                 line.push_str(&formatted);
             }
-            line.push_str(&format!(" {border_color}|\x1b[0m"));
+            line.push_str(&format!(" {border_color}│\x1b[0m"));
         }
         lines.push(line);
 
         if has_header && r_idx == 0 {
-            let mut sep = format!("{border_color}|");
-            for &col_w in &col_widths {
-                sep.push_str(&"─".repeat(col_w + 2));
-                sep.push('|');
-            }
-            sep.push_str("\x1b[0m");
-            lines.push(sep);
+            lines.push(border('├', '┼', '┤'));
         }
     }
+    lines.push(border('└', '┴', '┘'));
     lines
 }
 
@@ -170,6 +217,7 @@ impl Component for MarkdownView {
         let mut list_stack: Vec<Option<u64>> = Vec::new();
         let mut link_osc8_stack: Vec<bool> = Vec::new();
         let mut active_heading_style: Option<String> = None;
+        let mut active_heading_is_h1 = false;
 
         let quote_color = if !self.theme.md_quote.is_empty() {
             &self.theme.md_quote
@@ -184,7 +232,7 @@ impl Component for MarkdownView {
         let code_color = if !self.theme.md_code.is_empty() {
             &self.theme.md_code
         } else {
-            "\x1b[33m"
+            &self.theme.text
         };
 
         let flush_current_line =
@@ -207,10 +255,16 @@ impl Component for MarkdownView {
                         HeadingLevel::H5 => "##### ",
                         HeadingLevel::H6 => "###### ",
                     };
-                    let heading_style = if !self.theme.md_heading.is_empty() {
-                        self.theme.md_heading.clone()
-                    } else {
-                        "\x1b[1;36m".to_string()
+                    active_heading_is_h1 = matches!(level, HeadingLevel::H1);
+                    let heading_style = match level {
+                        HeadingLevel::H1 | HeadingLevel::H2 => {
+                            if !self.theme.md_heading.is_empty() {
+                                self.theme.md_heading.clone()
+                            } else {
+                                "\x1b[1;36m".to_string()
+                            }
+                        }
+                        _ => format!("\x1b[1m{}", self.theme.text),
                     };
                     current_line.push_str(&heading_style);
                     current_line.push_str(prefix);
@@ -220,6 +274,14 @@ impl Component for MarkdownView {
                     active_heading_style = None;
                     current_line.push_str("\x1b[0m");
                     flush_current_line(&mut current_line, &mut output_lines, blockquote_depth);
+                    if active_heading_is_h1 {
+                        output_lines.push(format!(
+                            "{}{}\x1b[0m",
+                            self.theme.border_muted,
+                            "─".repeat(width.min(40))
+                        ));
+                        active_heading_is_h1 = false;
+                    }
                     output_lines.push(String::new());
                 }
                 Event::Start(Tag::Paragraph) => {
@@ -382,11 +444,12 @@ impl Component for MarkdownView {
                     flush_current_line(&mut current_line, &mut output_lines, blockquote_depth);
                 }
                 Event::TaskListMarker(checked) => {
-                    if checked {
-                        current_line.push_str("\x1b[32m[x]\x1b[0m ");
+                    let (color, marker) = if checked {
+                        (&self.theme.success, "[x]")
                     } else {
-                        current_line.push_str("\x1b[2m[ ]\x1b[0m ");
-                    }
+                        (&self.theme.dim, "[ ]")
+                    };
+                    current_line.push_str(&format!("{color}{marker}\x1b[0m "));
                 }
                 Event::Start(Tag::Emphasis) => {
                     current_line.push_str("\x1b[3m");
@@ -443,10 +506,11 @@ impl Component for MarkdownView {
                         code_block_buf.push_str(&text);
                     } else {
                         let clean = sanitize_markdown_text(&text, false);
+                        let inline = format!("{}{}{clean}\x1b[0m", self.theme.surface_elevated, code_color);
                         if let Some(ref h_style) = active_heading_style {
-                            current_line.push_str(&format!("{code_color}{clean}\x1b[0m{h_style}"));
+                            current_line.push_str(&format!("{inline}{h_style}"));
                         } else {
-                            current_line.push_str(&format!("{code_color}{clean}\x1b[0m"));
+                            current_line.push_str(&inline);
                         }
                     }
                 }
@@ -500,6 +564,54 @@ impl Component for MarkdownView {
 mod tests {
     use super::*;
     use crate::ansi::strip_ansi;
+
+    #[test]
+    fn narrow_table_stays_within_width() {
+        let md = "| Name | Status | Owner |\n|---|---|---|\n| Auth | OK | team |";
+        let lines = MarkdownView::new(md)
+            .with_theme(Theme::dark())
+            .render(10);
+        assert!(!lines.is_empty());
+        assert!(
+            lines.iter().all(|l| crate::ansi::visible_width(l) <= 10),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn table_uses_unicode_box_drawing() {
+        let md = "| A | B |\n|---|---|\n| 1 | 2 |";
+        let lines = MarkdownView::new(md)
+            .with_theme(Theme::dark())
+            .render(40);
+        let joined = lines.join("\n");
+        assert!(joined.contains('┌') && joined.contains('┬') && joined.contains('┐'));
+        assert!(joined.contains('├') && joined.contains('┼') && joined.contains('┤'));
+        assert!(joined.contains('└') && joined.contains('┴') && joined.contains('┘'));
+        assert!(!joined.contains('|'), "{joined}");
+    }
+
+    #[test]
+    fn task_markers_come_from_theme() {
+        let t = Theme::dark();
+        let lines = MarkdownView::new("- [x] done\n- [ ] todo")
+            .with_theme(t.clone())
+            .render(40);
+        let joined = lines.join("\n");
+        assert!(joined.contains(&t.success), "{joined}");
+        assert!(!joined.contains("\x1b[32m"), "{joined}");
+    }
+
+    #[test]
+    fn headings_have_distinct_hierarchy() {
+        let lines = MarkdownView::new("# One\n\n### Three")
+            .with_theme(Theme::dark())
+            .render(40);
+        let h1 = lines.iter().find(|l| l.contains("One")).unwrap();
+        let h3 = lines.iter().find(|l| l.contains("Three")).unwrap();
+        assert_ne!(h1, h3);
+        assert!(lines.iter().any(|l| l.contains('─')), "{lines:?}");
+    }
 
     #[test]
     fn test_markdown_renders_tables_and_tasklists() {
@@ -570,7 +682,9 @@ mod tests {
         let after_idx = joined.find("should not be optional").unwrap();
         let between = &joined[code_end..after_idx];
         assert!(
-            between.contains(&theme.md_heading) || between.contains(&theme.accent),
+            between.contains(&theme.md_heading)
+                || between.contains(&theme.accent)
+                || between.contains(&theme.text),
             "Heading style must be re-applied immediately after inline code: {between:?}"
         );
     }

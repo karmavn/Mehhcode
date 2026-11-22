@@ -83,6 +83,16 @@ pub struct BorderedBox {
     pub title: Option<String>,
     pub style: BorderStyle,
     pub child: Box<dyn Component>,
+    pub border_color: String,
+    pub title_color: String,
+}
+
+fn paint(code: &str, text: &str) -> String {
+    if code.is_empty() {
+        text.to_string()
+    } else {
+        format!("{code}{text}\x1b[0m")
+    }
 }
 
 impl BorderedBox {
@@ -91,6 +101,8 @@ impl BorderedBox {
             title: None,
             style: BorderStyle::Rounded,
             child,
+            border_color: String::new(),
+            title_color: String::new(),
         }
     }
 
@@ -101,6 +113,16 @@ impl BorderedBox {
 
     pub fn with_style(mut self, style: BorderStyle) -> Self {
         self.style = style;
+        self
+    }
+
+    pub fn with_border_color(mut self, color: impl Into<String>) -> Self {
+        self.border_color = color.into();
+        self
+    }
+
+    pub fn with_title_color(mut self, color: impl Into<String>) -> Self {
+        self.title_color = color.into();
         self
     }
 }
@@ -121,12 +143,26 @@ impl Component for BorderedBox {
             let title_w = crate::ansi::visible_width(&title_clean);
             if title_w + 4 <= inner_width {
                 let right_pad = inner_width - title_w - 3;
-                format!("{tl}{h} {title} {}{tr}", h.to_string().repeat(right_pad))
+                let painted_title = if self.title_color.is_empty() {
+                    title.clone()
+                } else {
+                    format!("{}{}\x1b[0m{}", self.title_color, title, self.border_color)
+                };
+                paint(
+                    &self.border_color,
+                    &format!("{tl}{h} {painted_title} {}{tr}", h.to_string().repeat(right_pad)),
+                )
             } else {
-                format!("{tl}{}{tr}", h.to_string().repeat(inner_width))
+                paint(
+                    &self.border_color,
+                    &format!("{tl}{}{tr}", h.to_string().repeat(inner_width)),
+                )
             }
         } else {
-            format!("{tl}{}{tr}", h.to_string().repeat(inner_width))
+            paint(
+                &self.border_color,
+                &format!("{tl}{}{tr}", h.to_string().repeat(inner_width)),
+            )
         };
         lines.push(top_line);
 
@@ -135,11 +171,22 @@ impl Component for BorderedBox {
         for line in child_lines {
             let line_w = crate::ansi::visible_width(&line);
             let pad = inner_width.saturating_sub(line_w);
-            lines.push(format!("{v}{line}{}{v}", " ".repeat(pad)));
+            let right_v = if self.border_color.is_empty() {
+                v.to_string()
+            } else {
+                format!("{}{v}", self.border_color)
+            };
+            lines.push(paint(
+                &self.border_color,
+                &format!("{v}{line}{}{right_v}", " ".repeat(pad)),
+            ));
         }
 
         // Bottom line
-        lines.push(format!("{bl}{}{br}", h.to_string().repeat(inner_width)));
+        lines.push(paint(
+            &self.border_color,
+            &format!("{bl}{}{br}", h.to_string().repeat(inner_width)),
+        ));
 
         lines
     }
@@ -150,6 +197,18 @@ impl Component for BorderedBox {
 
     fn invalidate(&mut self) {
         self.child.invalidate();
+    }
+}
+
+/// A pre-rendered set of lines, used for panels whose content is already width-fitted.
+#[derive(Debug, Clone)]
+pub struct RawLines {
+    pub lines: Vec<String>,
+}
+
+impl Component for RawLines {
+    fn render(&self, _width: usize) -> Vec<String> {
+        self.lines.clone()
     }
 }
 
@@ -201,6 +260,8 @@ pub struct SelectItem {
     pub id: String,
     pub label: String,
     pub description: Option<String>,
+    #[serde(default)]
+    pub label_color: Option<String>,
 }
 
 impl SelectItem {
@@ -209,11 +270,17 @@ impl SelectItem {
             id: id.into(),
             label: label.into(),
             description: None,
+            label_color: None,
         }
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
         self.description = Some(desc.into());
+        self
+    }
+
+    pub fn with_label_color(mut self, color: impl Into<String>) -> Self {
+        self.label_color = Some(color.into());
         self
     }
 }
@@ -337,28 +404,44 @@ impl Component for SelectList {
             .clamp(0, (total as isize - max_vis as isize).max(0)) as usize;
         let end = (start + max_vis).min(total);
 
+        let max_label_width = filtered
+            .iter()
+            .map(|&idx| crate::ansi::visible_width(&self.items[idx].label))
+            .max()
+            .unwrap_or(12)
+            .clamp(10, 36);
+
         let mut lines = Vec::new();
         for (vis_idx, &item_idx) in filtered[start..end].iter().enumerate() {
             let actual_idx = start + vis_idx;
             let item = &self.items[item_idx];
             let is_selected = actual_idx == selected;
 
-            let desc_str = if let Some(ref d) = item.description {
-                format!(" {}", self.theme.fg(&self.theme.dim, d))
-            } else {
-                String::new()
-            };
+            let label_len = crate::ansi::visible_width(&item.label);
+            let label_pad = " ".repeat(max_label_width.saturating_sub(label_len));
+            let desc = item.description.as_deref().unwrap_or("");
+            let desc_len = crate::ansi::visible_width(desc);
+            let used = 2 + label_len + label_pad.len() + 2 + desc_len;
+            let tail_pad = " ".repeat(width.saturating_sub(used));
+            let reset = "\x1b[0m";
+            let bg = self.theme.selected_bg.as_str();
+            let rebg = bg;
+            let label_color = item.label_color.as_deref().unwrap_or(&self.theme.text);
 
             let line = if is_selected {
                 format!(
-                    "{} {}{desc_str}",
-                    self.theme.fg(&self.theme.accent, ">"),
-                    self.theme.fg(&self.theme.text, &item.label)
+                    "{bg}{accent}▎ {reset}{rebg}\x1b[1m{label_color}{label}{label_pad}  {reset}{rebg}{dim}{desc}{tail_pad}{reset}",
+                    accent = self.theme.accent,
+                    label_color = label_color,
+                    label = item.label,
+                    dim = self.theme.dim,
                 )
             } else {
                 format!(
-                    "  {}{desc_str}",
-                    self.theme.fg(&self.theme.text, &item.label)
+                    "  {label_color}{label}{label_pad}  {reset}{dim}{desc}{tail_pad}{reset}",
+                    label_color = label_color,
+                    label = item.label,
+                    dim = self.theme.dim,
                 )
             };
 
@@ -396,6 +479,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bordered_box_uses_theme_colors_without_changing_width() {
+        let boxed = BorderedBox::new(Box::new(Text::new("hi")))
+            .with_border_color("\x1b[38;2;1;2;3m")
+            .with_title_color("\x1b[38;2;4;5;6m")
+            .with_title("T");
+        let lines = boxed.render(20);
+        let joined = lines.join("\n");
+        assert!(joined.contains("\x1b[38;2;1;2;3m"));
+        assert!(joined.contains("\x1b[38;2;4;5;6m"));
+        assert!(lines.iter().all(|l| crate::ansi::visible_width(l) == 20), "{lines:?}");
+    }
+
+    #[test]
+    fn select_list_selected_row_uses_selected_bg_and_full_width() {
+        let mut list = SelectList::new(
+            vec![SelectItem::new("a", "Alpha").with_description("first")],
+            5,
+        );
+        list.theme.selected_bg = "\x1b[48;2;9;9;9m".to_string();
+        let lines = list.render(30);
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("\x1b[48;2;9;9;9m"), "{:?}", lines[0]);
+        assert!(lines[0].contains('▎'), "{:?}", lines[0]);
+        assert_eq!(crate::ansi::visible_width(&lines[0]), 30);
+    }
+
+    #[test]
+    fn raw_lines_returns_input_verbatim() {
+        let raw = RawLines {
+            lines: vec!["a".into(), "b".into()],
+        };
+        assert_eq!(raw.render(10), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
     fn test_select_list_out_of_bounds_highlights_clamped_item() {
         let items = vec![
             SelectItem::new("1", "Apple"),
@@ -404,7 +522,7 @@ mod tests {
         let mut list = SelectList::new(items, 5);
         list.selected = 10;
         let lines = list.render(30);
-        assert!(lines[1].contains('>'));
+        assert!(lines[1].contains('▎'));
         assert!(lines[1].contains("Banana"));
         assert_eq!(
             list.selected_item().map(|it| it.label.as_str()),
@@ -424,7 +542,7 @@ mod tests {
         // Centered window for selected=3 with max_visible=5 should start at 1 (3 - 5/2 = 1) -> Items 1, 2, 3, 4, 5
         assert!(lines[0].contains("Item 1"));
         assert!(lines[2].contains("Item 3"));
-        assert!(lines[2].contains('>'));
+        assert!(lines[2].contains('▎'));
         assert!(lines[4].contains("Item 5"));
     }
 

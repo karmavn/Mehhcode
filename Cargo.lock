@@ -846,6 +846,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "futures",
  "mehh-agent",
  "mehh-ai",
@@ -869,6 +870,7 @@ dependencies = [
  "mehh-agent",
  "mehh-ai",
  "mehh-codemode",
+ "mehh-execpolicy",
  "mehh-mcp",
  "mehh-tools",
  "mehh-tui",
@@ -881,6 +883,10 @@ dependencies = [
  "tokio-util",
  "uuid",
 ]
+
+[[package]]
+name = "mehh-execpolicy"
+version = "0.1.0"
 
 [[package]]
 name = "mehh-mcp"
@@ -903,6 +909,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "mehh-sandbox"
+version = "0.1.0"
+
+[[package]]
 name = "mehh-tools"
 version = "0.1.0"
 dependencies = [
@@ -913,6 +923,7 @@ dependencies = [
  "ignore",
  "mehh-agent",
  "mehh-ai",
+ "mehh-sandbox",
  "regex",
  "serde",
  "serde_json",

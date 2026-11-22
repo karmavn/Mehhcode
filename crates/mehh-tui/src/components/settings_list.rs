@@ -216,32 +216,31 @@ impl Component for SettingsList {
             let item = &self.items[item_idx];
             let is_selected = actual_idx == selected;
 
-            let prefix = if is_selected {
-                self.theme.fg(&self.theme.accent, "> ")
-            } else {
-                "  ".to_string()
-            };
-
             let label_len = visible_width(&item.label);
-            let pad = if max_label_width > label_len {
-                " ".repeat(max_label_width - label_len)
-            } else {
-                String::new()
-            };
+            let pad = " ".repeat(max_label_width.saturating_sub(label_len));
+            let value_len = visible_width(&item.current_value);
+            let used = 2 + label_len + pad.len() + 2 + value_len;
+            let tail_pad = " ".repeat(width.saturating_sub(used));
+            let reset = "\x1b[0m";
+            let bg = self.theme.selected_bg.as_str();
+            let rebg = bg;
 
-            let label_styled = if is_selected {
-                format!("\x1b[1m{}{pad}\x1b[0m", item.label)
+            let row = if is_selected {
+                format!(
+                    "{bg}{accent}▎ {reset}{rebg}\x1b[1m{label}{pad}  {reset}{rebg}{value_color}{value}{tail_pad}{reset}",
+                    accent = self.theme.accent,
+                    label = item.label,
+                    value_color = self.theme.accent,
+                    value = item.current_value,
+                )
             } else {
-                format!("{}{pad}", item.label)
+                format!(
+                    "  {label}{pad}  {reset}{dim}{value}{tail_pad}{reset}",
+                    label = item.label,
+                    dim = self.theme.dim,
+                    value = item.current_value,
+                )
             };
-
-            let value_styled = if is_selected {
-                self.theme.fg(&self.theme.accent, &item.current_value)
-            } else {
-                self.theme.fg(&self.theme.dim, &item.current_value)
-            };
-
-            let row = format!("{prefix}{label_styled}  {value_styled}");
             lines.push(truncate_to_width(&row, width, "...", false));
         }
 
@@ -316,6 +315,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn settings_list_selected_row_uses_selected_bg_and_full_width() {
+        let items = vec![SettingItem::new("x", "Label", "value").with_description("desc")];
+        let mut list = SettingsList::new(items, 5);
+        list.theme.selected_bg = "\x1b[48;2;9;9;9m".to_string();
+        let lines = list.render(30);
+        assert!(lines[0].contains("\x1b[48;2;9;9;9m"), "{:?}", lines[0]);
+        assert!(lines[0].contains('▎'), "{:?}", lines[0]);
+        assert_eq!(crate::ansi::visible_width(&lines[0]), 30);
+    }
+
+    #[test]
     fn test_settings_list_render_and_cycle() {
         let items = vec![
             SettingItem::new("theme", "Color theme", "dark")
@@ -330,7 +340,7 @@ mod tests {
         let mut list = SettingsList::new(items, 5);
 
         let lines = list.render(60);
-        assert!(lines[0].contains("> "));
+        assert!(lines[0].contains('▎'));
         assert!(lines[0].contains("Color theme"));
         assert!(lines[0].contains("dark"));
         assert!(lines
@@ -370,7 +380,7 @@ mod tests {
         list.selected = 100;
         let lines = list.render(60);
         assert!(!lines.is_empty());
-        assert!(lines[0].contains("> "));
+        assert!(lines[0].contains('▎'));
         assert!(lines[0].contains("Color theme"));
         assert_eq!(list.selected_item().map(|it| it.id.as_str()), Some("theme"));
         let cycled = list.cycle_current();
@@ -388,7 +398,7 @@ mod tests {
         // Centered window for selected=3 with max_visible=5 should start at Setting 1
         assert!(lines[0].contains("Setting 1"));
         assert!(lines[2].contains("Setting 3"));
-        assert!(lines[2].contains("> "));
+        assert!(lines[2].contains('▎'));
     }
 
     #[test]

@@ -3,11 +3,18 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine;
 use futures::future::BoxFuture;
 use mehh_ai::ToolDefinition;
 use rquickjs::FromJs;
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
+
+pub const CODEMODE_MAX_IMAGES: usize = 4;
+pub const CODEMODE_MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_STORE_TOTAL_BYTES: usize = 1024 * 1024;
+const MAX_STORE_VALUE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct CodemodeConfig {
@@ -15,6 +22,7 @@ pub struct CodemodeConfig {
     pub timeout: Duration,
     pub max_output_chars: usize,
     pub max_output_items: usize,
+    pub max_tool_calls: usize,
 }
 
 impl Default for CodemodeConfig {
@@ -22,8 +30,9 @@ impl Default for CodemodeConfig {
         Self {
             memory_limit_bytes: 64 * 1024 * 1024,
             timeout: Duration::from_secs(30),
-            max_output_chars: 16 * 1024 * 1024,
-            max_output_items: 100_000,
+            max_output_chars: 256 * 1024,
+            max_output_items: 1024,
+            max_tool_calls: 64,
         }
     }
 }
@@ -41,19 +50,6 @@ pub struct CodemodeResult {
     pub value: Option<serde_json::Value>,
     pub error: Option<String>,
     pub items: Vec<CodemodeOutputItem>,
-}
-
-pub type SandboxToolExecutor = Arc<
-    dyn Fn(&str, serde_json::Value) -> BoxFuture<'static, Result<serde_json::Value, String>>
-        + Send
-        + Sync,
->;
-
-#[derive(Serialize)]
-struct ToolMeta {
-    name: String,
-    js_name: String,
-    description: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +76,17 @@ impl From<mehh_ai::Model> for ModelSummary {
     }
 }
 
+fn webp_signature_valid(data: &str) -> bool {
+    if data.len() < 16 {
+        return false;
+    }
+    let head = match BASE64.decode(&data.as_bytes()[..16]) {
+        Ok(bytes) => bytes,
+        Err(_) => return false,
+    };
+    head.len() >= 12 && &head[0..4] == b"RIFF" && &head[8..12] == b"WEBP"
+}
+
 /// Rust-side validation of image outputs. The JS prelude performs the same
 /// checks, but user code can monkeypatch its built-ins, so this is authoritative.
 fn validate_image_payload(data: &str, mime: &str) -> Result<(), String> {
@@ -95,17 +102,51 @@ fn validate_image_payload(data: &str, mime: &str) -> Result<(), String> {
     {
         return Err("invalid image output: data is not valid base64".to_string());
     }
-    let expected_prefix = match mime {
-        "image/png" => "iVBORw0KGg",
-        "image/jpeg" => "/9j/",
-        "image/gif" => "R0lGOD",
-        "image/webp" => "UklG",
+    let valid = match mime {
+        "image/png" => data.starts_with("iVBORw0KGg"),
+        "image/jpeg" => data.starts_with("/9j/"),
+        "image/gif" => data.starts_with("R0lGOD"),
+        "image/webp" => webp_signature_valid(data),
         _ => return Err(format!("unsupported output image type: {mime}")),
     };
-    if !data.starts_with(expected_prefix) {
+    if !valid {
         return Err(format!("image data does not match declared type {mime}"));
     }
     Ok(())
+}
+
+fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// `exit()` sets the flag and lets QuickJS interrupt the VM. Only that specific
+/// internal error counts as a clean exit: if user code catches the interrupt
+/// and throws something else, the real error must still be reported.
+fn is_clean_exit(exited: &AtomicBool, err: &str) -> bool {
+    exited.load(Ordering::SeqCst) && err.contains("interrupted")
+}
+
+/// Cancels a child token when a tool call leaves scope, so a codemode timeout
+/// cannot leave the underlying tool (bash, subagent, ...) running on the host.
+struct CancelOnDrop(CancellationToken);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+pub type SandboxToolExecutor = Arc<
+    dyn Fn(&str, serde_json::Value, CancellationToken) -> BoxFuture<'static, Result<serde_json::Value, String>>
+        + Send
+        + Sync,
+>;
+
+#[derive(Debug, Clone, Serialize)]
+struct ResolvedToolMeta {
+    name: String,
+    js_name: String,
+    description: String,
 }
 
 pub fn to_identifier(name: &str) -> String {
@@ -141,6 +182,15 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
     const hostModelsList = globalThis.__host_models_list;
     const hostModelsResolve = globalThis.__host_models_resolve;
     const hostModelsGetAvailable = globalThis.__host_models_get_available;
+    // Capture pristine built-ins so user code cannot break the host bridge by
+    // monkeypatching JSON, Map, Array or Object after the prelude has run.
+    const jsonStringify = JSON.stringify;
+    const jsonParse = JSON.parse;
+    const mapGet = Function.prototype.call.bind(Map.prototype.get);
+    const mapHas = Function.prototype.call.bind(Map.prototype.has);
+    const mapSet = Function.prototype.call.bind(Map.prototype.set);
+    const arrayFrom = Array.from;
+    const objectFreeze = Object.freeze;
     for (const k of [
         "__host_call_tool",
         "__host_log",
@@ -162,23 +212,23 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
     const toolMap = new Map();
     const allTools = [];
     for (const t of __TOOLS_META__) {
-        toolMap.set(t.name, t.name);
-        toolMap.set(t.js_name, t.name);
-        allTools.push(Object.freeze({ name: t.js_name, description: t.description }));
+        mapSet(toolMap, t.name, t.name);
+        mapSet(toolMap, t.js_name, t.name);
+        allTools.push(objectFreeze({ name: t.js_name, description: t.description }));
     }
     const toolsProxy = new Proxy({}, {
         get(target, prop) {
             if (typeof prop !== "string" || prop === "then" || prop === "toJSON") {
                 return undefined;
             }
-            if (toolMap.has(prop)) {
-                const toolName = toolMap.get(prop);
+            if (mapHas(toolMap, prop)) {
+                const toolName = mapGet(toolMap, prop);
                 return async function(args) {
-                    const argsJson = JSON.stringify(args !== undefined ? args : {});
+                    const argsJson = jsonStringify(args !== undefined ? args : {});
                     const resJson = hostCallTool(toolName, argsJson);
                     let res;
                     try {
-                        res = JSON.parse(resJson);
+                        res = jsonParse(resJson);
                     } catch (e) {
                         throw new Error("Failed to parse tool call response: " + e.message);
                     }
@@ -189,7 +239,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
                 };
             }
             let msg = "tools." + prop + " does not exist.";
-            const available = Array.from(toolMap.keys());
+            const available = arrayFrom(toolMap.keys());
             if (available.length > 0) {
                 msg += " Available tools: " + available.join(", ") + ".";
             }
@@ -197,13 +247,13 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
             throw new TypeError(msg);
         },
         has(target, prop) {
-            return toolMap.has(prop);
+            return mapHas(toolMap, prop);
         },
         ownKeys(target) {
-            return Array.from(toolMap.keys());
+            return arrayFrom(toolMap.keys());
         },
         getOwnPropertyDescriptor(target, prop) {
-            if (toolMap.has(prop)) {
+            if (mapHas(toolMap, prop)) {
                 return { configurable: true, enumerable: true, writable: false, value: this.get(target, prop) };
             }
             return undefined;
@@ -215,7 +265,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
             return String(v);
         }
         try {
-            const json = JSON.stringify(v);
+            const json = jsonStringify(v);
             return json === undefined ? String(v) : json;
         } catch {
             return String(v);
@@ -230,7 +280,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
             if (err) throw new RangeError(err);
         };
     }
-    Object.freeze(consoleObj);
+    objectFreeze(consoleObj);
 
     function text(v) {
         const s = outputText(v);
@@ -308,7 +358,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
         }
         let json;
         try {
-            json = JSON.stringify(value);
+            json = jsonStringify(value);
         } catch (e) {
             throw new TypeError("store('" + key + "') value is not JSON-serializable: " + e.message);
         }
@@ -331,7 +381,7 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
             return undefined;
         }
         try {
-            return JSON.parse(raw);
+            return jsonParse(raw);
         } catch {
             return undefined;
         }
@@ -339,16 +389,20 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
 
     function exit() {
         hostExit();
-        throw new Error("__EXIT__");
+        // QuickJS polls its interrupt handler inside the interpreter loop and
+        // marks the resulting exception uncatchable. Spin until that happens:
+        // a plain `throw` could be caught by user code, which would let a
+        // later error be reported as a successful exit.
+        while (true) {}
     }
 
     async function searchTools(query, options) {
         if (typeof query !== "string") {
             throw new TypeError("searchTools(query) requires query to be a string");
         }
-        const optJson = JSON.stringify(options !== undefined ? options : {});
+        const optJson = jsonStringify(options !== undefined ? options : {});
         const resJson = hostSearchTools(query, optJson);
-        return JSON.parse(resJson);
+        return jsonParse(resJson);
     }
 
     async function describeTool(name) {
@@ -370,30 +424,30 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
         if (!raw) {
             return undefined;
         }
-        return JSON.parse(raw);
+        return jsonParse(raw);
     }
 
     const modelsObj = {
         list() {
-            return JSON.parse(hostModelsList());
+            return jsonParse(hostModelsList());
         },
         resolve(providerOrId, modelId) {
-            const mIdJson = JSON.stringify(modelId !== undefined ? modelId : null);
+            const mIdJson = jsonStringify(modelId !== undefined ? modelId : null);
             const res = hostModelsResolve(String(providerOrId), mIdJson);
             if (!res) {
                 return undefined;
             }
-            return JSON.parse(res);
+            return jsonParse(res);
         },
         getAvailableOfType(provider) {
-            const pJson = JSON.stringify(provider !== undefined ? provider : null);
-            return JSON.parse(hostModelsGetAvailable(pJson));
+            const pJson = jsonStringify(provider !== undefined ? provider : null);
+            return jsonParse(hostModelsGetAvailable(pJson));
         }
     };
-    Object.freeze(modelsObj);
+    objectFreeze(modelsObj);
 
     globalThis.tools = toolsProxy;
-    globalThis.ALL_TOOLS = Object.freeze(allTools);
+    globalThis.ALL_TOOLS = objectFreeze(allTools);
     globalThis.console = consoleObj;
     globalThis.text = text;
     globalThis.image = image;
@@ -500,14 +554,22 @@ fn run_codemode_blocking(
     };
 
     rt.set_memory_limit(config.memory_limit_bytes);
+    // Trigger GC well before the hard memory limit so a script cannot fill
+    // the heap with short-lived values and get killed without a chance to run
+    // its own cleanup path.
+    rt.set_gc_threshold(256 * 1024);
     // Bound the native stack so deep JS recursion raises InternalError instead
     // of aborting the whole process from a spawn_blocking worker thread.
     rt.set_max_stack_size(512 * 1024);
 
+    let exited = Arc::new(AtomicBool::new(false));
     let deadline = Instant::now() + config.timeout;
     let cancel_check = cancel.clone();
+    let interrupt_exited = exited.clone();
     rt.set_interrupt_handler(Some(Box::new(move || {
-        Instant::now() > deadline || cancel_check.is_cancelled()
+        interrupt_exited.load(Ordering::Relaxed)
+            || Instant::now() > deadline
+            || cancel_check.is_cancelled()
     })));
 
     let context = match rquickjs::Context::full(&rt) {
@@ -525,16 +587,7 @@ fn run_codemode_blocking(
     let items = Arc::new(Mutex::new(Vec::new()));
     let total_chars = Arc::new(AtomicUsize::new(0));
     let total_items = Arc::new(AtomicUsize::new(0));
-    let store_bytes = Arc::new(AtomicUsize::new(0));
-    {
-        let guard = kv_store.lock().unwrap();
-        let total: usize = guard
-            .iter()
-            .map(|(k, v)| k.len() + serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-            .sum();
-        store_bytes.store(total, Ordering::Relaxed);
-    }
-    let exited = Arc::new(AtomicBool::new(false));
+    let tool_calls = Arc::new(AtomicUsize::new(0));
 
     context.with(|ctx| {
         let globals = ctx.globals();
@@ -543,6 +596,8 @@ fn run_codemode_blocking(
         let handle_tool = handle.clone();
         let executor_tool = executor.clone();
         let cancel_tool = cancel.clone();
+        let calls = tool_calls.clone();
+        let max_tool_calls = config.max_tool_calls;
         let host_call_tool = match rquickjs::Function::new(
             ctx.clone(),
             move |name: String, args_json: String| -> String {
@@ -553,14 +608,35 @@ fn run_codemode_blocking(
                 if now >= deadline {
                     return serde_json::json!({ "ok": false, "error": "Execution timed out" }).to_string();
                 }
+                let seq = calls.fetch_add(1, Ordering::Relaxed) + 1;
+                if seq > max_tool_calls {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": format!("script exceeded the {max_tool_calls} tool-call limit")
+                    })
+                    .to_string();
+                }
+                let args_val: serde_json::Value = match serde_json::from_str(&args_json) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return serde_json::json!({
+                            "ok": false,
+                            "error": format!("invalid tool arguments: {e}")
+                        })
+                        .to_string();
+                    }
+                };
                 let remaining = deadline.saturating_duration_since(now);
-                let args_val = serde_json::from_str(&args_json)
-                    .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+                // A child token is cancelled on every exit path (including the
+                // sleep/timeout branch) so nested bash/subagent tools cannot
+                // outlive the codemode call that started them.
+                let call_cancel = cancel_tool.child_token();
+                let _cancel_on_drop = CancelOnDrop(call_cancel.clone());
                 let res = handle_tool.block_on(async {
                     tokio::select! {
-                        _ = cancel_tool.cancelled() => Err("Execution was cancelled".to_string()),
+                        _ = call_cancel.cancelled() => Err("Execution was cancelled".to_string()),
                         _ = tokio::time::sleep(remaining) => Err("Execution timed out".to_string()),
-                        out = (executor_tool)(&name, args_val) => out,
+                        out = (executor_tool)(&name, args_val, call_cancel.clone()) => out,
                     }
                 });
                 match res {
@@ -604,9 +680,7 @@ fn run_codemode_blocking(
                 }
                 total_chars_log.store(new_chars, Ordering::Relaxed);
                 total_items_log.store(new_items, Ordering::Relaxed);
-                items_log
-                    .lock()
-                    .unwrap()
+                lock_or_recover(&items_log)
                     .push(CodemodeOutputItem::Console { level, text });
                 String::new()
             },
@@ -644,9 +718,7 @@ fn run_codemode_blocking(
                 }
                 total_chars_text.store(new_chars, Ordering::Relaxed);
                 total_items_text.store(new_items, Ordering::Relaxed);
-                items_text
-                    .lock()
-                    .unwrap()
+                lock_or_recover(&items_text)
                     .push(CodemodeOutputItem::Text(text));
                 String::new()
             },
@@ -674,11 +746,22 @@ fn run_codemode_blocking(
         let items_image = items.clone();
         let total_chars_image = total_chars.clone();
         let total_items_image = total_items.clone();
+        let image_count = Arc::new(AtomicUsize::new(0));
         let host_image = match rquickjs::Function::new(
             ctx.clone(),
             move |data: String, mime: String| -> String {
                 if let Err(err) = validate_image_payload(&data, &mime) {
                     return err;
+                }
+                if data.len() > CODEMODE_MAX_IMAGE_BYTES {
+                    return format!(
+                        "Output image exceeds the {} MiB limit",
+                        CODEMODE_MAX_IMAGE_BYTES / (1024 * 1024)
+                    );
+                }
+                let next_image = image_count.fetch_add(1, Ordering::Relaxed) + 1;
+                if next_image > CODEMODE_MAX_IMAGES {
+                    return format!("Too many output images (maximum {CODEMODE_MAX_IMAGES})");
                 }
                 let new_chars = total_chars_image.load(Ordering::Relaxed) + data.len();
                 let new_items = total_items_image.load(Ordering::Relaxed) + 1;
@@ -687,7 +770,7 @@ fn run_codemode_blocking(
                 }
                 total_chars_image.store(new_chars, Ordering::Relaxed);
                 total_items_image.store(new_items, Ordering::Relaxed);
-                items_image.lock().unwrap().push(CodemodeOutputItem::Image {
+                lock_or_recover(&items_image).push(CodemodeOutputItem::Image {
                     data,
                     mime_type: mime,
                 });
@@ -715,45 +798,33 @@ fn run_codemode_blocking(
 
         // 5. __host_store
         let kv_store_set = kv_store.clone();
-        let store_bytes_host = store_bytes.clone();
         let host_store = match rquickjs::Function::new(
             ctx.clone(),
             move |key: String, val_json: String| -> String {
-                let mut map = kv_store_set.lock().unwrap();
+                let mut map = lock_or_recover(&kv_store_set);
                 if val_json == "__UNDEFINED__" {
-                    if let Some(old) = map.remove(&key) {
-                        let old_bytes = key.len()
-                            + serde_json::to_string(&old).map(|s| s.len()).unwrap_or(0);
-                        store_bytes_host.try_update(
-                            Ordering::Relaxed,
-                            Ordering::Relaxed,
-                            |v| Some(v.saturating_sub(old_bytes)),
-                        ).ok();
-                    }
+                    map.remove(&key);
                     return String::new();
                 }
-                if val_json.len() > 256 * 1024 {
+                if val_json.len() > MAX_STORE_VALUE_BYTES {
                     return format!("store('{key}') value exceeds 256KB limit");
                 }
                 let val: serde_json::Value = match serde_json::from_str(&val_json) {
                     Ok(v) => v,
                     Err(e) => return format!("store('{key}') invalid JSON: {e}"),
                 };
-                let old_bytes = map
-                    .get(&key)
-                    .and_then(|v| serde_json::to_string(v).ok())
-                    .map(|s| key.len() + s.len())
-                    .unwrap_or(0);
-                // Use one canonical representation for both old and new sizes;
-                // raw JSON whitespace would make the running total drift.
                 let canonical = serde_json::to_string(&val).unwrap_or_else(|_| val_json.clone());
                 let new_bytes = key.len() + canonical.len();
-                let current = store_bytes_host.load(Ordering::Relaxed);
-                let new_total = current.saturating_sub(old_bytes).saturating_add(new_bytes);
-                if new_total > 1024 * 1024 {
+                // Recompute from the shared map on every write. A per-run
+                // counter drifts when the KV store outlives a single script.
+                let total_others: usize = map
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != key)
+                    .map(|(k, v)| k.len() + serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+                    .sum();
+                if total_others.saturating_add(new_bytes) > MAX_STORE_TOTAL_BYTES {
                     return "store is full: stored values would exceed 1MB limit".to_string();
                 }
-                store_bytes_host.store(new_total, Ordering::Relaxed);
                 map.insert(key, val);
                 String::new()
             },
@@ -782,7 +853,7 @@ fn run_codemode_blocking(
         let host_load = match rquickjs::Function::new(
             ctx.clone(),
             move |key: String| -> String {
-                let map = kv_store_get.lock().unwrap();
+                let map = lock_or_recover(&kv_store_get);
                 match map.get(&key) {
                     Some(v) => {
                         serde_json::to_string(v).unwrap_or_else(|_| "null".to_string())
@@ -837,10 +908,33 @@ fn run_codemode_blocking(
             };
         }
 
+        // Resolve deduplicated JS identifiers once. The prelude, search,
+        // describe and namespace helpers must all use the same table.
+        let resolved_tools: Arc<[ResolvedToolMeta]> = {
+            let mut used_js_names = std::collections::HashSet::new();
+            tool_defs
+                .iter()
+                .map(|t| {
+                    let base = to_identifier(&t.name);
+                    let mut js_name = base.clone();
+                    let mut suffix = 2;
+                    while !used_js_names.insert(js_name.clone()) {
+                        js_name = format!("{base}_{suffix}");
+                        suffix += 1;
+                    }
+                    ResolvedToolMeta {
+                        name: t.name.clone(),
+                        js_name,
+                        description: t.description.clone(),
+                    }
+                })
+                .collect()
+        };
         let shared_tool_defs: Arc<[ToolDefinition]> = Arc::from(tool_defs);
 
         // 8. __host_search_tools
         let tool_defs_search = Arc::clone(&shared_tool_defs);
+        let resolved_search = Arc::clone(&resolved_tools);
         let host_search_tools = match rquickjs::Function::new(
             ctx.clone(),
             move |query: String, options_json: String| -> String {
@@ -868,9 +962,9 @@ fn run_codemode_blocking(
                     }
                 });
 
-                let mut scored: Vec<(f64, &ToolDefinition)> = Vec::new();
+                let mut scored: Vec<(f64, usize)> = Vec::new();
 
-                for tool in tool_defs_search.iter() {
+                for (idx, tool) in tool_defs_search.iter().enumerate() {
                     if let Some((ns, ref prefixes)) = ns_filter {
                         if let Some((ns_prefix, ns_prefix_sanitized)) = prefixes {
                             let exact = tool.name == ns;
@@ -915,7 +1009,7 @@ fn run_codemode_blocking(
                     }
 
                     if score > 0.0 || query_lower.is_empty() {
-                        scored.push((score, tool));
+                        scored.push((score, idx));
                     }
                 }
 
@@ -924,10 +1018,10 @@ fn run_codemode_blocking(
                 let results: Vec<serde_json::Value> = scored
                     .into_iter()
                     .take(limit)
-                    .map(|(_, t)| {
+                    .map(|(_, idx)| {
                         serde_json::json!({
-                            "name": to_identifier(&t.name),
-                            "description": t.description
+                            "name": resolved_search[idx].js_name.clone(),
+                            "description": resolved_search[idx].description.clone()
                         })
                     })
                     .collect();
@@ -956,14 +1050,16 @@ fn run_codemode_blocking(
 
         // 9. __host_describe_tool
         let tool_defs_desc = Arc::clone(&shared_tool_defs);
+        let resolved_desc = Arc::clone(&resolved_tools);
         let host_describe_tool = match rquickjs::Function::new(
             ctx.clone(),
             move |name: String| -> String {
-                let found = tool_defs_desc
+                let found = resolved_desc
                     .iter()
-                    .find(|t| t.name == name || to_identifier(&t.name) == name);
+                    .position(|m| m.name == name || m.js_name == name);
                 match found {
-                    Some(t) => {
+                    Some(idx) => {
+                        let t = &tool_defs_desc[idx];
                         let params_pretty =
                             serde_json::to_string_pretty(&t.parameters).unwrap_or_default();
                         format!(
@@ -995,28 +1091,28 @@ fn run_codemode_blocking(
         }
 
         // 10. __host_describe_namespace
-        let tool_defs_ns = Arc::clone(&shared_tool_defs);
+        let resolved_ns = Arc::clone(&resolved_tools);
         let host_describe_namespace = match rquickjs::Function::new(
             ctx.clone(),
             move |name: String| -> String {
                 let tools: Vec<String> = if name == "builtin" {
-                    tool_defs_ns
+                    resolved_ns
                         .iter()
                         .filter(|t| !t.name.starts_with("mcp__"))
-                        .map(|t| to_identifier(&t.name))
+                        .map(|t| t.js_name.clone())
                         .collect()
                 } else {
                     let prefix = format!("mcp__{name}__");
                     let sanitized = name.replace('-', "_");
                     let prefix_sanitized = format!("mcp__{sanitized}__");
-                    tool_defs_ns
+                    resolved_ns
                         .iter()
                         .filter(|t| {
                             t.name.starts_with(&prefix)
                                 || t.name.starts_with(&prefix_sanitized)
                                 || t.name == name
                         })
-                        .map(|t| to_identifier(&t.name))
+                        .map(|t| t.js_name.clone())
                         .collect()
                 };
 
@@ -1153,27 +1249,9 @@ fn run_codemode_blocking(
             };
         }
 
-        // Setup prelude
-        let mut used_js_names = std::collections::HashSet::new();
-        let tools_meta: Vec<ToolMeta> = tool_defs
-            .iter()
-            .map(|t| {
-                let base = to_identifier(&t.name);
-                let mut js_name = base.clone();
-                let mut suffix = 2;
-                while !used_js_names.insert(js_name.clone()) {
-                    js_name = format!("{base}_{suffix}");
-                    suffix += 1;
-                }
-                ToolMeta {
-                    name: t.name.clone(),
-                    js_name,
-                    description: t.description.clone(),
-                }
-            })
-            .collect();
+        // Setup prelude with the deduplicated table built above.
         let tools_meta_json =
-            serde_json::to_string(&tools_meta).unwrap_or_else(|_| "[]".to_string());
+            serde_json::to_string(&resolved_tools[..]).unwrap_or_else(|_| "[]".to_string());
         let prelude_code = format!("(({PRELUDE_JS}))({tools_meta_json});");
         if let Err(e) = ctx.eval::<(), _>(prelude_code.as_str()) {
             let exc = ctx.catch();
@@ -1186,8 +1264,13 @@ fn run_codemode_blocking(
             };
         }
 
-        // Evaluate user code
-        let wrapped_code = format!("(async () => {{\n{code}\n}})()");
+        // Evaluate user code. The source is passed as a JSON string literal to
+        // an AsyncFunction constructor, so no `})()` sequence in user code can
+        // break out of the wrapper and skip the result checks below.
+        let code_json = serde_json::to_string(code).unwrap_or_else(|_| "\"\"".to_string());
+        let wrapped_code = format!(
+            "((__src) => {{ const AsyncFunction = Object.getPrototypeOf(async function() {{}}).constructor; return AsyncFunction(__src)(); }})({code_json})"
+        );
         let eval_val: rquickjs::Value = match ctx.eval(wrapped_code.as_str()) {
             Ok(v) => v,
             Err(err) => {
@@ -1196,7 +1279,7 @@ fn run_codemode_blocking(
                         ok: false,
                         value: None,
                         error: Some("Execution timed out".to_string()),
-                        items: std::mem::take(&mut *items.lock().unwrap()),
+                        items: std::mem::take(&mut *lock_or_recover(&items)),
                     };
                 }
                 if cancel.is_cancelled() {
@@ -1204,24 +1287,24 @@ fn run_codemode_blocking(
                         ok: false,
                         value: None,
                         error: Some("Execution was cancelled".to_string()),
-                        items: std::mem::take(&mut *items.lock().unwrap()),
-                    };
-                }
-                if exited.load(Ordering::SeqCst) {
-                    return CodemodeResult {
-                        ok: true,
-                        value: None,
-                        error: None,
-                        items: std::mem::take(&mut *items.lock().unwrap()),
+                        items: std::mem::take(&mut *lock_or_recover(&items)),
                     };
                 }
                 let exc = ctx.catch();
                 let err_msg = format_js_error(&ctx, exc, err);
+                if is_clean_exit(&exited, &err_msg) {
+                    return CodemodeResult {
+                        ok: true,
+                        value: None,
+                        error: None,
+                        items: std::mem::take(&mut *lock_or_recover(&items)),
+                    };
+                }
                 return CodemodeResult {
                     ok: false,
                     value: None,
                     error: Some(err_msg),
-                    items: std::mem::take(&mut *items.lock().unwrap()),
+                    items: std::mem::take(&mut *lock_or_recover(&items)),
                 };
             }
         };
@@ -1241,7 +1324,7 @@ fn run_codemode_blocking(
                     ok: false,
                     value: None,
                     error: Some("Execution timed out".to_string()),
-                    items: std::mem::take(&mut *items.lock().unwrap()),
+                    items: std::mem::take(&mut *lock_or_recover(&items)),
                 };
             }
             if cancel.is_cancelled() {
@@ -1249,12 +1332,11 @@ fn run_codemode_blocking(
                     ok: false,
                     value: None,
                     error: Some("Execution was cancelled".to_string()),
-                    items: std::mem::take(&mut *items.lock().unwrap()),
+                    items: std::mem::take(&mut *lock_or_recover(&items)),
                 };
             }
-            // Do not short-circuit on `exited` before reading the promise result:
-            // a script that catches __EXIT__ and returns a value must keep it.
-
+            // Exit is an uncatchable QuickJS interrupt, so a rejected promise
+            // can still be a clean exit. Any other rejection is a real error.
             match promise.state() {
                 rquickjs::promise::PromiseState::Resolved => {
                     let res: Option<rquickjs::Result<rquickjs::Value>> = promise.result();
@@ -1267,7 +1349,7 @@ fn run_codemode_blocking(
                                 ok: false,
                                 value: None,
                                 error: Some(err_msg),
-                                items: std::mem::take(&mut *items.lock().unwrap()),
+                                items: std::mem::take(&mut *lock_or_recover(&items)),
                             };
                         }
                         None => rquickjs::Value::new_undefined(ctx.clone()),
@@ -1287,7 +1369,7 @@ fn run_codemode_blocking(
                                     ok: false,
                                     value: None,
                                     error: Some("Return value is not JSON-serializable".to_string()),
-                                    items: std::mem::take(&mut *items.lock().unwrap()),
+                                    items: std::mem::take(&mut *lock_or_recover(&items)),
                                 };
                             }
                         }
@@ -1297,39 +1379,78 @@ fn run_codemode_blocking(
                         ok: true,
                         value: parsed_value,
                         error: None,
-                        items: std::mem::take(&mut *items.lock().unwrap()),
+                        items: std::mem::take(&mut *lock_or_recover(&items)),
                     }
                 }
                 rquickjs::promise::PromiseState::Rejected => {
                     let _ = promise.result::<rquickjs::Value>();
                     let exc = ctx.catch();
+                    let err_msg = format_js_error(&ctx, exc, rquickjs::Error::Exception);
+                    if is_clean_exit(&exited, &err_msg) {
+                        return CodemodeResult {
+                            ok: true,
+                            value: None,
+                            error: None,
+                            items: std::mem::take(&mut *lock_or_recover(&items)),
+                        };
+                    }
+                    CodemodeResult {
+                        ok: false,
+                        value: None,
+                        error: Some(err_msg),
+                        items: std::mem::take(&mut *lock_or_recover(&items)),
+                    }
+                }
+                rquickjs::promise::PromiseState::Pending => {
+                    // An uncatchable exit raised inside a promise job leaves the
+                    // async function's promise pending: QuickJS does not settle
+                    // it when the interrupt prevents the resume from returning.
                     if exited.load(Ordering::SeqCst) {
                         return CodemodeResult {
                             ok: true,
                             value: None,
                             error: None,
-                            items: std::mem::take(&mut *items.lock().unwrap()),
+                            items: std::mem::take(&mut *lock_or_recover(&items)),
                         };
                     }
-                    let err_msg = format_js_error(&ctx, exc, rquickjs::Error::Exception);
                     CodemodeResult {
                         ok: false,
                         value: None,
-                        error: Some(err_msg),
-                        items: std::mem::take(&mut *items.lock().unwrap()),
+                        error: Some(
+                            "The script is waiting on a promise that can never settle: no tool call is pending, and timers do not exist here."
+                                .to_string(),
+                        ),
+                        items: std::mem::take(&mut *lock_or_recover(&items)),
                     }
                 }
-                rquickjs::promise::PromiseState::Pending => CodemodeResult {
-                    ok: false,
-                    value: None,
-                    error: Some(
-                        "The script is waiting on a promise that can never settle: no tool call is pending, and timers do not exist here."
-                            .to_string(),
-                    ),
-                    items: std::mem::take(&mut *items.lock().unwrap()),
-                },
             }
         } else {
+            // A plain value can only appear if QuickJS fails to construct the
+            // async function; still apply the same deadline/cancel/exit checks.
+            if Instant::now() > deadline {
+                return CodemodeResult {
+                    ok: false,
+                    value: None,
+                    error: Some("Execution timed out".to_string()),
+                    items: std::mem::take(&mut *lock_or_recover(&items)),
+                };
+            }
+            if cancel.is_cancelled() {
+                return CodemodeResult {
+                    ok: false,
+                    value: None,
+                    error: Some("Execution was cancelled".to_string()),
+                    items: std::mem::take(&mut *lock_or_recover(&items)),
+                };
+            }
+            if exited.load(Ordering::SeqCst) {
+                return CodemodeResult {
+                    ok: true,
+                    value: None,
+                    error: None,
+                    items: std::mem::take(&mut *lock_or_recover(&items)),
+                };
+            }
             let parsed_value = if eval_val.is_undefined() {
                 None
             } else {
@@ -1344,7 +1465,7 @@ fn run_codemode_blocking(
                             ok: false,
                             value: None,
                             error: Some("Return value is not JSON-serializable".to_string()),
-                            items: std::mem::take(&mut *items.lock().unwrap()),
+                            items: std::mem::take(&mut *lock_or_recover(&items)),
                         };
                     }
                 }
@@ -1353,7 +1474,7 @@ fn run_codemode_blocking(
                 ok: true,
                 value: parsed_value,
                 error: None,
-                items: std::mem::take(&mut *items.lock().unwrap()),
+                items: std::mem::take(&mut *lock_or_recover(&items)),
             }
         }
     })

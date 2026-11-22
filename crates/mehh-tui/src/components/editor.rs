@@ -315,6 +315,7 @@ pub struct Editor {
     pub prompt_prefix: String,
     pub placeholder: String,
     pub theme: Theme,
+    pub max_lines: usize,
     pastes: HashMap<usize, String>,
     paste_counter: usize,
 }
@@ -341,6 +342,7 @@ impl Editor {
             prompt_prefix: "> ".to_string(),
             placeholder: String::new(),
             theme: Theme::default(),
+            max_lines: usize::MAX,
             pastes: HashMap::new(),
             paste_counter: 0,
         }
@@ -359,6 +361,19 @@ impl Editor {
     pub fn with_theme(mut self, theme: Theme) -> Self {
         self.theme = theme;
         self
+    }
+
+    pub fn with_max_lines(mut self, max_lines: usize) -> Self {
+        self.max_lines = max_lines.max(1);
+        self
+    }
+
+    /// Render only autocomplete rows; the host places them above the prompt dock.
+    pub fn render_autocomplete(&self, width: usize) -> Vec<String> {
+        self.autocomplete
+            .as_ref()
+            .map(|ac| ac.render(width))
+            .unwrap_or_default()
     }
 
     /// Colorize collapsed paste tokens so they read as one atomic chip.
@@ -1108,11 +1123,15 @@ impl Component for Editor {
             }
         }
 
-        if let Some(ref ac) = self.autocomplete {
-            let ac_lines = ac.render(width);
-            for l in ac_lines {
-                result.push(l);
-            }
+        if self.max_lines != usize::MAX && result.len() > self.max_lines {
+            let marker_row = result
+                .iter()
+                .position(|line| line.contains(CURSOR_MARKER))
+                .unwrap_or(0);
+            let start = marker_row.saturating_sub(self.max_lines / 2);
+            let end = (start + self.max_lines).min(result.len());
+            let start = end.saturating_sub(self.max_lines);
+            result = result.into_iter().skip(start).take(end - start).collect();
         }
 
         result
@@ -1130,6 +1149,29 @@ impl Component for Editor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn editor_render_excludes_autocomplete() {
+        let mut e = Editor::new();
+        e.set_autocomplete(vec![SelectItem::new("x", "extra")]);
+        let lines = e.render(40);
+        assert!(lines.iter().all(|l| !l.contains("extra")), "{lines:?}");
+        assert!(e.render_autocomplete(40).iter().any(|l| l.contains("extra")));
+    }
+
+    #[test]
+    fn visible_window_keeps_cursor_marker_on_long_wrapped_line() {
+        let mut e = Editor::new();
+        e.lines = vec!["x".repeat(116)];
+        e.cursor_row = 0;
+        e.cursor_col = 116;
+        e.max_lines = 2;
+        let lines = e.render(58);
+        assert!(
+            lines.iter().any(|l| l.contains(CURSOR_MARKER)),
+            "cursor marker clipped: {lines:?}"
+        );
+    }
 
     #[test]
     fn test_set_autocomplete_replacing_replaces_range_on_accept() {

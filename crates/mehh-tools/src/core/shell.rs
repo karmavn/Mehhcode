@@ -186,11 +186,30 @@ pub(crate) async fn run_shell(
     timeout_ms: u64,
     cancel: CancellationToken,
     on_update: Option<AgentToolUpdateCallback>,
+    sandbox: Option<&mehh_sandbox::SandboxPlan>,
 ) -> Result<ShellOutcome, String> {
     let spec = build_command_spec(kind, command);
-    let mut cmd = tokio::process::Command::new(&spec.program);
-    cmd.args(&spec.args);
+    let (program, args, degraded) = match sandbox {
+        Some(plan) => {
+            let invocation = mehh_sandbox::wrap(plan, &spec.program, &spec.args)
+                .map_err(|e| format!("Sandbox setup failed: {e}"))?;
+            let degraded = invocation
+                .status
+                .degraded_reason()
+                .map(str::to_string);
+            (invocation.program, invocation.args, degraded)
+        }
+        None => (spec.program, spec.args, None),
+    };
+    let mut cmd = tokio::process::Command::new(&program);
+    cmd.args(&args);
     cmd.current_dir(cwd);
+    // Build scripts and shell commands must not inherit agent credentials.
+    for (key, _) in std::env::vars_os() {
+        if mehh_sandbox::is_secret_env_key(&key.to_string_lossy()) {
+            cmd.env_remove(&key);
+        }
+    }
     // Never let a child consume the agent's stdin (CLI interactive / MCP stdio).
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
@@ -306,7 +325,10 @@ pub(crate) async fn run_shell(
         }
     }
 
-    let text = format_bash_output(&captured.to_vec());
+    let mut text = format_bash_output(&captured.to_vec());
+    if let Some(reason) = degraded {
+        text = format!("[sandbox degraded: {reason}]\n{text}");
+    }
 
     if aborted_reason.is_some() || grace_expired {
         if let Some(cb) = on_update.as_ref() {

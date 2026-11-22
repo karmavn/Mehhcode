@@ -8,6 +8,8 @@ members = [
     "crates/mehh-tui",
     "crates/mehh-mcp",
     "crates/mehh-codemode",
+    "crates/mehh-execpolicy",
+    "crates/mehh-sandbox",
     "crates/mehh-cli",
 ]
 
@@ -46,3 +48,5 @@ mehh-coding-agent = { path = "crates/mehh-coding-agent" }
 mehh-tui = { path = "crates/mehh-tui" }
 mehh-mcp = { path = "crates/mehh-mcp" }
 mehh-codemode = { path = "crates/mehh-codemode" }
+mehh-execpolicy = { path = "crates/mehh-execpolicy" }
+mehh-sandbox = { path = "crates/mehh-sandbox" }

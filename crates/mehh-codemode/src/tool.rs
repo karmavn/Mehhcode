@@ -8,6 +8,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::sandbox::{
     run_codemode, to_identifier, CodemodeConfig, CodemodeOutputItem, SandboxToolExecutor,
+    CODEMODE_MAX_IMAGE_BYTES, CODEMODE_MAX_IMAGES,
 };
 
 pub type ToolCallInterceptor = Arc<
@@ -79,11 +80,15 @@ impl CodemodeTool {
     pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
         self.tools.read().unwrap().clone()
     }
+
+    /// Shared handle to the live tool list. Interceptors can read it on every
+    /// call so `replace_tools` cannot leave them holding a stale snapshot.
+    pub fn tools_handle(&self) -> Arc<RwLock<Vec<Arc<dyn AgentTool>>>> {
+        self.tools.clone()
+    }
 }
 
 const CODEMODE_MAX_OUTPUT_BYTES: usize = 40_000;
-const CODEMODE_MAX_IMAGES: usize = 4;
-const CODEMODE_MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 
 fn truncate_codemode_output(text: &str) -> String {
     if text.len() <= CODEMODE_MAX_OUTPUT_BYTES {
@@ -157,98 +162,101 @@ impl AgentTool for CodemodeTool {
 
         let tools = current_tools;
         let tool_call_prefix = tool_call_id.to_string();
-        let cancel_executor = cancel.clone();
         let interceptor = self.interceptor.clone();
         let executor_defs = tool_defs.clone();
         let call_seq = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-        let executor: SandboxToolExecutor = Arc::new(move |tool_name: &str, args: serde_json::Value| {
-            let tools = tools.clone();
-            let name_str = tool_name.to_string();
-            let prefix = tool_call_prefix.clone();
-            let cancel = cancel_executor.clone();
-            let interceptor = interceptor.clone();
-            let tool_defs = executor_defs.clone();
-            let call_seq = call_seq.clone();
+        let executor: SandboxToolExecutor = Arc::new(
 
-            Box::pin(async move {
-                let matching = tools.iter().find(|t| {
-                    t.name() == name_str || to_identifier(t.name()) == name_str
-                });
-                let tool = match matching {
-                    Some(t) => t.clone(),
-                    None => return Err(format!("Tool '{name_str}' not found")),
-                };
+            move |tool_name: &str, args: serde_json::Value, call_cancel: CancellationToken| {
 
-                let params_map = match args {
-                    serde_json::Value::Object(m) => m,
-                    _ => return Err("arguments must be an object".to_string()),
-                };
+                let tools = tools.clone();
 
-                let def = tool_defs
-                    .iter()
-                    .find(|d| d.name == name_str || to_identifier(&d.name) == name_str)
-                    .ok_or_else(|| format!("No schema for tool '{name_str}'"))?;
-                let seq = call_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let nested_call_id = format!("{prefix}/{name_str}#{seq}");
-                let tool_call = ToolCall {
-                    id: nested_call_id.clone(),
-                    name: name_str.clone(),
-                    arguments: params_map,
-                    arguments_error: None,
-                    thought_signature: None,
-                };
-                let validated = mehh_ai::validation::validate_tool_arguments(def, &tool_call)?;
+                let name_str = tool_name.to_string();
 
-                if let Some(ref intercept) = interceptor {
-                    intercept(&name_str, &validated).await?;
-                }
+                let prefix = tool_call_prefix.clone();
 
-                let tool_res = tool
-                    .execute(&nested_call_id, validated, cancel, None)
-                    .await?;
+                let interceptor = interceptor.clone();
 
-                let mut text_parts = Vec::new();
-                let mut images = Vec::new();
-                for c in &tool_res.content {
-                    match c {
-                        ToolResultContentBlock::Text(t) => text_parts.push(t.text.clone()),
-                        ToolResultContentBlock::Image(img) => {
-                            images.push(serde_json::json!({
-                                "mimeType": img.mime_type,
-                                "data": img.data
-                            }));
+                let tool_defs = executor_defs.clone();
+                let call_seq = call_seq.clone();
+                Box::pin(async move {
+                    let matching = tools.iter().find(|t| {
+                        t.name() == name_str || to_identifier(t.name()) == name_str
+                    });
+                    let tool = match matching {
+                        Some(t) => t.clone(),
+                        None => return Err(format!("Tool '{name_str}' not found")),
+                    };
+                    let canonical_name = tool.name();
+                    let params_map = match args {
+                        serde_json::Value::Object(m) => m,
+                        _ => return Err("arguments must be an object".to_string()),
+                    };
+                    let def = tool_defs
+                        .iter()
+                        .find(|d| d.name == name_str || to_identifier(&d.name) == name_str)
+                        .ok_or_else(|| format!("No schema for tool '{name_str}'"))?;
+                    let seq = call_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let nested_call_id = format!("{prefix}/{canonical_name}#{seq}");
+                    let tool_call = ToolCall {
+                        id: nested_call_id.clone(),
+                        name: canonical_name.to_string(),
+                        arguments: params_map,
+                        arguments_error: None,
+                        thought_signature: None,
+                    };
+                    let validated = mehh_ai::validation::validate_tool_arguments(def, &tool_call)?;
+                    // Always pass the canonical tool name to the inspector: the
+                    // argument may be a deduplicated JavaScript identifier.
+                    if let Some(ref intercept) = interceptor {
+                        intercept(canonical_name, &validated).await?;
+                    }
+                    let tool_res = tool
+                        .execute(&nested_call_id, validated, call_cancel, None)
+                        .await?;
+                    let mut text_parts = Vec::new();
+                    let mut images = Vec::new();
+                    for c in &tool_res.content {
+                        match c {
+                            ToolResultContentBlock::Text(t) => text_parts.push(t.text.clone()),
+                            ToolResultContentBlock::Image(img) => {
+                                images.push(serde_json::json!({
+                                    "mimeType": img.mime_type,
+                                    "data": img.data
+                                }));
+                            }
                         }
                     }
-                }
-                let text = text_parts.join("\n");
 
-                if tool_res.is_error.unwrap_or(false) {
-                    return Err(format!("Tool '{name_str}' reported an error: {text}"));
-                }
+                    let text = text_parts.join("\n");
 
-                // Preserve a plain string for the common case, but never drop
-                // `details`/`structured_content` or tool-produced images.
-                if tool_res.details.is_none()
-                    && tool_res.structured_content.is_none()
-                    && images.is_empty()
-                {
-                    return Ok(serde_json::Value::String(text));
-                }
-                let mut obj = serde_json::Map::new();
-                obj.insert("content".to_string(), serde_json::Value::String(text));
-                if !images.is_empty() {
-                    obj.insert("images".to_string(), serde_json::Value::Array(images));
-                }
-                if let Some(details) = tool_res.details {
-                    obj.insert("details".to_string(), details);
-                }
-                if let Some(sc) = tool_res.structured_content {
-                    obj.insert("structuredContent".to_string(), sc);
-                }
-                Ok(serde_json::Value::Object(obj))
-            })
-        });
+                    if tool_res.is_error.unwrap_or(false) {
+                        return Err(format!("Tool '{name_str}' reported an error: {text}"));
+                    }
+                    // Preserve a plain string for the common case, but never drop
+                    // `details`/`structured_content` or tool-produced images.
+                    if tool_res.details.is_none()
+                        && tool_res.structured_content.is_none()
+                        && images.is_empty()
+                    {
+                        return Ok(serde_json::Value::String(text));
+                    }
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("content".to_string(), serde_json::Value::String(text));
+                    if !images.is_empty() {
+                        obj.insert("images".to_string(), serde_json::Value::Array(images));
+                    }
+                    if let Some(details) = tool_res.details {
+                        obj.insert("details".to_string(), details);
+                    }
+                    if let Some(sc) = tool_res.structured_content {
+                        obj.insert("structuredContent".to_string(), sc);
+                    }
+                    Ok(serde_json::Value::Object(obj))
+                })
+            },
+        );
 
         let res = run_codemode(
             code,

@@ -1,0 +1,21 @@
+[package]
+name = "mehh-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mehh-ai = { workspace = true }
+mehh-agent = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+base64 = { workspace = true }
+uuid = { workspace = true }

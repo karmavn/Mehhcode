@@ -159,7 +159,13 @@ impl PermissionStore {
             if let Some(ref pfx) = rule.arg_prefix {
                 let matches_prefix =
                     if let Some(cmd) = ctx.args.get("command").and_then(|v| v.as_str()) {
-                        cmd.trim().starts_with(pfx.trim())
+                        if mehh_execpolicy::is_shell_tool(&ctx.tool_name) {
+                            // Never use a string prefix here: a chained command
+                            // would inherit the rule for its first command.
+                            mehh_execpolicy::check_prefix(pfx, cmd).matched
+                        } else {
+                            cmd.trim().starts_with(pfx.trim())
+                        }
                     } else if let Some(path) = ctx.args.get("path").and_then(|v| v.as_str()) {
                         let norm_path = path.trim().replace('\\', "/");
                         let norm_pfx = pfx.trim().replace('\\', "/");
@@ -208,6 +214,48 @@ impl PermissionStore {
         }
 
         let (_, rule) = best_match?;
+
+        // Shell rules are decided by the whole parsed command line, not by a
+        // raw string prefix. Every sub-command must be covered before an
+        // allow rule applies; anything unparseable fails closed to a prompt.
+        if mehh_execpolicy::is_shell_tool(&ctx.tool_name) {
+            if let (Some(pfx), Some(cmd)) = (
+                rule.arg_prefix.as_deref(),
+                ctx.args.get("command").and_then(|v| v.as_str()),
+            ) {
+                let eval = mehh_execpolicy::check_prefix(pfx, cmd);
+                let prompt = || InspectionVerdict::RequireApproval {
+                    reason: format!(
+                        "Permission rule for '{}' cannot safely cover this command",
+                        ctx.tool_name
+                    ),
+                    preview: Some(cmd.to_string()),
+                };
+                if !eval.safe_parse {
+                    // A hard deny must stay a hard deny even when the command
+                    // cannot be parsed; only allow rules degrade to a prompt.
+                    return Some(if rule.action == PermissionAction::NeverAllow {
+                        InspectionVerdict::Deny {
+                            reason: format!("Permission rule forbids tool '{}'", ctx.tool_name),
+                        }
+                    } else {
+                        prompt()
+                    });
+                }
+                let verdict = mehh_execpolicy::verdict_for(
+                    eval,
+                    rule.action == PermissionAction::AlwaysAllow,
+                );
+                return Some(match verdict {
+                    mehh_execpolicy::Verdict::Allow => InspectionVerdict::Allow,
+                    mehh_execpolicy::Verdict::Prompt => prompt(),
+                    mehh_execpolicy::Verdict::Deny => InspectionVerdict::Deny {
+                        reason: format!("Permission rule forbids tool '{}': '{cmd}'", ctx.tool_name),
+                    },
+                });
+            }
+        }
+
         match rule.action {
             PermissionAction::AlwaysAllow => Some(InspectionVerdict::Allow),
             PermissionAction::AskBefore => Some(InspectionVerdict::RequireApproval {
@@ -388,6 +436,60 @@ mod tests {
             .expect("rules present");
         assert_eq!(loaded_rules.len(), 1);
         assert_eq!(loaded_rules[0].action, PermissionAction::AskBefore);
+    }
+
+    #[test]
+    fn shell_chain_cannot_inherit_an_allow_rule() {
+        let store = PermissionStore::new(
+            vec![PermissionRule {
+                tool_name: "bash".to_string(),
+                arg_prefix: Some("git status".to_string()),
+                path_glob: None,
+                action: PermissionAction::AlwaysAllow,
+            }],
+            None,
+        );
+        let ctx = make_ctx("bash", Some("git status && rm -rf /"), None);
+        match store.evaluate(&ctx) {
+            Some(InspectionVerdict::RequireApproval { .. }) => {}
+            other => panic!("chained command must require approval, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unparseable_command_keeps_hard_deny() {
+        let store = PermissionStore::new(
+            vec![PermissionRule {
+                tool_name: "bash".to_string(),
+                arg_prefix: Some("rm -rf".to_string()),
+                path_glob: None,
+                action: PermissionAction::NeverAllow,
+            }],
+            None,
+        );
+        let ctx = make_ctx("bash", Some("rm -rf $(echo /)"), None);
+        match store.evaluate(&ctx) {
+            Some(InspectionVerdict::Deny { .. }) => {}
+            other => panic!("hard deny must survive unparseable input, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn absolute_path_cannot_bypass_a_basename_deny_rule() {
+        let store = PermissionStore::new(
+            vec![PermissionRule {
+                tool_name: "bash".to_string(),
+                arg_prefix: Some("git push".to_string()),
+                path_glob: None,
+                action: PermissionAction::NeverAllow,
+            }],
+            None,
+        );
+        let ctx = make_ctx("bash", Some("/usr/bin/git push --force origin main"), None);
+        match store.evaluate(&ctx) {
+            Some(InspectionVerdict::Deny { .. }) => {}
+            other => panic!("absolute path must still be denied, got {other:?}"),
+        }
     }
 
     #[test]

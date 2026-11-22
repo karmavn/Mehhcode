@@ -88,7 +88,15 @@ impl AgentTool for PowerShellTool {
         let timeout_ms = parse_timeout_ms(&params);
 
         let outcome =
-            run_shell(ShellKind::WindowsPowerShell, &self.cwd, command, timeout_ms, cancel, on_update)
+            run_shell(
+                ShellKind::WindowsPowerShell,
+                &self.cwd,
+                command,
+                timeout_ms,
+                cancel,
+                on_update,
+                None,
+            )
                 .await?;
 
         if let Some(reason) = outcome.aborted_reason {

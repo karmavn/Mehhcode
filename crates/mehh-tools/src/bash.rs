@@ -6,12 +6,14 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::context::PathPolicy;
+use mehh_sandbox::{SandboxPlan, SandboxPolicy};
 use crate::core::shell::{parse_timeout_ms, run_shell, ShellKind};
 
 #[derive(Debug, Clone)]
 pub struct BashTool {
     pub cwd: PathBuf,
     pub path_policy: PathPolicy,
+    pub sandbox_policy: SandboxPolicy,
 }
 
 impl BashTool {
@@ -19,11 +21,17 @@ impl BashTool {
         Self {
             cwd,
             path_policy: PathPolicy::Unrestricted,
+            sandbox_policy: SandboxPolicy::WorkspaceWrite,
         }
     }
 
     pub fn with_path_policy(mut self, policy: PathPolicy) -> Self {
         self.path_policy = policy;
+        self
+    }
+
+    pub fn with_sandbox_policy(mut self, policy: SandboxPolicy) -> Self {
+        self.sandbox_policy = policy;
         self
     }
 }
@@ -89,7 +97,17 @@ impl AgentTool for BashTool {
             ShellKind::PosixSh
         };
 
-        let outcome = run_shell(kind, &self.cwd, command, timeout_ms, cancel, on_update).await?;
+        let plan = SandboxPlan::new(self.sandbox_policy, self.cwd.clone());
+        let outcome = run_shell(
+            kind,
+            &self.cwd,
+            command,
+            timeout_ms,
+            cancel,
+            on_update,
+            Some(&plan),
+        )
+        .await?;
 
         if let Some(reason) = outcome.aborted_reason {
             return Err(if outcome.text == "(no output)" {
@@ -99,13 +117,23 @@ impl AgentTool for BashTool {
             });
         }
 
+        let exit_code = outcome.exit_status.as_ref().and_then(|s| s.code());
+        let mut text = outcome.text;
+        if mehh_sandbox::detect_violation(&text, exit_code)
+            && self.sandbox_policy != SandboxPolicy::DangerFullAccess
+        {
+            text.push_str(
+                "\n[sandbox denied] The sandbox likely blocked this command. Ask the user to approve a one-time re-run outside the sandbox if it is required.",
+            );
+        }
+
         match outcome.exit_status {
             Some(status) if !status.success() => Err(format!(
                 "Command exited with code {}:\n{}",
                 status.code().unwrap_or(-1),
-                outcome.text
+                text
             )),
-            Some(_) => Ok(AgentToolResult::text(outcome.text)),
+            Some(_) => Ok(AgentToolResult::text(text)),
             None => Err("Command finished without exit status".to_string()),
         }
     }

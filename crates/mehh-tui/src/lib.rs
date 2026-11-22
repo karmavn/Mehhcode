@@ -193,11 +193,11 @@ mod tests {
         ];
         let mut list = SelectList::new(items, 5);
         let list_rendered = list.render(30);
-        assert!(list_rendered[0].contains('>'));
+        assert!(list_rendered[0].contains('▎'));
         assert!(list_rendered[0].contains("Apple"));
         list.move_down();
         let list_rendered2 = list.render(30);
-        assert!(list_rendered2[1].contains('>'));
+        assert!(list_rendered2[1].contains('▎'));
         assert!(list_rendered2[1].contains("Banana"));
 
         // Fuzzy filter: "bnn" matches Banana
@@ -242,7 +242,7 @@ mod tests {
             SelectItem::new("model", "model"),
             SelectItem::new("mode", "mode"),
         ]);
-        let rendered = editor.render(40);
+        let rendered = editor.render_autocomplete(40);
         assert!(rendered.iter().any(|l| l.contains("model")));
 
         let kb = Keybindings::default_bindings();
