@@ -59,8 +59,8 @@ impl LlmProvider for OpenAiResponsesProvider {
             } else {
                 model.base_url.trim_end_matches('/')
             };
-            let url = if model.base_url.ends_with("/responses") {
-                model.base_url.clone()
+            let url = if base_url.ends_with("/responses") {
+                base_url.to_string()
             } else {
                 format!("{base_url}/responses")
             };
@@ -350,19 +350,42 @@ pub fn build_openai_responses_request(
                 } else {
                     &tr.tool_call_id
                 };
-                let text = tr
+                let has_image = tr
                     .content
                     .iter()
-                    .filter_map(|b| match b {
-                        ToolResultContentBlock::Text(tc) => Some(sanitize_surrogates(&tc.text)),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                    .any(|b| matches!(b, ToolResultContentBlock::Image(_)));
+                let output = if has_image {
+                    let mut parts: Vec<serde_json::Value> = Vec::new();
+                    for b in &tr.content {
+                        match b {
+                            ToolResultContentBlock::Text(tc) => parts.push(serde_json::json!({
+                                "type": "input_text",
+                                "text": sanitize_surrogates(&tc.text),
+                            })),
+                            ToolResultContentBlock::Image(img) => parts.push(serde_json::json!({
+                                "type": "input_image",
+                                "detail": "auto",
+                                "image_url": format!("data:{};base64,{}", img.mime_type, img.data),
+                            })),
+                        }
+                    }
+                    serde_json::Value::Array(parts)
+                } else {
+                    let text = tr
+                        .content
+                        .iter()
+                        .filter_map(|b| match b {
+                            ToolResultContentBlock::Text(tc) => Some(sanitize_surrogates(&tc.text)),
+                            ToolResultContentBlock::Image(_) => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    serde_json::Value::String(text)
+                };
                 input_items.push(serde_json::json!({
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": text,
+                    "output": output,
                 }));
             }
         }
@@ -1582,5 +1605,121 @@ mod tests {
         let result = process_openai_responses_sse_events(&model, &sse_events, &sender);
         assert_eq!(result.stop_reason, StopReason::Error);
         assert_eq!(result.error_message.as_deref(), Some("Model is overloaded"));
+    }
+
+    #[tokio::test]
+    async fn responses_url_with_trailing_slash_requests_responses_once() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]);
+                let path = request
+                    .lines()
+                    .next()
+                    .and_then(|line| line.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let _ = tx.send(path);
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let mut model = test_responses_model();
+        model.base_url = format!("http://{addr}/v1/responses/");
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("Hello".to_string()),
+                timestamp: 1,
+            })],
+            tools: None,
+        };
+        let provider = OpenAiResponsesProvider::new();
+        let stream = provider.stream(
+            &model,
+            &context,
+            &StreamOptions::default(),
+            tokio_util::sync::CancellationToken::new(),
+        );
+
+        let path = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .expect("request did not reach the server")
+            .expect("path sender dropped");
+        assert_eq!(path, "/v1/responses");
+        drop(stream);
+    }
+
+    #[test]
+    fn openai_responses_forwards_tool_result_images() {
+        let model = test_responses_model();
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Read the screenshot".to_string()),
+                    timestamp: 1,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContentBlock::ToolCall(ToolCall {
+                        id: "call_read_1|fc_read_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: {
+                            let mut m = serde_json::Map::new();
+                            m.insert("path".to_string(), serde_json::json!("screenshot.png"));
+                            m
+                        },
+                        arguments_error: None,
+                        thought_signature: None,
+                    })],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 2,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "call_read_1|fc_read_1".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ToolResultContentBlock::Image(ImageContent {
+                        mime_type: "image/png".to_string(),
+                        data: "iVBORw0KGgo=".to_string(),
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 3,
+                    duration_ms: None,
+                    usage: None,
+                }),
+            ],
+            tools: None,
+        };
+
+        let req = build_openai_responses_request(&model, &context, &StreamOptions::default());
+        let input = req["input"].as_array().expect("input array");
+        let output_item = input
+            .iter()
+            .find(|item| item["type"] == "function_call_output")
+            .expect("function_call_output item");
+
+        assert_eq!(output_item["call_id"], "call_read_1");
+        let parts = output_item["output"].as_array().expect(
+            "image-only tool result must serialize output as content parts, not an empty string",
+        );
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0]["type"], "input_image");
+        assert_eq!(parts[0]["image_url"], "data:image/png;base64,iVBORw0KGgo=");
     }
 }

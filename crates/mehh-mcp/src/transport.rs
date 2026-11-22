@@ -209,6 +209,13 @@ impl StdioTransport {
         if let Some(c) = cwd {
             cmd.current_dir(c);
         }
+        // Scrub inherited secret-shaped variables first; an explicitly
+        // declared cfg.env value is applied afterwards and is intentional.
+        for (key, _) in std::env::vars_os() {
+            if mehh_sandbox::is_secret_env_key(&key.to_string_lossy()) {
+                cmd.env_remove(&key);
+            }
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -682,5 +689,89 @@ mod tests {
         let third = read_bounded_line(&mut reader, 128).await.unwrap().unwrap();
         assert_eq!(third, b"{\"ok\":true}");
         assert!(read_bounded_line(&mut reader, 128).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn stdio_transport_scrubs_secret_env_vars_unless_explicitly_configured() {
+        struct EnvGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+        impl EnvGuard {
+            fn set(entries: &[(&'static str, &str)]) -> Self {
+                let mut prev = Vec::new();
+                for (k, v) in entries {
+                    prev.push((*k, std::env::var_os(k)));
+                    std::env::set_var(k, v);
+                }
+                Self(prev)
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                for (k, prev) in &self.0 {
+                    match prev {
+                        Some(v) => std::env::set_var(k, v),
+                        None => std::env::remove_var(k),
+                    }
+                }
+            }
+        }
+
+        let _guard = EnvGuard::set(&[
+            ("MEHH_TEST_ANTHROPIC_API_KEY", "LEAK_ANTHROPIC"),
+            ("MEHH_TEST_OPENAI_API_KEY", "LEAK_OPENAI"),
+            ("MEHH_TEST_AWS_SECRET", "LEAK_AWS"),
+            ("MEHH_TEST_GITHUB_TOKEN", "LEAK_GITHUB"),
+            ("MEHH_TEST_DB_PASSWORD", "LEAK_PASSWORD"),
+            ("DATABASE_URL", "LEAK_DATABASE_URL"),
+            ("REDIS_URL", "LEAK_REDIS_URL"),
+            ("GOOGLE_APPLICATION_CREDENTIALS", "LEAK_GOOGLE_CREDS"),
+            ("CONNECTION_STRING", "LEAK_CONN_STR"),
+        ]);
+
+        let mut cfg_env = HashMap::new();
+        cfg_env.insert(
+            "MEHH_TEST_ANTHROPIC_API_KEY".to_string(),
+            "EXPLICIT_OK".to_string(),
+        );
+
+        let (program, args) = if cfg!(windows) {
+            (
+                "cmd.exe",
+                vec!["/C".to_string(), "echo __ENV_DUMP__ 1>&2 & set 1>&2".to_string()],
+            )
+        } else {
+            (
+                "/bin/sh",
+                vec!["-c".to_string(), "echo __ENV_DUMP__ >&2; env >&2".to_string()],
+            )
+        };
+
+        let transport = StdioTransport::spawn(program, &args, &cfg_env, None).unwrap();
+        let dump = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let tail = transport.stderr_tail().await;
+                if tail.contains("__ENV_DUMP__") {
+                    return tail;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("child never dumped its environment");
+        transport.close().await.unwrap();
+
+        assert!(dump.contains("EXPLICIT_OK"), "declared cfg.env must win");
+        for leak in [
+            "LEAK_ANTHROPIC",
+            "LEAK_OPENAI",
+            "LEAK_AWS",
+            "LEAK_GITHUB",
+            "LEAK_PASSWORD",
+            "LEAK_DATABASE_URL",
+            "LEAK_REDIS_URL",
+            "LEAK_GOOGLE_CREDS",
+            "LEAK_CONN_STR",
+        ] {
+            assert!(!dump.contains(leak), "secret leaked to MCP child: {leak}");
+        }
     }
 }

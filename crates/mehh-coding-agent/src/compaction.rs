@@ -357,8 +357,19 @@ pub fn prepare_compaction(
 
     let (boundary_start, previous_summary) = match last_compaction_pos {
         Some(pos) => {
-            if let SessionEntryKind::Compaction { summary, .. } = &entries[pos].kind {
-                (pos + 1, Some(summary.clone()))
+            if let SessionEntryKind::Compaction {
+                summary,
+                first_kept_entry_id,
+                ..
+            } = &entries[pos].kind
+            {
+                // Entries kept by the previous compaction are still live
+                // context; the next summary must cover them too.
+                let prev_kept_pos = entries[..pos]
+                    .iter()
+                    .position(|e| e.id == *first_kept_entry_id)
+                    .unwrap_or(0);
+                (prev_kept_pos, Some(summary.clone()))
             } else {
                 (0, None)
             }
@@ -373,10 +384,7 @@ pub fn prepare_compaction(
     // Collect valid cut point candidate indices: Message::User or Message::Assistant
     let mut cut_point_candidates = Vec::new();
     for (i, entry) in entries.iter().enumerate().skip(boundary_start) {
-        if messages_for_entry(entry)
-            .iter()
-            .any(|message| is_cut_point_message(message))
-        {
+        if messages_for_entry(entry).iter().any(is_cut_point_message) {
             cut_point_candidates.push(i);
         }
     }
@@ -1015,6 +1023,63 @@ mod tests {
             .expect("Compaction should succeed by advancing to next User turn");
         assert_eq!(prep.first_kept_entry_id, "u2");
         assert_eq!(prep.messages_to_summarize.len(), 2);
+    }
+
+    #[test]
+    fn second_compaction_preserves_messages_kept_by_first_compaction() {
+        let long = "word ".repeat(20_000);
+        let mk_user = |id: &str, parent: Option<&str>, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            timestamp: "2026-11-12T10:00:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: now_ms(),
+                }),
+            },
+        };
+        let mk_ast = |id: &str, parent: &str, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            timestamp: "2026-11-12T10:01:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::Assistant(mehh_ai::faux_assistant_message(text)),
+            },
+        };
+
+        let u2_marker = "KEEP_U2_MARKER";
+        let a2_text = format!("KEEP_A2_MARKER {long}");
+        let mut entries = vec![
+            mk_user("u1", None, "first prompt"),
+            mk_ast("a1", "u1", "first reply"),
+            mk_user("u2", Some("a1"), u2_marker),
+            mk_ast("a2", "u2", &a2_text),
+        ];
+
+        let first = prepare_compaction(&entries, DEFAULT_KEEP_RECENT_TOKENS).unwrap();
+        assert_eq!(first.first_kept_entry_id, "u2");
+
+        entries.push(SessionEntry {
+            id: "c1".to_string(),
+            parent_id: Some("a2".to_string()),
+            timestamp: "2026-11-12T10:05:00.000Z".to_string(),
+            kind: SessionEntryKind::Compaction {
+                summary: "summary of first compaction".to_string(),
+                first_kept_entry_id: first.first_kept_entry_id.clone(),
+                tokens_before: first.tokens_before as u64,
+            },
+        });
+        entries.push(mk_user("u3", Some("c1"), "third prompt"));
+        entries.push(mk_ast("a3", "u3", &long));
+        entries.push(mk_user("u4", Some("a3"), "fourth prompt"));
+        entries.push(mk_ast("a4", "u4", "fourth reply"));
+
+        let second = prepare_compaction(&entries, DEFAULT_KEEP_RECENT_TOKENS).unwrap();
+        let summarized = serialize_conversation(&second.messages_to_summarize);
+        assert!(summarized.contains(u2_marker), "u2 kept by the first compaction was dropped");
+        assert!(summarized.contains("KEEP_A2_MARKER"), "a2 kept by the first compaction was dropped");
+        assert_eq!(second.first_kept_entry_id, "u3");
     }
 
     #[test]

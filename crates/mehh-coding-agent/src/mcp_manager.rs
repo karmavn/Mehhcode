@@ -520,9 +520,11 @@ impl McpManager {
             .await
             .context("Failed to parse token response JSON")?;
 
+        // tokens_expire_at is Unix SECONDS, not milliseconds: it is compared
+        // against SystemTime::as_secs() in StoredMcpBearerProvider.
         let expires_at = tokens
             .expires_in
-            .map(|exp| mehh_ai::now_ms() + (exp as i64 * 1000));
+            .map(mehh_mcp::oauth::mcp_token_expiry_seconds);
 
         let auth_entry = McpAuthEntry {
             server_url: url.clone(),

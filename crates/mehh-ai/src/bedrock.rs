@@ -494,6 +494,20 @@ pub fn build_bedrock_request(
                         })
                         .collect(),
                 };
+                // A steering user can follow a ToolResult, which is also emitted
+                // as role=user. Converse requires alternating roles, so merge
+                // the parts into the existing user message instead.
+                if let Some(last) = messages.last_mut() {
+                    if last.get("role").and_then(|r| r.as_str()) == Some("user") {
+                        if let Some(existing) =
+                            last.get_mut("content").and_then(|c| c.as_array_mut())
+                        {
+                            existing.extend(content_parts);
+                            i += 1;
+                            continue;
+                        }
+                    }
+                }
                 messages.push(serde_json::json!({
                     "role": "user",
                     "content": content_parts,
@@ -1856,5 +1870,83 @@ mod tests {
             .as_deref()
             .unwrap_or("")
             .contains("The model encountered an issue during generation"));
+    }
+
+    #[test]
+    fn bedrock_merges_user_message_following_tool_result() {
+        let model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            name: "Claude 3.7 Sonnet (Bedrock)".to_string(),
+            api: "bedrock-converse-stream".to_string(),
+            provider: "amazon-bedrock".to_string(),
+            base_url: String::new(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            headers: None,
+            ..Default::default()
+        };
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("run tool".to_string()),
+                    timestamp: 1,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContentBlock::ToolCall(ToolCall {
+                        id: "call_1".to_string(),
+                        name: "bash".to_string(),
+                        arguments: serde_json::Map::new(),
+                        arguments_error: None,
+                        thought_signature: None,
+                    })],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 2,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "call_1".to_string(),
+                    tool_name: "bash".to_string(),
+                    content: vec![ToolResultContentBlock::Text(TextContent {
+                        text: "tool output".to_string(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 3,
+                    duration_ms: None,
+                    usage: None,
+                }),
+                Message::User(UserMessage {
+                    content: UserContent::Text("steering follow-up".to_string()),
+                    timestamp: 4,
+                }),
+            ],
+            tools: None,
+        };
+        let opts = StreamOptions {
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+
+        let req = build_bedrock_request(&model, &context, &opts);
+        let messages = req["messages"].as_array().expect("messages array");
+
+        assert_eq!(messages.len(), 3, "consecutive user roles must be merged: {req}");
+        for pair in messages.windows(2) {
+            assert_ne!(pair[0]["role"], pair[1]["role"], "roles must alternate: {req}");
+        }
+        let merged = messages[2]["content"].as_array().expect("merged content");
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0]["toolResult"]["content"][0]["text"], "tool output");
+        assert_eq!(merged[1]["text"], "steering follow-up");
     }
 }

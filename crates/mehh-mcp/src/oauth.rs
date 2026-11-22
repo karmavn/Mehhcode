@@ -44,6 +44,13 @@ pub struct OAuthTokens {
     pub scope: Option<String>,
 }
 
+/// Converts an OAuth `expires_in` (SECONDS) into the absolute Unix-seconds
+/// timestamp stored in `McpAuthEntry::tokens_expire_at`. `bearer_token()` and
+/// `do_refresh()` compare it against `SystemTime::as_secs()`.
+pub fn mcp_token_expiry_seconds(expires_in: u64) -> i64 {
+    (mehh_ai::now_ms() / 1000) + expires_in as i64
+}
+
 /// Stored authentication state per MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpAuthEntry {
@@ -302,12 +309,14 @@ async fn read_bounded_oauth_bytes(
     Ok(buf)
 }
 
-/// Persistent store for MCP OAuth credentials keyed by `format!("{server_name}|{server_url}")`.
+/// Persistent store for MCP OAuth credentials keyed by a length-prefixed name plus URL.
 pub struct McpAuthStore {
     path: PathBuf,
     lock_path: PathBuf,
     process_lock: Arc<tokio::sync::Mutex<()>>,
     entries: RwLock<HashMap<String, McpAuthEntry>>,
+    #[cfg(test)]
+    pub(crate) load_count: std::sync::atomic::AtomicUsize,
 }
 
 impl McpAuthStore {
@@ -326,12 +335,15 @@ impl McpAuthStore {
             lock_path,
             process_lock,
             entries: RwLock::new(entries),
+            #[cfg(test)]
+            load_count: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 
-    /// Generates key formatted as `server_name|server_url`.
+    /// Generates an unambiguous key: the byte-length-prefixed name followed by the URL.
+    /// Length-prefixing the name prevents a `|` in either field from merging two identities.
     pub fn store_key(server_name: &str, server_url: &str) -> String {
-        format!("{server_name}|{server_url}")
+        format!("{}:{}|{}", server_name.len(), server_name, server_url)
     }
 
     /// Acquires an advisory file lock on `<path>.lock`.
@@ -357,6 +369,9 @@ impl McpAuthStore {
     }
 
     async fn load_fresh(&self) -> anyhow::Result<HashMap<String, McpAuthEntry>> {
+        #[cfg(test)]
+        self.load_count
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let path = self.path.clone();
         tokio::task::spawn_blocking(move || Self::load_from_path(&path))
             .await
@@ -1017,19 +1032,20 @@ impl StoredMcpBearerProvider {
         }
     }
 
-    async fn do_refresh(&self, entry: &McpAuthEntry) -> anyhow::Result<bool> {
+    /// Returns the refreshed access token when a refresh was performed.
+    async fn do_refresh(&self, entry: &McpAuthEntry) -> anyhow::Result<Option<String>> {
         let refresh_token = match entry
             .tokens
             .as_ref()
             .and_then(|t| t.refresh_token.as_ref())
         {
             Some(rt) => rt.clone(),
-            None => return Ok(false),
+            None => return Ok(None),
         };
 
         let client_id = match entry.client_id.as_ref() {
             Some(cid) => cid.clone(),
-            None => return Ok(false),
+            None => return Ok(None),
         };
 
         let endpoint = {
@@ -1065,6 +1081,7 @@ impl StoredMcpBearerProvider {
             .unwrap_or_default()
             .as_secs() as i64;
         let expire_at = new_tokens.expires_in.map(|exp| now + exp as i64);
+        let new_access_token = new_tokens.access_token.clone();
 
         let mut updated = entry.clone();
         updated.tokens = Some(new_tokens);
@@ -1073,15 +1090,14 @@ impl StoredMcpBearerProvider {
         self.auth_store
             .set(&self.server_name, &self.server_url, updated)
             .await?;
-        Ok(true)
+        Ok(Some(new_access_token))
     }
 }
 
 #[async_trait]
 impl McpBearerProvider for StoredMcpBearerProvider {
     async fn bearer_token(&self) -> anyhow::Result<Option<String>> {
-        let entry_opt = self.auth_store.get(&self.server_name, &self.server_url).await;
-        let entry = match entry_opt {
+        let entry = match self.auth_store.get(&self.server_name, &self.server_url).await {
             Some(e) => e,
             None => return Ok(None),
         };
@@ -1091,22 +1107,37 @@ impl McpBearerProvider for StoredMcpBearerProvider {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        // Proactive refresh within 30-second skew window
-        if let Some(exp) = entry.tokens_expire_at {
-            if exp <= now + 30 {
-                let _guard = self.refresh_lock.lock().await;
-                if let Some(current) = self.auth_store.get(&self.server_name, &self.server_url).await {
-                    if let Some(current_exp) = current.tokens_expire_at {
-                        if current_exp <= now + 30 {
-                            let _ = self.do_refresh(&current).await;
-                        }
-                    }
-                }
-            }
+        // Fast path: not near expiry, the single load above is sufficient.
+        if !entry.tokens_expire_at.is_some_and(|exp| exp <= now + 30) {
+            return Ok(entry.tokens.map(|t| t.access_token));
         }
 
-        let final_entry = self.auth_store.get(&self.server_name, &self.server_url).await;
-        Ok(final_entry.and_then(|e| e.tokens).map(|t| t.access_token))
+        // Near expiry: serialize refreshes and re-read the store under the
+        // lock so a refresh already performed by another task/process is seen
+        // instead of reusing a stale entry (and its stale refresh token).
+        let _guard = self.refresh_lock.lock().await;
+        let fresh = match self.auth_store.get(&self.server_name, &self.server_url).await {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if !fresh.tokens_expire_at.is_some_and(|exp| exp <= now + 30) {
+            return Ok(fresh.tokens.map(|t| t.access_token));
+        }
+        if let Ok(Some(refreshed)) = self.do_refresh(&fresh).await {
+            return Ok(Some(refreshed));
+        }
+        // Refresh failed (e.g. another caller rotated the refresh token).
+        // Re-read once more so a concurrent refresh becomes visible rather
+        // than returning the expired access token from `fresh`.
+        Ok(self
+            .auth_store
+            .get(&self.server_name, &self.server_url)
+            .await
+            .and_then(|e| e.tokens.map(|t| t.access_token)))
     }
 
     async fn on_unauthorized(
@@ -1128,7 +1159,7 @@ impl McpBearerProvider for StoredMcpBearerProvider {
                 return Ok(true);
             }
         }
-        self.do_refresh(&entry).await
+        Ok(self.do_refresh(&entry).await?.is_some())
     }
 }
 
@@ -1362,7 +1393,263 @@ mod tests {
         let verify_store = McpAuthStore::try_with_path(auth_path).unwrap();
         let list = verify_store.list().await;
         assert_eq!(list.len(), 2, "Expected both concurrent writes to be retained in store without clobbering");
-        assert!(list.contains_key("server1|http://server1.local"));
-        assert!(list.contains_key("server2|http://server2.local"));
+        assert!(list.contains_key(&McpAuthStore::store_key("server1", "http://server1.local")));
+        assert!(list.contains_key(&McpAuthStore::store_key("server2", "http://server2.local")));
+    }
+
+    #[tokio::test]
+    async fn test_store_key_collision_separates_server_tokens() {
+        let dir = crate::TempTestDir::new("oauth_key_collision");
+        let store = McpAuthStore::try_with_path(dir.path().join("mcp-auth.json")).unwrap();
+
+        let key_a = McpAuthStore::store_key("a|b", "c");
+        let key_b = McpAuthStore::store_key("a", "b|c");
+        assert_ne!(
+            key_a, key_b,
+            "distinct server identities must not map to the same store key"
+        );
+
+        let entry_a = McpAuthEntry {
+            server_url: "c".to_string(),
+            client_id: None,
+            client_secret: None,
+            tokens: Some(OAuthTokens {
+                access_token: "token_for_a_b".to_string(),
+                refresh_token: None,
+                expires_in: None,
+                token_type: None,
+                scope: None,
+            }),
+            tokens_expire_at: None,
+        };
+        let entry_b = McpAuthEntry {
+            server_url: "b|c".to_string(),
+            client_id: None,
+            client_secret: None,
+            tokens: Some(OAuthTokens {
+                access_token: "token_for_a".to_string(),
+                refresh_token: None,
+                expires_in: None,
+                token_type: None,
+                scope: None,
+            }),
+            tokens_expire_at: None,
+        };
+
+        store.set("a|b", "c", entry_a).await.unwrap();
+        store.set("a", "b|c", entry_b).await.unwrap();
+
+        let got_a = store.get("a|b", "c").await.unwrap();
+        let got_b = store.get("a", "b|c").await.unwrap();
+        assert_eq!(got_a.tokens.unwrap().access_token, "token_for_a_b");
+        assert_eq!(got_b.tokens.unwrap().access_token, "token_for_a");
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_tokens_expire_at_unit_triggers_proactive_refresh_after_expiry() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let refresh_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rc = refresh_count.clone();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            assert!(req.starts_with("POST /token"), "unexpected request: {req}");
+            rc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let body = serde_json::json!({
+                "access_token": "refreshed-access-token",
+                "refresh_token": "rotated-refresh-token",
+                "expires_in": 3600u64,
+            })
+            .to_string();
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+        });
+
+        // Build the entry exactly as mcp_manager.rs does.
+        let tokens = OAuthTokens {
+            access_token: "expired-access-token".to_string(),
+            refresh_token: Some("original-refresh-token".to_string()),
+            expires_in: Some(0),
+            token_type: Some("Bearer".to_string()),
+            scope: None,
+        };
+        let expires_at = tokens.expires_in.map(mcp_token_expiry_seconds);
+        let entry = McpAuthEntry {
+            server_url: "https://example.test/mcp".to_string(),
+            client_id: Some("client-123".to_string()),
+            client_secret: None,
+            tokens: Some(tokens),
+            tokens_expire_at: expires_at,
+        };
+
+        let dir = crate::TempTestDir::new("oauth_expiry_units");
+        let store = Arc::new(
+            McpAuthStore::try_with_path(dir.path().join("mcp-auth.json")).unwrap(),
+        );
+        store
+            .set("srv", "https://example.test/mcp", entry)
+            .await
+            .unwrap();
+
+        let provider = StoredMcpBearerProvider::new(
+            store,
+            "srv",
+            "https://example.test/mcp",
+            Some(format!("http://127.0.0.1:{port}/token")),
+        );
+        let token = provider.bearer_token().await.unwrap();
+        server.abort();
+
+        assert_eq!(
+            refresh_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "proactive refresh must fire when tokens_expire_at is in seconds"
+        );
+        assert_eq!(token.as_deref(), Some("refreshed-access-token"));
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_loads_auth_store_once() {
+        use std::sync::atomic::Ordering;
+
+        let dir = crate::TempTestDir::new("oauth_bearer_single_load");
+        let store = Arc::new(
+            McpAuthStore::try_with_path(dir.path().join("mcp-auth.json")).unwrap(),
+        );
+        let entry = McpAuthEntry {
+            server_url: "https://example.com/mcp".to_string(),
+            client_id: Some("client-id".to_string()),
+            client_secret: None,
+            tokens: Some(OAuthTokens {
+                access_token: "valid-token".to_string(),
+                refresh_token: Some("refresh-token".to_string()),
+                expires_in: Some(3600),
+                token_type: None,
+                scope: None,
+            }),
+            tokens_expire_at: None,
+        };
+        store
+            .set("srv", "https://example.com/mcp", entry)
+            .await
+            .unwrap();
+        let loads_after_setup = store.load_count.load(Ordering::SeqCst);
+
+        let provider = StoredMcpBearerProvider::new(
+            store.clone(),
+            "srv",
+            "https://example.com/mcp",
+            None,
+        );
+        let token = provider.bearer_token().await.unwrap();
+        assert_eq!(token.as_deref(), Some("valid-token"));
+        assert_eq!(
+            store.load_count.load(Ordering::SeqCst) - loads_after_setup,
+            1,
+            "a successful bearer_token() must load the auth store exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_rereads_store_under_refresh_lock() {
+        use std::sync::atomic::Ordering;
+
+        let dir = crate::TempTestDir::new("oauth_bearer_reread");
+        let store = Arc::new(
+            McpAuthStore::try_with_path(dir.path().join("mcp-auth.json")).unwrap(),
+        );
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let stale_entry = McpAuthEntry {
+            server_url: "https://example.com/mcp".to_string(),
+            client_id: Some("client-id".to_string()),
+            client_secret: None,
+            tokens: Some(OAuthTokens {
+                access_token: "expired-token".to_string(),
+                refresh_token: Some("old-refresh-token".to_string()),
+                expires_in: Some(3600),
+                token_type: None,
+                scope: None,
+            }),
+            tokens_expire_at: Some(now - 1), // already expired: forces the refresh path
+        };
+        store
+            .set("srv", "https://example.com/mcp", stale_entry)
+            .await
+            .unwrap();
+        let loads_after_setup = store.load_count.load(Ordering::SeqCst);
+
+        let provider = Arc::new(StoredMcpBearerProvider::new(
+            store.clone(),
+            "srv",
+            "https://example.com/mcp",
+            // Loopback port with no listener: if the stale entry is refreshed
+            // the request fails fast, which is exactly the rotating-token case.
+            Some("http://127.0.0.1:1/token".to_string()),
+        ));
+
+        // Hold the refresh lock so bearer_token() loads the stale entry, then
+        // blocks before deciding how to refresh it.
+        let guard = provider.refresh_lock.lock().await;
+        let p = provider.clone();
+        let task = tokio::spawn(async move { p.bearer_token().await });
+
+        // Wait until the initial load happened while the lock is still held.
+        for _ in 0..100 {
+            if store.load_count.load(Ordering::SeqCst) > loads_after_setup {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            store.load_count.load(Ordering::SeqCst),
+            loads_after_setup + 1,
+            "bearer_token() must have loaded the stale entry and now wait on the refresh lock"
+        );
+
+        // Simulate another caller/process refreshing with a rotated refresh
+        // token while our caller is blocked on the refresh lock.
+        let writer_store =
+            McpAuthStore::try_with_path(dir.path().join("mcp-auth.json")).unwrap();
+        let fresh_entry = McpAuthEntry {
+            server_url: "https://example.com/mcp".to_string(),
+            client_id: Some("client-id".to_string()),
+            client_secret: None,
+            tokens: Some(OAuthTokens {
+                access_token: "new-access-token".to_string(),
+                refresh_token: Some("rotated-refresh-token".to_string()),
+                expires_in: Some(3600),
+                token_type: None,
+                scope: None,
+            }),
+            tokens_expire_at: Some(now + 3600),
+        };
+        writer_store
+            .set("srv", "https://example.com/mcp", fresh_entry)
+            .await
+            .unwrap();
+
+        drop(guard);
+        let token = task.await.unwrap().unwrap();
+
+        assert_eq!(
+            token.as_deref(),
+            Some("new-access-token"),
+            "a fresher token written under the refresh lock must win over the stale entry"
+        );
+        assert_eq!(
+            store.load_count.load(Ordering::SeqCst) - loads_after_setup,
+            2,
+            "the near-expiry path must re-read the store under the refresh lock"
+        );
     }
 }

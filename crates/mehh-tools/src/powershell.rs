@@ -7,11 +7,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::context::PathPolicy;
 use crate::core::shell::{parse_timeout_ms, run_shell, ShellKind};
+use mehh_sandbox::{SandboxPlan, SandboxPolicy};
 
 #[derive(Debug, Clone)]
 pub struct PowerShellTool {
     pub cwd: PathBuf,
     pub path_policy: PathPolicy,
+    pub sandbox_policy: SandboxPolicy,
 }
 
 impl PowerShellTool {
@@ -19,11 +21,17 @@ impl PowerShellTool {
         Self {
             cwd,
             path_policy: PathPolicy::Unrestricted,
+            sandbox_policy: SandboxPolicy::WorkspaceWrite,
         }
     }
 
     pub fn with_path_policy(mut self, policy: PathPolicy) -> Self {
         self.path_policy = policy;
+        self
+    }
+
+    pub fn with_sandbox_policy(mut self, policy: SandboxPolicy) -> Self {
+        self.sandbox_policy = policy;
         self
     }
 }
@@ -87,6 +95,7 @@ impl AgentTool for PowerShellTool {
             .ok_or_else(|| "Missing required parameter 'command'".to_string())?;
         let timeout_ms = parse_timeout_ms(&params);
 
+        let plan = SandboxPlan::new(self.sandbox_policy, self.cwd.clone());
         let outcome =
             run_shell(
                 ShellKind::WindowsPowerShell,
@@ -95,7 +104,7 @@ impl AgentTool for PowerShellTool {
                 timeout_ms,
                 cancel,
                 on_update,
-                None,
+                Some(&plan),
             )
                 .await?;
 
@@ -107,6 +116,16 @@ impl AgentTool for PowerShellTool {
             });
         }
 
+        let exit_code = outcome.exit_status.as_ref().and_then(|s| s.code());
+        let mut text = outcome.text;
+        if mehh_sandbox::detect_violation(&text, exit_code)
+            && self.sandbox_policy != SandboxPolicy::DangerFullAccess
+        {
+            text.push_str(
+                "\n[sandbox denied] The sandbox likely blocked this command. Ask the user to approve a one-time re-run outside the sandbox if it is required.",
+            );
+        }
+
         match outcome.exit_status {
             Some(status) if !status.success() => Err(format!(
                 "Command exited with code {}:\n{}",
@@ -114,9 +133,9 @@ impl AgentTool for PowerShellTool {
                     .code()
                     .map(|c| c.to_string())
                     .unwrap_or_else(|| "terminated by signal".to_string()),
-                outcome.text
+                text
             )),
-            Some(_) => Ok(AgentToolResult::text(outcome.text)),
+            Some(_) => Ok(AgentToolResult::text(text)),
             None => Err("Command finished without exit status".to_string()),
         }
     }
@@ -167,5 +186,29 @@ mod tests {
             assert!(res.is_err());
             assert!(res.unwrap_err().contains("not supported"));
         }
+    }
+
+    #[tokio::test]
+    async fn powershell_tool_wires_sandbox_plan_and_fails_closed_on_invalid_cwd() {
+        if !cfg!(windows) {
+            return;
+        }
+        let missing =
+            std::env::temp_dir().join(format!("mehh_ps_missing_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let tool = PowerShellTool::new(missing);
+        let params = json!({ "command": "Write-Output ok" })
+            .as_object()
+            .unwrap()
+            .clone();
+
+        let err = tool
+            .execute("call-1", params, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("Sandbox setup failed"),
+            "sandbox plan must be applied before spawn, got: {err}"
+        );
     }
 }

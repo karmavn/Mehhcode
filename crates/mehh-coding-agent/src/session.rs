@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{create_dir_all, File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -39,6 +39,20 @@ pub fn now_iso8601() -> String {
     let y = if m <= 2 { y + 1 } else { y };
 
     format!("{y:04}-{m:02}-{d:02}T{hours:02}:{mins:02}:{secs:02}.{millis:03}Z")
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => 0,
+    }
 }
 
 /// Parses an ISO 8601 UTC string to unix timestamp in milliseconds, falling back to current time.
@@ -85,10 +99,26 @@ pub fn parse_iso8601_or_now(s: &str) -> i64 {
             .take_while(|c| c.is_ascii_digit())
             .take(3)
             .collect();
-        digits.parse().unwrap_or(0)
+        match digits.len() {
+            1 => digits.parse::<i64>().unwrap_or(0) * 100,
+            2 => digits.parse::<i64>().unwrap_or(0) * 10,
+            _ => digits.parse().unwrap_or(0),
+        }
     } else {
         0
     };
+
+    // Reject values that the civil-date algorithm would otherwise silently
+    // normalize into a different valid date (e.g. Feb 30 -> Mar 2).
+    if !(1..=12).contains(&m)
+        || d < 1
+        || d > days_in_month(y, m)
+        || !(0..=23).contains(&h)
+        || !(0..=59).contains(&min)
+        || !(0..=59).contains(&sec)
+    {
+        return now_ms();
+    }
 
     let y = if m <= 2 { y - 1 } else { y };
     let era = (if y >= 0 { y } else { y - 399 }) / 400;
@@ -473,8 +503,9 @@ pub fn list_sessions(cwd: &Path) -> Result<Vec<SessionSummary>> {
                     id: Option<&'a str>,
                     #[serde(rename = "type")]
                     kind: Option<&'a str>,
-                    #[serde(borrow)]
-                    name: Option<&'a str>,
+                    // A renamed session can contain escaped quotes/backslashes;
+                    // serde cannot hand those back as a borrowed &str.
+                    name: Option<String>,
                 }
 
                 if let Ok(fast) = serde_json::from_str::<FastSessionLine>(trimmed) {
@@ -483,6 +514,7 @@ pub fn list_sessions(cwd: &Path) -> Result<Vec<SessionSummary>> {
                         if fast.kind == Some("session_info") {
                             session_name = fast
                                 .name
+                                .as_deref()
                                 .map(str::trim)
                                 .filter(|s| !s.is_empty())
                                 .map(String::from);
@@ -547,6 +579,26 @@ pub fn export_session(input_file: &Path, output_file: Option<&Path>, cwd: &Path)
         std::io::Write::flush(&mut stdout)?;
     }
     Ok(())
+}
+
+/// Returns true when an existing file's final byte is not a newline, meaning a
+/// plain append would be concatenated onto a partial/truncated line.
+fn file_needs_leading_newline(path: &Path) -> Result<bool> {
+    let mut file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e)
+                .with_context(|| format!("Failed to inspect session file: {}", path.display()));
+        }
+    };
+    if file.metadata()?.len() == 0 {
+        return Ok(false);
+    }
+    file.seek(SeekFrom::End(-1))?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last)?;
+    Ok(last[0] != b'\n')
 }
 
 /// Manages session persistence, tree navigation, branching, and context projection.
@@ -730,11 +782,15 @@ impl SessionManager {
         };
 
         if let Some(path) = &self.file_path {
+            let needs_newline = file_needs_leading_newline(path)?;
             let mut file = OpenOptions::new()
                 .create(true)
                 .append(true)
                 .open(path)
                 .with_context(|| format!("Failed to append to session file: {}", path.display()))?;
+            if needs_newline {
+                file.write_all(b"\n")?;
+            }
             let line = serde_json::to_string(&entry)?;
             writeln!(file, "{line}")?;
             file.flush()?;
@@ -842,6 +898,7 @@ impl SessionManager {
         if self.by_id.contains_key(entry_id) {
             self.leaf_id = Some(entry_id.to_string());
             if let Some(path) = &self.file_path {
+                let needs_newline = file_needs_leading_newline(path)?;
                 let mut file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -852,6 +909,9 @@ impl SessionManager {
                             path.display()
                         )
                     })?;
+                if needs_newline {
+                    file.write_all(b"\n")?;
+                }
                 let line = serde_json::to_string(&PersistedBranchSelection::new(entry_id))?;
                 writeln!(file, "{line}")?;
                 file.flush()?;
@@ -866,8 +926,15 @@ impl SessionManager {
     pub fn build_context_messages(&self) -> Vec<Message> {
         let mut path_indices = Vec::new();
         let mut curr = self.leaf_id.as_deref();
+        let mut steps = 0;
 
         while let Some(id) = curr {
+            // A tampered file can contain a parentId cycle; never walk more
+            // than one step per stored entry.
+            if steps >= self.entries.len() {
+                break;
+            }
+            steps += 1;
             if let Some(&idx) = self.by_id.get(id) {
                 path_indices.push(idx);
                 curr = self.entries[idx].parent_id.as_deref();
@@ -972,7 +1039,7 @@ impl SessionManager {
                 let first_kept_pos = path_indices[..comp_pos]
                     .iter()
                     .position(|&idx| self.entries[idx].id == *first_kept_entry_id)
-                    .unwrap_or(comp_pos);
+                    .unwrap_or(0);
 
                 for &idx in &path_indices[first_kept_pos..comp_pos] {
                     messages.extend(project_entry(&self.entries[idx]));
@@ -1086,8 +1153,15 @@ impl SessionManager {
     pub fn active_path_entries(&self) -> Vec<&SessionEntry> {
         let mut path_indices = Vec::new();
         let mut curr = self.leaf_id.as_deref();
+        let mut steps = 0;
 
         while let Some(id) = curr {
+            // A tampered file can contain a parentId cycle; never walk more
+            // than one step per stored entry.
+            if steps >= self.entries.len() {
+                break;
+            }
+            steps += 1;
             if let Some(&idx) = self.by_id.get(id) {
                 path_indices.push(idx);
                 curr = self.entries[idx].parent_id.as_deref();
@@ -1130,6 +1204,10 @@ impl SessionManager {
             leaf_id: Option<&str>,
             out: &mut Vec<SessionTreeNode>,
         ) {
+            // Cap recursion depth so a cyclic parent chain cannot overflow the stack.
+            if depth > entries.len() {
+                return;
+            }
             if let Some(child_indices) = children.get(&parent) {
                 for &idx in child_indices {
                     let entry = &entries[idx];
@@ -1202,18 +1280,33 @@ impl SessionManager {
             entry: &SessionEntry,
             children_map: &HashMap<Option<&str>, Vec<&SessionEntry>>,
             labels_by_target: &HashMap<String, Option<String>>,
+            max_depth: usize,
+            depth: usize,
         ) -> RpcSessionTreeNode {
             let labels = match labels_by_target.get(&entry.id) {
                 Some(Some(lbl)) if !lbl.is_empty() => vec![lbl.clone()],
                 _ => Vec::new(),
             };
-            let children = children_map
-                .get(&Some(entry.id.as_str()))
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|child| build_rpc_node(child, children_map, labels_by_target))
-                .collect();
+            let children = if depth >= max_depth {
+                // Cap recursion depth so a cyclic parent chain cannot overflow the stack.
+                Vec::new()
+            } else {
+                children_map
+                    .get(&Some(entry.id.as_str()))
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|child| {
+                        build_rpc_node(
+                            child,
+                            children_map,
+                            labels_by_target,
+                            max_depth,
+                            depth + 1,
+                        )
+                    })
+                    .collect()
+            };
 
             RpcSessionTreeNode {
                 id: entry.id.clone(),
@@ -1224,12 +1317,13 @@ impl SessionManager {
             }
         }
 
+        let max_depth = self.entries.len();
         children_map
             .get(&None)
             .cloned()
             .unwrap_or_default()
             .into_iter()
-            .map(|entry| build_rpc_node(entry, &children_map, &labels_by_target))
+            .map(|entry| build_rpc_node(entry, &children_map, &labels_by_target, max_depth, 0))
             .collect()
     }
 
@@ -1245,8 +1339,13 @@ impl SessionManager {
         let target = target_entry_id.or(self.leaf_id.as_deref());
         let mut path_indices = Vec::new();
         let mut curr = target;
+        let mut steps = 0;
 
         while let Some(id) = curr {
+            if steps >= self.entries.len() {
+                break;
+            }
+            steps += 1;
             if let Some(&idx) = self.by_id.get(id) {
                 path_indices.push(idx);
                 curr = self.entries[idx].parent_id.as_deref();
@@ -1312,8 +1411,15 @@ impl SessionManager {
     pub fn clone_at_leaf(&self) -> Result<SessionManager> {
         let mut path_indices = Vec::new();
         let mut curr = self.leaf_id.as_deref();
+        let mut steps = 0;
 
         while let Some(id) = curr {
+            // A tampered file can contain a parentId cycle; never walk more
+            // than one step per stored entry.
+            if steps >= self.entries.len() {
+                break;
+            }
+            steps += 1;
             if let Some(&idx) = self.by_id.get(id) {
                 path_indices.push(idx);
                 curr = self.entries[idx].parent_id.as_deref();
@@ -1496,6 +1602,38 @@ fn entry_to_label(entry: &SessionEntry) -> String {
 mod tests {
     use super::*;
     use mehh_ai::{now_ms, UserContent, UserMessage};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    fn run_with_timeout<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("operation hung on a parentId cycle")
+    }
+
+    fn cyclic_session() -> SessionManager {
+        let mut s = SessionManager::in_memory(std::env::temp_dir());
+        let mk = |id: &str, parent: Option<&str>| SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            timestamp: "2026-01-01T00:00:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::User(UserMessage {
+                    content: UserContent::Text(id.to_string()),
+                    timestamp: now_ms(),
+                }),
+            },
+        };
+        // A.parentId = B and B.parentId = A; the active leaf is A.
+        s.entries = vec![mk("A", Some("B")), mk("B", Some("A"))];
+        s.by_id.insert("A".to_string(), 0);
+        s.by_id.insert("B".to_string(), 1);
+        s.leaf_id = Some("A".to_string());
+        s
+    }
 
     #[test]
     fn test_default_session_path() {
@@ -1957,6 +2095,73 @@ mod tests {
     }
 
     #[test]
+    fn list_sessions_parses_escaped_quotes_and_backslashes_in_session_name() {
+        let temp = crate::TempTestDir::new("list_escaped_name");
+        let mut session = SessionManager::create_default_file(temp.path()).unwrap();
+
+        session
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("initial prompt".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        let name = "Fix \"auth\" bug in D:\\Mehhcode";
+        session.set_session_name(Some(name.to_string())).unwrap();
+
+        let list = list_sessions(temp.path()).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].name.as_deref(), Some(name));
+        assert_eq!(list[0].entry_count, 2);
+    }
+
+    #[test]
+    fn parse_iso8601_fractional_seconds_pads_right() {
+        assert_eq!(parse_iso8601_or_now("1970-01-01T00:00:00.5Z"), 500);
+        assert_eq!(parse_iso8601_or_now("1970-01-01T00:00:00.25Z"), 250);
+        assert_eq!(parse_iso8601_or_now("1970-01-01T00:00:00.125Z"), 125);
+        assert_eq!(parse_iso8601_or_now("1970-01-01T00:00:00.1234Z"), 123);
+    }
+
+    #[test]
+    fn branch_from_after_truncated_tail_survives_reopen() {
+        let temp = crate::TempTestDir::new("branch_truncated_tail");
+        let file = temp.path().join("branch_truncated.jsonl");
+
+        let (m1, m2) = {
+            let mut s = SessionManager::open_file(&file, temp.path()).unwrap();
+            let m1 = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("first".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            let m2 = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("second".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            (m1, m2)
+        };
+
+        {
+            let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+            write!(f, "{{\"id\":\"fragment\"").unwrap();
+        }
+
+        let mut reopened = SessionManager::open_file(&file, temp.path()).unwrap();
+        assert_eq!(reopened.leaf_id(), Some(m2.as_str()));
+        assert_eq!(reopened.build_context_messages().len(), 2);
+
+        reopened.branch_from(&m1).unwrap();
+
+        let final_session = SessionManager::open_file(&file, temp.path()).unwrap();
+        assert_eq!(final_session.leaf_id(), Some(m1.as_str()));
+        assert_eq!(final_session.build_context_messages().len(), 1);
+    }
+
+    #[test]
     fn test_list_sessions_skips_empty_user_message_for_first_prompt_and_trims_whitespace_name() {
         let temp = crate::TempTestDir::new("list_empty_prompt");
         let mut session = SessionManager::create_default_file(temp.path()).unwrap();
@@ -1988,6 +2193,144 @@ mod tests {
         assert_eq!(
             list[0].first_prompt.as_deref(),
             Some("Actual user goal here")
+        );
+    }
+
+    #[test]
+    fn truncated_tail_does_not_corrupt_appended_entry() {
+        let dir = std::env::temp_dir().join(format!("mehh_trunc_tail_{}", Uuid::now_v7()));
+        create_dir_all(&dir).unwrap();
+        let file = dir.join("truncated.jsonl");
+
+        // A valid session with one real entry.
+        let real_id = {
+            let mut s = SessionManager::open_file(&file, &dir).unwrap();
+            s.append_message(Message::User(UserMessage {
+                content: UserContent::Text("real entry".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap()
+        };
+
+        // Simulate a crash-truncated final line: valid JSON prefix, no newline.
+        {
+            let mut f = OpenOptions::new().append(true).open(&file).unwrap();
+            write!(f, "{{\"id\":\"fragment\"").unwrap();
+        }
+
+        // Reopen: the fragment is skipped, the real entry survives.
+        let mut reopened = SessionManager::open_file(&file, &dir).unwrap();
+        assert!(reopened.get_entry(&real_id).is_some());
+        assert_eq!(reopened.entries().len(), 1);
+
+        // Append a new entry. Without the fix this concatenates onto the
+        // unterminated fragment, so BOTH the fragment line and the new entry
+        // become unparseable on the next open.
+        let new_id = reopened
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("appended after truncation".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        let final_session = SessionManager::open_file(&file, &dir).unwrap();
+        assert!(
+            final_session.get_entry(&new_id).is_some(),
+            "the appended entry must survive reopening a file with a truncated tail"
+        );
+        assert!(
+            final_session.get_entry(&real_id).is_some(),
+            "the earlier valid entry must also survive"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn cyclic_parent_ids_do_not_hang_context_projection() {
+        let msgs = run_with_timeout(|| cyclic_session().build_context_messages());
+        assert!(
+            msgs.len() <= 2,
+            "a parentId cycle must be traversed at most once per id, got {} messages",
+            msgs.len()
+        );
+    }
+
+    #[test]
+    fn cyclic_parent_ids_do_not_overflow_tree_builders() {
+        let (tree, rpc_tree) = run_with_timeout(|| {
+            let s = cyclic_session();
+            (s.build_tree(), s.build_rpc_tree())
+        });
+        assert!(
+            tree.len() <= 2,
+            "tree traversal must terminate on a parentId cycle, got {} nodes",
+            tree.len()
+        );
+        assert!(rpc_tree.len() <= 2);
+    }
+
+    #[test]
+    fn compaction_falls_back_to_full_history_when_first_kept_id_missing() {
+        let mut s = SessionManager::in_memory(std::env::temp_dir());
+
+        let _earlier_id = s
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("earlier message".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+
+        // A Compaction referencing an id that does not exist on the active path.
+        s.append_entry(SessionEntryKind::Compaction {
+            summary: "summary of history".to_string(),
+            first_kept_entry_id: "does_not_exist".to_string(),
+            tokens_before: 100,
+        })
+        .unwrap();
+
+        let msgs = s.build_context_messages();
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                Message::User(u) if u.content.text() == "earlier message"
+            )),
+            "earlier messages must stay in context when firstKeptEntryId cannot be found"
+        );
+    }
+
+    #[test]
+    fn invalid_calendar_timestamps_fall_back_to_now() {
+        let before = now_ms();
+        for bad in [
+            "2026-13-01T10:00:00.000Z", // month > 12
+            "2026-00-01T10:00:00.000Z", // month 0
+            "2026-02-30T10:00:00.000Z", // day out of range for February
+            "2026-04-31T10:00:00.000Z", // day out of range for April
+            "2026-01-00T10:00:00.000Z", // day 0
+            "2025-02-29T10:00:00.000Z", // Feb 29 in a non-leap year
+            "2026-01-01T24:00:00.000Z", // hour 24
+            "2026-01-01T10:60:00.000Z", // minute 60
+            "2026-01-01T10:00:60.000Z", // second 60
+        ] {
+            let got = parse_iso8601_or_now(bad);
+            assert!(
+                got >= before && got <= now_ms(),
+                "invalid timestamp {bad} should fall back to now_ms(), got {got}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_calendar_timestamp_parses_exactly() {
+        assert_eq!(parse_iso8601_or_now("1970-01-01T00:00:00.000Z"), 0);
+        assert_eq!(
+            parse_iso8601_or_now("2026-11-12T13:17:17.000Z"),
+            1_794_489_437_000
+        );
+        assert_eq!(
+            parse_iso8601_or_now("2024-02-29T10:00:00.000Z"),
+            1_709_200_800_000
         );
     }
 }

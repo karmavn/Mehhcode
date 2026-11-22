@@ -1,7 +1,6 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use clap::Parser;
 use mehh_ai::{
     catalog, faux, LlmProvider, Model, ModelCost, ThinkingLevel,
@@ -14,7 +13,6 @@ use mehh_coding_agent::{
     AgentSession, McpManager, OutputMode, SessionManager, SessionSummary, Settings,
     SettingsManager,
 };
-use tokio::io::AsyncBufReadExt;
 
 #[derive(clap::Parser, Debug, Clone, PartialEq, Eq)]
 #[command(name = "mehh", version, about = "mehh coding agent CLI")]
@@ -202,6 +200,16 @@ impl CliArgs {
     }
 }
 
+/// `todo` and `subagent` are added by main.rs after tool selection, so they
+/// must never reach `select_coding_tools` (which only knows built-in tools).
+fn parse_tool_list(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty() && t != "todo" && t != "subagent")
+        .collect()
+}
+
 pub fn resolve_cli_tools(
     args: &CliArgs,
     cwd: PathBuf,
@@ -209,21 +217,11 @@ pub fn resolve_cli_tools(
     if args.no_tools || args.no_builtin_tools {
         return Ok(Vec::new());
     }
-    let include = args.tools.as_deref().map(|s| {
-        s.split(',')
-            .map(|t| t.trim().to_string())
-            .filter(|t| !t.is_empty())
-            .collect::<Vec<_>>()
-    });
+    let include = args.tools.as_deref().map(parse_tool_list);
     let exclude = args
         .exclude_tools
         .as_deref()
-        .map(|s| {
-            s.split(',')
-                .map(|t| t.trim().to_string())
-                .filter(|t| !t.is_empty())
-                .collect::<Vec<_>>()
-        })
+        .map(parse_tool_list)
         .unwrap_or_default();
     mehh_tools::select_coding_tools(cwd, include.as_deref(), &exclude)
 }
@@ -992,33 +990,6 @@ async fn main() -> anyhow::Result<()> {
     run_res
 }
 
-/// Reads piped stdin. When a prompt argument is present, stdin is supplementary,
-/// so an idle pipe must not block the run forever; an idle window of 500ms is
-/// enough to decide there is nothing to append. Without a prompt, stdin is the
-/// prompt itself, so wait for EOF as before.
-async fn read_piped_stdin(supplementary: bool) -> anyhow::Result<String> {
-    let mut reader = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut bytes = Vec::new();
-    loop {
-        let fill = reader.fill_buf();
-        let buf = if supplementary {
-            match tokio::time::timeout(Duration::from_millis(500), fill).await {
-                Ok(result) => result?,
-                Err(_) => break,
-            }
-        } else {
-            fill.await?
-        };
-        if buf.is_empty() {
-            break;
-        }
-        let len = buf.len();
-        bytes.extend_from_slice(buf);
-        reader.consume(len);
-    }
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
 async fn run_print_flow(
     agent_session: &mut AgentSession,
     args: &CliArgs,
@@ -1032,44 +1003,17 @@ async fn run_print_flow(
     } else {
         process_file_arguments(&agent_session.cwd, &args.prompt)?
     };
-    let mut prompt_text = processed.text;
-    let mut blocks = processed.blocks;
     // Piped stdin is added to the prompt argument, never discarded. For
     // example `git diff | mehh -p "review"` must include both pieces.
+    let mut piped = String::new();
     if !io::stdin().is_terminal() {
-        let stdin_input = read_piped_stdin(args.prompt.is_empty()).await?;
-        let piped = stdin_input.trim_start_matches('\u{feff}');
-        if !piped.trim().is_empty() {
-            if !prompt_text.trim().is_empty() {
-                prompt_text.push_str("\n\n");
-            }
-            prompt_text.push_str(piped);
-        }
+        piped = mehh_cli::read_piped_stdin_for_prompt(
+            tokio::io::BufReader::new(tokio::io::stdin()),
+            &args.prompt,
+        )
+        .await?;
     }
-
-    if prompt_text.trim().is_empty() && blocks.is_empty() {
-        anyhow::bail!(
-            "Prompt is required. Pass a prompt argument, pipe input via stdin, or use --mode rpc."
-        );
-    }
-
-    let user_content = if blocks.is_empty() {
-        mehh_ai::UserContent::Text(prompt_text)
-    } else {
-        if !prompt_text.trim().is_empty() {
-            let has_text = blocks.iter().any(|b| matches!(b, mehh_ai::UserContentBlock::Text(_)));
-            if !has_text {
-                blocks.insert(
-                    0,
-                    mehh_ai::UserContentBlock::Text(mehh_ai::TextContent {
-                        text: prompt_text,
-                        text_signature: None,
-                    }),
-                );
-            }
-        }
-        mehh_ai::UserContent::Blocks(blocks)
-    };
+    let user_content = mehh_cli::build_print_user_content(processed, &piped)?;
 
     run_print_mode_content(agent_session, user_content, output_mode).await?;
     Ok(())
@@ -1850,6 +1794,31 @@ mod tests {
         let args_nobuiltin = CliArgs::try_parse_from(["mehh", "--no-builtin-tools"]).unwrap();
         let tools_nobuiltin = resolve_cli_tools(&args_nobuiltin, temp_dir.clone()).unwrap();
         assert!(tools_nobuiltin.is_empty());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn cli_tools_flag_accepts_todo_and_subagent_in_include_and_exclude() {
+        let temp_dir = make_temp_dir("mehh_tools_todo");
+
+        // todo/subagent are toggled by main.rs itself, not by select_coding_tools.
+        // They must be accepted and filtered before that call.
+        let inc = CliArgs::try_parse_from(["mehh", "--tools", "read,todo,subagent"]).unwrap();
+        let tools = resolve_cli_tools(&inc, temp_dir.clone()).unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name(), "read");
+
+        let exc = CliArgs::try_parse_from(["mehh", "--exclude-tools", "subagent,todo"]).unwrap();
+        let tools = resolve_cli_tools(&exc, temp_dir.clone()).unwrap();
+        assert!(!tools
+            .iter()
+            .any(|t| t.name() == "subagent" || t.name() == "todo"));
+        assert_eq!(tools.len(), 9);
+
+        // Unknown names must still be rejected.
+        let bogus = CliArgs::try_parse_from(["mehh", "--tools", "bogus"]).unwrap();
+        assert!(resolve_cli_tools(&bogus, temp_dir.clone()).is_err());
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

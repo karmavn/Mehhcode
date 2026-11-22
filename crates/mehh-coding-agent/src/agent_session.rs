@@ -50,7 +50,7 @@ use crate::settings::Settings;
 use crate::skills::Skill;
 use crate::subagent::SubagentTool;
 use crate::subagent_control::{SubagentControl, DEFAULT_MAX_CONCURRENT_SUBAGENTS};
-use crate::system_prompt::build_system_prompt_with_skills;
+use crate::system_prompt::build_system_prompt_with_skills_and_context;
 use crate::tool_search::{DeferredToolCatalog, ToolSearchTool};
 
 /// MCP tool count above which `mcp__*` tools are registered behind `tool_search`.
@@ -143,8 +143,7 @@ impl AgentSession {
             crate::tool_inspection::PermissionMode::SmartApprove
         };
         let permission_mode = settings.permission_mode.unwrap_or(default_mode);
-        let perm_store =
-            crate::permissions::PermissionStore::load(&cwd, trusted).unwrap_or_default();
+        let perm_store = crate::permissions::PermissionStore::load_fail_closed(&cwd, trusted);
         let inspection_manager = Arc::new(
             crate::tool_inspection::ToolInspectionManager::new_with_store(
                 permission_mode,
@@ -225,7 +224,9 @@ impl AgentSession {
         let todo_tool = Arc::new(crate::todo::TodoTool::new(todo_state.clone()));
         tools.push(todo_tool);
         let tool_names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
-        let system_prompt = build_system_prompt_with_skills(&cwd, None, None, &tool_names, &skills);
+        let system_prompt = build_system_prompt_with_skills_and_context(
+            &cwd, None, None, &tool_names, &skills, trusted,
+        );
 
         Self {
             cwd,
@@ -422,7 +423,7 @@ impl AgentSession {
             self.append_system_prompt.as_deref(),
             &tool_names,
             &self.skills,
-            !self.no_context_files,
+            self.trusted && !self.no_context_files,
         );
     }
 
@@ -1436,6 +1437,52 @@ mod tests {
         assert!(!session.is_active());
         assert!(cancel.is_cancelled());
         assert!(!session.abort());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_context_files_injection_gated_by_trust() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("agent_session_ctx_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let marker = "UNTRUSTED_AGENTS_MD_MARKER_7F3A";
+        std::fs::write(
+            temp_dir.join("AGENTS.md"),
+            format!("Project rule {marker} must be followed."),
+        )
+        .unwrap();
+
+        let mut untrusted = AgentSession::new_with_trust(
+            temp_dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+            false,
+        );
+        assert!(
+            !untrusted.system_prompt.contains(marker),
+            "untrusted AGENTS.md must not be injected into the system prompt"
+        );
+        untrusted.rebuild_system_prompt();
+        assert!(
+            !untrusted.system_prompt.contains(marker),
+            "rebuild must also keep untrusted AGENTS.md out of the system prompt"
+        );
+
+        let trusted = AgentSession::new_with_trust(
+            temp_dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+            true,
+        );
+        assert!(
+            trusted.system_prompt.contains(marker),
+            "trusted AGENTS.md must be injected into the system prompt"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }

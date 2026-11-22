@@ -54,8 +54,13 @@ pub fn has_local_trust_targets(cwd: &Path) -> bool {
     let mehh_dir = cwd.join(".mehh");
     mehh_dir.join("mcp.json").exists()
         || mehh_dir.join("settings.json").exists()
+        || mehh_dir.join("permissions.json").exists()
+        || mehh_dir.join("MOIM.md").exists()
         || mehh_dir.join("skills").is_dir()
         || mehh_dir.join("prompts").is_dir()
+        || cwd.join("AGENTS.md").exists()
+        || cwd.join("AGENTS.override.md").exists()
+        || cwd.join("CLAUDE.md").exists()
         || cwd.join(".agents").join("skills").is_dir()
 }
 
@@ -204,6 +209,27 @@ mod tests {
         let temp = std::env::temp_dir();
         let k1 = normalize_project_key(&temp);
         assert!(!k1.ends_with('\\'));
+    }
+
+    #[test]
+    fn has_local_trust_targets_detects_agents_md_moim_and_permissions_json() {
+        let dir = crate::TempTestDir::new("trust_targets");
+        let cwd = dir.path();
+        assert!(!has_local_trust_targets(cwd), "empty workspace has no targets");
+
+        for rel in [
+            "AGENTS.md",
+            "AGENTS.override.md",
+            "CLAUDE.md",
+            ".mehh/MOIM.md",
+            ".mehh/permissions.json",
+        ] {
+            let full = cwd.join(rel);
+            std::fs::create_dir_all(full.parent().unwrap()).unwrap();
+            std::fs::write(&full, "x").unwrap();
+            assert!(has_local_trust_targets(cwd), "must detect {rel}");
+            std::fs::remove_file(&full).unwrap();
+        }
     }
 
     #[test]

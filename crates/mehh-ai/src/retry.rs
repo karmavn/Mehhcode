@@ -67,16 +67,87 @@ pub fn is_retryable_status(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504 | 529)
 }
 
-/// Parses `retry-after-ms` or integer `retry-after` headers, clamped to 60 seconds.
+/// Number of days from 1970-01-01 to the given civil date (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Parses an RFC 7231 IMF-fixdate (e.g. `Wed, 21 Oct 2015 07:28:00 GMT`) into epoch seconds.
+fn parse_http_date(value: &str) -> Option<u64> {
+    let parts: Vec<&str> = value.split_whitespace().collect();
+    if parts.len() != 6 || !parts[0].ends_with(',') || parts[5] != "GMT" {
+        return None;
+    }
+    let day = parts[1].parse::<i64>().ok()?;
+    let month = match parts[2] {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year = parts[3].parse::<i64>().ok()?;
+    if !(1970..=9999).contains(&year) {
+        return None;
+    }
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        _ => return None,
+    };
+    if day < 1 || day > days_in_month {
+        return None;
+    }
+    let mut clock = parts[4].split(':');
+    let hour = clock.next()?.parse::<u64>().ok()?;
+    let minute = clock.next()?.parse::<u64>().ok()?;
+    let second = clock.next()?.parse::<u64>().ok()?;
+    if clock.next().is_some() || hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let days = days_from_civil(year, month, day) as u64;
+    Some(days * 86_400 + hour * 3_600 + minute * 60 + second)
+}
+
+/// Parses `retry-after-ms`, integer `retry-after`, or an HTTP-date, clamped to 60 seconds.
 pub fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
     if let Some(val) = headers.get("retry-after-ms").and_then(|v| v.to_str().ok()) {
         if let Ok(ms) = val.trim().parse::<u64>() {
-            return Some(Duration::from_millis(ms).min(Duration::from_secs(60)));
+            return Some(Duration::from_millis(ms).min(MAX_RETRY_DELAY));
         }
     }
     if let Some(val) = headers.get("retry-after").and_then(|v| v.to_str().ok()) {
-        if let Ok(secs) = val.trim().parse::<u64>() {
-            return Some(Duration::from_secs(secs).min(Duration::from_secs(60)));
+        let value = val.trim();
+        if let Ok(secs) = value.parse::<u64>() {
+            return Some(Duration::from_secs(secs).min(MAX_RETRY_DELAY));
+        }
+        if let Some(epoch) = parse_http_date(value) {
+            // HTTP-date is absolute: the delay is the time remaining, not the
+            // epoch itself (which always exceeds the clamp).
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            return Some(
+                Duration::from_secs(epoch.saturating_sub(now)).min(MAX_RETRY_DELAY),
+            );
         }
     }
     None
@@ -254,6 +325,93 @@ mod tests {
 
         headers.insert("retry-after-ms", "999999".parse().unwrap());
         assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn parse_retry_after_accepts_http_date_and_rejects_malformed() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        // A past HTTP-date means retry immediately, not sleep for the clamp.
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(0)));
+
+        headers.insert(
+            "retry-after",
+            "Wed, 21 Oct 2015 07:28:00".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers), None);
+
+        headers.insert("retry-after", "not-a-date".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_http_date_subtracts_current_time() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        fn format_http_date(epoch_secs: u64) -> String {
+            const WD: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+            const MON: [&str; 12] = [
+                "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov",
+                "Dec",
+            ];
+            let days = (epoch_secs / 86_400) as i64;
+            let rem = epoch_secs % 86_400;
+            let z = days + 719_468;
+            let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+            let doe = z - era * 146_097;
+            let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+            let mut y = yoe + era * 400;
+            let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+            let mp = (5 * doy + 2) / 153;
+            let d = doy - (153 * mp + 2) / 5 + 1;
+            let m = if mp < 10 { mp + 3 } else { mp - 9 };
+            if m <= 2 {
+                y += 1;
+            }
+            let wd = (days + 4).rem_euclid(7) as usize;
+            format!(
+                "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+                WD[wd],
+                d,
+                MON[(m - 1) as usize],
+                y,
+                rem / 3_600,
+                (rem % 3_600) / 60,
+                rem % 60
+            )
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "retry-after",
+            "Wed, 21 Oct 2015 07:28:00 GMT".parse().unwrap(),
+        );
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(0)));
+
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        headers.insert(
+            "retry-after",
+            format_http_date(now_secs + 5).parse().unwrap(),
+        );
+        let delay = parse_retry_after(&headers).expect("HTTP-date retry-after should parse");
+        assert!(delay <= Duration::from_secs(5), "delay {delay:?} exceeds 5s");
+    }
+
+    #[test]
+    fn parse_http_date_returns_epoch_seconds() {
+        assert_eq!(
+            parse_http_date("Wed, 21 Oct 2015 07:28:00 GMT"),
+            Some(1_445_412_480)
+        );
+        assert_eq!(
+            parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT"),
+            Some(784_111_777)
+        );
     }
 
     #[test]

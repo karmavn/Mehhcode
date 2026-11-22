@@ -50,7 +50,7 @@ pub fn default_permissions_path() -> Result<PathBuf> {
     Ok(home.join(".mehh").join("agent").join("permissions.json"))
 }
 
-type RuleSpecificity = (bool, bool, bool, usize);
+type RuleSpecificity = (bool, bool, bool, usize, u8);
 
 impl PermissionStore {
     pub fn new(rules: Vec<PermissionRule>, user_rules_path: Option<PathBuf>) -> Self {
@@ -76,8 +76,13 @@ impl PermissionStore {
         if trusted {
             let ws_path = cwd.join(".mehh").join("permissions.json");
             if let Some(ws_rules) = Self::read_rules_from_file(&ws_path)? {
-                // Workspace rules prepend so they take precedence
-                let mut combined = ws_rules;
+                // A project may only narrow permissions. An AlwaysAllow rule in
+                // a repo-local file would let the repo grant itself access and
+                // cancel an equal-specificity global NeverAllow.
+                let mut combined: Vec<PermissionRule> = ws_rules
+                    .into_iter()
+                    .filter(|r| r.action != PermissionAction::AlwaysAllow)
+                    .collect();
                 combined.extend(rules);
                 rules = combined;
             }
@@ -202,7 +207,19 @@ impl PermissionStore {
             let both_filtered = rule.arg_prefix.is_some() && rule.path_glob.is_some();
             let exact_tool = !rule.tool_name.eq_ignore_ascii_case("*");
             let prefix_len = rule.arg_prefix.as_ref().map_or(0, |s| s.len());
-            let specificity = (is_filtered, both_filtered, exact_tool, prefix_len);
+            // Strictest action wins at equal specificity.
+            let action_rank = match rule.action {
+                PermissionAction::NeverAllow => 2,
+                PermissionAction::AskBefore => 1,
+                PermissionAction::AlwaysAllow => 0,
+            };
+            let specificity = (
+                is_filtered,
+                both_filtered,
+                exact_tool,
+                prefix_len,
+                action_rank,
+            );
 
             if let Some((best_spec, _)) = best_match {
                 if specificity > best_spec {
@@ -218,7 +235,11 @@ impl PermissionStore {
         // Shell rules are decided by the whole parsed command line, not by a
         // raw string prefix. Every sub-command must be covered before an
         // allow rule applies; anything unparseable fails closed to a prompt.
-        if mehh_execpolicy::is_shell_tool(&ctx.tool_name) {
+        // AskBefore is not an allow/deny decision: its `false` would become a
+        // hard deny in `verdict_for`, so let the action match below handle it.
+        if rule.action != PermissionAction::AskBefore
+            && mehh_execpolicy::is_shell_tool(&ctx.tool_name)
+        {
             if let (Some(pfx), Some(cmd)) = (
                 rule.arg_prefix.as_deref(),
                 ctx.args.get("command").and_then(|v| v.as_str()),
@@ -275,6 +296,24 @@ impl PermissionStore {
             }),
         }
     }
+
+    /// Fail-closed loader: a corrupt/unreadable permissions file must never
+    /// become an empty, permissive store. Deny everything until it is repaired.
+    pub fn load_fail_closed(cwd: &Path, trusted: bool) -> Self {
+        let user_rules_path = default_permissions_path().ok();
+        match Self::load(cwd, trusted) {
+            Ok(store) => store,
+            Err(_) => Self {
+                user_rules_path,
+                rules: vec![PermissionRule {
+                    tool_name: "*".to_string(),
+                    arg_prefix: None,
+                    path_glob: None,
+                    action: PermissionAction::NeverAllow,
+                }],
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -300,6 +339,143 @@ mod tests {
             cwd: PathBuf::from("."),
             origin: None,
         }
+    }
+
+    #[test]
+    fn permission_store_ask_before_shell_rule_returns_require_approval_not_deny() {
+        let store = PermissionStore::new(
+            vec![PermissionRule {
+                tool_name: "bash".to_string(),
+                arg_prefix: Some("git status".to_string()),
+                path_glob: None,
+                action: PermissionAction::AskBefore,
+            }],
+            None,
+        );
+        let ctx = make_ctx("bash", Some("git status --short"), None);
+        match store.evaluate(&ctx) {
+            Some(InspectionVerdict::RequireApproval { .. }) => {}
+            other => panic!("AskBefore with arg_prefix must require approval, got {other:?}"),
+        }
+
+        let chained = make_ctx("bash", Some("git status && rm -rf /"), None);
+        match store.evaluate(&chained) {
+            Some(InspectionVerdict::RequireApproval { .. }) => {}
+            other => panic!("AskBefore must not deny a chained command, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_store_workspace_cannot_override_global_never_allow_and_corrupt_file_fails_closed() {
+        struct HomeGuard {
+            prev: Option<std::ffi::OsString>,
+        }
+        impl HomeGuard {
+            fn set(home: &std::path::Path) -> Self {
+                let prev = std::env::var_os("USERPROFILE");
+                std::env::set_var("USERPROFILE", home);
+                Self { prev }
+            }
+        }
+        impl Drop for HomeGuard {
+            fn drop(&mut self) {
+                match &self.prev {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+            }
+        }
+
+        let dir = crate::TempTestDir::new("perm_escalation");
+        let home = dir.path().join("home");
+        let agent_dir = home.join(".mehh").join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let global = agent_dir.join("permissions.json");
+        std::fs::write(
+            &global,
+            r#"{"rules":[{"tool_name":"bash","action":"never_allow"}]}"#,
+        )
+        .unwrap();
+
+        let cwd = dir.path().join("workspace");
+        std::fs::create_dir_all(cwd.join(".mehh")).unwrap();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::write(cwd.join("src").join("main.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(
+            cwd.join(".mehh").join("permissions.json"),
+            r#"{"rules":[
+                {"tool_name":"*","action":"always_allow"},
+                {"tool_name":"bash","action":"always_allow"}
+            ]}"#,
+        )
+        .unwrap();
+
+        let _home = HomeGuard::set(&home);
+
+        let store = PermissionStore::load(&cwd, true).unwrap();
+        assert!(
+            store.rules().iter().all(|r| r.action != PermissionAction::AlwaysAllow),
+            "workspace AlwaysAllow rules must be rejected: {:?}",
+            store.rules()
+        );
+        let bash_ctx = make_ctx("bash", Some("cargo check"), None);
+        assert!(
+            matches!(store.evaluate(&bash_ctx), Some(InspectionVerdict::Deny { .. })),
+            "global NeverAllow must survive workspace escalation"
+        );
+
+        let tie = PermissionStore::new(
+            vec![
+                PermissionRule {
+                    tool_name: "bash".into(),
+                    arg_prefix: None,
+                    path_glob: None,
+                    action: PermissionAction::AlwaysAllow,
+                },
+                PermissionRule {
+                    tool_name: "bash".into(),
+                    arg_prefix: None,
+                    path_glob: None,
+                    action: PermissionAction::NeverAllow,
+                },
+            ],
+            None,
+        );
+        assert!(
+            matches!(tie.evaluate(&bash_ctx), Some(InspectionVerdict::Deny { .. })),
+            "NeverAllow must beat AlwaysAllow at equal specificity"
+        );
+
+        std::fs::write(&global, "{not json").unwrap();
+        let settings = crate::Settings {
+            permission_mode: Some(crate::tool_inspection::PermissionMode::Auto),
+            ..crate::Settings::default()
+        };
+        let session = crate::AgentSession::new_with_trust(
+            cwd.clone(),
+            mehh_ai::faux_model(),
+            std::sync::Arc::new(mehh_ai::FauxProvider::new()),
+            crate::SessionManager::in_memory(&cwd),
+            settings,
+            true,
+        );
+        let mut args = serde_json::Map::new();
+        args.insert("path".into(), serde_json::json!("src/main.rs"));
+        let edit_ctx = crate::tool_inspection::ToolInspectionContext {
+            tool_call_id: "call_perm_fail_closed".into(),
+            tool_name: "edit".into(),
+            args,
+            is_read_only: Some(false),
+            cwd: cwd.clone(),
+            origin: None,
+        };
+        assert!(
+            matches!(
+                session.inspection_manager.inspect(&edit_ctx).await,
+                InspectionVerdict::Deny { .. }
+            ),
+            "corrupt permissions file must fail closed, not auto-allow"
+        );
     }
 
     #[test]

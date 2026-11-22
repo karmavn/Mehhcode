@@ -76,8 +76,35 @@ pub struct SandboxPlan {
 }
 
 const PROTECTED_NAMES: &[&str] = &[".git", ".mehh", ".agents", ".codex"];
+const SKIP_SCAN_DIR_NAMES: &[&str] = &["target", "node_modules", ".git", ".venv", "dist", "build"];
 const MAX_ENV_FILES: usize = 256;
 const MAX_WALK_DEPTH: usize = 6;
+
+/// Canonicalize as much of `path` as exists, then re-append the missing tail.
+/// Protected paths may not exist yet (e.g. a missing `.git`), but mount sources
+/// must match the already-canonicalized cwd.
+fn canonicalize_or_extend(path: &Path) -> PathBuf {
+    if let Ok(canon) = path.canonicalize() {
+        return canon;
+    }
+    let mut cur = path.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    while !cur.exists() {
+        match cur.file_name() {
+            Some(name) => tail.push(name.to_os_string()),
+            None => break,
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent.to_path_buf(),
+            None => break,
+        }
+    }
+    let mut out = cur.canonicalize().unwrap_or(cur);
+    for part in tail.into_iter().rev() {
+        out.push(part);
+    }
+    out
+}
 
 impl SandboxPlan {
     pub fn new(policy: SandboxPolicy, cwd: impl Into<PathBuf>) -> Self {
@@ -127,17 +154,39 @@ impl SandboxPlan {
                 )));
             }
         }
-        Ok(PreparedSandbox { cwd })
+        let protected_paths = self
+            .protected_paths
+            .iter()
+            .map(|p| canonicalize_or_extend(p))
+            .collect();
+        let deny_read_paths = self
+            .deny_read_paths
+            .iter()
+            .map(|p| canonicalize_or_extend(p))
+            .collect();
+        Ok(PreparedSandbox {
+            cwd,
+            protected_paths,
+            deny_read_paths,
+        })
     }
 }
 
 pub struct PreparedSandbox {
     cwd: PathBuf,
+    protected_paths: Vec<PathBuf>,
+    deny_read_paths: Vec<PathBuf>,
 }
 
 impl PreparedSandbox {
     pub fn cwd(&self) -> &Path {
         &self.cwd
+    }
+    pub fn protected_paths(&self) -> &[PathBuf] {
+        &self.protected_paths
+    }
+    pub fn deny_read_paths(&self) -> &[PathBuf] {
+        &self.deny_read_paths
     }
 }
 
@@ -163,13 +212,18 @@ fn find_env_files(root: &Path) -> Vec<PathBuf> {
             let path = entry.path();
             let name = entry.file_name();
             let name_s = name.to_string_lossy();
-            if name_s == ".env" || name_s.ends_with(".env") {
+            if name_s == ".env" || name_s.starts_with(".env.") || name_s.ends_with(".env") {
                 out.push(path.clone());
                 if out.len() >= MAX_ENV_FILES {
                     return;
                 }
             }
-            if path.is_dir() && !path.is_symlink() {
+            if path.is_dir()
+                && !path.is_symlink()
+                && !SKIP_SCAN_DIR_NAMES
+                    .iter()
+                    .any(|skip| name_s.eq_ignore_ascii_case(skip))
+            {
                 visit(&path, depth + 1, out);
             }
         }
@@ -222,12 +276,19 @@ pub fn default_env_denylist() -> Vec<String> {
         "*_API_KEY".into(),
         "*_SECRET".into(),
         "*_TOKEN".into(),
+        "*_PASSWORD".into(),
+        "*_PASSWD".into(),
+        "*_PRIVATE_KEY".into(),
         "AWS_*".into(),
         "GITHUB_TOKEN".into(),
         "GH_TOKEN".into(),
         "OPENAI_API_KEY".into(),
         "ANTHROPIC_API_KEY".into(),
         "GOOGLE_API_KEY".into(),
+        "DATABASE_URL".into(),
+        "REDIS_URL".into(),
+        "GOOGLE_APPLICATION_CREDENTIALS".into(),
+        "CONNECTION_STRING".into(),
     ]
 }
 
@@ -238,6 +299,9 @@ pub fn is_secret_env_key(key: &str) -> bool {
     upper.ends_with("_API_KEY")
         || upper.ends_with("_SECRET")
         || upper.ends_with("_TOKEN")
+        || upper.ends_with("_PASSWORD")
+        || upper.ends_with("_PASSWD")
+        || upper.ends_with("_PRIVATE_KEY")
         || upper.starts_with("AWS_")
         || matches!(
             upper.as_str(),
@@ -247,9 +311,14 @@ pub fn is_secret_env_key(key: &str) -> bool {
                 | "ANTHROPIC_API_KEY"
                 | "GOOGLE_API_KEY"
                 | "MEHH_API_KEY"
+                | "DATABASE_URL"
+                | "REDIS_URL"
+                | "GOOGLE_APPLICATION_CREDENTIALS"
+                | "CONNECTION_STRING"
         )
 }
 
+#[cfg(target_os = "linux")]
 fn find_in_path(binary: &str) -> Option<PathBuf> {
     let paths = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&paths) {
@@ -261,6 +330,7 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "linux")]
 fn linux_wrapper(plan: &SandboxPlan, prepared: &PreparedSandbox) -> Option<(String, Vec<String>)> {
     let bwrap = find_in_path("bwrap")?;
     let mut args = vec![
@@ -285,7 +355,7 @@ fn linux_wrapper(plan: &SandboxPlan, prepared: &PreparedSandbox) -> Option<(Stri
     args.push(cwd.clone());
     args.push(cwd.clone());
 
-    for path in &plan.protected_paths {
+    for path in prepared.protected_paths() {
         let rendered = path.to_string_lossy().into_owned();
         if path.exists() {
             args.push("--ro-bind".to_string());
@@ -298,7 +368,7 @@ fn linux_wrapper(plan: &SandboxPlan, prepared: &PreparedSandbox) -> Option<(Stri
             args.push(rendered);
         }
     }
-    for path in &plan.deny_read_paths {
+    for path in prepared.deny_read_paths() {
         let rendered = path.to_string_lossy().into_owned();
         args.push("--tmpfs".to_string());
         args.push(rendered);
@@ -329,9 +399,9 @@ pub fn wrap(
         });
     }
 
-    let prepared = plan.prepare()?;
+    let _prepared = plan.prepare()?;
     #[cfg(target_os = "linux")]
-    let wrapper: Option<(String, Vec<String>)> = linux_wrapper(plan, &prepared);
+    let wrapper: Option<(String, Vec<String>)> = linux_wrapper(plan, &_prepared);
     #[cfg(not(target_os = "linux"))]
     let wrapper: Option<(String, Vec<String>)> = None;
 
@@ -395,7 +465,7 @@ fn seatbelt_profile(plan: &SandboxPlan) -> Option<String> {
     profile.push_str(&cwd_s);
     profile.push_str("\"))\n");
     for path in plan.protected_paths.iter().chain(plan.deny_read_paths.iter()) {
-        let escaped = escape_sbpl_string(&path.to_string_lossy());
+        let escaped = escape_sbpl_string(&canonicalize_or_extend(path).to_string_lossy());
         profile.push_str("(deny file-read* (subpath \"");
         profile.push_str(&escaped);
         profile.push_str("\"))\n(deny file-write* (subpath \"");
@@ -443,6 +513,101 @@ mod tests {
         for key in ["PATH", "HOME", "USERPROFILE", "RUSTFLAGS"] {
             assert!(!is_secret_env_key(key), "{key}");
         }
+        for key in [
+            "DB_PASSWORD",
+            "SSH_PASSWD",
+            "SSH_PRIVATE_KEY",
+            "DATABASE_URL",
+            "REDIS_URL",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "CONNECTION_STRING",
+        ] {
+            assert!(is_secret_env_key(key), "secret key not recognized: {key}");
+        }
+    }
+
+    #[test]
+    fn sandbox_find_env_files_catches_env_local_and_skips_target_dir() {
+        let root = std::env::temp_dir().join(format!("sandbox_env_scan_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for rel in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".env.development",
+            "app.env",
+            "target/.env",
+            "node_modules/.env",
+            ".git/.env",
+            ".venv/.env",
+            "dist/.env",
+            "build/.env",
+            "src/nested/.env.local",
+        ] {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"SECRET=1").unwrap();
+        }
+
+        let found = find_env_files(&root);
+        let rels: Vec<String> = found
+            .iter()
+            .map(|p| {
+                p.strip_prefix(&root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        for expected in [
+            ".env",
+            ".env.local",
+            ".env.production",
+            ".env.development",
+            "app.env",
+            "src/nested/.env.local",
+        ] {
+            assert!(rels.iter().any(|r| r == expected), "missing {expected} in {rels:?}");
+        }
+        for skipped in [
+            "target/.env",
+            "node_modules/.env",
+            ".git/.env",
+            ".venv/.env",
+            "dist/.env",
+            "build/.env",
+        ] {
+            assert!(
+                !rels.iter().any(|r| r == skipped),
+                "build/dependency directory was scanned: {skipped}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn prepared_sandbox_mount_targets_are_canonical() {
+        let cwd = std::env::temp_dir().join(format!(
+            "sandbox_canon_paths_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(cwd.join(".git")).unwrap();
+
+        let plan = SandboxPlan::new(SandboxPolicy::WorkspaceWrite, cwd.clone());
+        let prepared = plan.prepare().unwrap();
+        let expected = cwd.join(".git").canonicalize().unwrap();
+
+        assert!(
+            prepared.protected_paths().contains(&expected),
+            "protected mount source must match the canonicalized cwd: {:?}",
+            prepared.protected_paths()
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
@@ -481,5 +646,17 @@ mod tests {
         assert!(detect_violation("Permission denied", Some(1)));
         assert!(!detect_violation("Permission denied", Some(0)));
         assert!(!detect_violation("all good", Some(1)));
+    }
+
+    #[test]
+    fn wrap_propagates_prepare_failure() {
+        // wrap() must run the fail-closed prepare() check even on backends
+        // that do not consume the PreparedSandbox (non-Linux), so an invalid
+        // cwd still aborts the spawn instead of yielding a degraded invocation.
+        let missing = std::env::temp_dir()
+            .join(format!("sandbox-missing-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let plan = SandboxPlan::new(SandboxPolicy::WorkspaceWrite, missing);
+        assert!(wrap(&plan, "echo", &["hi".to_string()]).is_err());
     }
 }

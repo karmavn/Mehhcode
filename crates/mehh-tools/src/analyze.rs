@@ -72,9 +72,46 @@ struct SymbolSpan {
     signature: String,
 }
 
+/// Length of a closed Rust char literal at `start` (`'x'`, `'\n'`, `'\xNN'`,
+/// `'\u{...}'`), or `None` for lifetimes, labels and prose apostrophes.
+fn char_literal_len(chars: &[char], start: usize) -> Option<usize> {
+    if chars.get(start) != Some(&'\'') {
+        return None;
+    }
+    let first = *chars.get(start + 1)?;
+    let second = *chars.get(start + 2)?;
+    // `'ident` is a lifetime/label, never a char literal. Only a single char
+    // followed by the closing quote or a backslash escape qualifies.
+    if first != '\\' && second != '\'' {
+        return None;
+    }
+    let mut k = start + 2;
+    let mut escaped = first == '\\';
+    while let Some(&ch) = chars.get(k) {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == '\'' {
+            return Some(k + 1 - start);
+        }
+        if k - start > 12 {
+            return None;
+        }
+        k += 1;
+    }
+    None
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ApostropheMode {
+    CharLiteral,
+    SingleQuoteString,
+}
+
 /// Find the closing brace of a declaration without counting braces inside
 /// strings, character literals or comments.
-fn track_brace_end(lines: &[&str], start_idx: usize) -> usize {
+fn track_brace_end(lines: &[&str], start_idx: usize, apostrophes: ApostropheMode) -> usize {
     let mut depth: i32 = 0;
     let mut saw_open = false;
     let mut quote: Option<char> = None;
@@ -123,10 +160,23 @@ fn track_brace_end(lines: &[&str], start_idx: usize) -> usize {
                     block_comment = true;
                     k += 2;
                 }
-                '"' | '\'' => {
-                    quote = Some(ch);
+                '"' => {
+                    quote = Some('"');
                     k += 1;
                 }
+                '\'' => match apostrophes {
+                    ApostropheMode::CharLiteral => {
+                        if let Some(len) = char_literal_len(&chars, k) {
+                            k += len;
+                        } else {
+                            k += 1;
+                        }
+                    }
+                    ApostropheMode::SingleQuoteString => {
+                        quote = Some('\'');
+                        k += 1;
+                    }
+                },
                 '{' => {
                     depth += 1;
                     saw_open = true;
@@ -218,7 +268,7 @@ fn extract_rust_symbols(content: &str) -> Vec<SymbolSpan> {
                 name,
                 kind,
                 start_line: idx + 1,
-                end_line: track_brace_end(&lines, idx),
+                end_line: track_brace_end(&lines, idx, ApostropheMode::CharLiteral),
                 signature: line.trim().to_string(),
             });
         }
@@ -254,7 +304,7 @@ fn extract_ts_symbols(content: &str) -> Vec<SymbolSpan> {
                 name,
                 kind,
                 start_line: idx + 1,
-                end_line: track_brace_end(&lines, idx),
+                end_line: track_brace_end(&lines, idx, ApostropheMode::SingleQuoteString),
                 signature: line.trim().to_string(),
             });
         }
@@ -292,7 +342,7 @@ fn extract_go_symbols(content: &str) -> Vec<SymbolSpan> {
                 name,
                 kind: "func".to_string(),
                 start_line: idx + 1,
-                end_line: track_brace_end(&lines, idx),
+                end_line: track_brace_end(&lines, idx, ApostropheMode::CharLiteral),
                 signature: line.trim().to_string(),
             });
         } else if let Some(caps) = GO_TYPE_RE.captures(line) {
@@ -302,7 +352,7 @@ fn extract_go_symbols(content: &str) -> Vec<SymbolSpan> {
                 name,
                 kind,
                 start_line: idx + 1,
-                end_line: track_brace_end(&lines, idx),
+                end_line: track_brace_end(&lines, idx, ApostropheMode::CharLiteral),
                 signature: line.trim().to_string(),
             });
         }
@@ -520,7 +570,9 @@ async fn read_source_for_analysis(path: &Path, path_str: &str) -> Result<String,
     let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("Failed to read file {}: {}", path_str, e))?;
-    if bytes.iter().take(1024).any(|&b| b == 0) {
+    // The file may be up to MAX_ANALYZE_FILE_BYTES, so sniff the whole bounded
+    // slice; a NUL past byte 1024 still means the file is binary.
+    if bytes.contains(&0) {
         return Err(format!("File {} appears to be binary", path_str));
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
@@ -654,5 +706,61 @@ impl AgentTool for AnalyzeTool {
             "\n... [Output truncated to 24000 characters. Use focus mode or specific file paths]",
         );
         Ok(AgentToolResult::text(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn analyze_focus_handles_rust_function_with_odd_number_of_lifetimes() {
+        let content = "fn f<'a>(s: &'a str) -> &'a str {\n    s\n}\n";
+        let out = analyze_focus(Path::new("lib.rs"), content, "f").expect("focus output");
+
+        assert!(
+            out.contains("(L1-L3):"),
+            "focus span must cover the whole function, got: {out}"
+        );
+        assert!(out.contains("     s\n"), "body line missing from focus: {out}");
+        assert!(out.contains("}\n"), "closing brace missing from focus: {out}");
+    }
+
+    #[test]
+    fn analyze_focus_keeps_ts_single_quoted_string_braces_out_of_depth() {
+        let content = "const open = 'function () {';\nfunction real() {\n  return 1;\n}\n";
+        let out = analyze_focus(Path::new("app.ts"), content, "open").expect("focus output");
+        assert!(
+            out.contains("(L1-L1):"),
+            "single-quoted TS string must not leave a brace open: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn analyze_rejects_binary_with_nul_after_first_1024_bytes() {
+        let dir = crate::TempTestDir::new("analyze_binary");
+        let file = dir.path().join("mixed.rs");
+
+        // First 1024 bytes are clean text; the NUL sits past the old sniff window.
+        let mut data = b"pub fn visible_symbol() {}\n".to_vec();
+        data.resize(2000, b' ');
+        data.push(0);
+        data.extend_from_slice(b"\npub fn after_nul() {}\n");
+        std::fs::write(&file, &data).unwrap();
+
+        let tool = AnalyzeTool::new(dir.path().to_path_buf());
+        let mut args = serde_json::Map::new();
+        args.insert("path".to_string(), serde_json::json!("mixed.rs"));
+        args.insert("mode".to_string(), serde_json::json!("symbols"));
+
+        let err = tool
+            .execute("tc", args, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("binary"),
+            "a file with an embedded NUL must be refused as binary, got: {}",
+            err
+        );
     }
 }

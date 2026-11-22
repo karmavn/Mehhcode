@@ -898,6 +898,7 @@ dependencies = [
  "futures",
  "mehh-agent",
  "mehh-ai",
+ "mehh-sandbox",
  "reqwest",
  "serde",
  "serde_json",
