@@ -208,7 +208,9 @@ fn left_right(left: String, right: String, width: usize) -> String {
 }
 
 fn ctx_bar(pct: u64, theme: &Theme) -> String {
-    let filled = (pct * 8 / 100).min(8) as usize;
+    // Round up so any non-zero usage fills at least one block; otherwise a
+    // large context window makes the meter look frozen at zero.
+    let filled = pct.div_ceil(13).min(8) as usize;
     let color = if pct >= 85 {
         &theme.error
     } else if pct >= 70 {
@@ -279,11 +281,11 @@ fn search_bar_text(filter: &str, shown: usize, total: usize, theme: &Theme) -> S
 }
 
 fn scroll_pill_text(offset: usize, max_scroll: usize, new_lines: usize) -> String {
-    let pct = if max_scroll == 0 {
-        100
-    } else {
-        offset.min(max_scroll) * 100 / max_scroll
-    };
+    let pct = offset
+        .min(max_scroll)
+        .saturating_mul(100)
+        .checked_div(max_scroll)
+        .unwrap_or(100);
     format!("↑ Paused at {pct}% · +{new_lines} new lines · End to jump")
 }
 
@@ -362,6 +364,10 @@ pub struct InteractiveState {
     pub(crate) thinking_expanded: bool,
     pub(crate) thinking_elapsed: Mutex<std::collections::HashMap<usize, u64>>,
     pub last_prompt_text: Option<String>,
+    /// Full expanded prompt of the current turn (expanded text + blocks from
+    /// `@file` expansion). Kept as one value so the two cannot drift apart.
+    /// Overflow auto-retries must resend this, not the raw submitted text.
+    pub last_prompt_content: Option<(String, Vec<UserContentBlock>)>,
     pub overflow_retried: bool,
     pub turn_start_idx: Option<usize>,
     pub last_turn_error: Option<String>,
@@ -397,6 +403,7 @@ impl InteractiveState {
             thinking_expanded: false,
             thinking_elapsed: Mutex::new(std::collections::HashMap::new()),
             last_prompt_text: None,
+            last_prompt_content: None,
             overflow_retried: false,
             turn_start_idx: None,
             last_turn_error: None,
@@ -627,18 +634,62 @@ pub async fn refresh_session_api_key(
     Ok(())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ToolApprovalDecision {
+    allow: bool,
+    persist_rule: bool,
+    session_rule: bool,
+}
+
+/// Maps a key press at the tool approval prompt to a decision.
+/// The generic interrupt handler runs only after the selector branch returns,
+/// so Ctrl+C must be handled here or it is swallowed by the prompt.
+fn tool_approval_decision(
+    key_str: &str,
+    keybindings: &Keybindings,
+    selected_id: Option<&str>,
+) -> Option<ToolApprovalDecision> {
+    if keybindings.matches(key_str, TuiAction::Interrupt) {
+        return Some(ToolApprovalDecision {
+            allow: false,
+            persist_rule: false,
+            session_rule: false,
+        });
+    }
+    let (allow, persist_rule, session_rule) = match key_str {
+        "y" => (true, false, false),
+        "a" => (true, false, true),
+        "A" => (true, true, false),
+        "n" | "escape" => (false, false, false),
+        "enter" => match selected_id {
+            None | Some("allow_once") => (true, false, false),
+            Some("allow_session") => (true, false, true),
+            Some("always_allow") => (true, true, false),
+            Some(_) => (false, false, false),
+        },
+        _ => return None,
+    };
+    Some(ToolApprovalDecision {
+        allow,
+        persist_rule,
+        session_rule,
+    })
+}
+
 /// Runs the OAuth PKCE flow against a loopback callback listener.
 async fn login_via_pkce(
     client: &reqwest::Client,
     kind: OAuthProviderKind,
 ) -> anyhow::Result<StoredCredential> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+    // Keep the listener bound until the callback helper takes ownership;
+    // dropping it here would let another process steal the port (TOCTOU).
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
         .context("Failed to bind loopback listener for OAuth callback")?;
     let port = listener
         .local_addr()
         .context("Failed to read loopback listener address")?
         .port();
-    drop(listener);
 
     let redirect_uri = format!("http://127.0.0.1:{port}/callback");
     let pkce = oauth::generate_pkce();
@@ -647,7 +698,8 @@ async fn login_via_pkce(
 
     println!("Open the following URL to authenticate:\n{url}");
 
-    let code = oauth::wait_for_loopback_callback(port, &state, Duration::from_secs(300)).await?;
+    let code =
+        oauth::wait_for_loopback_callback(listener, &state, Duration::from_secs(300)).await?;
     oauth::exchange_code_for_tokens(client, kind, &code, &pkce.verifier, &redirect_uri).await
 }
 
@@ -734,6 +786,20 @@ fn queue_mode_label(mode: QueueMode) -> &'static str {
     match mode {
         QueueMode::OneAtATime => "one-at-a-time",
         QueueMode::All => "all",
+    }
+}
+
+/// Status line shown after an approval decision saved a permission rule.
+/// `save_result` is `None` for a session-only rule, which is never persisted.
+fn permission_rule_status_message(
+    persist_rule: bool,
+    tool_name: &str,
+    save_result: Option<&anyhow::Result<()>>,
+) -> String {
+    let scope = if persist_rule { "Rule" } else { "Session rule" };
+    match save_result {
+        Some(Err(e)) => format!("Could not save rule: {e}"),
+        Some(Ok(())) | None => format!("{scope} added: always allow tool '{tool_name}'"),
     }
 }
 
@@ -1221,17 +1287,12 @@ Keybindings:
         }
         "/compact" => {
             state.invalidate_context_tokens();
-            let custom_instructions = if let Some(first_arg) = arg {
-                let rest_idx = trimmed.find(first_arg).unwrap_or(trimmed.len());
-                let rest = trimmed[rest_idx..].trim();
-                if rest.is_empty() {
-                    None
-                } else {
-                    Some(rest.to_string())
-                }
-            } else {
-                None
-            };
+            // Use the suffix after the command itself. Searching for the first
+            // argument inside the whole line also matches "/compact" when the
+            // argument is e.g. "act", duplicating the first word.
+            let custom_instructions = full_arg
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             SlashCommandOutcome::Compact(custom_instructions)
         }
         "/model" => {
@@ -2409,8 +2470,7 @@ pub fn render_interactive_frame(
     };
     let ctx_pct = ctx_tokens
         .saturating_mul(100)
-        .checked_div(session.model.context_window.max(1) as u64)
-        .unwrap_or(0)
+        .div_ceil(session.model.context_window.max(1))
         .min(999);
     // The header already carries provider/model; the footer keeps live metrics only.
     let ctx_display_color = if ctx_pct >= 85 {
@@ -2971,6 +3031,10 @@ fn apply_agent_signal(
                     "Failed to persist turn: {e}"
                 )));
             }
+            // finish_prompt appends the turn's messages to the session. A render
+            // between MessageEnd and this point may have cached the old transcript,
+            // so invalidate after the mutation, not before it.
+            state.invalidate_context_tokens();
             true
         }
         AgentSignal::Failed(message) => {
@@ -3065,6 +3129,8 @@ async fn handle_agent_signal_async(
                     state.items.push(TranscriptItem::System(format!(
                         "Warning: failed to persist proactive auto-compaction: {e}"
                     )));
+                } else {
+                    state.invalidate_context_tokens();
                 }
             }
             if let Some(w) = warning {
@@ -3100,8 +3166,20 @@ async fn handle_agent_signal_async(
         } => {
             *session.active_cancel_slot().lock().unwrap() = None;
             if !cancelled {
-                if let (Ok(summary), Some((first_kept_id, tokens_before)), Some(retry_text)) =
-                    (result.as_ref(), prep, state.last_prompt_text.clone())
+                // Resend the fully expanded prompt (including @file blocks), not
+                // the raw submitted text. Fall back to the raw text only when no
+                // expanded content was recorded for this turn.
+                let retry_content = state.last_prompt_content.clone().or_else(|| {
+                    state
+                        .last_prompt_text
+                        .clone()
+                        .map(|text| (text, Vec::new()))
+                });
+                if let (
+                    Ok(summary),
+                    Some((first_kept_id, tokens_before)),
+                    Some((retry_text, retry_blocks)),
+                ) = (result.as_ref(), prep, retry_content)
                 {
                     match session.apply_prepared_compaction(
                         summary.clone(),
@@ -3109,6 +3187,7 @@ async fn handle_agent_signal_async(
                         tokens_before,
                     ) {
                         Ok(()) => {
+                            state.invalidate_context_tokens();
                             if let Some(start_idx) = state.turn_start_idx {
                                 state.items.truncate(start_idx);
                             }
@@ -3117,7 +3196,7 @@ async fn handle_agent_signal_async(
                                 "Context overflow detected; auto-compacted history and retrying turn..."
                                     .to_string(),
                             ));
-                            start_turn(session, state, &retry_text, Vec::new(), agent_tx);
+                            start_turn(session, state, &retry_text, retry_blocks, agent_tx);
                             return SignalOutcome::RetryStarted;
                         }
                         Err(e) => {
@@ -3638,40 +3717,17 @@ pub async fn run_interactive_mode(
                             // 1. Selector overlay handling
                             if state.selector.is_some() {
                                 if state.selector.as_ref().map(|s| s.kind) == Some(SelectorKind::ToolApproval) {
-                                    let mut decision: Option<bool> = None;
-                                    let mut persist_rule = false;
-                                    let mut session_rule = false;
+                                    let selected_id = state
+                                        .selector
+                                        .as_ref()
+                                        .and_then(|s| s.list.selected_item())
+                                        .map(|i| i.id.clone());
+                                    let decision = tool_approval_decision(
+                                        &key_str,
+                                        &keybindings,
+                                        selected_id.as_deref(),
+                                    );
                                     match key_str.as_str() {
-                                        "y" => decision = Some(true),
-                                        "a" => {
-                                            decision = Some(true);
-                                            session_rule = true;
-                                        }
-                                        "A" => {
-                                            decision = Some(true);
-                                            persist_rule = true;
-                                        }
-                                        "n" | "escape" => decision = Some(false),
-                                        "enter" => {
-                                            let selected_id = state
-                                                .selector
-                                                .as_ref()
-                                                .and_then(|s| s.list.selected_item())
-                                                .map(|i| i.id.as_str())
-                                                .unwrap_or("allow_once");
-                                            match selected_id {
-                                                "allow_once" => decision = Some(true),
-                                                "allow_session" => {
-                                                    decision = Some(true);
-                                                    session_rule = true;
-                                                }
-                                                "always_allow" => {
-                                                    decision = Some(true);
-                                                    persist_rule = true;
-                                                }
-                                                _ => decision = Some(false),
-                                            }
-                                        }
                                         "up" => {
                                             if let Some(sel) = state.selector.as_mut() {
                                                 sel.list.move_up();
@@ -3695,10 +3751,10 @@ pub async fn run_interactive_mode(
                                         _ => {}
                                     }
 
-                                    if let Some(allowed) = decision {
+                                    if let Some(decision) = decision {
                                         state.selector = None;
                                         if let Some(pending) = state.pending_approval.take() {
-                                            if persist_rule || session_rule {
+                                            if decision.persist_rule || decision.session_rule {
                                                 let arg_prefix = pending
                                                     .args
                                                     .get("command")
@@ -3719,19 +3775,22 @@ pub async fn run_interactive_mode(
                                                         path_glob: None,
                                                         action: crate::permissions::PermissionAction::AlwaysAllow,
                                                     };
-                                                    if persist_rule {
-                                                        let _ = session.inspection_manager.add_permission_rule(rule).await;
+                                                    let save_result = if decision.persist_rule {
+                                                        Some(session.inspection_manager.add_permission_rule(rule).await)
                                                     } else {
                                                         session.inspection_manager.add_session_permission_rule(rule).await;
-                                                    }
-                                                    let scope = if persist_rule { "Rule" } else { "Session rule" };
-                                                    state.items.push(TranscriptItem::System(format!(
-                                                        "{scope} added: always allow tool '{}'",
-                                                        pending.tool_name
-                                                    )));
+                                                        None
+                                                    };
+                                                    state.items.push(TranscriptItem::System(
+                                                        permission_rule_status_message(
+                                                            decision.persist_rule,
+                                                            &pending.tool_name,
+                                                            save_result.as_ref(),
+                                                        ),
+                                                    ));
                                                 }
                                             }
-                                            let _ = pending.reply_tx.send(allowed);
+                                            let _ = pending.reply_tx.send(decision.allow);
                                         }
                                     }
                                     render_now(&state, &editor, session, &mut terminal, &mut renderer);
@@ -3995,6 +4054,7 @@ pub async fn run_interactive_mode(
                                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
 
                                             let compact_res = session.compact(custom_instructions.as_deref()).await;
+                                            state.invalidate_context_tokens();
                                             state.is_busy = false;
                                             state.status = None;
 
@@ -4049,6 +4109,12 @@ pub async fn run_interactive_mode(
                                             state.scroll_offset = 0;
                                             state.items.push(TranscriptItem::User(trimmed.to_string()));
                                             state.last_prompt_text = Some(trimmed.to_string());
+                                            // Keep the fully expanded prompt so the overflow
+                                            // retry does not drop attached @file content.
+                                            state.last_prompt_content = Some((
+                                                expanded_text.clone(),
+                                                prompt_blocks.clone(),
+                                            ));
                                             state.overflow_retried = false;
                                             state.is_busy = true;
                                             state.status = Some("Preparing turn...".to_string());
@@ -4130,6 +4196,26 @@ mod tests {
     use crate::settings::Settings;
     use mehh_ai::{Model, ModelCost, Usage, UsageCost};
 
+    #[test]
+    fn interrupt_key_denies_pending_tool_approval() {
+        let bindings = Keybindings::default_bindings();
+        let decision = tool_approval_decision("ctrl+c", &bindings, Some("allow_once"))
+            .expect("interrupt must deny a pending tool approval");
+        assert!(!decision.allow, "interrupt must not allow the tool");
+        assert!(!decision.persist_rule && !decision.session_rule);
+
+        let mut custom = Keybindings::default_bindings();
+        custom.set_bindings(TuiAction::Interrupt, vec!["ctrl+q".to_string()]);
+        let decision = tool_approval_decision("ctrl+q", &custom, Some("allow_once"))
+            .expect("a configured interrupt binding must deny a pending tool approval");
+        assert!(!decision.allow);
+
+        // Normal approval keys must keep their behavior.
+        let allow = tool_approval_decision("y", &bindings, Some("deny"))
+            .expect("y must still allow");
+        assert!(allow.allow);
+    }
+
     fn make_test_session() -> AgentSession {
         let temp_dir = std::env::temp_dir().join(format!("mehh_test_int_{}", uuid::Uuid::now_v7()));
         let session_mgr = SessionManager::in_memory(&temp_dir);
@@ -4159,6 +4245,94 @@ mod tests {
 
     fn make_test_state() -> InteractiveState {
         InteractiveState::new(Vec::new(), &Settings::default())
+    }
+
+    #[tokio::test]
+    async fn overflow_retry_resends_expanded_file_blocks() {
+        let mut session = make_test_session();
+        let mut state = make_test_state();
+        let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+        let _keepalive = agent_tx.clone();
+
+        let marker = "EXPANDED_DIFF_MARKER_9F2A";
+        let expanded = format!("review <file name=\"large.diff\">{marker}</file>");
+        let blocks = vec![UserContentBlock::Text(mehh_ai::TextContent {
+            text: expanded.clone(),
+            text_signature: None,
+        })];
+
+        // The first turn was submitted as `review @large.diff`, but the prompt
+        // actually sent contained the expanded file content.
+        state.last_prompt_text = Some("review @large.diff".to_string());
+        state.last_prompt_content = Some((expanded.clone(), blocks));
+        state.overflow_retried = true;
+
+        let outcome = handle_agent_signal_async(
+            AgentSignal::OverflowCompacted {
+                original_messages: Vec::new(),
+                prep: Some(("entry-1".to_string(), 100)),
+                result: Ok("summary".to_string()),
+                cancelled: false,
+            },
+            &mut session,
+            &mut state,
+            &agent_tx,
+        )
+        .await;
+        assert_eq!(outcome, SignalOutcome::RetryStarted);
+
+        let mut finished = None;
+        while let Some(sig) = agent_rx.recv().await {
+            if let AgentSignal::Finished(messages) = sig {
+                finished = Some(messages);
+                break;
+            }
+        }
+        let retry_messages = finished.expect("retry turn must finish");
+        let sent_text = retry_messages
+            .iter()
+            .find_map(|m| match m {
+                Message::User(u) => match &u.content {
+                    UserContent::Text(t) => Some(t.clone()),
+                    UserContent::Blocks(bs) => bs.iter().find_map(|b| match b {
+                        UserContentBlock::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    }),
+                },
+                _ => None,
+            })
+            .expect("retry turn must carry a user message");
+        assert!(
+            sent_text.contains(marker),
+            "overflow retry must resend expanded @file content, got: {sent_text}"
+        );
+    }
+
+    #[test]
+    fn test_permission_rule_status_reports_save_failure() {
+        let saved = Ok::<(), anyhow::Error>(());
+        assert_eq!(
+            permission_rule_status_message(true, "bash", Some(&saved)),
+            "Rule added: always allow tool 'bash'"
+        );
+        assert_eq!(
+            permission_rule_status_message(false, "bash", None),
+            "Session rule added: always allow tool 'bash'"
+        );
+
+        let failed = permission_rule_status_message(
+            true,
+            "bash",
+            Some(&Err::<(), anyhow::Error>(anyhow::anyhow!("disk full"))),
+        );
+        assert!(
+            failed.contains("Could not save rule") && failed.contains("disk full"),
+            "failed save must be reported, got: {failed}"
+        );
+        assert!(
+            !failed.contains("Rule added"),
+            "failed save must not claim success: {failed}"
+        );
     }
 
     fn temp_dir(prefix: &str) -> PathBuf {
@@ -5478,6 +5652,52 @@ mod tests {
         *state.cached_ctx_tokens.lock().unwrap() = Some(4242);
         state.invalidate_context_tokens();
         assert!(state.cached_ctx_tokens.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn finished_turn_invalidates_context_cache_after_persisting_messages() {
+        let mut session = make_test_session();
+        let mut state = make_test_state();
+        // A render between MessageEnd and Finished can repopulate the cache with
+        // the pre-turn transcript before the turn's messages are appended.
+        *state.cached_ctx_tokens.lock().unwrap() = Some(0);
+
+        let messages = vec![Message::User(mehh_ai::UserMessage {
+            content: UserContent::Text("hello".to_string()),
+            timestamp: mehh_ai::now_ms(),
+        })];
+        assert!(apply_agent_signal(
+            AgentSignal::Finished(messages),
+            &mut session,
+            &mut state,
+        ));
+
+        assert!(
+            state.cached_ctx_tokens.lock().unwrap().is_none(),
+            "cache must be invalidated after finish_prompt mutates the session"
+        );
+    }
+
+    #[test]
+    fn context_meter_shows_nonzero_for_small_usage_on_large_window() {
+        let mut session = make_test_session();
+        session.model.context_window = 1_000_000;
+        session
+            .session_mut()
+            .append_message(Message::User(mehh_ai::UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: mehh_ai::now_ms(),
+            }))
+            .unwrap();
+
+        let state = make_test_state();
+        let editor = Editor::new();
+        let frame = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
+        let clean = mehh_tui::strip_ansi(&frame);
+        assert!(
+            clean.contains("ctx 1%"),
+            "meter must show nonzero usage instead of 0%, footer: {clean}"
+        );
     }
 
     #[test]

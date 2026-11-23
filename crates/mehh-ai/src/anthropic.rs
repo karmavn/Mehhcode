@@ -186,7 +186,9 @@ impl LlmProvider for AnthropicProvider {
 /// Builds the Messages API endpoint from a base URL, ensuring the `/v1/messages` path.
 fn anthropic_messages_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    if base.contains("/messages") {
+    // Only a final `/messages` segment means the endpoint is already complete.
+    // A base like `/messages-proxy/v1` must still get `/v1/messages` appended.
+    if base.rsplit('/').next() == Some("messages") {
         return base.to_string();
     }
     if base.ends_with("/v1") {
@@ -290,7 +292,7 @@ pub fn adjust_max_tokens_for_thinking(
     let mut thinking_budget = thinking_budget_for_level(reasoning_level, custom_budgets);
     let max_tokens = match base_max_tokens {
         None => model_max_tokens,
-        Some(base) => (base + thinking_budget).min(model_max_tokens),
+        Some(base) => base.saturating_add(thinking_budget).min(model_max_tokens),
     };
 
     if max_tokens <= thinking_budget {
@@ -657,7 +659,7 @@ pub fn build_anthropic_request(
 
     if is_oauth {
         let mut sys_blocks = Vec::new();
-        let mut identity_block = serde_json::json!({
+        let identity_block = serde_json::json!({
             "type": "text",
             "text": "You are Claude Code, Anthropic's official CLI for Claude.",
         });
@@ -797,44 +799,42 @@ pub fn build_anthropic_request(
             let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
             req_map.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
         } else {
-            let (mut adj_max_tokens, adj_budget) = adjust_max_tokens_for_thinking(
+            let (adj_max_tokens, adj_budget) = adjust_max_tokens_for_thinking(
                 options.max_tokens,
                 model.max_tokens,
                 reasoning_level,
                 options.thinking_budgets.as_ref(),
             );
-            let mut final_budget = options
-                .thinking_budget_tokens
-                .unwrap_or(adj_budget)
-                .max(MIN_ANSWER_TOKENS);
-            // Anthropic rejects budget_tokens >= max_tokens. Keep at least one
-            // token of answer room, raising max_tokens if the floor forces it.
-            if final_budget >= adj_max_tokens {
-                final_budget = adj_max_tokens.saturating_sub(1);
-            }
-            if final_budget < MIN_ANSWER_TOKENS {
-                final_budget = MIN_ANSWER_TOKENS;
-                adj_max_tokens = MIN_ANSWER_TOKENS + 1;
-            }
-
             req_map.insert("max_tokens".to_string(), serde_json::json!(adj_max_tokens));
 
-            let display_str = match options.thinking_display {
-                Some(AnthropicThinkingDisplay::Omitted) => "omitted",
-                _ => "summarized",
-            };
+            // The API requires budget_tokens >= MIN_ANSWER_TOKENS and
+            // budget_tokens < max_tokens. If the ceiling cannot fit both, omit
+            // the thinking block entirely instead of emitting a sub-floor
+            // budget that makes every request fail with HTTP 400.
+            if adj_max_tokens > MIN_ANSWER_TOKENS {
+                let final_budget = options
+                    .thinking_budget_tokens
+                    .unwrap_or(adj_budget)
+                    .max(MIN_ANSWER_TOKENS)
+                    .min(adj_max_tokens.saturating_sub(MIN_ANSWER_TOKENS));
 
-            let mut thinking_obj = serde_json::json!({
-                "type": "enabled",
-                "budget_tokens": final_budget,
-            });
-            if options.thinking_display.is_some() {
-                thinking_obj
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("display".to_string(), serde_json::json!(display_str));
+                let display_str = match options.thinking_display {
+                    Some(AnthropicThinkingDisplay::Omitted) => "omitted",
+                    _ => "summarized",
+                };
+
+                let mut thinking_obj = serde_json::json!({
+                    "type": "enabled",
+                    "budget_tokens": final_budget,
+                });
+                if options.thinking_display.is_some() {
+                    thinking_obj
+                        .as_object_mut()
+                        .unwrap()
+                        .insert("display".to_string(), serde_json::json!(display_str));
+                }
+                req_map.insert("thinking".to_string(), thinking_obj);
             }
-            req_map.insert("thinking".to_string(), thinking_obj);
         }
     } else {
         let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
@@ -1398,10 +1398,15 @@ impl AnthropicStreamState {
         if let Some(cache_write) = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()) {
             self.output.usage.cache_write = cache_write;
         }
-        self.output.usage.total_tokens = self.output.usage.input
-            + self.output.usage.output
-            + self.output.usage.cache_read
-            + self.output.usage.cache_write;
+        // Provider-reported counts are untrusted; wrapping them would corrupt
+        // accounting or panic in debug builds.
+        self.output.usage.total_tokens = self
+            .output
+            .usage
+            .input
+            .saturating_add(self.output.usage.output)
+            .saturating_add(self.output.usage.cache_read)
+            .saturating_add(self.output.usage.cache_write);
         self.output.usage.calculate_cost(&self.model.cost);
     }
 }
@@ -2340,5 +2345,45 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,
 
         let result = resolve_anthropic_beta_headers(&model, &options, false);
         assert_eq!(result, "beta-1,beta-2,beta-3");
+    }
+
+    #[test]
+    fn thinking_budget_never_exceeds_model_max_tokens() {
+        let mut model = test_model();
+        model.max_tokens = 1000;
+        model.reasoning = true;
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("Hello".to_string()),
+                timestamp: 1,
+            })],
+            tools: None,
+        };
+        let options = StreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+
+        let req = build_anthropic_request(&model, &context, &options, false);
+        assert_eq!(req["max_tokens"], 1000);
+        assert!(
+            req.get("thinking").is_none(),
+            "a ceiling that cannot fit the 1024-token floor must omit thinking, got: {}",
+            req["thinking"]
+        );
+    }
+
+    #[test]
+    fn adjust_max_tokens_for_thinking_saturates_on_overflow() {
+        let (max_tokens, thinking_budget) = adjust_max_tokens_for_thinking(
+            Some(u64::MAX),
+            8_192,
+            &ThinkingLevel::High,
+            None,
+        );
+        assert_eq!(max_tokens, 8_192);
+        assert_eq!(thinking_budget, 8_192 - MIN_ANSWER_TOKENS);
     }
 }

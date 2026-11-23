@@ -22,6 +22,7 @@ pub struct SseParser {
     max_buffer_bytes: usize,
     overflowed: bool,
     incomplete_at_eof: bool,
+    at_stream_start: bool,
 }
 
 impl Default for SseParser {
@@ -41,6 +42,7 @@ impl SseParser {
             max_buffer_bytes: MAX_SSE_BUFFER_BYTES,
             overflowed: false,
             incomplete_at_eof: false,
+            at_stream_start: true,
         }
     }
 
@@ -95,10 +97,14 @@ impl SseParser {
             let next_cursor = pos + 1;
             let remaining_raw_bytes = raw_buf.len() - next_cursor;
             let line = String::from_utf8_lossy(&raw_buf[cursor..line_end]);
-            self.process_line(&line, remaining_raw_bytes, &mut events);
+            let line = self.strip_initial_bom(line.as_ref());
+            self.process_line(line, remaining_raw_bytes, &mut events);
             cursor = next_cursor;
             if self.overflowed {
-                return Vec::new();
+                // Frames parsed earlier in this chunk are valid; dropping them
+                // would lose complete tool deltas. Callers already stop the
+                // stream when has_overflowed() is set.
+                return events;
             }
         }
 
@@ -128,6 +134,7 @@ impl SseParser {
             }
             let line = String::from_utf8(line_bytes)
                 .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+            let line = self.strip_initial_bom(&line);
             let recognized = line.is_empty()
                 || line.starts_with(':')
                 || line == "data"
@@ -141,7 +148,7 @@ impl SseParser {
             if !recognized {
                 self.incomplete_at_eof = true;
             }
-            self.process_line(&line, 0, &mut events);
+            self.process_line(line, 0, &mut events);
         }
         if !self.current_data.is_empty() {
             events.push(SseEvent {
@@ -155,6 +162,17 @@ impl SseParser {
             self.incomplete_at_eof = true;
         }
         events
+    }
+
+    /// Removes a UTF-8 BOM from the first line of the stream, if present.
+    /// BOMs appearing later in the stream are left untouched.
+    fn strip_initial_bom<'a>(&mut self, line: &'a str) -> &'a str {
+        if self.at_stream_start {
+            self.at_stream_start = false;
+            line.strip_prefix('\u{FEFF}').unwrap_or(line)
+        } else {
+            line
+        }
     }
 
     fn process_line(
@@ -183,7 +201,9 @@ impl SseParser {
 
         if let Some(rest) = line.strip_prefix("data:") {
             let val = rest.strip_prefix(' ').unwrap_or(rest);
-            self.data_bytes = self.data_bytes.saturating_add(val.len());
+            // An empty value still allocates a String in current_data. Charge
+            // at least one byte so empty data lines cannot evade the buffer cap.
+            self.data_bytes = self.data_bytes.saturating_add(val.len().max(1));
             if remaining_raw_bytes.saturating_add(self.data_bytes) > self.max_buffer_bytes {
                 self.overflowed = true;
                 self.raw_buffer.clear();
@@ -194,6 +214,8 @@ impl SseParser {
             }
             self.current_data.push(val.to_string());
         } else if line == "data" {
+            // Same accounting for the colon-less form: it also pushes a String.
+            self.data_bytes = self.data_bytes.saturating_add(1);
             self.current_data.push(String::new());
         } else if let Some(rest) = line.strip_prefix("event:") {
             let val = rest.strip_prefix(' ').unwrap_or(rest);
@@ -282,6 +304,21 @@ mod tests {
     }
 
     #[test]
+    fn test_leading_bom_does_not_drop_first_event() {
+        let mut parser = SseParser::new();
+        let mut stream = vec![0xEF, 0xBB, 0xBF];
+        stream.extend_from_slice(b"data: {\"type\":\"message_start\"}\n\n");
+        let events = parser.feed_bytes(&stream);
+        assert_eq!(
+            events.len(),
+            1,
+            "the first event after a leading BOM must not be dropped"
+        );
+        assert_eq!(events[0].data, "{\"type\":\"message_start\"}");
+        assert!(!events[0].data.contains('\u{FFFD}'));
+    }
+
+    #[test]
     fn test_feed_bytes_caps_buffer() {
         let mut parser = SseParser::with_max_buffer_bytes(64);
         let events = parser.feed_bytes(&[b'a'; 100]);
@@ -296,5 +333,38 @@ mod tests {
         let events = parser.finish();
         assert!(events.is_empty());
         assert!(parser.has_pending_bytes());
+    }
+
+    #[test]
+    fn empty_data_lines_count_towards_buffer_limit() {
+        const LINE_COUNT: usize = 200;
+        const MAX: usize = 64;
+
+        let mut with_colon = SseParser::with_max_buffer_bytes(MAX);
+        for _ in 0..LINE_COUNT {
+            with_colon.feed("data:\n");
+        }
+        assert!(
+            with_colon.has_overflowed(),
+            "repeated `data:` lines must trip the buffer guard"
+        );
+
+        let mut with_space = SseParser::with_max_buffer_bytes(MAX);
+        for _ in 0..LINE_COUNT {
+            with_space.feed("data: \n");
+        }
+        assert!(
+            with_space.has_overflowed(),
+            "repeated `data: ` lines must trip the buffer guard"
+        );
+
+        let mut bare = SseParser::with_max_buffer_bytes(MAX);
+        for _ in 0..LINE_COUNT {
+            bare.feed("data\n");
+        }
+        assert!(
+            bare.has_overflowed(),
+            "repeated bare `data` lines must trip the buffer guard"
+        );
     }
 }

@@ -164,8 +164,10 @@ pub fn truncate_error_body(body: &str, max_chars: usize) -> String {
     }
 }
 
-/// Reads at most `MAX_ERROR_BODY_BYTES` from a non-2xx response and truncates text cleanly.
-pub async fn read_error_body_capped(resp: reqwest::Response) -> String {
+/// Reads at most `MAX_ERROR_BODY_BYTES` from a non-2xx response as raw text,
+/// without character truncation. Callers that redact before truncating must use
+/// this so a secret's closing delimiter is not cut off by an earlier cap.
+pub async fn read_error_body_bytes_capped(resp: reqwest::Response) -> String {
     let mut stream = resp.bytes_stream();
     let mut buf = Vec::new();
     let read_fut = async {
@@ -185,7 +187,12 @@ pub async fn read_error_body_capped(resp: reqwest::Response) -> String {
         }
     };
     let _ = tokio::time::timeout(Duration::from_secs(10), read_fut).await;
-    let text = String::from_utf8_lossy(&buf);
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+/// Reads at most `MAX_ERROR_BODY_BYTES` from a non-2xx response and truncates text cleanly.
+pub async fn read_error_body_capped(resp: reqwest::Response) -> String {
+    let text = read_error_body_bytes_capped(resp).await;
     truncate_error_body(&text, MAX_ERROR_BODY_CHARS)
 }
 
@@ -230,13 +237,14 @@ where
                     continue;
                 }
 
-                let body = read_error_body_capped(resp).await;
+                let body =
+                    crate::oauth::redact_error_body(&read_error_body_bytes_capped(resp).await, &[]);
                 return Err(RetryFailure::HttpStatus { status, body });
             }
             Ok(Err(err)) => {
-                if attempt < policy.max_retries
-                    && (err.is_timeout() || err.is_connect() || err.is_request())
-                {
+                // Request-builder errors (bad URL, invalid header) are
+                // deterministic; retrying them only adds backoff delay.
+                if attempt < policy.max_retries && (err.is_timeout() || err.is_connect()) {
                     let delay = policy.backoff_for_attempt(attempt);
                     attempt += 1;
                     tokio::select! {
@@ -500,5 +508,56 @@ mod tests {
             other => panic!("Unexpected error variant: {:?}", other),
         }
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_failure_event_redacts_provider_secret_in_error_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let body = r#"{"error":"invalid_request","error_description":"bad key sk-ant-SECRETVALUE123"}"#;
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let client = default_http_client();
+        let url = format!("http://{addr}/test");
+        let policy = RetryPolicy {
+            max_retries: 0,
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(5),
+        };
+        let cancel = CancellationToken::new();
+
+        let failure = send_with_retry(|| client.get(&url), &policy, &cancel)
+            .await
+            .unwrap_err();
+        let model = crate::types::Model {
+            id: "test".to_string(),
+            ..Default::default()
+        };
+        let event = retry_failure_event(failure, &model);
+        let err_msg = match event {
+            crate::types::AssistantMessageEvent::Error { error, .. } => {
+                error.error_message.unwrap_or_default()
+            }
+            other => panic!("expected error event, got: {other:?}"),
+        };
+        assert!(
+            !err_msg.contains("sk-ant-SECRETVALUE123"),
+            "secret leaked into error message: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("[REDACTED]"),
+            "expected redaction marker: {err_msg}"
+        );
     }
 }
