@@ -1764,7 +1764,8 @@ mod tests {
 
         let args3 = CliArgs::try_parse_from(["mehh", "--approve"]).unwrap();
         assert!(args3.validate().is_ok());
-        assert_eq!(args3.trust_override(), mehh_coding_agent::TrustOverride::Approve);
+        // --approve only changes tool approvals, never project trust.
+        assert_eq!(args3.trust_override(), mehh_coding_agent::TrustOverride::None);
 
         let args4 = CliArgs::try_parse_from(["mehh", "--no-approve"]).unwrap();
         assert!(args4.validate().is_ok());
