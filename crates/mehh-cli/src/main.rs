@@ -192,7 +192,10 @@ impl CliArgs {
     pub fn trust_override(&self) -> TrustOverride {
         if self.no_approve {
             TrustOverride::NoApprove
-        } else if self.approve || self.trust {
+        } else if self.trust {
+            // --approve only controls tool approvals. Letting it also trust the
+            // repo would enable project MCP servers, skills and instructions
+            // without the user ever making a trust decision.
             TrustOverride::Approve
         } else {
             TrustOverride::None
@@ -697,6 +700,10 @@ async fn main() -> anyhow::Result<()> {
             .parse::<mehh_coding_agent::PermissionMode>()
             .map_err(|e| anyhow::anyhow!(e))?;
         settings.permission_mode = Some(mode);
+    } else if args.approve && !args.no_approve {
+        // Keep --approve useful: it now auto-approves tools without granting
+        // trust to project-local configuration.
+        settings.permission_mode = Some(mehh_coding_agent::PermissionMode::Auto);
     }
     if let Some(ref wm) = args.worker_model {
         settings.worker_model = Some(wm.clone());
@@ -920,13 +927,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     if let Some((sub_model, sub_provider)) = subagent_models {
-        // Rebuild the subagent tool with the final tool set (including MCP).
-        let mut tools: Vec<Arc<dyn mehh_agent::AgentTool>> = agent_session
-            .tools
-            .iter()
-            .filter(|t| t.name() != "subagent")
-            .cloned()
-            .collect();
+        // Rebuild the subagent tool with a usable tool set. The --tools include
+        // list filters out "subagent" itself, so with `--tools subagent` the
+        // parent has no builtin tools at all; children must not inherit that.
+        let mut tools: Vec<Arc<dyn mehh_agent::AgentTool>> = Vec::new();
+        if !args.no_tools && !args.no_builtin_tools {
+            tools.extend(mehh_tools::select_coding_tools(cwd.clone(), None, &[]));
+        }
+        let mut seen: std::collections::HashSet<String> =
+            tools.iter().map(|t| t.name().to_string()).collect();
+        for tool in agent_session.tools.iter().filter(|t| t.name() != "subagent") {
+            if seen.insert(tool.name().to_string()) {
+                tools.push(tool.clone());
+            }
+        }
         let subagent = Arc::new(
             mehh_coding_agent::subagent::SubagentTool::new(
                 cwd.clone(),

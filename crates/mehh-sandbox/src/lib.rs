@@ -7,6 +7,11 @@
 
 use std::path::{Path, PathBuf};
 
+#[cfg(any(target_os = "macos", test))]
+use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(target_os = "macos")]
+use std::sync::Mutex;
+
 /// Access level granted to a spawned command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxPolicy {
@@ -71,7 +76,6 @@ pub struct SandboxPlan {
     pub protected_paths: Vec<PathBuf>,
     /// Paths whose contents must never be readable by the child.
     pub deny_read_paths: Vec<PathBuf>,
-    pub env_denylist: Vec<String>,
     pub network: bool,
 }
 
@@ -128,7 +132,6 @@ impl SandboxPlan {
             cwd,
             protected_paths,
             deny_read_paths,
-            env_denylist: default_env_denylist(),
             network: matches!(policy, SandboxPolicy::DangerFullAccess),
         }
     }
@@ -271,33 +274,15 @@ fn path_through_writable_symlink(path: &Path, writable_root: &Path) -> Result<bo
     Ok(false)
 }
 
-pub fn default_env_denylist() -> Vec<String> {
-    vec![
-        "*_API_KEY".into(),
-        "*_SECRET".into(),
-        "*_TOKEN".into(),
-        "*_PASSWORD".into(),
-        "*_PASSWD".into(),
-        "*_PRIVATE_KEY".into(),
-        "AWS_*".into(),
-        "GITHUB_TOKEN".into(),
-        "GH_TOKEN".into(),
-        "OPENAI_API_KEY".into(),
-        "ANTHROPIC_API_KEY".into(),
-        "GOOGLE_API_KEY".into(),
-        "DATABASE_URL".into(),
-        "REDIS_URL".into(),
-        "GOOGLE_APPLICATION_CREDENTIALS".into(),
-        "CONNECTION_STRING".into(),
-    ]
-}
-
 /// Keys matching the denylist are removed before a child is spawned so build
 /// scripts and `npm test` cannot exfiltrate the agent's credentials.
 pub fn is_secret_env_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
     upper.ends_with("_API_KEY")
         || upper.ends_with("_SECRET")
+        || upper.ends_with("_SECRET_KEY")
+        || upper.ends_with("_ACCESS_KEY")
+        || upper.ends_with("_STORAGE_KEY")
         || upper.ends_with("_TOKEN")
         || upper.ends_with("_PASSWORD")
         || upper.ends_with("_PASSWD")
@@ -305,7 +290,13 @@ pub fn is_secret_env_key(key: &str) -> bool {
         || upper.starts_with("AWS_")
         || matches!(
             upper.as_str(),
-            "GITHUB_TOKEN"
+            "API_KEY"
+                | "SECRET"
+                | "TOKEN"
+                | "PASSWORD"
+                | "PASSWD"
+                | "PRIVATE_KEY"
+                | "GITHUB_TOKEN"
                 | "GH_TOKEN"
                 | "OPENAI_API_KEY"
                 | "ANTHROPIC_API_KEY"
@@ -316,6 +307,24 @@ pub fn is_secret_env_key(key: &str) -> bool {
                 | "GOOGLE_APPLICATION_CREDENTIALS"
                 | "CONNECTION_STRING"
         )
+}
+
+/// How the cwd is exposed to a child. Derived once so both backends agree.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CwdAccess {
+    ReadOnly,
+    Writable,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn cwd_access(policy: SandboxPolicy) -> CwdAccess {
+    match policy {
+        SandboxPolicy::ReadOnly => CwdAccess::ReadOnly,
+        // DangerFullAccess is short-circuited in wrap(); mapping it here keeps
+        // this helper total without weakening either restricted policy.
+        SandboxPolicy::WorkspaceWrite | SandboxPolicy::DangerFullAccess => CwdAccess::Writable,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -333,6 +342,14 @@ fn find_in_path(binary: &str) -> Option<PathBuf> {
 #[cfg(target_os = "linux")]
 fn linux_wrapper(plan: &SandboxPlan, prepared: &PreparedSandbox) -> Option<(String, Vec<String>)> {
     let bwrap = find_in_path("bwrap")?;
+    Some((
+        bwrap.to_string_lossy().into_owned(),
+        linux_wrapper_args(plan, prepared),
+    ))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_wrapper_args(plan: &SandboxPlan, prepared: &PreparedSandbox) -> Vec<String> {
     let mut args = vec![
         "--new-session".to_string(),
         "--die-with-parent".to_string(),
@@ -350,8 +367,13 @@ fn linux_wrapper(plan: &SandboxPlan, prepared: &PreparedSandbox) -> Option<(Stri
     args.push("/".to_string());
     args.push("--dev".to_string());
     args.push("/dev".to_string());
-    args.push("--bind".to_string());
     let cwd = prepared.cwd().to_string_lossy().into_owned();
+    let cwd_bind = if cwd_access(plan.policy) == CwdAccess::ReadOnly {
+        "--ro-bind"
+    } else {
+        "--bind"
+    };
+    args.push(cwd_bind.to_string());
     args.push(cwd.clone());
     args.push(cwd.clone());
 
@@ -381,7 +403,7 @@ fn linux_wrapper(plan: &SandboxPlan, prepared: &PreparedSandbox) -> Option<(Stri
         }
     }
     args.push("--".to_string());
-    Some((bwrap.to_string_lossy().into_owned(), args))
+    args
 }
 
 /// Apply the plan to a command. Never silently drops restrictions: if no
@@ -417,12 +439,19 @@ pub fn wrap(
 
     #[cfg(target_os = "macos")]
     if let Some(profile) = seatbelt_profile(plan) {
-        let path = std::env::temp_dir().join(format!(
-            "mehh-sandbox-{}.sbp",
-            std::process::id()
-        ));
+        let path = seatbelt_profile_path();
         std::fs::write(&path, profile)
             .map_err(|e| SandboxError::new(format!("cannot write sandbox profile: {e}")))?;
+        {
+            // The caller spawns after wrap() returns, so profiles stay guarded
+            // for a short grace period instead of being deleted too early.
+            let now = std::time::Instant::now();
+            let mut guards = PROFILE_GUARDS
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guards.retain(|(created, _)| now.duration_since(*created) < PROFILE_RETAIN);
+            guards.push((now, ProfileGuard(path.clone())));
+        }
         let mut seatbelt = vec!["-f".to_string(), path.to_string_lossy().into_owned(), "--".to_string()];
         seatbelt.push(program.to_string());
         seatbelt.extend(args.iter().cloned());
@@ -444,6 +473,31 @@ pub fn wrap(
     })
 }
 
+#[cfg(target_os = "macos")]
+const PROFILE_RETAIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[cfg(any(target_os = "macos", test))]
+static PROFILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+#[cfg(target_os = "macos")]
+static PROFILE_GUARDS: Mutex<Vec<(std::time::Instant, ProfileGuard)>> = Mutex::new(Vec::new());
+
+#[cfg(any(target_os = "macos", test))]
+struct ProfileGuard(PathBuf);
+
+#[cfg(any(target_os = "macos", test))]
+impl Drop for ProfileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Each call gets its own path so concurrent spawns cannot swap allowlists.
+#[cfg(any(target_os = "macos", test))]
+fn seatbelt_profile_path() -> PathBuf {
+    let id = PROFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    std::env::temp_dir().join(format!("mehh-sandbox-{}-{id}.sbp", std::process::id()))
+}
+
 /// Escape a value for a quoted SBPL string literal. Seatbelt uses C-style
 /// escapes; an unescaped quote or backslash in a path (for example an
 /// attacker-controlled `.env` filename found under the workspace) could close
@@ -453,17 +507,19 @@ fn escape_sbpl_string(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn seatbelt_profile(plan: &SandboxPlan) -> Option<String> {
     let cwd = plan.cwd.canonicalize().ok()?;
     let cwd_s = escape_sbpl_string(&cwd.to_string_lossy());
     let mut profile = String::from(
         "(version 1)\n(deny default)\n(allow process-exec)\n(allow process-fork)\n\
-         (allow sysctl-read)\n(allow file-read* (subpath \"/usr\") (subpath \"/System\"))\n\
-         (allow file-write* (subpath \"",
+         (allow sysctl-read)\n(allow file-read* (subpath \"/usr\") (subpath \"/System\"))\n",
     );
-    profile.push_str(&cwd_s);
-    profile.push_str("\"))\n");
+    if cwd_access(plan.policy) == CwdAccess::Writable {
+        profile.push_str("(allow file-write* (subpath \"");
+        profile.push_str(&cwd_s);
+        profile.push_str("\"))\n");
+    }
     for path in plan.protected_paths.iter().chain(plan.deny_read_paths.iter()) {
         let escaped = escape_sbpl_string(&canonicalize_or_extend(path).to_string_lossy());
         profile.push_str("(deny file-read* (subpath \"");
@@ -524,6 +580,23 @@ mod tests {
         ] {
             assert!(is_secret_env_key(key), "secret key not recognized: {key}");
         }
+    }
+
+    #[test]
+    fn bare_secret_keys_are_recognized() {
+        for key in [
+            "API_KEY",
+            "SECRET",
+            "TOKEN",
+            "PASSWORD",
+            "PASSWD",
+            "PRIVATE_KEY",
+            "api_key",
+            "Token",
+        ] {
+            assert!(is_secret_env_key(key), "bare secret key not recognized: {key}");
+        }
+        assert!(!is_secret_env_key("PATH"));
     }
 
     #[test]
@@ -639,6 +712,74 @@ mod tests {
         let inv = wrap(&plan, "echo", &["hi".to_string()]).unwrap();
         assert_eq!(inv.program, "echo");
         assert!(!inv.status.is_active());
+    }
+
+    #[test]
+    fn seatbelt_profile_paths_are_unique_per_call() {
+        let first = seatbelt_profile_path();
+        let second = seatbelt_profile_path();
+        assert_ne!(
+            first, second,
+            "two spawns in one process must not reuse a profile path"
+        );
+    }
+
+    #[test]
+    fn profile_guard_removes_profile_on_drop() {
+        let path = std::env::temp_dir().join(format!(
+            "mehh-sandbox-guard-{}-{}.sbp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"(version 1)").unwrap();
+        {
+            let _guard = ProfileGuard(path.clone());
+            assert!(path.exists());
+        }
+        assert!(!path.exists(), "profile file must not leak after use");
+    }
+
+    #[test]
+    fn cwd_access_follows_policy() {
+        assert_eq!(cwd_access(SandboxPolicy::ReadOnly), CwdAccess::ReadOnly);
+        assert_eq!(cwd_access(SandboxPolicy::WorkspaceWrite), CwdAccess::Writable);
+        assert_eq!(cwd_access(SandboxPolicy::DangerFullAccess), CwdAccess::Writable);
+    }
+
+    #[test]
+    fn linux_read_only_wrapper_mounts_cwd_read_only() {
+        let dir = std::env::temp_dir().join(format!("sandbox-ro-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ro_plan = SandboxPlan::new(SandboxPolicy::ReadOnly, dir.clone());
+        let rw_plan = SandboxPlan::new(SandboxPolicy::WorkspaceWrite, dir.clone());
+        let prepared = ro_plan.prepare().unwrap();
+        let cwd = dir.canonicalize().unwrap().to_string_lossy().into_owned();
+        let ro_mount = vec!["--ro-bind".to_string(), cwd.clone(), cwd.clone()];
+        let rw_mount = vec!["--bind".to_string(), cwd.clone(), cwd.clone()];
+
+        let ro_args = linux_wrapper_args(&ro_plan, &prepared);
+        let rw_args = linux_wrapper_args(&rw_plan, &prepared);
+        assert!(ro_args.windows(3).any(|w| w == ro_mount.as_slice()), "{ro_args:?}");
+        assert!(!ro_args.windows(3).any(|w| w == rw_mount.as_slice()), "{ro_args:?}");
+        assert!(rw_args.windows(3).any(|w| w == rw_mount.as_slice()), "{rw_args:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn seatbelt_read_only_policy_drops_cwd_write_rule() {
+        let dir = std::env::temp_dir().join(format!("sandbox-ro-seatbelt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ro_plan = SandboxPlan::new(SandboxPolicy::ReadOnly, dir.clone());
+        let rw_plan = SandboxPlan::new(SandboxPolicy::WorkspaceWrite, dir.clone());
+        let ro_profile = seatbelt_profile(&ro_plan).unwrap();
+        let rw_profile = seatbelt_profile(&rw_plan).unwrap();
+
+        assert!(!ro_profile.contains("(allow file-write*"), "{ro_profile}");
+        assert!(rw_profile.contains("(allow file-write*"), "{rw_profile}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -90,6 +90,10 @@ fn split_commands(input: &str) -> Option<Vec<Vec<String>>> {
                     quote = None;
                 } else if ch == '\\' && q == '"' {
                     token.push(chars.next()?);
+                } else if q == '"' && (ch == '$' || ch == '`') {
+                    // The shell still expands these inside double quotes, so
+                    // the command cannot be scored as literal text.
+                    return None;
                 } else {
                     token.push(ch);
                 }
@@ -105,6 +109,10 @@ fn split_commands(input: &str) -> Option<Vec<Vec<String>>> {
                     has_token = true;
                 }
                 '$' => return None,
+                // PowerShell evaluates bare `(...)` and `@(...)` as expressions.
+                // Treating them as literal token characters would let a rule for
+                // `echo hi` cover `echo hi (Start-Process calc)`.
+                '(' | ')' => return None,
                 '`' | '>' | '<' => return None,
                 ';' | '&' | '|' | '\n' => {
                     if has_token {
@@ -164,11 +172,10 @@ pub fn executable_key(name: &str) -> String {
 }
 
 fn token_eq(a: &str, b: &str) -> bool {
-    // `-`-prefixed flags are case-insensitive on every platform; on Windows
-    // every token is case-insensitive (`/K` vs `/k`). An absolute path such as
-    // `/tmp/Foo` is an argument, not a flag, and stays case-sensitive on POSIX.
-    let flag = a.starts_with('-') || b.starts_with('-');
-    if cfg!(windows) || flag {
+    // On Windows every token is case-insensitive (`/K` vs `/k`). On POSIX
+    // flags are case-sensitive too: `-x` and `-X` are different options.
+    // Absolute paths such as `/tmp/Foo` stay case-sensitive on POSIX.
+    if cfg!(windows) {
         a.eq_ignore_ascii_case(b)
     } else {
         a == b
@@ -350,16 +357,52 @@ mod tests {
     }
 
     #[test]
+    fn double_quoted_substitution_never_matches_a_rule() {
+        for cmd in [
+            "echo ok \"$(rm -rf /tmp/data)\"",
+            "echo ok \"`rm -rf /tmp/data`\"",
+        ] {
+            let eval = check_prefix("echo ok", cmd);
+            assert!(!eval.safe_parse, "{cmd} must refuse shell substitution");
+            assert!(!eval.all_covered, "{cmd} must not be covered by a rule");
+            assert_eq!(verdict_for(eval, true), Verdict::Prompt, "{cmd}");
+        }
+        // An escaped dollar inside double quotes is literal and stays scorable.
+        assert!(check_prefix("echo", "echo \"\\$HOME\"").safe_parse);
+    }
+
+    #[test]
     fn windows_extension_and_case_do_not_bypass_a_rule() {
         // Executable case/extension normalization applies on every platform.
-        // `/k` is a case-insensitive flag only on Windows, so POSIX uses `-k`.
+        // Flag case is insensitive only on Windows; POSIX keeps it identical.
         let (rule, cmd) = if cfg!(windows) {
             ("CMD.EXE /k", "cmd.exe /K whoami")
         } else {
-            ("CMD.EXE -k", "cmd.exe -K whoami")
+            ("CMD.EXE -k", "cmd.exe -k whoami")
         };
         let eval = check_prefix(rule, cmd);
         assert!(eval.all_covered, "case/extension must be normalized");
+        assert_eq!(verdict_for(eval, false), Verdict::Deny);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn posix_flag_case_is_significant() {
+        let eval = check_prefix("curl -x", "curl -X DELETE url");
+        assert!(eval.safe_parse);
+        assert!(!eval.all_covered, "-X must not match -x on POSIX");
+        assert_eq!(verdict_for(eval, false), Verdict::Allow);
+
+        let eval = check_prefix("curl -x", "curl -x proxy");
+        assert!(eval.all_covered, "exact flag case must still match on POSIX");
+        assert_eq!(verdict_for(eval, false), Verdict::Deny);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_flag_case_is_insignificant() {
+        let eval = check_prefix("curl -x", "curl -X DELETE url");
+        assert!(eval.all_covered, "flags are case-insensitive on Windows");
         assert_eq!(verdict_for(eval, false), Verdict::Deny);
     }
 

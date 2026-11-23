@@ -25,6 +25,12 @@ fn escape_xml_attribute(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+/// Escapes text placed inside the `<file>` body so file content cannot close
+/// the wrapper and pass itself off as a new instruction.
+fn escape_xml_text(value: &str) -> String {
+    value.replace('&', "&amp;").replace('<', "&lt;")
+}
+
 /// Reads each `@path` argument into a text block or a base64 image block.
 /// Non-`@` arguments are joined into the text prompt verbatim.
 pub fn process_file_arguments(cwd: &Path, args: &[String]) -> Result<ProcessedPromptArgs> {
@@ -88,8 +94,9 @@ pub fn process_file_arguments(cwd: &Path, args: &[String]) -> Result<ProcessedPr
                     let raw = String::from_utf8_lossy(&bytes);
                     let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
                     let tag = format!(
-                        "<file name=\"{}\">\n{clean}\n</file>",
-                        escape_xml_attribute(path_str)
+                        "<file name=\"{}\">\n{}\n</file>",
+                        escape_xml_attribute(path_str),
+                        escape_xml_text(clean)
                     );
                     text_parts.push(tag);
                     continue;

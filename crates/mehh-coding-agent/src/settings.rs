@@ -5,6 +5,81 @@ use std::path::{Path, PathBuf};
 
 static ATOMIC_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Replaces the DACL on a freshly created temp file with a single entry for the
+/// current process user. On Windows there is no std API for this; without it
+/// `restricted` writes (credentials, permissions) inherit the parent ACL.
+#[cfg(windows)]
+fn restrict_to_current_user_windows(path: &Path) -> anyhow::Result<()> {
+    use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
+    use windows_sys::Win32::Security::Authorization::{
+        SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT,
+        TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
+    };
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        TOKEN_QUERY, TOKEN_USER,
+    };
+    use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = 0;
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            anyhow::bail!("OpenProcessToken failed");
+        }
+        let mut len = 0u32;
+        let _ = GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut len);
+        if len == 0 {
+            CloseHandle(token);
+            anyhow::bail!("GetTokenInformation returned no token size");
+        }
+        let mut buf = vec![0u8; len as usize];
+        let ok = GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), len, &mut len);
+        CloseHandle(token);
+        if ok == 0 {
+            anyhow::bail!("GetTokenInformation failed");
+        }
+        let user = buf.as_ptr().cast::<TOKEN_USER>().read_unaligned();
+        let trustee = TRUSTEE_W {
+            pMultipleTrustee: std::ptr::null_mut(),
+            MultipleTrusteeOperation: 0,
+            TrusteeForm: TRUSTEE_IS_SID,
+            TrusteeType: TRUSTEE_IS_USER,
+            ptstrName: user.User.Sid as windows_sys::core::PWSTR,
+        };
+        let explicit = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: FILE_ALL_ACCESS,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: 0,
+            Trustee: trustee,
+        };
+        let mut acl: *mut windows_sys::Win32::Security::ACL = std::ptr::null_mut();
+        let status = SetEntriesInAclW(1, &explicit, std::ptr::null(), &mut acl);
+        if status != ERROR_SUCCESS {
+            anyhow::bail!("SetEntriesInAclW failed with {status}");
+        }
+        let wide: Vec<u16> = path
+            .to_string_lossy()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let status = SetNamedSecurityInfoW(
+            wide.as_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            acl,
+            std::ptr::null(),
+        );
+        LocalFree(acl.cast());
+        if status != ERROR_SUCCESS {
+            anyhow::bail!("SetNamedSecurityInfoW failed with {status}");
+        }
+    }
+    Ok(())
+}
+
 /// Atomically writes `bytes` to `path` via a unique temp file in the same directory and `rename`.
 /// When `restricted` is true on Unix, creates the temp file with `0o600` permissions.
 pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], restricted: bool) -> anyhow::Result<()> {
@@ -42,9 +117,6 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], restricted: bool) -> 
         }
     };
 
-    #[cfg(not(unix))]
-    let _ = restricted;
-
     let write_res = (|| -> std::io::Result<()> {
         use std::io::Write;
         file.write_all(bytes)?;
@@ -66,6 +138,16 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], restricted: bool) -> 
             let _ = std::fs::remove_file(&tmp_path);
             return Err(e).with_context(|| {
                 format!("Failed to set 0600 permissions on: {}", tmp_path.display())
+            });
+        }
+    }
+
+    #[cfg(windows)]
+    if restricted {
+        if let Err(e) = restrict_to_current_user_windows(&tmp_path) {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e).with_context(|| {
+                format!("Failed to restrict permissions on: {}", tmp_path.display())
             });
         }
     }
@@ -109,8 +191,6 @@ pub struct Settings {
     pub steering_mode: Option<mehh_agent::QueueMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub follow_up_mode: Option<mehh_agent::QueueMode>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tree_filter_mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hide_thinking_block: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,7 +277,6 @@ impl SettingsManager {
             temperature: overlay.temperature.or(base.temperature),
             steering_mode: overlay.steering_mode.or(base.steering_mode),
             follow_up_mode: overlay.follow_up_mode.or(base.follow_up_mode),
-            tree_filter_mode: overlay.tree_filter_mode.or(base.tree_filter_mode),
             hide_thinking_block: overlay.hide_thinking_block.or(base.hide_thinking_block),
             permission_mode: overlay.permission_mode.or(base.permission_mode),
             worker_model: overlay.worker_model.or(base.worker_model),
@@ -228,12 +307,31 @@ impl SettingsManager {
             return Ok(global);
         }
         let mut local = Self::load_file(project_path)?;
-        // Escalation guard: Workspace .mehh/settings.json cannot elevate to Auto.
-        // Neutralized to None so that it does not override user's global preference.
-        if local.permission_mode == Some(crate::tool_inspection::PermissionMode::Auto) {
-            local.permission_mode = None;
+        // Escalation guard: a trusted project file may only tighten permissions, never loosen
+        // them. Permissiveness ranks Chat < Approve < SmartApprove < Auto. When there is no
+        // global preference, SmartApprove is the baseline. A more permissive project value is
+        // dropped (neutralized to None) so it cannot override the user's global preference.
+        if let Some(project_mode) = local.permission_mode {
+            let baseline = global
+                .permission_mode
+                .unwrap_or(crate::tool_inspection::PermissionMode::SmartApprove);
+            if permission_mode_rank(project_mode) > permission_mode_rank(baseline) {
+                local.permission_mode = None;
+            }
         }
         Ok(Self::merge(global, local))
+    }
+}
+
+/// Permissiveness ranking used by the project-settings escalation guard: Chat is the strictest
+/// and Auto is the most permissive.
+fn permission_mode_rank(mode: crate::tool_inspection::PermissionMode) -> u8 {
+    use crate::tool_inspection::PermissionMode::*;
+    match mode {
+        Chat => 0,
+        Approve => 1,
+        SmartApprove => 2,
+        Auto => 3,
     }
 }
 
@@ -257,7 +355,6 @@ mod tests {
             temperature: Some(0.7),
             steering_mode: Some(QueueMode::All),
             follow_up_mode: Some(QueueMode::OneAtATime),
-            tree_filter_mode: Some("user".to_string()),
             hide_thinking_block: Some(true),
             permission_mode: Some(crate::tool_inspection::PermissionMode::SmartApprove),
             worker_model: None,
@@ -285,7 +382,6 @@ mod tests {
             temperature: Some(0.2),
             steering_mode: Some(QueueMode::OneAtATime),
             follow_up_mode: Some(QueueMode::OneAtATime),
-            tree_filter_mode: Some("all".to_string()),
             hide_thinking_block: Some(false),
             permission_mode: Some(crate::tool_inspection::PermissionMode::SmartApprove),
             worker_model: Some("gemini-2.5-flash".to_string()),
@@ -302,7 +398,6 @@ mod tests {
             temperature: None,
             steering_mode: Some(QueueMode::All),
             follow_up_mode: None,
-            tree_filter_mode: None,
             hide_thinking_block: Some(true),
             permission_mode: Some(crate::tool_inspection::PermissionMode::Auto),
             worker_model: None,
@@ -319,7 +414,6 @@ mod tests {
         assert_eq!(merged.temperature, Some(0.2));
         assert_eq!(merged.steering_mode, Some(QueueMode::All));
         assert_eq!(merged.follow_up_mode, Some(QueueMode::OneAtATime));
-        assert_eq!(merged.tree_filter_mode.as_deref(), Some("all"));
         assert_eq!(merged.hide_thinking_block, Some(true));
         assert_eq!(
             merged.permission_mode,
@@ -385,6 +479,35 @@ mod tests {
     }
 
     #[test]
+    fn test_project_settings_cannot_escalate_chat_to_smart_approve() {
+        let dir = crate::TempTestDir::new("settings_chat_escalation");
+        let global_path = dir.path().join("global-settings.json");
+        let project_path = dir.path().join("project-settings.json");
+
+        // Global Chat must not be escalated to SmartApprove by a trusted project file.
+        std::fs::write(&global_path, r#"{"permissionMode":"chat"}"#).unwrap();
+        std::fs::write(&project_path, r#"{"permissionMode":"smart_approve"}"#).unwrap();
+        let loaded =
+            SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
+        assert_eq!(
+            loaded.permission_mode,
+            Some(crate::tool_inspection::PermissionMode::Chat),
+            "project must not escalate global chat to smart_approve"
+        );
+
+        // An equal-or-stricter project value (Approve is stricter than SmartApprove) is preserved.
+        std::fs::write(&global_path, r#"{"permissionMode":"smart_approve"}"#).unwrap();
+        std::fs::write(&project_path, r#"{"permissionMode":"approve"}"#).unwrap();
+        let loaded2 =
+            SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
+        assert_eq!(
+            loaded2.permission_mode,
+            Some(crate::tool_inspection::PermissionMode::Approve),
+            "equal-or-stricter project value must be preserved"
+        );
+    }
+
+    #[test]
     fn test_project_settings_auto_permission_escalation_guard() {
         let dir = crate::TempTestDir::new("settings_escalation");
         let global_path = dir.path().join("global-settings.json");
@@ -395,7 +518,7 @@ mod tests {
         std::fs::write(&project_path, r#"{"permissionMode":"auto"}"#).unwrap();
         let loaded =
             SettingsManager::try_load_from_paths(&global_path, &project_path, true).unwrap();
-        // Since local Auto was neutralized to None, global Auto is preserved!
+        // Equal-rank Auto is not an escalation, so the project value is preserved.
         assert_eq!(
             loaded.permission_mode,
             Some(crate::tool_inspection::PermissionMode::Auto)

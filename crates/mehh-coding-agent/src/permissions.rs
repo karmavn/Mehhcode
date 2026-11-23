@@ -2,7 +2,7 @@
 
 use crate::tool_inspection::{InspectionVerdict, ToolInspectionContext};
 use anyhow::{Context, Result};
-use globset::Glob;
+use globset::GlobBuilder;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -52,6 +52,28 @@ pub fn default_permissions_path() -> Result<PathBuf> {
 
 type RuleSpecificity = (bool, bool, bool, usize, u8);
 
+/// Path rules are matched against resolved paths, not the raw argument: a
+/// `..` segment or a symlink must not let `src/**/*.rs` cover `secret.rs`.
+/// Returns `None` when resolution fails so callers fail closed.
+fn canonical_rule_paths(ctx: &ToolInspectionContext, raw: &str) -> Option<Vec<String>> {
+    let resolved = crate::tool_inspection::resolve_existing_path(&ctx.cwd, raw)?;
+    let cwd = crate::tool_inspection::resolve_existing_path(&ctx.cwd, "")?;
+    let text = resolved.to_string_lossy();
+    let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
+    let absolute = text.replace('\\', "/");
+
+    let mut candidates = vec![absolute.clone()];
+    if let Ok(relative) = resolved.strip_prefix(&cwd) {
+        candidates.push(relative.to_string_lossy().replace('\\', "/"));
+    }
+    // Rules written as `/etc/**` have no drive letter; on Windows expose the
+    // drive-root-relative form as well so they still match their intended tree.
+    if let Some(idx) = absolute.find(":/") {
+        candidates.push(absolute[idx + 1..].to_string());
+    }
+    Some(candidates)
+}
+
 impl PermissionStore {
     pub fn new(rules: Vec<PermissionRule>, user_rules_path: Option<PathBuf>) -> Self {
         Self {
@@ -76,12 +98,13 @@ impl PermissionStore {
         if trusted {
             let ws_path = cwd.join(".mehh").join("permissions.json");
             if let Some(ws_rules) = Self::read_rules_from_file(&ws_path)? {
-                // A project may only narrow permissions. An AlwaysAllow rule in
-                // a repo-local file would let the repo grant itself access and
-                // cancel an equal-specificity global NeverAllow.
+                // A project may only narrow permissions. Keep only NeverAllow:
+                // AskBefore in a repo file would otherwise win over
+                // a global NeverAllow at equal specificity (is_filtered is
+                // compared before action_rank) and let the repo soften a ban.
                 let mut combined: Vec<PermissionRule> = ws_rules
                     .into_iter()
-                    .filter(|r| r.action != PermissionAction::AlwaysAllow)
+                    .filter(|r| r.action == PermissionAction::NeverAllow)
                     .collect();
                 combined.extend(rules);
                 rules = combined;
@@ -108,6 +131,24 @@ impl PermissionStore {
         let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
         let file: PermissionsFile = serde_json::from_str(clean)
             .with_context(|| format!("Failed to parse permissions JSON in '{}'", path.display()))?;
+
+        // A malformed glob would silently turn a NeverAllow rule into a no-op
+        // during evaluate(). Reject the whole file instead so load_fail_closed
+        // can substitute a deny-all store.
+        for rule in &file.rules {
+            if let Some(ref pattern) = rule.path_glob {
+                GlobBuilder::new(pattern)
+                    .case_insensitive(cfg!(windows))
+                    .build()
+                    .with_context(|| {
+                        format!(
+                            "Invalid path_glob '{}' in permissions file '{}'",
+                            pattern,
+                            path.display()
+                        )
+                    })?;
+            }
+        }
 
         Ok(Some(file.rules))
     }
@@ -172,9 +213,13 @@ impl PermissionStore {
                             cmd.trim().starts_with(pfx.trim())
                         }
                     } else if let Some(path) = ctx.args.get("path").and_then(|v| v.as_str()) {
-                        let norm_path = path.trim().replace('\\', "/");
                         let norm_pfx = pfx.trim().replace('\\', "/");
-                        norm_path.starts_with(&norm_pfx) || path.trim().starts_with(pfx.trim())
+                        canonical_rule_paths(ctx, path.trim()).is_some_and(|candidates| {
+                            candidates.iter().any(|candidate| {
+                                candidate.starts_with(&norm_pfx)
+                                    || candidate.starts_with(pfx.trim())
+                            })
+                        })
                     } else {
                         false
                     };
@@ -186,14 +231,16 @@ impl PermissionStore {
             if let Some(ref glob_pattern) = rule.path_glob {
                 let matches_glob =
                     if let Some(raw_path) = ctx.args.get("path").and_then(|v| v.as_str()) {
-                        let norm_path = raw_path.trim().replace('\\', "/");
-                        if let Ok(glob) = Glob::new(glob_pattern) {
-                            let matcher = glob.compile_matcher();
-                            matcher.is_match(&norm_path)
-                                || matcher.is_match(raw_path)
-                                || matcher.is_match(Path::new(raw_path))
-                        } else {
-                            false
+                        match GlobBuilder::new(glob_pattern)
+                            .case_insensitive(cfg!(windows))
+                            .build()
+                        {
+                            Ok(glob) => {
+                                let matcher = glob.compile_matcher();
+                                canonical_rule_paths(ctx, raw_path.trim())
+                                    .is_some_and(|paths| paths.iter().any(|p| matcher.is_match(p)))
+                            }
+                            Err(_) => false,
                         }
                     } else {
                         false
@@ -300,18 +347,26 @@ impl PermissionStore {
     /// Fail-closed loader: a corrupt/unreadable permissions file must never
     /// become an empty, permissive store. Deny everything until it is repaired.
     pub fn load_fail_closed(cwd: &Path, trusted: bool) -> Self {
-        let user_rules_path = default_permissions_path().ok();
+        let Some(user_rules_path) = default_permissions_path().ok() else {
+            // No home means the global NeverAllow rules could not be read.
+            // `load` would return Ok with an empty store, so fail closed here.
+            return Self::deny_all(None);
+        };
         match Self::load(cwd, trusted) {
             Ok(store) => store,
-            Err(_) => Self {
-                user_rules_path,
-                rules: vec![PermissionRule {
-                    tool_name: "*".to_string(),
-                    arg_prefix: None,
-                    path_glob: None,
-                    action: PermissionAction::NeverAllow,
-                }],
-            },
+            Err(_) => Self::deny_all(Some(user_rules_path)),
+        }
+    }
+
+    fn deny_all(user_rules_path: Option<PathBuf>) -> Self {
+        Self {
+            user_rules_path,
+            rules: vec![PermissionRule {
+                tool_name: "*".to_string(),
+                arg_prefix: None,
+                path_glob: None,
+                action: PermissionAction::NeverAllow,
+            }],
         }
     }
 }
@@ -367,6 +422,7 @@ mod tests {
 
     #[tokio::test]
     async fn permission_store_workspace_cannot_override_global_never_allow_and_corrupt_file_fails_closed() {
+        let _env_lock = crate::ENV_MUTEX.lock().await;
         struct HomeGuard {
             prev: Option<std::ffi::OsString>,
         }
@@ -475,6 +531,47 @@ mod tests {
                 InspectionVerdict::Deny { .. }
             ),
             "corrupt permissions file must fail closed, not auto-allow"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_home_fails_closed_for_global_permissions() {
+        let _env_lock = crate::ENV_MUTEX.lock().await;
+        struct EnvGuard {
+            userprofile: Option<std::ffi::OsString>,
+            home: Option<std::ffi::OsString>,
+        }
+        impl EnvGuard {
+            fn clear() -> Self {
+                let guard = Self {
+                    userprofile: std::env::var_os("USERPROFILE"),
+                    home: std::env::var_os("HOME"),
+                };
+                std::env::remove_var("USERPROFILE");
+                std::env::remove_var("HOME");
+                guard
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.userprofile {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+                match &self.home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+
+        let _guard = EnvGuard::clear();
+        let store = PermissionStore::load_fail_closed(Path::new("."), false);
+        let ctx = make_ctx("read", None, Some("notes.txt"));
+        assert!(
+            matches!(store.evaluate(&ctx), Some(InspectionVerdict::Deny { .. })),
+            "unresolvable global rules path must fail closed, got {:?}",
+            store.rules()
         );
     }
 
@@ -666,6 +763,68 @@ mod tests {
             Some(InspectionVerdict::Deny { .. }) => {}
             other => panic!("absolute path must still be denied, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn path_glob_rule_cannot_match_parent_dir_traversal() {
+        let dir = crate::TempTestDir::new("perm_path_traversal");
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("src").join("sub")).unwrap();
+        std::fs::write(cwd.join("src").join("sub").join("main.rs"), "").unwrap();
+        std::fs::write(cwd.join("secret.rs"), "").unwrap();
+
+        let store = PermissionStore::new(
+            vec![PermissionRule {
+                tool_name: "edit".to_string(),
+                arg_prefix: None,
+                path_glob: Some("src/**/*.rs".to_string()),
+                action: PermissionAction::AlwaysAllow,
+            }],
+            None,
+        );
+
+        let mut traversal = make_ctx("edit", None, Some("src/../secret.rs"));
+        traversal.cwd = cwd.to_path_buf();
+        assert_ne!(
+            store.evaluate(&traversal),
+            Some(InspectionVerdict::Allow),
+            "traversal must not match a rule scoped to src/"
+        );
+
+        let mut legit = make_ctx("edit", None, Some("src/sub/main.rs"));
+        legit.cwd = cwd.to_path_buf();
+        assert_eq!(
+            store.evaluate(&legit),
+            Some(InspectionVerdict::Allow),
+            "a real path under src/ must still match"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn path_glob_rule_is_case_insensitive_on_windows() {
+        let dir = crate::TempTestDir::new("perm_path_case");
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("SRC")).unwrap();
+        std::fs::write(cwd.join("SRC").join("Main.RS"), "").unwrap();
+
+        let store = PermissionStore::new(
+            vec![PermissionRule {
+                tool_name: "edit".to_string(),
+                arg_prefix: None,
+                path_glob: Some("src/**/*.rs".to_string()),
+                action: PermissionAction::AlwaysAllow,
+            }],
+            None,
+        );
+
+        let mut ctx = make_ctx("edit", None, Some("SRC/Main.RS"));
+        ctx.cwd = cwd.to_path_buf();
+        assert_eq!(
+            store.evaluate(&ctx),
+            Some(InspectionVerdict::Allow),
+            "Windows path rules must ignore case"
+        );
     }
 
     #[test]
