@@ -708,7 +708,7 @@ impl AgentTool for ListMcpResourcesTool {
     }
 
     fn description(&self) -> &str {
-        "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models. Prefer resources over web search when possible."
+        "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models. Prefer resources over web search when possible. Without `server`, the same cursor is sent to every server and the result contains a per-server `nextCursors` map; use a specific `server` for precise pagination."
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -888,7 +888,7 @@ impl AgentTool for ListMcpResourceTemplatesTool {
     }
 
     fn description(&self) -> &str {
-        "Lists parameterized RFC 6570 resource templates provided by MCP servers."
+        "Lists parameterized RFC 6570 resource templates provided by MCP servers. Without `server`, the same cursor is sent to every server and the result contains a per-server `nextCursors` map; use a specific `server` for precise pagination."
     }
 
     fn parameters(&self) -> serde_json::Value {
