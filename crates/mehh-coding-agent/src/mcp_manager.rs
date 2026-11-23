@@ -1,6 +1,6 @@
 //! MCP server connection management, tool lifecycle, and summaries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -8,7 +8,8 @@ use std::time::Duration;
 use anyhow::Context;
 use mehh_agent::AgentTool;
 use mehh_mcp::{
-    create_mcp_agent_tools, load_mcp_configs_with_trust, ListMcpResourceTemplatesTool,
+    create_mcp_agent_tools, create_mcp_agent_tools_with_shared_names,
+    load_mcp_configs_with_trust, ListMcpResourceTemplatesTool,
     ListMcpResourcesTool, McpAuthEntry, McpAuthStore, McpClient, McpRoot, McpServerConfig,
     McpServerRegistry, McpToolInfo, McpTransport, OAuthTokens, ReadMcpResourceTool, StdioTransport,
     StoredMcpBearerProvider, StreamableHttpTransport,
@@ -157,6 +158,7 @@ impl McpManager {
         });
         let results = futures::future::join_all(connect_futs).await;
 
+        let mut used_names: HashSet<String> = HashSet::new();
         for (name, res) in results {
             match res {
                 Ok((client, tool_infos)) => {
@@ -167,7 +169,12 @@ impl McpManager {
                             dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                         }),
                     );
-                    let adapted = create_mcp_agent_tools(&name, tool_infos, client.clone());
+                    let adapted = create_mcp_agent_tools_with_shared_names(
+                        &name,
+                        tool_infos,
+                        client.clone(),
+                        &mut used_names,
+                    );
                     let tool_count = adapted.len();
                     mgr.server_tools.insert(name.clone(), adapted);
                     mgr.clients.push((name.clone(), client));
@@ -192,6 +199,17 @@ impl McpManager {
         mgr.rebuild_tools();
 
         mgr
+    }
+
+    /// Names already used by other servers, so a sanitized collision
+    /// (`svc-a` and `svc_a` both become `mcp__svc_a__*`) cannot make two tools
+    /// share a name. Dispatch by name would otherwise reach the wrong server.
+    fn names_used_by_other_servers(&self, except: Option<&str>) -> HashSet<String> {
+        self.server_tools
+            .iter()
+            .filter(|(name, _)| except.map_or(true, |ex| name.as_str() != ex))
+            .flat_map(|(_, tools)| tools.iter().map(|tool| tool.name().to_string()))
+            .collect()
     }
 
     fn rebuild_tools(&mut self) {
@@ -317,7 +335,9 @@ impl McpManager {
         let mut changed = false;
         for (name, client) in &self.clients {
             if let Ok(new_tools) = client.list_tools().await {
-                let adapted = create_mcp_agent_tools(name, new_tools, client.clone());
+                let mut used = self.names_used_by_other_servers(Some(name));
+                let adapted =
+                    create_mcp_agent_tools_with_shared_names(name, new_tools, client.clone(), &mut used);
                 self.server_tools.insert(name.clone(), adapted);
                 changed = true;
             }
@@ -381,7 +401,13 @@ impl McpManager {
                             dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                         }),
                     );
-                    let adapted = create_mcp_agent_tools(name, tool_infos, client.clone());
+                    let mut used = self.names_used_by_other_servers(Some(name));
+                    let adapted = create_mcp_agent_tools_with_shared_names(
+                        name,
+                        tool_infos,
+                        client.clone(),
+                        &mut used,
+                    );
                     let tool_count = adapted.len();
                     self.server_tools.insert(name.to_string(), adapted);
                     self.clients.push((name.to_string(), client));
@@ -447,7 +473,8 @@ impl McpManager {
             .local_addr()
             .context("Failed to get local port")?
             .port();
-        drop(listener);
+        // The listener stays bound: the callback helper takes ownership so no
+        // other process can claim the port between URL printing and accept().
 
         let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
@@ -493,7 +520,8 @@ impl McpManager {
         on_url(&auth_url);
 
         let auth_code =
-            mehh_mcp::oauth::run_loopback_callback(port, &state, Duration::from_secs(120)).await?;
+            mehh_mcp::oauth::run_loopback_callback(listener, &state, Duration::from_secs(120))
+                .await?;
 
         let mut form_params: HashMap<&str, &str> = HashMap::new();
         form_params.insert("grant_type", "authorization_code");

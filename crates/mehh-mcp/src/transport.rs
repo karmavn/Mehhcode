@@ -476,6 +476,22 @@ impl McpTransport for StreamableHttpTransport {
             None
         };
 
+        // Values sent as credentials must never come back in an error body.
+        let mut secrets: Vec<&str> = Vec::new();
+        if let Some(t) = token.as_deref() {
+            secrets.push(t);
+        }
+        for (k, v) in &self.headers {
+            let lower = k.to_ascii_lowercase();
+            if lower == "authorization"
+                || lower == "x-api-key"
+                || lower.contains("token")
+                || lower.contains("secret")
+            {
+                secrets.push(v);
+            }
+        }
+
         let mut req = build_req(token.as_deref());
         if let Some(sid) = self.session_id.read().await.as_ref() {
             req = req.header("Mcp-Session-Id", sid);
@@ -537,7 +553,8 @@ impl McpTransport for StreamableHttpTransport {
                 .await
                 .unwrap_or_default();
             let err_body = String::from_utf8_lossy(&err_bytes);
-            anyhow::bail!("MCP HTTP request failed ({status}): {err_body}");
+            let safe_body = crate::oauth::redact_oauth_error_body(&err_body, &secrets);
+            anyhow::bail!("MCP HTTP request failed ({status}): {safe_body}");
         }
 
         let content_type = resp
@@ -616,7 +633,9 @@ impl McpTransport for StreamableHttpTransport {
                     }
                 } else {
                     let preview: String = trimmed.chars().take(200).collect();
-                    anyhow::bail!("Invalid JSON-RPC payload in MCP HTTP response: {preview}");
+                    let safe_preview =
+                        crate::oauth::redact_oauth_error_body(&preview, &secrets);
+                    anyhow::bail!("Invalid JSON-RPC payload in MCP HTTP response: {safe_preview}");
                 }
             }
         }

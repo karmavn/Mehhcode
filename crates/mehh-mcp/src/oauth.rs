@@ -48,7 +48,8 @@ pub struct OAuthTokens {
 /// timestamp stored in `McpAuthEntry::tokens_expire_at`. `bearer_token()` and
 /// `do_refresh()` compare it against `SystemTime::as_secs()`.
 pub fn mcp_token_expiry_seconds(expires_in: u64) -> i64 {
-    (mehh_ai::now_ms() / 1000) + expires_in as i64
+    let now = mehh_ai::now_ms() / 1000;
+    now.saturating_add(i64::try_from(expires_in).unwrap_or(i64::MAX))
 }
 
 /// Stored authentication state per MCP server.
@@ -307,6 +308,141 @@ async fn read_bounded_oauth_bytes(
         buf.extend_from_slice(&chunk);
     }
     Ok(buf)
+}
+
+const REDACTED_SECRET: &str = "[REDACTED]";
+
+/// Returns true for JSON keys whose values are credentials.
+fn is_secret_json_key(key: &str) -> bool {
+    let normalized: String = key
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .map(|c| c.to_ascii_lowercase())
+        .collect();
+    normalized == "token"
+        || normalized == "secret"
+        || normalized == "key"
+        || normalized == "authorization"
+        || normalized == "password"
+        || normalized.ends_with("token")
+        || normalized.ends_with("secret")
+        || normalized.ends_with("password")
+        || normalized.ends_with("apikey")
+        || normalized.ends_with("secretkey")
+        || normalized.ends_with("privatekey")
+}
+
+/// True when free text mentions a credential concept (for example an OAuth
+/// `error_description` naming the parameter that failed).
+fn is_secret_bearing_text(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["token", "secret", "password", "authorization", "key"]
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
+fn redact_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                if is_secret_json_key(key)
+                    || (key.eq_ignore_ascii_case("error_description")
+                        && child.as_str().is_some_and(is_secret_bearing_text))
+                {
+                    *child = serde_json::Value::String(REDACTED_SECRET.to_string());
+                } else {
+                    redact_json_value(child);
+                }
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn is_opaque_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'~' | b'+' | b'/' | b'=' | b'-')
+}
+
+/// Replaces `Bearer <token>` and `sk-...` shapes in free text, where no JSON
+/// key identifies the value as a credential.
+fn redact_secret_shaped_values(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i..].len() >= 7 && bytes[i..i + 7].eq_ignore_ascii_case(b"bearer ") {
+            let mut j = i + 7;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && is_opaque_token_byte(bytes[j]) {
+                out.push_str("Bearer [REDACTED]");
+                while j < bytes.len() && is_opaque_token_byte(bytes[j]) {
+                    j += 1;
+                }
+                i = j;
+                continue;
+            }
+        }
+        if bytes[i..].starts_with(b"sk-") {
+            let mut j = i + 3;
+            while j < bytes.len() && is_opaque_token_byte(bytes[j]) {
+                j += 1;
+            }
+            out.push_str(REDACTED_SECRET);
+            i = j;
+            continue;
+        }
+        let ch = text[i..]
+            .chars()
+            .next()
+            .expect("index is always a char boundary");
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+/// Percent-encodes a secret's non-unreserved bytes in both `%XX` spellings.
+/// Providers echo token values encoded and disagree on hex letter casing.
+fn percent_encoded_secret_forms(secret: &str) -> (String, String) {
+    let mut upper = String::with_capacity(secret.len());
+    let mut lower = String::with_capacity(secret.len());
+    for &b in secret.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            upper.push(b as char);
+            lower.push(b as char);
+        } else {
+            upper.push_str(&format!("%{b:02X}"));
+            lower.push_str(&format!("%{b:02x}"));
+        }
+    }
+    (upper, lower)
+}
+
+/// Redacts known request secrets (plain and percent-encoded), JSON credential
+/// keys, and bearer/sk- token shapes before an error body reaches a message.
+pub(crate) fn redact_oauth_error_body(body: &str, secrets: &[&str]) -> String {
+    let mut redacted = body.to_string();
+    for secret in secrets {
+        if secret.is_empty() {
+            continue;
+        }
+        redacted = redacted.replace(secret, REDACTED_SECRET);
+        let (upper, lower) = percent_encoded_secret_forms(secret);
+        redacted = redacted.replace(&upper, REDACTED_SECRET);
+        redacted = redacted.replace(&lower, REDACTED_SECRET);
+    }
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&redacted) {
+        redact_json_value(&mut value);
+        redacted = value.to_string();
+    }
+    redact_secret_shaped_values(&redacted)
 }
 
 /// Persistent store for MCP OAuth credentials keyed by a length-prefixed name plus URL.
@@ -745,7 +881,10 @@ pub async fn register_dynamic_client(
             .await
             .unwrap_or_default();
         let err_text = String::from_utf8_lossy(&err_bytes);
-        anyhow::bail!("Dynamic client registration failed ({status}): {err_text}");
+        anyhow::bail!(
+            "Dynamic client registration failed ({status}): {}",
+            redact_oauth_error_body(&err_text, &[])
+        );
     }
 
     let body_bytes = read_bounded_oauth_bytes(resp, MAX_OAUTH_BODY_BYTES).await?;
@@ -849,18 +988,15 @@ async fn write_callback_response(stream: &mut tokio::net::TcpStream, status: &st
     let _ = stream.flush().await;
 }
 
-/// Runs a local loopback HTTP callback server on `127.0.0.1:{port}` awaiting authorization callback.
+/// Runs a local loopback HTTP callback server on a pre-bound listener awaiting authorization callback.
+/// The caller owns the bind so the port cannot be stolen between binding and listening.
 /// Ignores speculative connections and unrelated paths, and never accepts a callback with a
 /// mismatched `state`.
 pub async fn run_loopback_callback(
-    port: u16,
+    listener: TcpListener,
     expected_state: &str,
     timeout: Duration,
 ) -> anyhow::Result<String> {
-    let listener = TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .with_context(|| format!("Failed to bind loopback TCP listener on port {port}"))?;
-
     tokio::time::timeout(timeout, async move {
         loop {
             let (mut stream, _) = listener.accept().await?;
@@ -919,10 +1055,9 @@ pub async fn run_loopback_callback(
     async fn test_loopback_callback_ignores_preconnect_and_decodes_code() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let server = tokio::spawn(async move {
-            run_loopback_callback(port, "st%2Fate", Duration::from_secs(5)).await
+            run_loopback_callback(listener, "st%2Fate", Duration::from_secs(5)).await
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -978,7 +1113,14 @@ pub async fn refresh_mcp_tokens(
             .await
             .unwrap_or_default();
         let body = String::from_utf8_lossy(&err_bytes);
-        anyhow::bail!("OAuth token refresh failed ({status}): {body}");
+        let mut secrets = vec![refresh_token];
+        if let Some(secret) = client_secret {
+            secrets.push(secret);
+        }
+        anyhow::bail!(
+            "OAuth token refresh failed ({status}): {}",
+            redact_oauth_error_body(&body, &secrets)
+        );
     }
 
     let body_bytes = read_bounded_oauth_bytes(resp, MAX_OAUTH_BODY_BYTES).await?;
@@ -1076,11 +1218,7 @@ impl StoredMcpBearerProvider {
         if new_tokens.refresh_token.is_none() {
             new_tokens.refresh_token = Some(refresh_token.clone());
         }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let expire_at = new_tokens.expires_in.map(|exp| now + exp as i64);
+        let expire_at = new_tokens.expires_in.map(mcp_token_expiry_seconds);
         let new_access_token = new_tokens.access_token.clone();
 
         let mut updated = entry.clone();
@@ -1310,17 +1448,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_run_loopback_callback_success() {
-        // Bind ephemeral port
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener); // release so run_loopback_callback can rebind
 
         let server_task = tokio::spawn(async move {
-            run_loopback_callback(port, "state_expected_123", Duration::from_secs(5)).await
+            run_loopback_callback(listener, "state_expected_123", Duration::from_secs(5)).await
         });
-
-        // Give listener brief time to spin up
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
         let request = "GET /callback?code=test_code_auth&state=state_expected_123 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
@@ -1339,12 +1472,10 @@ mod tests {
     async fn test_run_loopback_callback_decodes_non_ascii_query() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        drop(listener);
 
         let server_task = tokio::spawn(async move {
-            run_loopback_callback(port, "state", Duration::from_secs(5)).await
+            run_loopback_callback(listener, "state", Duration::from_secs(5)).await
         });
-        tokio::time::sleep(Duration::from_millis(100)).await;
 
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}")).await.unwrap();
         // A raw non-ASCII byte right after a `%` used to make the decoder slice
@@ -1650,6 +1781,197 @@ mod tests {
             store.load_count.load(Ordering::SeqCst) - loads_after_setup,
             2,
             "the near-expiry path must re-read the store under the refresh lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_mcp_tokens_redacts_echoed_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let secret = "refresh-secret-DO-NOT-LEAK";
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = format!(
+                    r#"{{"error":"invalid_grant","error_description":"Invalid refresh_token: {secret}"}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let err = refresh_mcp_tokens(
+            &reqwest::Client::new(),
+            &format!("http://{addr}/token"),
+            "client-id",
+            None,
+            secret,
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains(secret), "secret leaked into error: {msg}");
+        assert!(msg.contains("[REDACTED]"), "expected redaction marker: {msg}");
+    }
+
+    #[tokio::test]
+    async fn register_dynamic_client_redacts_echoed_secret() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let secret = "registration-secret-DO-NOT-LEAK";
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let body = format!(
+                    r#"{{"error":"invalid_client_metadata","client_secret":"{secret}"}}"#
+                );
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let metadata = OAuthMetadata {
+            issuer: None,
+            authorization_endpoint: "https://example.test/authorize".to_string(),
+            token_endpoint: "https://example.test/token".to_string(),
+            registration_endpoint: Some(format!("http://{addr}/register")),
+            scopes_supported: None,
+            code_challenge_methods_supported: None,
+        };
+        let err = register_dynamic_client(
+            &reqwest::Client::new(),
+            &metadata,
+            "http://127.0.0.1/callback",
+            "test-client",
+        )
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(!msg.contains(secret), "secret leaked into error: {msg}");
+        assert!(msg.contains("[REDACTED]"), "expected redaction marker: {msg}");
+    }
+
+    #[test]
+    fn redact_oauth_error_body_redacts_percent_encoded_secret_echoes() {
+        let secret = "a/b+c";
+        let upper = r#"{"error":"invalid_grant","error_description":"Invalid refresh_token: a%2Fb%2Bc"}"#;
+        let redacted = redact_oauth_error_body(upper, &[secret]);
+        assert!(!redacted.contains("a%2Fb%2Bc"), "encoded secret leaked: {redacted}");
+        assert!(!redacted.contains(secret), "decoded secret leaked: {redacted}");
+        assert!(redacted.contains("[REDACTED]"), "expected marker: {redacted}");
+
+        let lower = r#"{"error":"invalid_grant","error_description":"Invalid refresh_token: a%2fb%2bc"}"#;
+        let redacted_lower = redact_oauth_error_body(lower, &[secret]);
+        assert!(
+            !redacted_lower.contains("a%2fb%2bc"),
+            "lowercase encoded secret leaked: {redacted_lower}"
+        );
+        assert!(redacted_lower.contains("[REDACTED]"), "expected marker: {redacted_lower}");
+
+        let without_known_secret = redact_oauth_error_body(upper, &[]);
+        assert!(
+            without_known_secret.contains(r#""error_description":"[REDACTED]""#),
+            "token-bearing error_description must be redacted by key: {without_known_secret}"
+        );
+    }
+
+    #[test]
+    fn mcp_token_expiry_seconds_saturates_on_extreme_expires_in() {
+        let now = mehh_ai::now_ms() / 1000;
+        let expiry = mcp_token_expiry_seconds(u64::MAX);
+        assert_eq!(
+            expiry,
+            i64::MAX,
+            "extreme expires_in must saturate, not wrap into the past"
+        );
+        assert!(expiry > now, "stored expiry must stay in the future");
+    }
+
+    #[tokio::test]
+    async fn refresh_with_extreme_expires_in_does_not_cause_repeated_refreshes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let refresh_count = Arc::new(AtomicUsize::new(0));
+        let rc = refresh_count.clone();
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let mut buf = [0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                rc.fetch_add(1, Ordering::SeqCst);
+                let body = serde_json::json!({
+                    "access_token": "refreshed-access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "expires_in": u64::MAX,
+                })
+                .to_string();
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let dir = crate::TempTestDir::new("oauth_extreme_expires_in");
+        let store = Arc::new(
+            McpAuthStore::try_with_path(dir.path().join("mcp-auth.json")).unwrap(),
+        );
+        let entry = McpAuthEntry {
+            server_url: "https://example.test/mcp".to_string(),
+            client_id: Some("client-123".to_string()),
+            client_secret: None,
+            tokens: Some(OAuthTokens {
+                access_token: "expired-access-token".to_string(),
+                refresh_token: Some("original-refresh-token".to_string()),
+                expires_in: Some(0),
+                token_type: Some("Bearer".to_string()),
+                scope: None,
+            }),
+            tokens_expire_at: Some(0),
+        };
+        store
+            .set("srv", "https://example.test/mcp", entry)
+            .await
+            .unwrap();
+
+        let provider = StoredMcpBearerProvider::new(
+            store.clone(),
+            "srv",
+            "https://example.test/mcp",
+            Some(format!("http://127.0.0.1:{port}/token")),
+        );
+        let first = provider.bearer_token().await.unwrap();
+        let second = provider.bearer_token().await.unwrap();
+        server.abort();
+
+        assert_eq!(first.as_deref(), Some("refreshed-access-token"));
+        assert_eq!(second.as_deref(), Some("refreshed-access-token"));
+        assert_eq!(
+            refresh_count.load(Ordering::SeqCst),
+            1,
+            "a far-future expiry from the token endpoint must prevent a second refresh"
+        );
+        let stored = store.get("srv", "https://example.test/mcp").await.unwrap();
+        assert_eq!(
+            stored.tokens_expire_at,
+            Some(i64::MAX),
+            "extreme expires_in must be stored as a saturated future expiry"
         );
     }
 }

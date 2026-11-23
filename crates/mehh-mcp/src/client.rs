@@ -965,6 +965,15 @@ impl Drop for McpClient {
                 handle.abort();
             }
         }
+        // Aborting the tasks alone leaves HTTP SSE tasks and the server-side
+        // MCP session alive. Best-effort close on the runtime if one is still
+        // available; skip it otherwise so Drop never panics at shutdown.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let transport = self.transport.clone();
+            runtime.spawn(async move {
+                let _ = transport.close().await;
+            });
+        }
     }
 }
 

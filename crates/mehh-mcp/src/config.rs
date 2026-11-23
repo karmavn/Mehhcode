@@ -1,13 +1,13 @@
 //! MCP configuration loading, schema definition, and override merging.
 
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use anyhow::Context;
 
 /// Configuration defining an MCP server (either local stdio process or remote HTTP endpoint).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpServerConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
@@ -25,8 +25,7 @@ pub struct McpServerConfig {
     /// Timeout in milliseconds. Serialized as `timeoutMs`; the legacy snake_case alias is accepted.
     #[serde(default, alias = "timeout_ms", skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
-    /// `timeout` is expressed in *seconds*; kept separate from `timeout_ms` to avoid a 1000x error.
-    /// Note: older configs relied on `timeout` aliasing `timeout_ms`; those values need migration.
+    /// Timeout in seconds. Serialized as `timeout`; `timeoutSecs` and `timeout_secs` are also accepted.
     #[serde(default, rename = "timeout", alias = "timeoutSecs", alias = "timeout_secs", skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,7 +63,7 @@ impl McpServerConfig {
 
 /// Container schema for `mcp.json` configuration files.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct McpConfigFile {
     #[serde(default, alias = "mcp_servers")]
     pub mcp_servers: HashMap<String, McpServerConfig>,
@@ -157,12 +156,16 @@ pub(crate) fn load_mcp_configs_from_paths(
         let local_path = cwd.join(".mehh").join("mcp.json");
         if let Some(local_file) = read_mcp_config_file(&local_path)? {
             for (name, local_cfg) in local_file.mcp_servers {
-                if servers.contains_key(&name) {
-                    let base = servers.get_mut(&name).expect("checked contains_key");
-                    merge_server_config(base, local_cfg);
-                } else if !local_cfg.is_override() {
-                    // An override for a server that does not exist is not a server.
-                    servers.insert(name, local_cfg);
+                match servers.entry(name) {
+                    Entry::Occupied(mut entry) => {
+                        merge_server_config(entry.get_mut(), local_cfg);
+                    }
+                    Entry::Vacant(entry) => {
+                        // An override for a server that does not exist is not a server.
+                        if !local_cfg.is_override() {
+                            entry.insert(local_cfg);
+                        }
+                    }
                 }
             }
         }
@@ -249,6 +252,7 @@ mod tests {
             "timeout": 30
         }))
         .unwrap();
+        // Bare `timeout` is seconds, matching the documented legacy contract.
         assert_eq!(base.effective_timeout_ms(), Some(30_000));
 
         let mut merged = base;
@@ -273,4 +277,31 @@ mod tests {
         assert_eq!(mixed.effective_timeout_ms(), Some(12_000));
     }
 
+    #[test]
+    fn timeout_units_accept_bare_secs_explicit_secs_and_millis() {
+        let bare_secs: McpServerConfig =
+            serde_json::from_value(serde_json::json!({ "timeout": 5 })).unwrap();
+        assert_eq!(bare_secs.effective_timeout_ms(), Some(5000));
+
+        let camel_secs: McpServerConfig =
+            serde_json::from_value(serde_json::json!({ "timeoutSecs": 5 })).unwrap();
+        assert_eq!(camel_secs.effective_timeout_ms(), Some(5000));
+        let round_trip = serde_json::to_value(&camel_secs).unwrap();
+        assert_eq!(round_trip.get("timeout"), Some(&serde_json::json!(5)));
+        assert!(round_trip.get("timeoutSecs").is_none());
+        let round_tripped: McpServerConfig = serde_json::from_value(round_trip).unwrap();
+        assert_eq!(round_tripped.effective_timeout_ms(), Some(5000));
+
+        let snake_secs: McpServerConfig =
+            serde_json::from_value(serde_json::json!({ "timeout_secs": 5 })).unwrap();
+        assert_eq!(snake_secs.effective_timeout_ms(), Some(5000));
+
+        let explicit_ms: McpServerConfig =
+            serde_json::from_value(serde_json::json!({ "timeoutMs": 250 })).unwrap();
+        assert_eq!(explicit_ms.effective_timeout_ms(), Some(250));
+
+        let snake_ms: McpServerConfig =
+            serde_json::from_value(serde_json::json!({ "timeout_ms": 250 })).unwrap();
+        assert_eq!(snake_ms.effective_timeout_ms(), Some(250));
+    }
 }

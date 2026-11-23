@@ -151,16 +151,65 @@ fn sanitize_schema_value(val: &mut serde_json::Value) {
     }
 }
 
+fn strip_schema_descriptions(val: &mut serde_json::Value) {
+    match val {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                strip_schema_descriptions(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            map.remove("description");
+            for value in map.values_mut() {
+                strip_schema_descriptions(value);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn schema_too_big(schema: &serde_json::Value) -> bool {
+    serde_json::to_vec(schema)
+        .map(|bytes| bytes.len() > MAX_TOOL_SCHEMA_BYTES)
+        .unwrap_or(true)
+}
+
 fn sanitize_input_schema(mut schema: serde_json::Value) -> serde_json::Value {
     sanitize_schema_value(&mut schema);
-    if serde_json::to_vec(&schema)
-        .map(|b| b.len() > MAX_TOOL_SCHEMA_BYTES)
-        .unwrap_or(true)
-    {
-        serde_json::json!({ "type": "object" })
-    } else {
-        schema
+    if !schema_too_big(&schema) {
+        return schema;
     }
+    // Descriptions are usually most of the bulk. Drop them before losing the
+    // actual parameter shape.
+    strip_schema_descriptions(&mut schema);
+    if !schema_too_big(&schema) {
+        return schema;
+    }
+    // Keep type, required and property names so the model can still call the
+    // tool instead of guessing against an empty `{}` schema.
+    let mut minimal = serde_json::Map::new();
+    if let Some(kind) = schema.get("type") {
+        minimal.insert("type".to_string(), kind.clone());
+    }
+    if let Some(serde_json::Value::Object(props)) = schema.get("properties") {
+        let mut kept = serde_json::Map::new();
+        for (name, prop) in props {
+            let mut slim = serde_json::Map::new();
+            if let Some(kind) = prop.get("type") {
+                slim.insert("type".to_string(), kind.clone());
+            }
+            kept.insert(name.clone(), serde_json::Value::Object(slim));
+        }
+        minimal.insert("properties".to_string(), serde_json::Value::Object(kept));
+    }
+    if let Some(required) = schema.get("required") {
+        minimal.insert("required".to_string(), required.clone());
+    }
+    minimal.insert(
+        "description".to_string(),
+        serde_json::json!("[schema truncated: original exceeded size limit]"),
+    );
+    serde_json::Value::Object(minimal)
 }
 
 /// Sanitizes and formats an MCP tool into `mcp__<server>__<tool>`.
@@ -211,17 +260,19 @@ pub fn resolve_unique_mcp_tool_name(
     }
 }
 
-/// Builds collision-free `McpAgentTool` adapters for a list of tools from one server.
-pub fn create_mcp_agent_tools(
+/// Builds collision-free `McpAgentTool` adapters, sharing `used_names` across
+/// all servers registered through this function so sanitized names cannot shadow
+/// one another (for example `svc-a` and `svc_a` both map to `mcp__svc_a__*`).
+pub fn create_mcp_agent_tools_with_shared_names(
     server_name: &str,
     tools: Vec<McpToolInfo>,
     client: Arc<McpClient>,
+    used_names: &mut HashSet<String>,
 ) -> Vec<Arc<dyn AgentTool>> {
-    let mut used = HashSet::new();
     tools
         .into_iter()
         .map(|info| {
-            let unique_name = resolve_unique_mcp_tool_name(server_name, &info.name, &mut used);
+            let unique_name = resolve_unique_mcp_tool_name(server_name, &info.name, used_names);
             Arc::new(McpAgentTool::with_resolved_name(
                 server_name,
                 info,
@@ -230,6 +281,16 @@ pub fn create_mcp_agent_tools(
             )) as Arc<dyn AgentTool>
         })
         .collect()
+}
+
+/// Builds collision-free `McpAgentTool` adapters for a list of tools from one server.
+pub fn create_mcp_agent_tools(
+    server_name: &str,
+    tools: Vec<McpToolInfo>,
+    client: Arc<McpClient>,
+) -> Vec<Arc<dyn AgentTool>> {
+    let mut used = HashSet::new();
+    create_mcp_agent_tools_with_shared_names(server_name, tools, client, &mut used)
 }
 
 /// Computes the server namespace `mcp__<server>` with hyphens replaced by underscores.
@@ -440,9 +501,14 @@ pub async fn convert_mcp_result_with_saver(
 
     blocks.extend(images);
 
+    let mut structured_content = call_res.structured_content;
+    if let Some(ref mut value) = structured_content {
+        truncate_details(value);
+    }
+
     AgentToolResult {
         content: blocks,
-        structured_content: call_res.structured_content,
+        structured_content,
         ..Default::default()
     }
 }
@@ -590,19 +656,26 @@ impl AgentTool for McpAgentTool {
         let tool_res = convert_mcp_result_with_saver(res, None).await;
 
         if is_error {
-            let err_text = tool_res
-                .content
-                .iter()
-                .filter_map(|b| match b {
-                    ToolResultContentBlock::Text(t) => Some(t.text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(if err_text.is_empty() {
+            let mut details: Vec<String> = Vec::new();
+            for block in &tool_res.content {
+                match block {
+                    ToolResultContentBlock::Text(t) => {
+                        if !t.text.is_empty() {
+                            details.push(t.text.clone());
+                        }
+                    }
+                    ToolResultContentBlock::Image(img) => {
+                        details.push(format!("[image {}]", img.mime_type));
+                    }
+                }
+            }
+            if let Some(ref structured) = tool_res.structured_content {
+                details.push(format!("structuredContent: {structured}"));
+            }
+            Err(if details.is_empty() {
                 "Tool execution failed".to_string()
             } else {
-                err_text
+                details.join("\n")
             })
         } else {
             Ok(tool_res)
@@ -725,20 +798,28 @@ impl AgentTool for ListMcpResourcesTool {
 
             let requests = reg.into_iter().map(|(srv, client)| {
                 let cancel = cancel.clone();
+                let req_params = match cursor {
+                    Some(c) => serde_json::json!({ "cursor": c }),
+                    None => serde_json::json!({}),
+                };
                 async move {
                     let res = client
                         .request_with_options(
                             "resources/list",
-                            Some(serde_json::json!({})),
+                            Some(req_params),
                             McpRequestOptions::new().with_cancel(cancel),
                         )
                         .await;
                     (srv, res)
                 }
             });
+            let mut next_cursors = serde_json::Map::new();
             for (srv, outcome) in futures::future::join_all(requests).await {
                 match outcome {
                     Ok(res) => {
+                        if let Some(next) = res.get("nextCursor").filter(|v| !v.is_null()) {
+                            next_cursors.insert(srv.clone(), next.clone());
+                        }
                         if let Some(arr) = res.get("resources").and_then(|v| v.as_array()) {
                             for r in arr {
                                 let uri = r.get("uri").and_then(|u| u.as_str()).unwrap_or("");
@@ -763,7 +844,8 @@ impl AgentTool for ListMcpResourcesTool {
 
             serde_json::json!({
                 "resources": all_resources,
-                "errors": errors
+                "errors": errors,
+                "nextCursors": next_cursors
             })
         };
 
@@ -881,20 +963,28 @@ impl AgentTool for ListMcpResourceTemplatesTool {
 
             let requests = reg.into_iter().map(|(srv, client)| {
                 let cancel = cancel.clone();
+                let req_params = match cursor {
+                    Some(c) => serde_json::json!({ "cursor": c }),
+                    None => serde_json::json!({}),
+                };
                 async move {
                     let res = client
                         .request_with_options(
                             "resources/templates/list",
-                            Some(serde_json::json!({})),
+                            Some(req_params),
                             McpRequestOptions::new().with_cancel(cancel),
                         )
                         .await;
                     (srv, res)
                 }
             });
+            let mut next_cursors = serde_json::Map::new();
             for (srv, outcome) in futures::future::join_all(requests).await {
                 match outcome {
                     Ok(res) => {
+                        if let Some(next) = res.get("nextCursor").filter(|v| !v.is_null()) {
+                            next_cursors.insert(srv.clone(), next.clone());
+                        }
                         if let Some(arr) = res.get("resourceTemplates").and_then(|v| v.as_array()) {
                             for t in arr {
                                 let mut t = t.clone();
@@ -913,7 +1003,8 @@ impl AgentTool for ListMcpResourceTemplatesTool {
 
             serde_json::json!({
                 "resourceTemplates": all_templates,
-                "errors": errors
+                "errors": errors,
+                "nextCursors": next_cursors
             })
         };
 
@@ -1345,5 +1436,150 @@ mod tests {
 
         assert!(res.is_err());
         assert!(update_received.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn test_mcp_agent_tool_error_includes_structured_content_and_block_descriptors() {
+        use crate::jsonrpc::{JsonRpcMessage, JsonRpcResponse};
+
+        let (client_transport, server_transport) = crate::transport::InMemoryTransport::pair();
+        let server = tokio::spawn(async move {
+            if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                    }),
+                );
+                let _ = server_transport.send(JsonRpcMessage::Response(resp)).await;
+            }
+            let _ = server_transport.recv().await; // notifications/initialized
+            if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                assert_eq!(req.method, "tools/call");
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "content": [
+                            { "type": "image", "data": "AAAA", "mimeType": "image/png" }
+                        ],
+                        "isError": true,
+                        "structuredContent": { "error_code": "E42", "detail": "bad input" }
+                    }),
+                );
+                let _ = server_transport.send(JsonRpcMessage::Response(resp)).await;
+            }
+        });
+
+        let client = Arc::new(McpClient::connect(Arc::new(client_transport)).await.unwrap());
+        let tool_info = McpToolInfo {
+            name: "failing_tool".to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        let agent_tool = McpAgentTool::new("mock_server", tool_info, client.clone());
+
+        let err = agent_tool
+            .execute(
+                "call-err",
+                serde_json::Map::new(),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("error_code") && err.contains("E42") && err.contains("bad input"),
+            "error must surface structuredContent, got: {err}"
+        );
+        assert!(
+            err.contains("image/png"),
+            "error must describe non-text blocks, got: {err}"
+        );
+
+        client.close().await.unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn convert_mcp_result_truncates_oversized_structured_content() {
+        let oversized = "x".repeat(MCP_OUTPUT_MAX_BYTES + 2_000);
+        let res = McpCallToolResult {
+            content: vec![McpContentBlock::Text { text: "ok".to_string() }],
+            is_error: false,
+            structured_content: Some(serde_json::json!({ "output": oversized })),
+        };
+
+        let converted = convert_mcp_result(res).await;
+        let structured = converted
+            .structured_content
+            .expect("structured content must be preserved");
+        let text = structured
+            .get("output")
+            .and_then(|v| v.as_str())
+            .expect("output must remain a string");
+
+        assert!(
+            text.contains("Warning: truncated output"),
+            "oversized structuredContent must be truncated, got {} bytes",
+            text.len()
+        );
+        assert!(
+            text.len() < MCP_OUTPUT_MAX_BYTES + 256,
+            "structuredContent still exceeds cap: {} bytes",
+            text.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn create_mcp_agent_tools_with_shared_names_dedupes_across_servers() {
+        use crate::jsonrpc::{JsonRpcMessage, JsonRpcResponse};
+
+        let (client_transport, server_transport) = crate::transport::InMemoryTransport::pair();
+        let server = tokio::spawn(async move {
+            while let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                    }),
+                );
+                let _ = server_transport.send(JsonRpcMessage::Response(resp)).await;
+            }
+        });
+        let client = Arc::new(McpClient::connect(Arc::new(client_transport)).await.unwrap());
+
+        let tool = || McpToolInfo {
+            name: "delete".to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        let mut used = HashSet::new();
+        let from_dash = create_mcp_agent_tools_with_shared_names(
+            "svc-a",
+            vec![tool()],
+            client.clone(),
+            &mut used,
+        );
+        let from_underscore = create_mcp_agent_tools_with_shared_names(
+            "svc_a",
+            vec![tool()],
+            client.clone(),
+            &mut used,
+        );
+
+        let name_a = from_dash[0].name().to_string();
+        let name_b = from_underscore[0].name().to_string();
+        assert_eq!(name_a, "mcp__svc_a__delete");
+        assert_eq!(name_b, "mcp__svc_a__delete_2");
+        assert_ne!(name_a, name_b);
+
+        client.close().await.unwrap();
+        server.abort();
     }
 }
