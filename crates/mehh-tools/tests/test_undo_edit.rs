@@ -125,6 +125,7 @@ async fn test_undo_edit_order_sync_and_cleanup() {
         mehh_tools::undo_edit::FileSnapshot::Existed {
             bytes: b"v1".to_vec(),
             timestamp_ms: 1000,
+            target: path.to_path_buf(),
         },
     );
     assert!(store.has_snapshot(path));

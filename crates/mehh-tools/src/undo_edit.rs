@@ -30,7 +30,10 @@ pub enum FileSnapshot {
         /// symlink swap would make undo write the old bytes into a new target.
         target: PathBuf,
     },
-    DidNotExist,
+    DidNotExist {
+        /// Target approved when the creation was recorded.
+        target: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -73,7 +76,7 @@ impl EditUndoStore {
                 }
                 bytes.len()
             }
-            FileSnapshot::DidNotExist => 0,
+            FileSnapshot::DidNotExist { .. } => 0,
         };
 
         let key = get_mutation_queue_key(path);
@@ -248,18 +251,20 @@ impl AgentTool for UndoEditTool {
             })?;
 
             match snapshot {
-                FileSnapshot::DidNotExist => {
+                FileSnapshot::DidNotExist {
+                    target: recorded_target,
+                } => {
                     if full_path.exists() {
                         // A creation through a (possibly dangling) symlink puts
                         // the new file at the resolved target, not at the link.
                         // Remove the target so the link itself survives, but
                         // only if the link still points where it did when the
-                        // call was inspected; otherwise a swapped symlink would
-                        // delete an unrelated file.
+                        // creation was recorded; otherwise a swapped symlink
+                        // would delete an unrelated pre-existing file.
                         let target = crate::core::fs::resolve_write_target(&full_path).await;
-                        if !crate::core::fs::targets_match(&target, &inspected_target) {
+                        if !crate::core::fs::targets_match(&target, &recorded_target) {
                             return Err(format!(
-                                "Refusing to undo creation of {}: target changed since it was inspected",
+                                "Refusing to undo creation of {}: target changed since it was recorded",
                                 path_str
                             ));
                         }
@@ -393,7 +398,12 @@ mod tests {
         // recording DidNotExist for the requested path.
         std::fs::write(&target, b"new content").unwrap();
         let undo_store = Arc::new(EditUndoStore::new());
-        undo_store.push_snapshot(&link, FileSnapshot::DidNotExist);
+        undo_store.push_snapshot(
+            &link,
+            FileSnapshot::DidNotExist {
+                target: target.clone(),
+            },
+        );
 
         let tool = UndoEditTool::new(dir.path().to_path_buf(), undo_store);
         let params = json!({ "path": "link.txt" }).as_object().unwrap().clone();

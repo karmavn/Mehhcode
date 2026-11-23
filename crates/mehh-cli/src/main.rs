@@ -704,6 +704,11 @@ async fn main() -> anyhow::Result<()> {
         // Keep --approve useful: it now auto-approves tools without granting
         // trust to project-local configuration.
         settings.permission_mode = Some(mehh_coding_agent::PermissionMode::Auto);
+    } else if cli_mode == CliMode::Rpc {
+        // RPC has no approval channel. SmartApprove would block every mutating
+        // command with "approval required but not granted". Security
+        // inspectors and persisted deny rules still apply in Auto mode.
+        settings.permission_mode = Some(mehh_coding_agent::PermissionMode::Auto);
     }
     if let Some(ref wm) = args.worker_model {
         settings.worker_model = Some(wm.clone());

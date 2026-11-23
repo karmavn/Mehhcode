@@ -135,7 +135,9 @@ impl AgentTool for WriteTool {
                         target: inspected_target.clone(),
                     }),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        Some(FileSnapshot::DidNotExist)
+                        Some(FileSnapshot::DidNotExist {
+                            target: inspected_target.clone(),
+                        })
                     }
                     Err(e) => {
                         return Err(format!(
