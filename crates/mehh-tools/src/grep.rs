@@ -1,4 +1,3 @@
-use std::io::Read as _;
 use std::path::PathBuf;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
@@ -275,6 +274,8 @@ impl AgentTool for GrepTool {
             let mut total_matches = 0usize;
             let mut total_bytes = 0usize;
             let mut byte_cap_reached = false;
+            let mut file_cap_reached = false;
+            let mut skipped_large_files = false;
 
             let push_lines = |lines: Vec<String>,
                               output_lines: &mut Vec<String>,
@@ -303,20 +304,13 @@ impl AgentTool for GrepTool {
                         search_path_str, GREP_MAX_FILE_BYTES
                     ));
                 }
-                // Sniff the first 1 KB before loading up to 10 MB into memory.
-                let mut file = std::fs::File::open(&target_path)
-                    .map_err(|e| format!("Failed to open {}: {}", search_path_str, e))?;
-                let mut sniff = [0u8; 1024];
-                let sniff_len = file
-                    .read(&mut sniff)
-                    .map_err(|e| format!("Failed to read {}: {}", search_path_str, e))?;
-                if sniff[..sniff_len].contains(&0) {
-                    return Err(format!("File {} appears to be binary", search_path_str));
-                }
-                drop(file);
-
+                // Check the whole bounded file for NUL bytes, not just the
+                // first 1 KB: a NUL past byte 1024 still means it is binary.
                 let bytes = std::fs::read(&target_path)
                     .map_err(|e| format!("Failed to read {}: {}", search_path_str, e))?;
+                if bytes.contains(&0) {
+                    return Err(format!("File {} appears to be binary", search_path_str));
+                }
                 let content = std::str::from_utf8(&bytes)
                     .map_err(|_| format!("File {} is not valid UTF-8 text", search_path_str))?;
                 let rel_display = target_path
@@ -368,12 +362,14 @@ impl AgentTool for GrepTool {
                     }
                     if let Ok(meta) = entry.metadata() {
                         if meta.len() > GREP_MAX_FILE_BYTES {
+                            skipped_large_files = true;
                             continue;
                         }
                     }
 
                     files.push((file_path.to_path_buf(), rel_path_str));
                     if files.len() >= GREP_MAX_FILES {
+                        file_cap_reached = true;
                         break;
                     }
                 }
@@ -400,24 +396,16 @@ impl AgentTool for GrepTool {
                                 if token.is_cancelled() {
                                     return;
                                 }
-                                let mut file = match std::fs::File::open(file_path) {
-                                    Ok(f) => f,
-                                    Err(_) => continue,
-                                };
-                                let mut sniff = [0u8; 1024];
-                                let sniff_len = match file.read(&mut sniff) {
-                                    Ok(n) => n,
-                                    Err(_) => continue,
-                                };
-                                if sniff[..sniff_len].contains(&0) {
-                                    continue;
-                                }
-                                drop(file);
-
+                                // Check the whole bounded file for NUL bytes,
+                                // not just the first 1 KB: a NUL past byte
+                                // 1024 still means the file is binary.
                                 let bytes = match std::fs::read(file_path) {
                                     Ok(b) => b,
                                     Err(_) => continue,
                                 };
+                                if bytes.contains(&0) {
+                                    continue;
+                                }
                                 let content = match std::str::from_utf8(&bytes) {
                                     Ok(s) => s,
                                     Err(_) => continue,
@@ -472,6 +460,18 @@ impl AgentTool for GrepTool {
             } else if total_matches >= limit {
                 output.push_str(&format!("\n\n[Reached limit of {} matches]", limit));
             }
+            if file_cap_reached {
+                output.push_str(&format!(
+                    "\n\n[Stopped after {} files; later files were not searched]",
+                    GREP_MAX_FILES
+                ));
+            }
+            if skipped_large_files {
+                output.push_str(&format!(
+                    "\n\n[Skipped files larger than {} bytes]",
+                    GREP_MAX_FILE_BYTES
+                ));
+            }
 
             Ok(AgentToolResult::text(output))
         })
@@ -511,5 +511,53 @@ mod tests {
         let cancelled = CancellationToken::new();
         cancelled.cancel();
         assert!(tool.execute("tc2", params, cancelled, None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_grep_single_file_rejects_nul_beyond_first_kb() {
+        let dir = crate::TempTestDir::new("grep_binary_nul_file");
+        let mut data = vec![b' '; 2000];
+        data.push(0);
+        data.extend_from_slice(b"needle\n");
+        std::fs::write(dir.path().join("data.txt"), &data).unwrap();
+
+        let tool = GrepTool::new(dir.path().to_path_buf());
+        let params = json!({ "pattern": "needle", "path": "data.txt" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let err = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("appears to be binary"),
+            "a NUL past byte 1024 must still be detected: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grep_directory_skips_nul_beyond_first_kb() {
+        let dir = crate::TempTestDir::new("grep_binary_nul_dir");
+        let mut data = vec![b' '; 2000];
+        data.push(0);
+        data.extend_from_slice(b"needle\n");
+        std::fs::write(dir.path().join("binary.txt"), &data).unwrap();
+        std::fs::write(dir.path().join("clean.txt"), "nothing relevant here\n").unwrap();
+
+        let tool = GrepTool::new(dir.path().to_path_buf());
+        let params = json!({ "pattern": "needle" }).as_object().unwrap().clone();
+        let res = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt = match &res.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert_eq!(
+            txt, "No matches found",
+            "binary file must be skipped: {txt}"
+        );
     }
 }

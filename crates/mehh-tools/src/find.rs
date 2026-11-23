@@ -227,12 +227,12 @@ impl AgentTool for FindTool {
                     "\n\n[Output truncated at {} byte limit]",
                     FIND_MAX_OUTPUT_BYTES
                 ));
+            } else if selected.len() >= limit {
+                output.push_str(&format!("\n\n[Reached limit of {} results]", limit));
             } else if result_cap_reached {
                 output.push_str(&format!(
                     "\n\n[Stopped after {FIND_MAX_RESULTS} results]"
                 ));
-            } else if selected.len() >= limit {
-                output.push_str(&format!("\n\n[Reached limit of {} results]", limit));
             }
 
             Ok(AgentToolResult::text(output))

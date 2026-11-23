@@ -5,9 +5,9 @@ use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecut
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 use crate::core::context::{self, PathPolicy};
-use crate::core::fs::atomic_write;
+use crate::core::fs::atomic_write_checked;
 use crate::file_mutation_queue::with_file_mutation_queue;
-use crate::undo_edit::{EditUndoStore, FileSnapshot};
+use crate::undo_edit::{EditUndoStore, FileSnapshot, UNDO_UNAVAILABLE_WARNING};
 
 #[derive(Debug, Clone)]
 pub struct WriteTool {
@@ -97,6 +97,12 @@ impl AgentTool for WriteTool {
             .ok_or_else(|| "Missing required parameter 'content'".to_string())?;
 
         let full_path = self.resolve_path(path_str)?;
+        // Bound to the path the security inspector approved, not to whatever
+        // the path happens to resolve to now.
+        let inspected_target = crate::core::fs::inspected_target(&params, &full_path).await;
+        // The requested path passed policy, but a dangling symlink can resolve
+        // to a target outside the allowed roots. Validate the target itself.
+        self.path_policy.validate(&inspected_target)?;
         let undo_store = self.undo_store.clone();
         let cancel_inner = cancel.clone();
 
@@ -122,30 +128,46 @@ impl AgentTool for WriteTool {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                if full_path.exists() {
-                    tokio::fs::read(&full_path)
-                        .await
-                        .ok()
-                        .map(|bytes| FileSnapshot::Existed { bytes, timestamp_ms })
-                } else {
-                    Some(FileSnapshot::DidNotExist)
+                match tokio::fs::read(&full_path).await {
+                    Ok(bytes) => Some(FileSnapshot::Existed {
+                        bytes,
+                        timestamp_ms,
+                        target: inspected_target.clone(),
+                    }),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Some(FileSnapshot::DidNotExist)
+                    }
+                    Err(e) => {
+                        return Err(format!(
+                            "Failed to read {} for undo snapshot: {}",
+                            path_str, e
+                        ));
+                    }
                 }
             } else {
                 None
             };
 
-            atomic_write(&full_path, content.as_bytes()).await?;
+            atomic_write_checked(&full_path, &inspected_target, content.as_bytes()).await?;
 
+            let mut undo_unavailable = false;
             if let (Some(store), Some(snapshot)) = (undo_store.as_ref(), snapshot) {
-                store.push_snapshot(&full_path, snapshot);
+                if !store.push_snapshot(&full_path, snapshot) {
+                    undo_unavailable = true;
+                }
             }
 
             let byte_count = content.len();
             let line_count = content.lines().count();
+            let warning = if undo_unavailable {
+                format!("\n\n{}", UNDO_UNAVAILABLE_WARNING)
+            } else {
+                String::new()
+            };
 
             Ok(AgentToolResult::text(format!(
-                "Successfully wrote {} bytes ({} lines) to {}",
-                byte_count, line_count, path_str
+                "Successfully wrote {} bytes ({} lines) to {}{}",
+                byte_count, line_count, path_str, warning
             )))
         })
         .await

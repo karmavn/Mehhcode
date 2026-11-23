@@ -7,9 +7,9 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::context::{self, PathPolicy};
-use crate::core::fs::atomic_write;
+use crate::core::fs::atomic_write_checked;
 use crate::core::output::truncate_head;
-use crate::undo_edit::{EditUndoStore, FileSnapshot};
+use crate::undo_edit::{EditUndoStore, FileSnapshot, UNDO_UNAVAILABLE_WARNING};
 
 const MAX_DIFF_BYTES: usize = 64 * 1024;
 
@@ -461,6 +461,12 @@ impl AgentTool for EditTool {
         let edits = parse_edits(&params)?;
 
         let full_path = self.resolve_path(path_str)?;
+        // Bound to the path the security inspector approved, not to whatever
+        // the path happens to resolve to now.
+        let inspected_target = crate::core::fs::inspected_target(&params, &full_path).await;
+        // The requested path passed policy, but a dangling symlink can resolve
+        // to a target outside the allowed roots. Validate the target itself.
+        self.path_policy.validate(&inspected_target)?;
         let undo_store = self.undo_store.clone();
         let cancel_inner = cancel.clone();
         with_file_mutation_queue(&full_path, async {
@@ -563,22 +569,26 @@ impl AgentTool for EditTool {
             };
             let final_content = format!("{bom}{final_body}");
 
-            atomic_write(&full_path, final_content.as_bytes()).await?;
+            atomic_write_checked(&full_path, &inspected_target, final_content.as_bytes()).await?;
 
             // Record undo history only after the write actually succeeded;
             // otherwise a failed write would leave a phantom snapshot.
+            let mut undo_unavailable = false;
             if let Some(ref store) = undo_store {
                 let timestamp_ms = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                store.push_snapshot(
+                if !store.push_snapshot(
                     &full_path,
                     FileSnapshot::Existed {
                         bytes: raw_bytes,
                         timestamp_ms,
+                        target: inspected_target.clone(),
                     },
-                );
+                ) {
+                    undo_unavailable = true;
+                }
             }
 
             let diff = similar::TextDiff::from_lines(&raw_content, &final_content)
@@ -592,6 +602,12 @@ impl AgentTool for EditTool {
                 "\n... [diff truncated]",
             );
 
+            let warning = if undo_unavailable {
+                format!("\n\n{}", UNDO_UNAVAILABLE_WARNING)
+            } else {
+                String::new()
+            };
+
             let details = json!({
                 "diff": diff,
                 "path": path_str,
@@ -599,7 +615,7 @@ impl AgentTool for EditTool {
 
             Ok(AgentToolResult {
                 content: vec![ToolResultContentBlock::Text(TextContent {
-                    text: format!("Successfully edited {}.\n\n{}", path_str, diff),
+                    text: format!("Successfully edited {}.\n\n{}{}", path_str, diff, warning),
                     text_signature: None,
                 })],
                 details: Some(details),
@@ -715,5 +731,62 @@ mod tests {
         let final_content = std::fs::read_to_string(&file).unwrap();
         assert!(final_content.contains("ALPHA_EDITED"));
         assert!(final_content.contains("BETA_EDITED"));
+    }
+
+    #[tokio::test]
+    async fn edit_oversized_file_warns_that_undo_is_unavailable() {
+        let dir = crate::TempTestDir::new("edit_oversized");
+        let file = dir.path().join("huge.txt");
+        // Snapshot cap is 4 MiB; make the original file larger than that so
+        // push_snapshot cannot record it.
+        let mut content = "fn keep() {}\n".to_string();
+        content.push_str(&"x".repeat(5 * 1024 * 1024));
+        content.push_str("\nUNIQUE_TARGET old\n");
+        std::fs::write(&file, content.as_bytes()).unwrap();
+
+        let undo_store = Arc::new(EditUndoStore::new());
+        let tool = EditTool::new(dir.path().to_path_buf()).with_undo_store(undo_store.clone());
+        let params = json!({
+            "path": "huge.txt",
+            "oldText": "UNIQUE_TARGET old",
+            "newText": "UNIQUE_TARGET new"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let res = tool
+            .execute("tc_edit", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let text = match &res.content[0] {
+            ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(
+            text.contains("undo") && text.contains("unavailable"),
+            "edit of an oversized file must warn that undo is unavailable, got: {}",
+            &text[..text.len().min(200)]
+        );
+
+        // No snapshot was recorded, so undo_edit cannot revert the change.
+        let undo = crate::UndoEditTool::new(dir.path().to_path_buf(), undo_store);
+        let mut undo_params = serde_json::Map::new();
+        undo_params.insert("path".to_string(), serde_json::json!("huge.txt"));
+        let undo_err = undo
+            .execute("tc_undo", undo_params, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        let lower = undo_err.to_lowercase();
+        assert!(
+            lower.contains("undo") && lower.contains("unavailable"),
+            "undo_edit must say undo is unavailable, got: {}",
+            undo_err
+        );
+        assert!(
+            !undo_err.contains("No previous edit history found"),
+            "undo_edit must not report the old cryptic message, got: {}",
+            undo_err
+        );
     }
 }

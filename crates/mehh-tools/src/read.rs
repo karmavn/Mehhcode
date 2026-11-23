@@ -5,7 +5,7 @@ use base64::prelude::*;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use mehh_ai::{ImageContent, ToolResultContentBlock};
 use serde_json::json;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
 use tokio_util::sync::CancellationToken;
 
 use crate::core::context::{self, PathPolicy};
@@ -166,52 +166,31 @@ impl AgentTool for ReadTool {
             ));
         }
 
-        // Sniff for NUL bytes before decoding the whole file; a 9 MB binary
-        // must not be turned into a multi-million-character text block.
-        let mut first = tokio::fs::File::open(&full_path)
-            .await
-            .map_err(|e| format!("Failed to open {}: {e}", path_str))?;
-        let mut sniff = [0u8; 1024];
-        let sniff_len = first
-            .read(&mut sniff)
+        // One bounded read: a NUL anywhere in the file means it is binary.
+        // meta.len() is already bounded by MAX_TEXT_FILE_BYTES above.
+        let bytes = tokio::fs::read(&full_path)
             .await
             .map_err(|e| format!("Failed to read {}: {e}", path_str))?;
-        if sniff[..sniff_len].contains(&0) {
+        if bytes.contains(&0) {
             return Err(format!("File {} appears to be binary", path_str));
         }
-        drop(first);
-
-        let file = tokio::fs::File::open(&full_path)
-            .await
-            .map_err(|e| format!("Failed to open {}: {e}", path_str))?;
-        let mut reader = BufReader::new(file);
+        let text = std::str::from_utf8(&bytes)
+            .map_err(|_| format!("File {} is not valid UTF-8 and appears to be binary", path_str))?;
 
         let start_line = offset - 1;
-        let stop_line = start_line + limit;
+        let stop_line = start_line.saturating_add(limit);
         let mut line_no = 0usize;
         let mut total_lines = 0usize;
         let mut shown_lines = 0usize;
         let mut output_bytes = 0usize;
         let mut output_capped = false;
         let mut output = String::new();
-        let mut line_buf = String::new();
 
-        loop {
-            line_buf.clear();
-            let read = reader.read_line(&mut line_buf).await.map_err(|e| {
-                if e.kind() == std::io::ErrorKind::InvalidData {
-                    format!("File {} is not valid UTF-8 and appears to be binary", path_str)
-                } else {
-                    format!("Failed to read {}: {e}", path_str)
-                }
-            })?;
-            if read == 0 {
-                break;
-            }
+        for line in text.split_inclusive('\n') {
             total_lines += 1;
 
             if line_no >= start_line && line_no < stop_line {
-                let mut line = line_buf.strip_suffix('\n').unwrap_or(&line_buf);
+                let mut line = line.strip_suffix('\n').unwrap_or(line);
                 line = line.strip_suffix('\r').unwrap_or(line);
                 if line_no == 0 {
                     line = line.strip_prefix('\u{feff}').unwrap_or(line);
@@ -263,5 +242,31 @@ impl AgentTool for ReadTool {
         }
 
         Ok(AgentToolResult::text(output))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_read_rejects_nul_beyond_first_kb() {
+        let dir = crate::TempTestDir::new("read_binary_nul");
+        let path = dir.path().join("data.txt");
+        let mut data = vec![b' '; 2000];
+        data.push(0);
+        data.extend_from_slice(b"text after nul");
+        std::fs::write(&path, &data).unwrap();
+
+        let tool = ReadTool::new(dir.path().to_path_buf());
+        let params = json!({ "path": "data.txt" }).as_object().unwrap().clone();
+        let err = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("appears to be binary"),
+            "a NUL past byte 1024 must still be detected: {err}"
+        );
     }
 }

@@ -2,6 +2,7 @@ use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -13,6 +14,18 @@ pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
+}
+
+/// Parses a tool-supplied status without silently turning typos into Pending.
+fn parse_status(value: &str) -> Result<TodoStatus, String> {
+    match value {
+        "pending" => Ok(TodoStatus::Pending),
+        "in_progress" => Ok(TodoStatus::InProgress),
+        "completed" => Ok(TodoStatus::Completed),
+        other => Err(format!(
+            "Invalid status '{other}'. Expected pending, in_progress or completed"
+        )),
+    }
 }
 
 impl TodoStatus {
@@ -61,8 +74,12 @@ impl TodoState {
     }
 
     pub fn add(&mut self, content: String) -> usize {
-        let id = self.next_id;
-        self.next_id += 1;
+        let used: HashSet<usize> = self.items.iter().map(|item| item.id).collect();
+        let mut id = self.next_id;
+        while used.contains(&id) {
+            id = if id == usize::MAX { 1 } else { id + 1 };
+        }
+        self.next_id = id.saturating_add(1);
         self.items.push(TodoItem {
             id,
             content,
@@ -91,7 +108,12 @@ impl TodoState {
     }
 
     pub fn replace(&mut self, new_items: Vec<TodoItem>) {
-        self.next_id = new_items.iter().map(|i| i.id).max().unwrap_or(0) + 1;
+        self.next_id = new_items
+            .iter()
+            .map(|i| i.id)
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
         self.items = new_items;
     }
 
@@ -276,13 +298,10 @@ impl AgentTool for TodoTool {
                     .ok_or_else(|| "Parameter 'id' is required for action 'update'".to_string())?
                     as usize;
 
-                let status = params.get("status").and_then(|v| v.as_str()).map(|s| {
-                    match s {
-                        "in_progress" => TodoStatus::InProgress,
-                        "completed" => TodoStatus::Completed,
-                        _ => TodoStatus::Pending,
-                    }
-                });
+                let status = match params.get("status").and_then(|v| v.as_str()) {
+                    Some(s) => Some(parse_status(s)?),
+                    None => None,
+                };
 
                 let content = params
                     .get("content")
@@ -302,27 +321,43 @@ impl AgentTool for TodoTool {
                     .and_then(|v| v.as_array())
                     .ok_or_else(|| "Parameter 'items' array is required for 'replace'".to_string())?;
 
+                // Reserve every explicit id first so generated ids cannot collide with one.
+                let mut used_ids: HashSet<usize> = items_val
+                    .iter()
+                    .filter_map(|v| v.get("id").and_then(|x| x.as_u64()).map(|u| u as usize))
+                    .collect();
+                let mut next_fresh = 1usize;
+                let mut claimed_explicit: HashSet<usize> = HashSet::new();
+
                 let mut new_items = Vec::new();
-                for (idx, item_val) in items_val.iter().enumerate() {
-                    let id = item_val
+                for item_val in items_val.iter() {
+                    let explicit = item_val
                         .get("id")
                         .and_then(|v| v.as_u64())
-                        .map(|u| u as usize)
-                        .unwrap_or(idx + 1);
+                        .map(|u| u as usize);
+                    let id = match explicit {
+                        Some(u) if claimed_explicit.insert(u) => u,
+                        // Missing or duplicate explicit id: allocate an unused
+                        // id so every task remains targetable by id.
+                        _ => {
+                            while used_ids.contains(&next_fresh) && next_fresh < usize::MAX {
+                                next_fresh += 1;
+                            }
+                            let fresh = next_fresh;
+                            used_ids.insert(fresh);
+                            next_fresh = next_fresh.saturating_add(1);
+                            fresh
+                        }
+                    };
                     let content = item_val
                         .get("content")
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let status = item_val
-                        .get("status")
-                        .and_then(|v| v.as_str())
-                        .map(|s| match s {
-                            "in_progress" => TodoStatus::InProgress,
-                            "completed" => TodoStatus::Completed,
-                            _ => TodoStatus::Pending,
-                        })
-                        .unwrap_or(TodoStatus::Pending);
+                    let status = match item_val.get("status").and_then(|v| v.as_str()) {
+                        Some(s) => parse_status(s)?,
+                        None => TodoStatus::Pending,
+                    };
 
                     new_items.push(TodoItem { id, content, status });
                 }
@@ -363,5 +398,114 @@ impl AgentTool for TodoTool {
                 unknown
             )),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_replace_saturates_max_id() {
+        let mut state = TodoState::new();
+        state.replace(vec![TodoItem {
+            id: usize::MAX,
+            content: "max".to_string(),
+            status: TodoStatus::Pending,
+        }]);
+        assert_eq!(state.next_id, usize::MAX);
+    }
+
+    #[test]
+    fn add_after_max_id_replace_does_not_reissue_an_existing_id() {
+        let mut state = TodoState::new();
+        state.replace(vec![TodoItem {
+            id: usize::MAX,
+            content: "max".to_string(),
+            status: TodoStatus::Pending,
+        }]);
+
+        let id = state.add("next".to_string());
+        assert_ne!(id, usize::MAX, "add must skip an already used id");
+        let ids: Vec<usize> = state.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "duplicate ids: {ids:?}");
+        assert!(ids.iter().all(|i| *i != 0), "id 0 must not be issued");
+    }
+
+    #[test]
+    fn test_add_after_max_id_replace_does_not_panic_or_wrap_to_zero() {
+        let mut state = TodoState::new();
+        state.replace(vec![TodoItem {
+            id: usize::MAX,
+            content: "max".to_string(),
+            status: TodoStatus::Pending,
+        }]);
+
+        let id = state.add("next".to_string());
+        assert_ne!(id, usize::MAX, "add must not reuse a saturated id");
+        assert_ne!(id, 0, "overflow must not wrap to id 0: {:?}", state.items);
+        assert_eq!(state.items.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_replace_assigns_unique_ids_when_missing() {
+        let state = Arc::new(RwLock::new(TodoState::new()));
+        let tool = TodoTool::new(state.clone());
+        let mut params = serde_json::Map::new();
+        params.insert("action".to_string(), json!("replace"));
+        params.insert(
+            "items".to_string(),
+            json!([{ "id": 2, "content": "a" }, { "content": "b" }]),
+        );
+
+        tool.execute("test", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+
+        let guard = state.read().await;
+        let ids: Vec<usize> = guard.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(ids[0], ids[1], "duplicate ids: {ids:?}");
+    }
+
+    #[tokio::test]
+    async fn test_replace_deduplicates_explicit_ids() {
+        let state = Arc::new(RwLock::new(TodoState::new()));
+        let tool = TodoTool::new(state.clone());
+        let mut params = serde_json::Map::new();
+        params.insert("action".to_string(), json!("replace"));
+        params.insert(
+            "items".to_string(),
+            json!([{ "id": 1, "content": "a" }, { "id": 1, "content": "b" }]),
+        );
+
+        tool.execute("test", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+
+        let guard = state.read().await;
+        let ids: Vec<usize> = guard.items.iter().map(|i| i.id).collect();
+        assert_eq!(ids.len(), 2);
+        assert_eq!(ids[0], 1, "the first explicit id must be preserved");
+        assert_ne!(ids[1], ids[0], "duplicate explicit ids: {ids:?}");
+        drop(guard);
+
+        // Both tasks must be reachable by their own id.
+        for id in ids {
+            let mut update = serde_json::Map::new();
+            update.insert("action".to_string(), json!("update"));
+            update.insert("id".to_string(), json!(id));
+            update.insert("status".to_string(), json!("completed"));
+            tool.execute("test", update, CancellationToken::new(), None)
+                .await
+                .unwrap();
+        }
+
+        let guard = state.read().await;
+        assert!(
+            guard.items.iter().all(|i| i.status == TodoStatus::Completed),
+            "every replaced task must be targetable by id"
+        );
     }
 }

@@ -391,6 +391,9 @@ fn analyze_structure(
     let walker = WalkBuilder::new(dir_path)
         .max_depth(Some(max_depth))
         .standard_filters(true)
+        // .gitignore must apply even when the directory was exported without
+        // its .git metadata, matching grep/find behaviour.
+        .require_git(false)
         .sort_by_file_name(|a, b| a.cmp(b))
         .build();
 

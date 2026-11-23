@@ -8,7 +8,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::context::{self, PathPolicy};
-use crate::core::fs::atomic_write;
+use crate::core::fs::atomic_write_checked;
 use crate::core::output::truncate_head;
 use crate::file_mutation_queue::{get_mutation_queue_key, with_file_mutation_queue};
 
@@ -17,11 +17,18 @@ const MAX_SNAPSHOTS_PER_FILE: usize = 20;
 pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOTAL_UNDO_BYTES: usize = 16 * 1024 * 1024;
 
+/// Appended to edit/write results when no snapshot could be recorded, so the
+/// caller is not left believing `undo_edit` will be able to revert the change.
+pub(crate) const UNDO_UNAVAILABLE_WARNING: &str = "Warning: undo is unavailable for this change (the previous content was too large to snapshot); undo_edit cannot revert it.";
+
 #[derive(Debug, Clone)]
 pub enum FileSnapshot {
     Existed {
         bytes: Vec<u8>,
         timestamp_ms: i64,
+        /// Target approved when the snapshot was taken. Without it a later
+        /// symlink swap would make undo write the old bytes into a new target.
+        target: PathBuf,
     },
     DidNotExist,
 }
@@ -55,11 +62,14 @@ impl EditUndoStore {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    pub fn push_snapshot(&self, path: &Path, snapshot: FileSnapshot) {
+    /// Records a snapshot, returning `true` only when it was actually stored.
+    /// Returns `false` when the snapshot exceeds [`MAX_SNAPSHOT_BYTES`], so
+    /// callers can warn that undo is unavailable instead of reporting success.
+    pub fn push_snapshot(&self, path: &Path, snapshot: FileSnapshot) -> bool {
         let size = match &snapshot {
             FileSnapshot::Existed { bytes, .. } => {
                 if bytes.len() > MAX_SNAPSHOT_BYTES {
-                    return;
+                    return false;
                 }
                 bytes.len()
             }
@@ -93,6 +103,7 @@ impl EditUndoStore {
         }
         inner.total_bytes += size;
         inner.order.push(key);
+        true
     }
 
     /// Read the most recent snapshot without consuming it. Callers that write
@@ -215,6 +226,12 @@ impl AgentTool for UndoEditTool {
             .ok_or_else(|| "Missing required parameter 'path'".to_string())?;
 
         let full_path = self.resolve_path(path_str)?;
+        // Same revalidation as `write`/`edit`: bound to the inspector-approved
+        // target so a swapped symlink cannot redirect the restore.
+        let inspected_target = crate::core::fs::inspected_target(&params, &full_path).await;
+        // The requested path passed policy, but a dangling symlink can resolve
+        // to a target outside the allowed roots. Validate the target itself.
+        self.path_policy.validate(&inspected_target)?;
         let undo_store = self.undo_store.clone();
         let cancel_inner = cancel.clone();
 
@@ -223,14 +240,30 @@ impl AgentTool for UndoEditTool {
                 return Err("Tool execution cancelled".to_string());
             }
 
-            let snapshot = undo_store
-                .peek_snapshot(&full_path)
-                .ok_or_else(|| format!("No previous edit history found for {}", path_str))?;
+            let snapshot = undo_store.peek_snapshot(&full_path).ok_or_else(|| {
+                format!(
+                    "Undo is unavailable for {}: no previous edit snapshot was recorded (the file may be too large to snapshot)",
+                    path_str
+                )
+            })?;
 
             match snapshot {
                 FileSnapshot::DidNotExist => {
                     if full_path.exists() {
-                        tokio::fs::remove_file(&full_path)
+                        // A creation through a (possibly dangling) symlink puts
+                        // the new file at the resolved target, not at the link.
+                        // Remove the target so the link itself survives, but
+                        // only if the link still points where it did when the
+                        // call was inspected; otherwise a swapped symlink would
+                        // delete an unrelated file.
+                        let target = crate::core::fs::resolve_write_target(&full_path).await;
+                        if !crate::core::fs::targets_match(&target, &inspected_target) {
+                            return Err(format!(
+                                "Refusing to undo creation of {}: target changed since it was inspected",
+                                path_str
+                            ));
+                        }
+                        tokio::fs::remove_file(&target)
                             .await
                             .map_err(|e| format!("Failed to remove {}: {}", path_str, e))?;
                     }
@@ -240,7 +273,18 @@ impl AgentTool for UndoEditTool {
                         path_str
                     )))
                 }
-                FileSnapshot::Existed { bytes: original_bytes, .. } => {
+                FileSnapshot::Existed {
+                    bytes: original_bytes,
+                    target: recorded_target,
+                    ..
+                } => {
+                    let current_target = crate::core::fs::resolve_write_target(&full_path).await;
+                    if !crate::core::fs::targets_match(&current_target, &recorded_target) {
+                        return Err(format!(
+                            "Refusing to undo {}: target changed since the edit was recorded",
+                            path_str
+                        ));
+                    }
                     let current_str = if full_path.exists() {
                         tokio::fs::read(&full_path)
                             .await
@@ -250,7 +294,7 @@ impl AgentTool for UndoEditTool {
                         None
                     };
 
-                    atomic_write(&full_path, &original_bytes).await?;
+                    atomic_write_checked(&full_path, &recorded_target, &original_bytes).await?;
                     undo_store.pop_snapshot(&full_path);
 
                     let restored_str = String::from_utf8_lossy(&original_bytes);
@@ -283,5 +327,87 @@ impl AgentTool for UndoEditTool {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn push_snapshot_oversized_returns_false_and_does_not_store() {
+        let store = EditUndoStore::new();
+        let path = Path::new("huge.bin");
+        let too_big = vec![0u8; MAX_SNAPSHOT_BYTES + 1];
+
+        let recorded = store.push_snapshot(
+            path,
+            FileSnapshot::Existed {
+                bytes: too_big,
+                timestamp_ms: 1,
+                target: path.to_path_buf(),
+            },
+        );
+
+        assert!(
+            !recorded,
+            "oversized snapshot must report that it was not recorded"
+        );
+        assert!(
+            !store.has_snapshot(path),
+            "oversized snapshot must not be stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_undo_creation_through_dangling_symlink_removes_target_not_link() {
+        fn create_file_symlink(target: &Path, link: &Path) -> std::io::Result<()> {
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_file(target, link)
+            }
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(target, link)
+            }
+            #[cfg(not(any(windows, unix)))]
+            {
+                let _ = (target, link);
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "symlinks are not supported on this platform",
+                ))
+            }
+        }
+
+        let dir = crate::TempTestDir::new("undo_dangling_symlink");
+        let target = dir.path().join("target.txt");
+        let link = dir.path().join("link.txt");
+
+        if let Err(e) = create_file_symlink(&target, &link) {
+            eprintln!("skipping dangling symlink undo test: cannot create symlinks ({e})");
+            return;
+        }
+
+        // The write resolves through the dangling link and creates the target,
+        // recording DidNotExist for the requested path.
+        std::fs::write(&target, b"new content").unwrap();
+        let undo_store = Arc::new(EditUndoStore::new());
+        undo_store.push_snapshot(&link, FileSnapshot::DidNotExist);
+
+        let tool = UndoEditTool::new(dir.path().to_path_buf(), undo_store);
+        let params = json!({ "path": "link.txt" }).as_object().unwrap().clone();
+        tool.execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+            "undo must not delete the symlink"
+        );
+        assert!(
+            !target.exists(),
+            "undo must delete the file created through the symlink"
+        );
     }
 }
