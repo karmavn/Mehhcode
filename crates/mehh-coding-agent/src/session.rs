@@ -559,25 +559,19 @@ pub fn create_default_file(cwd: impl Into<PathBuf>) -> Result<SessionManager> {
 pub fn export_session(input_file: &Path, output_file: Option<&Path>, cwd: &Path) -> Result<()> {
     let sm = SessionManager::open_file(input_file, cwd.to_path_buf())?;
     if let Some(out) = output_file {
-        if out == Path::new("-") {
-            let mut stdout = std::io::stdout().lock();
-            writeln!(stdout, "{}", serde_json::to_string(&sm.header)?)?;
-            for entry in sm.entries() {
-                writeln!(stdout, "{}", serde_json::to_string(entry)?)?;
-            }
-            std::io::Write::flush(&mut stdout)?;
-        } else {
+        if out != Path::new("-") {
             sm.export_jsonl(out)?;
             eprintln!("Exported session to {}", out.display());
+            return Ok(());
         }
-    } else {
-        let mut stdout = std::io::stdout().lock();
-        writeln!(stdout, "{}", serde_json::to_string(&sm.header)?)?;
-        for entry in sm.entries() {
-            writeln!(stdout, "{}", serde_json::to_string(entry)?)?;
-        }
-        std::io::Write::flush(&mut stdout)?;
     }
+
+    // Both stdout paths share the same serialization, including the final
+    // branch selection, so reopening the output restores the active leaf.
+    let content = sm.export_content()?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(content.as_bytes())?;
+    std::io::Write::flush(&mut stdout)?;
     Ok(())
 }
 
@@ -608,6 +602,8 @@ pub struct SessionManager {
     by_id: HashMap<String, usize>,
     leaf_id: Option<String>,
     file_path: Option<PathBuf>,
+    /// Malformed lines encountered while loading; surfaced via `skipped_entries()`.
+    skipped_entries: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -652,6 +648,7 @@ impl SessionManager {
             by_id: HashMap::new(),
             leaf_id: None,
             file_path: None,
+            skipped_entries: 0,
         }
     }
 
@@ -669,11 +666,13 @@ impl SessionManager {
             let mut entries = Vec::new();
             let mut by_id = HashMap::new();
             let mut persisted_leaf_id: Option<String> = None;
+            let mut skipped_entries = 0usize;
 
             for (line_idx, line_res) in reader.lines().enumerate() {
                 let line = match line_res {
                     Ok(l) => l,
                     Err(e) => {
+                        skipped_entries += 1;
                         eprintln!(
                             "Warning: failed to read session line {} in '{}': {e}",
                             line_idx + 1,
@@ -707,6 +706,7 @@ impl SessionManager {
                             entries.push(entry);
                         }
                         Err(e) => {
+                            skipped_entries += 1;
                             eprintln!(
                                 "Warning: skipping malformed session entry at line {} in '{}': {e}",
                                 line_idx + 1,
@@ -733,6 +733,7 @@ impl SessionManager {
                 by_id,
                 leaf_id,
                 file_path: Some(file_path),
+                skipped_entries,
             })
         } else {
             if let Some(parent) = file_path.parent() {
@@ -765,6 +766,7 @@ impl SessionManager {
                 by_id: HashMap::new(),
                 leaf_id: None,
                 file_path: Some(file_path),
+                skipped_entries: 0,
             })
         }
     }
@@ -794,6 +796,9 @@ impl SessionManager {
             let line = serde_json::to_string(&entry)?;
             writeln!(file, "{line}")?;
             file.flush()?;
+            // A flush only reaches the OS page cache; a crash could still lose
+            // the last entry. Force it to stable storage before updating memory.
+            file.sync_all()?;
         }
 
         let idx = self.entries.len();
@@ -896,7 +901,6 @@ impl SessionManager {
     /// Branches conversation from the specified entry ID and persists active branch selection.
     pub fn branch_from(&mut self, entry_id: &str) -> Result<()> {
         if self.by_id.contains_key(entry_id) {
-            self.leaf_id = Some(entry_id.to_string());
             if let Some(path) = &self.file_path {
                 let needs_newline = file_needs_leading_newline(path)?;
                 let mut file = OpenOptions::new()
@@ -915,7 +919,10 @@ impl SessionManager {
                 let line = serde_json::to_string(&PersistedBranchSelection::new(entry_id))?;
                 writeln!(file, "{line}")?;
                 file.flush()?;
+                file.sync_all()?;
             }
+            // Only after the selection is durable may memory follow the disk.
+            self.leaf_id = Some(entry_id.to_string());
             Ok(())
         } else {
             Err(anyhow!("Entry ID not found in session: {entry_id}"))
@@ -1066,24 +1073,41 @@ impl SessionManager {
         &self.entries
     }
 
+    /// Number of malformed lines skipped while loading the session file.
+    pub fn skipped_entries(&self) -> usize {
+        self.skipped_entries
+    }
+
     /// Looks up an entry by its ID in O(1) time.
     pub fn get_entry(&self, id: &str) -> Option<&SessionEntry> {
         let &idx = self.by_id.get(id)?;
         self.entries.get(idx)
     }
 
+    /// Serializes the header, every entry, and the active leaf as JSONL text.
+    /// The trailing branch-selection line is required when the leaf is not the
+    /// last stored entry; `open_file` otherwise restores that newer entry.
+    fn export_content(&self) -> Result<String> {
+        let mut content = String::new();
+        content.push_str(&serde_json::to_string(&self.header)?);
+        content.push('\n');
+        for entry in &self.entries {
+            content.push_str(&serde_json::to_string(entry)?);
+            content.push('\n');
+        }
+        if let Some(leaf_id) = &self.leaf_id {
+            if self.entries.last().map(|e| e.id.as_str()) != Some(leaf_id.as_str()) {
+                content.push_str(&serde_json::to_string(&PersistedBranchSelection::new(leaf_id))?);
+                content.push('\n');
+            }
+        }
+        Ok(content)
+    }
+
     /// Exports the entire session as a JSONL file to `output_path`.
     pub fn export_jsonl(&self, output_path: &Path) -> Result<()> {
-        if let Some(parent) = output_path.parent() {
-            create_dir_all(parent)?;
-        }
-        let mut file = File::create(output_path)?;
-        writeln!(file, "{}", serde_json::to_string(&self.header)?)?;
-        for entry in &self.entries {
-            writeln!(file, "{}", serde_json::to_string(entry)?)?;
-        }
-        file.flush()?;
-        Ok(())
+        let content = self.export_content()?;
+        crate::settings::write_file_atomic(output_path, content.as_bytes(), true)
     }
 
     /// Returns the session ID.
@@ -1117,11 +1141,9 @@ impl SessionManager {
     pub fn new_session(&mut self) -> Result<()> {
         let id = Uuid::now_v7().to_string();
         let timestamp = now_iso8601();
-        self.header.id = id.clone();
-        self.header.timestamp = timestamp.clone();
-        self.entries.clear();
-        self.by_id.clear();
-        self.leaf_id = None;
+        let mut new_header = self.header.clone();
+        new_header.id = id.clone();
+        new_header.timestamp = timestamp.clone();
 
         if let Some(existing_path) = &self.file_path {
             let parent = existing_path.parent().unwrap_or_else(|| Path::new("."));
@@ -1139,12 +1161,21 @@ impl SessionManager {
                     format!("Failed to create new session file: {}", new_path.display())
                 })?;
 
-            let header_line = serde_json::to_string(&self.header)?;
+            let header_line = serde_json::to_string(&new_header)?;
             writeln!(file, "{header_line}")?;
             file.flush()?;
 
             self.file_path = Some(new_path);
         }
+
+        // Only discard the old session once its replacement is on disk. A
+        // failed write would otherwise leave a new empty id pointing at the
+        // old file, mixing two sessions in one JSONL file.
+        self.header = new_header;
+        self.entries.clear();
+        self.by_id.clear();
+        self.leaf_id = None;
+        self.skipped_entries = 0;
 
         Ok(())
     }
@@ -1404,6 +1435,7 @@ impl SessionManager {
             by_id,
             leaf_id,
             file_path: Some(new_session_path),
+            skipped_entries: self.skipped_entries,
         })
     }
 
@@ -1477,6 +1509,7 @@ impl SessionManager {
             by_id,
             leaf_id,
             file_path: Some(new_session_path),
+            skipped_entries: self.skipped_entries,
         })
     }
 }
@@ -1880,6 +1913,135 @@ mod tests {
         assert!(ts > 0);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn export_jsonl_preserves_branch_selection_and_replaces_destination() {
+        let temp = crate::TempTestDir::new("export_branch_selection");
+        let source = temp.path().join("source.jsonl");
+        let backup = temp.path().join("backup.jsonl");
+
+        let (m1, m3) = {
+            let mut s = SessionManager::open_file(&source, temp.path()).unwrap();
+            let m1 = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("root".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            let _m2 = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("abandoned branch".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            s.branch_from(&m1).unwrap();
+            let m3 = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("selected branch".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            // Switch the leaf back to the older message without a later entry.
+            s.branch_from(&m1).unwrap();
+            (m1, m3)
+        };
+
+        // A pre-existing destination must be replaced, not partially rewritten.
+        std::fs::write(&backup, b"stale backup content\n").unwrap();
+        SessionManager::open_file(&source, temp.path())
+            .unwrap()
+            .export_jsonl(&backup)
+            .unwrap();
+
+        let exported = std::fs::read_to_string(&backup).unwrap();
+        assert!(
+            exported
+                .lines()
+                .any(|line| PersistedBranchSelection::parse(line).as_deref() == Some(m1.as_str())),
+            "export must emit the persisted branch selection: {exported}"
+        );
+        assert!(
+            !exported.contains("stale backup content"),
+            "export must replace the destination with a complete file"
+        );
+
+        let reopened = SessionManager::open_file(&backup, temp.path()).unwrap();
+        assert_eq!(reopened.leaf_id(), Some(m1.as_str()));
+        assert_eq!(reopened.build_context_messages().len(), 1);
+        assert!(reopened.entries().iter().any(|e| e.id == m3));
+    }
+
+    #[test]
+    fn branch_from_does_not_move_leaf_when_persist_fails() {
+        let temp = crate::TempTestDir::new("branch_write_order");
+        let file = temp.path().join("branch.jsonl");
+        let mut session = SessionManager::open_file(&file, temp.path()).unwrap();
+        let m1 = session
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("first".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+        let m2 = session
+            .append_message(Message::User(UserMessage {
+                content: UserContent::Text("second".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+        assert_eq!(session.leaf_id(), Some(m2.as_str()));
+
+        // Turn the file path into a directory so appending the branch
+        // selection fails after the file has been closed.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+
+        assert!(
+            session.branch_from(&m1).is_err(),
+            "persisting a branch selection into a directory must fail"
+        );
+        assert_eq!(
+            session.leaf_id(),
+            Some(m2.as_str()),
+            "failed persist must not change the in-memory leaf"
+        );
+    }
+
+    #[test]
+    fn open_file_reports_skipped_malformed_entry() {
+        let temp = crate::TempTestDir::new("skipped_entry_count");
+        let file = temp.path().join("skipped.jsonl");
+        let (m1, m2) = {
+            let mut s = SessionManager::open_file(&file, temp.path()).unwrap();
+            let a = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("one".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            let b = s
+                .append_message(Message::User(UserMessage {
+                    content: UserContent::Text("two".to_string()),
+                    timestamp: now_ms(),
+                }))
+                .unwrap();
+            (a, b)
+        };
+
+        // Header, m1, corrupt line, m2
+        let raw = std::fs::read_to_string(&file).unwrap();
+        let mut lines: Vec<&str> = raw.lines().collect();
+        lines.insert(2, "{not-json");
+        std::fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+
+        let reopened = SessionManager::open_file(&file, temp.path()).unwrap();
+        assert_eq!(
+            reopened.skipped_entries(),
+            1,
+            "malformed mid-file line must be surfaced, not silently dropped"
+        );
+        let ids: Vec<&str> = reopened.entries().iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec![m1.as_str(), m2.as_str()]);
     }
 
     #[test]

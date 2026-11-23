@@ -15,6 +15,11 @@ use crate::types::{
 /// Default upper bound on assistant turns per `run_agent_loop` invocation.
 pub const DEFAULT_MAX_AGENT_TURNS: usize = 200;
 
+/// Maximum number of consecutive turns whose tool-call response was truncated
+/// at the output token limit. Retrying such a turn re-sends a strictly larger
+/// context, so without a bound the loop can spin up to `max_turns` times.
+const MAX_CONSECUTIVE_TRUNCATED_TURNS: usize = 2;
+
 /// Shared thread-safe handle to dynamic tools list.
 pub type DynamicToolsList = Arc<RwLock<Vec<Arc<dyn AgentTool>>>>;
 
@@ -144,6 +149,7 @@ pub async fn run_agent_loop(
 
     let mut pending_messages: Vec<Message> = drain_queue(&config.steering_queue, config.steering_mode);
     let mut last_completed_turn: Option<crate::types::AgentTurnContext> = None;
+    let mut consecutive_truncated_turns: usize = 0;
 
     'outer: loop {
         let mut has_more_tool_calls = true;
@@ -245,12 +251,14 @@ pub async fn run_agent_loop(
             }
 
             let assistant_message = stream_assistant_response(
-                &current_messages,
-                &active_tools,
-                &current_model,
-                &current_provider,
-                current_api_key.as_deref(),
-                current_thinking_level,
+                StreamRequest {
+                    messages: &current_messages,
+                    tools: &active_tools,
+                    model: &current_model,
+                    provider: &current_provider,
+                    api_key: current_api_key.as_deref(),
+                    thinking_level: current_thinking_level,
+                },
                 &config,
                 &on_event,
             )
@@ -286,14 +294,56 @@ pub async fn run_agent_loop(
             let mut tool_results: Vec<ToolResultMessage> = Vec::new();
             has_more_tool_calls = false;
 
+            let is_truncated_tool_turn =
+                !tool_calls.is_empty() && assistant_message.stop_reason == StopReason::Length;
+            if is_truncated_tool_turn {
+                consecutive_truncated_turns += 1;
+            } else {
+                consecutive_truncated_turns = 0;
+            }
+
             if !tool_calls.is_empty() {
-                if assistant_message.stop_reason == StopReason::Length {
+                if is_truncated_tool_turn {
                     let batch = fail_truncated_tool_calls(&tool_calls, &on_event);
                     for tr in &batch {
                         current_messages.push(Message::ToolResult(tr.clone()));
                         new_messages.push(Message::ToolResult(tr.clone()));
                     }
                     tool_results.extend(batch);
+
+                    if consecutive_truncated_turns >= MAX_CONSECUTIVE_TRUNCATED_TURNS {
+                        let mut error_msg = AssistantMessage::empty_for_model(&current_model);
+                        error_msg.stop_reason = StopReason::Error;
+                        error_msg.error_message = Some(format!(
+                            "Tool call arguments were truncated {consecutive_truncated_turns} consecutive times at the output token limit; stopping to avoid an unbounded retry loop."
+                        ));
+                        current_messages.push(Message::Assistant(error_msg.clone()));
+                        new_messages.push(Message::Assistant(error_msg.clone()));
+                        emit(AgentEvent::MessageStart {
+                            message: Message::Assistant(error_msg.clone()),
+                        });
+                        emit(AgentEvent::MessageEnd {
+                            message: Message::Assistant(error_msg.clone()),
+                        });
+                        if let Some(ref hook) = config.finish_turn {
+                            let turn_ctx = crate::types::AgentTurnContext {
+                                turn_index: turns_completed,
+                                messages: current_messages.clone(),
+                                assistant_message: error_msg.clone(),
+                                tool_results: tool_results.clone(),
+                            };
+                            let _ = hook(turn_ctx, config.cancel.clone()).await;
+                        }
+                        emit(AgentEvent::TurnEnd {
+                            message: error_msg,
+                            tool_results,
+                        });
+                        emit(AgentEvent::AgentEnd {
+                            messages: new_messages.clone(),
+                        });
+                        return new_messages;
+                    }
+
                     has_more_tool_calls = true;
                 } else {
                     let (batch, terminate) = execute_tool_calls(
@@ -369,13 +419,23 @@ pub async fn run_agent_loop(
         let follow_up_messages: Vec<Message> = drain_queue(&config.follow_up_queue, config.follow_up_mode);
 
         if !follow_up_messages.is_empty() {
-            pending_messages = follow_up_messages;
-            if !config.cancel.is_cancelled()
-                && !config.max_turns.is_some_and(|cap| turns_completed >= cap)
+            if config.cancel.is_cancelled()
+                || config.max_turns.is_some_and(|cap| turns_completed >= cap)
             {
-                emit(AgentEvent::TurnStart);
-                turn_open = true;
+                // They were removed from the shared queue; put them back before
+                // the outer guard ends the loop or they disappear silently.
+                let mut queue = config
+                    .follow_up_queue
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                for msg in follow_up_messages.into_iter().rev() {
+                    queue.push_front(msg);
+                }
+                break 'outer;
             }
+            pending_messages = follow_up_messages;
+            emit(AgentEvent::TurnStart);
+            turn_open = true;
             continue 'outer;
         }
 
@@ -402,16 +462,28 @@ pub async fn run_agent_loop(
     new_messages
 }
 
-async fn stream_assistant_response(
-    messages: &[Message],
-    tools: &[Arc<dyn AgentTool>],
-    model: &Model,
-    provider: &Arc<dyn mehh_ai::LlmProvider>,
-    api_key: Option<&str>,
+struct StreamRequest<'a> {
+    messages: &'a [Message],
+    tools: &'a [Arc<dyn AgentTool>],
+    model: &'a Model,
+    provider: &'a Arc<dyn mehh_ai::LlmProvider>,
+    api_key: Option<&'a str>,
     thinking_level: Option<mehh_ai::ThinkingLevel>,
+}
+
+async fn stream_assistant_response(
+    request: StreamRequest<'_>,
     config: &AgentLoopConfig,
     on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
 ) -> AssistantMessage {
+    let StreamRequest {
+        messages,
+        tools,
+        model,
+        provider,
+        api_key,
+        thinking_level,
+    } = request;
     let emit = |event: AgentEvent| {
         if let Some(ref cb) = on_event {
             cb(event);
@@ -695,7 +767,7 @@ async fn execute_single_tool(
     };
 
     let tool_def = tool_to_definition(tool.as_ref());
-    let validated_args = match mehh_ai::validation::validate_tool_arguments(&tool_def, tool_call) {
+    let mut validated_args = match mehh_ai::validation::validate_tool_arguments(&tool_def, tool_call) {
         Ok(args) => args,
         Err(err_msg) => {
             let res = AgentToolResult::text(err_msg);
@@ -759,6 +831,15 @@ async fn execute_single_tool(
         }
         if before_res.terminate {
             terminate = true;
+        }
+        if let Some(target) = before_res.approved_path {
+            // Bind the write to the exact path the inspector approved. Tools
+            // revalidate it immediately before the rename, closing the gap
+            // between inspection and execution.
+            validated_args.insert(
+                crate::types::INSPECTED_TARGET_ARG.to_string(),
+                serde_json::Value::String(target.to_string_lossy().into_owned()),
+            );
         }
     }
 
@@ -988,9 +1069,9 @@ async fn execute_tool_calls(
     });
 
     if has_sequential {
-        execute_tool_calls_sequential(assistant_message, tool_calls, &tools, current_messages, config, on_event).await
+        execute_tool_calls_sequential(assistant_message, tool_calls, tools, current_messages, config, on_event).await
     } else {
-        execute_tool_calls_parallel(assistant_message, tool_calls, &tools, current_messages, config, on_event).await
+        execute_tool_calls_parallel(assistant_message, tool_calls, tools, current_messages, config, on_event).await
     }
 }
 
@@ -1063,6 +1144,72 @@ mod tests {
             .filter(|m| matches!(m, Message::Assistant(_)))
             .count();
         assert_eq!(assistant_count, 2);
+    }
+
+    #[tokio::test]
+    async fn truncated_tool_calls_terminate_after_bounded_retries() {
+        let provider = Arc::new(FauxProvider::new());
+        // Queue more truncated responses than the retry bound so we can prove
+        // the loop stops early instead of draining the queue up to max_turns.
+        for i in 0..5 {
+            let mut msg = faux_tool_call_message(vec![faux_tool_call(
+                format!("c{i}"),
+                "ping",
+                serde_json::json!({}),
+            )]);
+            msg.stop_reason = StopReason::Length;
+            provider.add_response(msg);
+        }
+        // A normal final message that must NOT be consumed once the loop stops.
+        provider.add_response(faux_assistant_message("should not be reached"));
+
+        let mut config = AgentLoopConfig::new(faux_model(), provider.clone());
+        config.tools = vec![Arc::new(DummyTool {
+            tool_name: "ping".to_string(),
+            mode: ToolExecutionMode::Parallel,
+            on_exec: None,
+        })];
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+        let prompt = Message::User(UserMessage {
+            content: UserContent::Text("go".to_string()),
+            timestamp: now_ms(),
+        });
+        let out = run_agent_loop(
+            vec![prompt],
+            vec![],
+            config,
+            Some(Arc::new(move |ev| events_clone.lock().unwrap().push(ev))),
+        )
+        .await;
+
+        // Bounded to 2 consecutive truncated turns: stop before draining all queued responses.
+        let request_count = provider.recorded_requests().len();
+        assert_eq!(
+            request_count, 2,
+            "loop should terminate after the retry bound, got {request_count} requests"
+        );
+
+        let has_truncation_error = out.iter().any(|m| match m {
+            Message::Assistant(a) => a
+                .error_message
+                .as_deref()
+                .is_some_and(|e| e.contains("truncat")),
+            _ => false,
+        });
+        assert!(
+            has_truncation_error,
+            "final messages must contain a truncation error"
+        );
+
+        let agent_end_count = events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::AgentEnd { .. }))
+            .count();
+        assert_eq!(agent_end_count, 1, "AgentEnd must be emitted exactly once");
     }
 
     #[tokio::test]
@@ -1243,6 +1390,7 @@ mod tests {
                     block: true,
                     reason: Some("blocked by policy".to_string()),
                     terminate: false,
+                    approved_path: None,
                 }
             })
         }));

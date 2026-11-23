@@ -32,6 +32,10 @@ pub const MAX_SUBAGENT_DEPTH: usize = 2;
 /// Maximum assistant turns allowed per subagent invocation.
 pub const SUBAGENT_MAX_TURNS: usize = 20;
 
+/// Maximum number of tasks accepted in one parallel batch. The batch
+/// semaphore only limits concurrency; this bounds the total spawned work.
+pub const MAX_BATCH_TASKS: usize = 16;
+
 /// Maximum wall-clock timeout for a subagent invocation in seconds.
 pub const SUBAGENT_TIMEOUT_SECS: u64 = 180;
 
@@ -45,6 +49,11 @@ const SUBAGENT_CANCEL_GRACE: Duration = Duration::from_secs(5);
 /// Shorter grace for an explicit kill: the caller wants the child stopped
 /// now, so cleanup is best-effort before the loop future is dropped.
 const SUBAGENT_KILL_GRACE: Duration = Duration::from_millis(500);
+
+/// The finalize call must not extend the caller's `timeout_secs` budget.
+fn finalize_wait_budget(remaining: Duration) -> Duration {
+    remaining.min(Duration::from_secs(SUBAGENT_FINALIZE_TIMEOUT_SECS))
+}
 
 /// RAII guard: cancels the child token whenever the run scope exits —
 /// timeout, error, or the parent dropping this future mid-run.
@@ -122,7 +131,7 @@ impl ChildOutcome {
 /// from being recorded as the subagent's own deadline expiry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ChildRunError {
-    TimedOut,
+    TimedOut(std::time::Duration),
     Aborted,
     ModelError(String),
     ToolFailure(String),
@@ -134,7 +143,7 @@ enum ChildRunError {
 impl ChildRunError {
     fn failure_class(&self) -> SubagentFailureClass {
         match self {
-            Self::TimedOut => SubagentFailureClass::Timeout,
+            Self::TimedOut(_) => SubagentFailureClass::Timeout,
             Self::Aborted => SubagentFailureClass::Aborted,
             Self::ToolFailure(_) => SubagentFailureClass::ToolRuntime,
             Self::Panic(_) | Self::ManifestWrite(_) => SubagentFailureClass::Infra,
@@ -145,7 +154,7 @@ impl ChildRunError {
 
     fn terminal_kind(&self) -> SubagentEventKind {
         match self {
-            Self::TimedOut => SubagentEventKind::TimedOut,
+            Self::TimedOut(_) => SubagentEventKind::TimedOut,
             _ => SubagentEventKind::Aborted,
         }
     }
@@ -154,7 +163,7 @@ impl ChildRunError {
 impl std::fmt::Display for ChildRunError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TimedOut => write!(f, "Subagent timed out"),
+            Self::TimedOut(d) => write!(f, "Subagent timed out after {}s", d.as_secs()),
             Self::Aborted => write!(f, "Subagent execution was aborted"),
             Self::ModelError(msg)
             | Self::ToolFailure(msg)
@@ -549,7 +558,7 @@ impl SubagentTool {
 
     /// Builds the structured subagent update result for a lifecycle event.
     pub fn subagent_update(child_id: &str, mode: &str, event: &SubagentEvent) -> AgentToolResult {
-        let event_kind = serde_json::to_value(&event.kind).unwrap_or_else(|_| json!("unknown"));
+        let event_kind = serde_json::to_value(event.kind).unwrap_or_else(|_| json!("unknown"));
         let details = json!({
             "subagent": {
                 "child_id": child_id,
@@ -657,7 +666,9 @@ impl SubagentTool {
         match write_manifest(&agent_store_dir(cwd), manifest) {
             Ok(_) => outcome.map_err(|e| e.to_string()),
             Err(write_err) => Err(match &outcome {
-                Ok(_) => format!("subagent run completed but manifest write failed: {write_err}"),
+                Ok(out) => format!(
+                    "{out}\n\nWarning: subagent manifest write failed: {write_err}"
+                ),
                 Err(original) => format!("{original}; manifest write failed: {write_err}"),
             }),
         }
@@ -887,7 +898,7 @@ impl SubagentTool {
             loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
-                    return Err(ChildRunError::TimedOut);
+                    return Err(ChildRunError::TimedOut(timeout));
                 }
                 let attempt_budget = max_turns.saturating_sub(turns_used).max(1);
                 let mut config = base_config.clone();
@@ -983,6 +994,12 @@ impl SubagentTool {
                 let sleep = tokio::time::sleep(remaining);
                 tokio::pin!(sleep);
                 let messages = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        child_cancel.cancel();
+                        let _ = tokio::time::timeout(SUBAGENT_KILL_GRACE, &mut loop_fut).await;
+                        return Err(ChildRunError::Aborted);
+                    }
                     msgs = &mut loop_fut => msgs,
                     _ = &mut sleep => {
                         // Cancel BEFORE dropping the loop future so cancellation-aware
@@ -990,14 +1007,16 @@ impl SubagentTool {
                         // drop after the grace period if the loop fails to unwind.
                         child_cancel.cancel();
                         let _ = tokio::time::timeout(SUBAGENT_CANCEL_GRACE, &mut loop_fut).await;
-                        return Err(ChildRunError::TimedOut);
-                    }
-                    _ = cancel.cancelled() => {
-                        child_cancel.cancel();
-                        let _ = tokio::time::timeout(SUBAGENT_KILL_GRACE, &mut loop_fut).await;
-                        return Err(ChildRunError::Aborted);
+                        return Err(ChildRunError::TimedOut(timeout));
                     }
                 };
+                // Cancellation can also arrive after the loop future became
+                // ready. Do not finalize that result as Completed.
+                if cancel.is_cancelled() {
+                    child_cancel.cancel();
+                    let _ = tokio::time::timeout(SUBAGENT_KILL_GRACE, &mut loop_fut).await;
+                    return Err(ChildRunError::Aborted);
+                }
 
                 for m in &messages {
                     if let Message::Assistant(a) = m {
@@ -1105,8 +1124,11 @@ impl SubagentTool {
                         &base_config.stream_options,
                         child_cancel.clone(),
                     );
+                    let finalize_budget = finalize_wait_budget(
+                        deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    );
                     let mut summary = match tokio::time::timeout(
-                        Duration::from_secs(SUBAGENT_FINALIZE_TIMEOUT_SECS),
+                        finalize_budget,
                         stream.collect_final_message(),
                     )
                     .await
@@ -1201,6 +1223,12 @@ impl AgentTool for SubagentTool {
 
         // Check if parallel batch of tasks was provided
         if let Some(tasks_arr) = params.get("tasks").and_then(|v| v.as_array()) {
+            if tasks_arr.len() > MAX_BATCH_TASKS {
+                return Err(format!(
+                    "Too many batch tasks: {} supplied, maximum is {MAX_BATCH_TASKS}",
+                    tasks_arr.len()
+                ));
+            }
             let task_prompts: Vec<String> = tasks_arr
                 .iter()
                 .filter_map(|v| {
@@ -1523,6 +1551,19 @@ mod tests {
     use super::*;
     use mehh_ai::{faux_assistant_message, faux_model, FauxProvider};
 
+    #[test]
+    fn finalize_wait_is_bounded_by_remaining_wall_clock_budget() {
+        assert_eq!(
+            finalize_wait_budget(Duration::from_secs(10)),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            finalize_wait_budget(Duration::from_secs(120)),
+            Duration::from_secs(SUBAGENT_FINALIZE_TIMEOUT_SECS)
+        );
+        assert_eq!(finalize_wait_budget(Duration::ZERO), Duration::ZERO);
+    }
+
     #[tokio::test]
     async fn resolved_api_key_reuses_cached_credential() {
         let cwd = std::env::temp_dir();
@@ -1617,7 +1658,7 @@ mod tests {
                       _context: &mehh_ai::Context,
                       _options: &mehh_ai::StreamOptions| {
                     counter.fetch_add(1, Ordering::SeqCst);
-                    let mut msg = faux_assistant_message(&format!("failed on {}", model.id));
+                    let mut msg = faux_assistant_message(format!("failed on {}", model.id));
                     msg.stop_reason = StopReason::Error;
                     msg.error_message = Some(format!("simulated {} failure", model.id));
                     msg
@@ -1677,7 +1718,7 @@ mod tests {
                         lead_keys.lock().unwrap_or_else(PoisonError::into_inner).push(options.api_key.clone());
                         faux_assistant_message("lead recovered")
                     } else {
-                        let mut msg = faux_assistant_message(&format!("worker failed {n}"));
+                        let mut msg = faux_assistant_message(format!("worker failed {n}"));
                         msg.stop_reason = StopReason::Error;
                         msg.error_message = Some("simulated worker failure".into());
                         msg
@@ -1896,7 +1937,7 @@ mod tests {
             &dir,
             &mut manifest2,
             &events2,
-            Err(ChildRunError::TimedOut),
+            Err(ChildRunError::TimedOut(std::time::Duration::from_secs(1))),
             &cancel,
             None,
             "",
@@ -2120,5 +2161,33 @@ mod tests {
             .count();
         assert_eq!(failed, 1, "the FAIL task is failed: {statuses:?}");
         assert_eq!(completed, 2, "both OK tasks are completed: {statuses:?}");
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_oversized_task_arrays_before_spawning() {
+        let cwd = std::env::temp_dir();
+        let sub = SubagentTool::new(
+            cwd.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            None,
+            mehh_tools::create_coding_tools(cwd),
+            0,
+        );
+
+        let tasks: Vec<Value> = (0..100)
+            .map(|i| Value::String(format!("task {i}")))
+            .collect();
+        let mut params = Map::new();
+        params.insert("tasks".to_string(), Value::Array(tasks));
+
+        let err = sub
+            .execute("tc_batch_cap", params, CancellationToken::new(), None)
+            .await
+            .expect_err("an oversized batch must be rejected before any work is spawned");
+        assert!(
+            err.contains(&MAX_BATCH_TASKS.to_string()),
+            "the error should state the batch limit: {err}"
+        );
     }
 }

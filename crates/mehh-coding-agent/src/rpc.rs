@@ -97,13 +97,15 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcOutput<W> {
     }
 }
 
-/// Converts an `AgentEvent` into a wire JSON object, stripping the cumulative `partial`
-/// snapshot from `message_update` events to keep lines small.
+/// Converts an `AgentEvent` into a wire JSON object, stripping the cumulative
+/// snapshots from `message_update` events to keep lines small. The deltas in
+/// `assistantMessageEvent` and the final `MessageEnd` carry the same data.
 pub fn format_rpc_event(event: &AgentEvent) -> serde_json::Value {
     match serde_json::to_value(event) {
         Ok(mut val) => {
             if let Some(obj) = val.as_object_mut() {
                 if obj.get("type").and_then(|v| v.as_str()) == Some("message_update") {
+                    obj.remove("message");
                     let key = if obj.contains_key("assistantMessageEvent") {
                         Some("assistantMessageEvent")
                     } else if obj.contains_key("assistant_message_event") {
@@ -136,6 +138,7 @@ async fn handle_concurrent_command<W>(
     steering_queue: &Arc<StdMutex<VecDeque<Message>>>,
     follow_queue: &Arc<StdMutex<VecDeque<Message>>>,
     cancel_slot: &Arc<StdMutex<Option<CancellationToken>>>,
+    bash_cancel_slot: &Arc<StdMutex<Option<CancellationToken>>>,
 ) -> Result<bool>
 where
     W: AsyncWrite + Unpin + Send + 'static,
@@ -159,14 +162,25 @@ where
             }
             output.send_success(id, "abort", None).await?;
         }
+        "abort_bash" => {
+            if let Some(tok) = bash_cancel_slot.lock().unwrap().take() {
+                tok.cancel();
+            }
+            output.send_success(id, "abort_bash", None).await?;
+        }
         "steer" | "follow_up" => {
+            let msg = text();
+            if msg.trim().is_empty() {
+                output.send_error(id, cmd, "Message must not be empty").await?;
+                return Ok(true);
+            }
             let queue = if cmd == "steer" {
                 steering_queue
             } else {
                 follow_queue
             };
             queue.lock().unwrap().push_back(Message::User(UserMessage {
-                content: UserContent::Text(text().to_string()),
+                content: UserContent::Text(msg.to_string()),
                 timestamp: now_ms(),
             }));
             output.send_success(id, cmd, None).await?;
@@ -200,7 +214,7 @@ where
             let ok = val
                 .get("agent_id")
                 .and_then(|v| v.as_str())
-                .map_or(false, |agent_id| sub_control.kill(agent_id));
+                .is_some_and(|agent_id| sub_control.kill(agent_id));
             output
                 .send_success(id, "subagent_kill", Some(serde_json::json!({ "ok": ok })))
                 .await?;
@@ -262,6 +276,12 @@ where
         match cmd_type {
             "prompt" => {
                 let message = val.get("message").and_then(|v| v.as_str()).unwrap_or("");
+                if message.trim().is_empty() {
+                    output
+                        .send_error(id, "prompt", "Message must not be empty")
+                        .await?;
+                    continue;
+                }
                 let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<AgentEvent>();
                 let out_clone = output.clone();
 
@@ -280,6 +300,7 @@ where
                 let sub_control = session.subagent_control();
                 let steering_queue = session.steering_queue();
                 let follow_queue = session.follow_up_queue();
+                let bash_cancel_slot = session.active_bash_cancel.clone();
                 let prompt_res = {
                     let prompt_fut = session.prompt(message, Some(on_event));
                     tokio::pin!(prompt_fut);
@@ -308,6 +329,7 @@ where
                                                 &steering_queue,
                                                 &follow_queue,
                                                 &cancel_slot,
+                                                &bash_cancel_slot,
                                             )
                                             .await?
                                             {
@@ -555,6 +577,12 @@ where
                     .or_else(|| val.get("text"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if msg.trim().is_empty() {
+                    output
+                        .send_error(id, "steer", "Message must not be empty")
+                        .await?;
+                    continue;
+                }
                 session.steer(msg);
                 output.send_success(id, "steer", None).await?;
             }
@@ -611,6 +639,12 @@ where
                     .or_else(|| val.get("text"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                if msg.trim().is_empty() {
+                    output
+                        .send_error(id, "follow_up", "Message must not be empty")
+                        .await?;
+                    continue;
+                }
                 session.follow_up(msg);
                 output.send_success(id, "follow_up", None).await?;
             }
@@ -637,51 +671,123 @@ where
                 let cancel = CancellationToken::new();
                 *session.active_bash_cancel.lock().unwrap() = Some(cancel.clone());
 
-                let bash_tool = mehh_tools::BashTool::new(session.cwd.clone());
-                let args = [("command".to_string(), serde_json::json!(command))]
-                    .into_iter()
-                    .collect();
+                // The RPC route must go through the same governance chain as
+                // agent tool calls: security denies, persisted rules and
+                // approval requirements all apply here too.
+                let mut inspect_args = serde_json::Map::new();
+                inspect_args.insert("command".to_string(), serde_json::json!(command));
+                let inspect_ctx = crate::tool_inspection::ToolInspectionContext {
+                    tool_call_id: "rpc_bash".to_string(),
+                    tool_name: "bash".to_string(),
+                    args: inspect_args,
+                    is_read_only: Some(false),
+                    cwd: session.cwd.clone(),
+                    origin: None,
+                };
+                let decision = session
+                    .inspection_manager
+                    .inspect_and_authorize(&inspect_ctx, session.approval_handler.as_deref())
+                    .await;
+                if decision.block {
+                    *session.active_bash_cancel.lock().unwrap() = None;
+                    let reason = decision
+                        .reason
+                        .unwrap_or_else(|| "Tool blocked by security policy".to_string());
+                    output.send_error(id, "bash", &reason).await?;
+                } else {
+                    let bash_tool = mehh_tools::BashTool::new(session.cwd.clone());
+                    let args = [("command".to_string(), serde_json::json!(command))]
+                        .into_iter()
+                        .collect();
 
-                let res = bash_tool.execute("rpc_bash", args, cancel, None).await;
-                *session.active_bash_cancel.lock().unwrap() = None;
+                    // Keep reading commands while bash runs, otherwise
+                    // `abort_bash` waits in the buffer until the command ends.
+                    let cancel_slot = session.active_cancel_slot();
+                    let sub_control = session.subagent_control();
+                    let steering_queue = session.steering_queue();
+                    let follow_queue = session.follow_up_queue();
+                    let bash_cancel_slot = session.active_bash_cancel.clone();
+                    let exec_fut = bash_tool.execute("rpc_bash", args, cancel, None);
+                    tokio::pin!(exec_fut);
+                    let mut concurrent_line = String::new();
+                    let mut stdin_eof = false;
+                    let res = loop {
+                        tokio::select! {
+                            res = &mut exec_fut => break res,
+                            read_res = reader.read_line(&mut concurrent_line), if !stdin_eof => {
+                                match read_res {
+                                    Ok(0) => stdin_eof = true,
+                                    Ok(_) => {
+                                        let conc_trimmed = concurrent_line.trim().to_string();
+                                        concurrent_line.clear();
+                                        if conc_trimmed.is_empty() {
+                                            continue;
+                                        }
+                                        if let Ok(cval) = serde_json::from_str::<serde_json::Value>(&conc_trimmed) {
+                                            if handle_concurrent_command(
+                                                &cval,
+                                                &output,
+                                                &sub_control,
+                                                &steering_queue,
+                                                &follow_queue,
+                                                &cancel_slot,
+                                                &bash_cancel_slot,
+                                            )
+                                            .await?
+                                            {
+                                                continue;
+                                            }
+                                        }
+                                        pending_lines.push_back(conc_trimmed);
+                                    }
+                                    Err(e) => return Err(e.into()),
+                                }
+                            }
+                        }
+                    };
+                    *session.active_bash_cancel.lock().unwrap() = None;
 
-                match res {
-                    Ok(tool_res) => {
-                        let text = tool_res
-                            .content
-                            .iter()
-                            .filter_map(|b| match b {
-                                mehh_ai::ToolResultContentBlock::Text(t) => Some(t.text.as_str()),
-                                _ => None,
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n");
-                        output
-                            .send_success(
-                                id,
-                                "bash",
-                                Some(serde_json::json!({
-                                    "output": text,
-                                    "isError": tool_res.is_error.unwrap_or(false),
-                                })),
-                            )
-                            .await?;
-                    }
-                    Err(e) => {
-                        if e.contains("Command aborted") || e.contains("Missing required parameter")
-                        {
-                            output.send_error(id, "bash", &e).await?;
-                        } else {
+                    match res {
+                        Ok(tool_res) => {
+                            let text = tool_res
+                                .content
+                                .iter()
+                                .filter_map(|b| match b {
+                                    mehh_ai::ToolResultContentBlock::Text(t) => {
+                                        Some(t.text.as_str())
+                                    }
+                                    _ => None,
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n");
                             output
                                 .send_success(
                                     id,
                                     "bash",
                                     Some(serde_json::json!({
-                                        "output": e,
-                                        "isError": true,
+                                        "output": text,
+                                        "isError": tool_res.is_error.unwrap_or(false),
                                     })),
                                 )
                                 .await?;
+                        }
+                        Err(e) => {
+                            if e.contains("Command aborted")
+                                || e.contains("Missing required parameter")
+                            {
+                                output.send_error(id, "bash", &e).await?;
+                            } else {
+                                output
+                                    .send_success(
+                                        id,
+                                        "bash",
+                                        Some(serde_json::json!({
+                                            "output": e,
+                                            "isError": true,
+                                        })),
+                                    )
+                                    .await?;
+                            }
                         }
                     }
                 }
@@ -1054,6 +1160,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subagent_kill_without_agent_id_reports_false() {
+        let temp_dir = std::env::temp_dir().join(format!("mehh_rpc_kill_{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let (started_tx, mut started_rx) = tokio::sync::watch::channel(false);
+        let release = Arc::new(AtomicBool::new(false));
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            make_test_model(),
+            Arc::new(GatedProvider {
+                started: started_tx,
+                release: release.clone(),
+            }),
+            SessionManager::in_memory(temp_dir.clone()),
+            Settings::default(),
+        );
+
+        let (client_write, server_read) = tokio::io::duplex(8192);
+        let (server_write, client_read) = tokio::io::duplex(8192);
+        let mut client_writer = client_write;
+        let mut client_reader = BufReader::new(client_read);
+        let rpc_handle = tokio::spawn(async move {
+            run_rpc_mode(&mut session, BufReader::new(server_read), server_write).await
+        });
+
+        client_writer
+            .write_all(b"{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"slow\"}\n")
+            .await
+            .unwrap();
+        client_writer.flush().await.unwrap();
+        while !*started_rx.borrow() {
+            started_rx.changed().await.unwrap();
+        }
+
+        client_writer
+            .write_all(b"{\"id\":\"k1\",\"type\":\"subagent_kill\"}\n")
+            .await
+            .unwrap();
+        client_writer.flush().await.unwrap();
+
+        let answered = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let mut line = String::new();
+                if client_reader.read_line(&mut line).await.unwrap() == 0 {
+                    return None;
+                }
+                let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+                if value["id"] == "k1" {
+                    return Some(value);
+                }
+            }
+        })
+        .await
+        .expect("subagent_kill must be answered")
+        .expect("RPC stream closed unexpectedly");
+        assert_eq!(
+            answered["data"]["ok"], false,
+            "a kill request without agent_id must not report success"
+        );
+
+        release.store(true, Ordering::SeqCst);
+        drop(client_writer);
+        let _ = rpc_handle.await;
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
     async fn subagent_list_responds_while_prompt_is_still_running() {
         let temp_dir = std::env::temp_dir().join(format!("mehh_rpc_busy_{}", Uuid::now_v7()));
         std::fs::create_dir_all(&temp_dir).unwrap();
@@ -1238,6 +1410,16 @@ mod tests {
             SessionManager::in_memory(&temp_dir),
             Settings::default(),
         );
+        // This test asserts RPC plumbing, not the global permission store. Other
+        // tests mutate USERPROFILE/HOME in parallel, so make the governance
+        // chain hermetic here instead of inheriting a possible deny-all store.
+        session.inspection_manager = Arc::new(
+            crate::tool_inspection::ToolInspectionManager::new_with_store(
+                crate::tool_inspection::PermissionMode::Auto,
+                temp_dir.clone(),
+                crate::permissions::PermissionStore::new(Vec::new(), None),
+            ),
+        );
 
         let (client_write, server_read) = tokio::io::duplex(64 * 1024);
         let (server_write, client_read) = tokio::io::duplex(64 * 1024);
@@ -1405,6 +1587,66 @@ mod tests {
             "switch_session",
         ).await;
         assert_eq!(switch_resp["data"]["sessionId"], sw_mgr.session_id());
+
+        drop(writer);
+        assert!(rpc_handle.await.unwrap().is_ok());
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn rpc_bash_obeys_tool_inspection_deny() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("mehh_rpc_bash_deny_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            mehh_ai::faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&temp_dir),
+            Settings {
+                permission_mode: Some(crate::tool_inspection::PermissionMode::SmartApprove),
+                ..Settings::default()
+            },
+        );
+
+        let (client_write, server_read) = tokio::io::duplex(64 * 1024);
+        let (server_write, client_read) = tokio::io::duplex(64 * 1024);
+        let rpc_handle = tokio::spawn(async move {
+            run_rpc_mode(&mut session, BufReader::new(server_read), server_write).await
+        });
+
+        let mut writer = client_write;
+        let mut reader = BufReader::new(client_read);
+        writer
+            .write_all(b"{\"id\":\"deny_1\",\"type\":\"bash\",\"command\":\"rm -rf /\"}\n")
+            .await
+            .unwrap();
+        writer.flush().await.unwrap();
+
+        let mut response = None;
+        for _ in 0..8 {
+            let mut line = String::new();
+            let n = reader.read_line(&mut line).await.unwrap();
+            assert!(n > 0, "EOF before bash response");
+            let ev: serde_json::Value = serde_json::from_str(&line).unwrap();
+            if ev.get("type").and_then(|v| v.as_str()) == Some("response")
+                && ev.get("command").and_then(|v| v.as_str()) == Some("bash")
+                && ev.get("id").and_then(|v| v.as_str()) == Some("deny_1")
+            {
+                response = Some(ev);
+                break;
+            }
+        }
+        let response = response.expect("bash response for deny_1");
+        assert_eq!(
+            response["success"], false,
+            "dangerous RPC bash must be blocked: {response}"
+        );
+        let error = response["error"].as_str().unwrap_or("");
+        assert!(
+            error.contains("security policy"),
+            "unexpected block reason: {error}"
+        );
 
         drop(writer);
         assert!(rpc_handle.await.unwrap().is_ok());

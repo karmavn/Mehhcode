@@ -29,7 +29,7 @@ fn strip_moim_text(text: &mut String) -> bool {
     false
 }
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock};
@@ -297,13 +297,19 @@ impl AgentSession {
     }
 
     /// Aborts any currently active running prompt loop. Returns true if a cancel was triggered.
+    ///
+    /// The cancelled token stays in the slot. That lets the next turn's
+    /// `prepare_prompt_content` inherit the cancellation when Ctrl+C lands in
+    /// the handoff window after the UI already checked the preparation token.
     pub fn abort(&self) -> bool {
-        let cancel = self.active_cancel.lock().unwrap().take();
-        if let Some(c) = cancel {
-            c.cancel();
-            true
-        } else {
-            false
+        let guard = self.active_cancel.lock().unwrap();
+        match guard.as_ref() {
+            Some(c) => {
+                let was_active = !c.is_cancelled();
+                c.cancel();
+                was_active
+            }
+            None => false,
         }
     }
 
@@ -533,7 +539,9 @@ impl AgentSession {
                         .reason
                         .unwrap_or_else(|| "Tool call blocked by inspection policy".to_string()))
                 } else {
-                    Ok(())
+                    // Hand the approved target back so the codemode executor can
+                    // bind it into the nested call before the tool writes.
+                    Ok(res.approved_path)
                 }
             })
         });
@@ -833,7 +841,16 @@ impl AgentSession {
         let history = self.session.build_context_messages();
 
         let cancel = CancellationToken::new();
-        *self.active_cancel.lock().unwrap() = Some(cancel.clone());
+        {
+            let mut slot = self.active_cancel.lock().unwrap();
+            // Idempotent handoff: a cancelled preparation token means Ctrl+C
+            // fired before this loop token existed. Carry the cancellation
+            // over instead of blindly replacing it and running the turn.
+            if slot.as_ref().is_some_and(|prev| prev.is_cancelled()) {
+                cancel.cancel();
+            }
+            *slot = Some(cancel.clone());
+        }
 
         let mut config = AgentLoopConfig::new(self.model.clone(), self.provider.clone());
         config.steering_queue = self.steering_queue.clone();
@@ -1255,7 +1272,10 @@ impl AgentSession {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    eprintln!("Warning: overflow auto-compaction failed: {e}");
+                    // The overflow turn must not be persisted: it is only a
+                    // trigger for compaction, and retry deliberately avoids
+                    // saving it. Surface the failure instead of swallowing it.
+                    return Err(e).context("Overflow auto-compaction failed");
                 }
             }
         }
@@ -1437,6 +1457,40 @@ mod tests {
         assert!(!session.is_active());
         assert!(cancel.is_cancelled());
         assert!(!session.abort());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_prepare_prompt_content_inherits_aborted_prep_cancellation() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("agent_session_handoff_{}", uuid::Uuid::now_v7()));
+        let session = AgentSession::new(
+            temp_dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+        );
+
+        // `start_turn_preparation` installs a preparation token in the slot.
+        let prep_cancel = CancellationToken::new();
+        *session.active_cancel_slot().lock().unwrap() = Some(prep_cancel.clone());
+        assert!(session.is_active());
+
+        // Ctrl+C lands after ReadyForTurn's `is_cancelled` check but before the
+        // loop token is installed. abort() cancels the preparation token.
+        assert!(session.abort());
+        assert!(prep_cancel.is_cancelled());
+
+        // `start_turn` -> `prepare_prompt_content` installs the loop token. It
+        // must inherit the preparation cancellation instead of clearing it.
+        let (_msg, _history, config) =
+            session.prepare_prompt_content(UserContent::Text("retry".to_string()));
+        assert!(
+            config.cancel.is_cancelled(),
+            "loop token must inherit cancellation from the aborted preparation token"
+        );
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
