@@ -138,7 +138,11 @@ impl Usage {
         self.cost.total =
             self.cost.input + self.cost.output + self.cost.cache_read + self.cost.cache_write;
         if self.total_tokens == 0 {
-            self.total_tokens = self.input + self.output + self.cache_read + self.cache_write;
+            self.total_tokens = self
+                .input
+                .saturating_add(self.output)
+                .saturating_add(self.cache_read)
+                .saturating_add(self.cache_write);
         }
     }
 }
@@ -903,5 +907,19 @@ mod tests {
         };
         let tool_json = serde_json::to_value(&tool_event).unwrap();
         assert_eq!(tool_json["toolCall"], tool_call_to_json(&tool_call));
+    }
+
+    #[test]
+    fn calculate_cost_saturates_total_tokens_on_overflow() {
+        let mut usage = Usage {
+            input: u64::MAX,
+            output: u64::MAX,
+            cache_read: u64::MAX,
+            cache_write: u64::MAX,
+            total_tokens: 0,
+            cost: UsageCost::default(),
+        };
+        usage.calculate_cost(&ModelCost::default());
+        assert_eq!(usage.total_tokens, u64::MAX);
     }
 }

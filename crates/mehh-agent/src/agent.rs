@@ -44,6 +44,8 @@ impl CancelHandle {
     }
 }
 
+type EventListener = Arc<dyn Fn(AgentEvent) + Send + Sync>;
+
 pub struct Agent {
     model: Model,
     provider: Arc<dyn LlmProvider>,
@@ -55,7 +57,7 @@ pub struct Agent {
     follow_up_queue: Arc<Mutex<VecDeque<Message>>>,
     steering_mode: QueueMode,
     follow_up_mode: QueueMode,
-    listeners: Vec<(usize, Arc<dyn Fn(AgentEvent) + Send + Sync>)>,
+    listeners: Vec<(usize, EventListener)>,
     before_tool_call: Option<BeforeToolCallHook>,
     after_tool_call: Option<AfterToolCallHook>,
     dynamic_tools: Option<DynamicToolsList>,
@@ -894,6 +896,7 @@ mod tests {
                         block: true,
                         reason: Some("Echoing secret is blocked".to_string()),
                         terminate: false,
+                        approved_path: None,
                     }
                 } else {
                     BeforeToolCallResult::default()

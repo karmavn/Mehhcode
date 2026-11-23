@@ -655,13 +655,17 @@ impl GoogleStreamState {
                 .unwrap_or(0);
 
             self.output.usage.input = prompt.saturating_sub(cached);
-            self.output.usage.output = candidates + thoughts;
+            self.output.usage.output = candidates.saturating_add(thoughts);
             self.output.usage.cache_read = cached;
             self.output.usage.cache_write = 0;
             self.output.usage.total_tokens = if total > 0 {
                 total
             } else {
-                self.output.usage.input + self.output.usage.output + cached
+                self.output
+                    .usage
+                    .input
+                    .saturating_add(self.output.usage.output)
+                    .saturating_add(cached)
             };
             self.output.usage.calculate_cost(&self.model.cost);
         }
@@ -1420,5 +1424,26 @@ mod tests {
             result.error_message.as_deref(),
             Some("User location is not supported for the API use.")
         );
+    }
+
+    #[test]
+    fn google_usage_saturates_overflowing_totals() {
+        let model = test_gemini_model();
+        let (sender, _stream) = create_event_stream();
+        // totalTokenCount omitted so the fallback sum path is exercised too.
+        let data = serde_json::json!({
+            "candidates": [{ "content": { "parts": [{ "text": "done" }] }, "finishReason": "STOP" }],
+            "usageMetadata": {
+                "promptTokenCount": u64::MAX,
+                "candidatesTokenCount": u64::MAX,
+                "thoughtsTokenCount": u64::MAX,
+                "cachedContentTokenCount": 0
+            }
+        })
+        .to_string();
+        let events = vec![SseEvent { event: None, data }];
+        let result = process_google_sse_events(&model, &events, &sender);
+        assert_eq!(result.usage.output, u64::MAX);
+        assert_eq!(result.usage.total_tokens, u64::MAX);
     }
 }

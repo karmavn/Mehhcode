@@ -93,7 +93,12 @@ fn build_system_prompt_inner(
     let has_find = tool_names.contains(&"find");
     let has_ls = tool_names.contains(&"ls");
     if (has_bash || has_ps) && !has_grep && !has_find && !has_ls {
-        rules.insert(0, "Use bash for file operations like ls, rg, find");
+        let rule = if has_ps && !has_bash {
+            "Use powershell for file operations like ls, rg, find"
+        } else {
+            "Use bash for file operations like ls, rg, find"
+        };
+        rules.insert(0, rule);
     }
 
     let mut rules_sec = String::from("<rules>\n");
@@ -175,4 +180,35 @@ pub fn build_system_prompt_with_skills_and_context(
         prompt.push_str(&skills_sec);
     }
     prompt
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_powershell_only_prompt_uses_powershell_for_file_ops() {
+        let prompt = build_system_prompt(Path::new("."), None, None, &["powershell"]);
+        assert!(
+            prompt.contains("Use powershell for file operations"),
+            "expected powershell guidance, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Use bash for file operations"),
+            "bash is not available, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_bash_prompt_uses_bash_for_file_ops() {
+        let prompt = build_system_prompt(Path::new("."), None, None, &["bash"]);
+        assert!(
+            prompt.contains("Use bash for file operations"),
+            "expected bash guidance, got: {prompt}"
+        );
+        assert!(
+            !prompt.contains("Use powershell for file operations"),
+            "powershell is not available, got: {prompt}"
+        );
+    }
 }

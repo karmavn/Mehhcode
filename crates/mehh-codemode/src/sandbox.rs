@@ -90,7 +90,7 @@ fn webp_signature_valid(data: &str) -> bool {
 /// Rust-side validation of image outputs. The JS prelude performs the same
 /// checks, but user code can monkeypatch its built-ins, so this is authoritative.
 fn validate_image_payload(data: &str, mime: &str) -> Result<(), String> {
-    if data.is_empty() || data.len() % 4 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(4) {
         return Err("invalid image output: data is not valid base64".to_string());
     }
     let trimmed = data.trim_end_matches('=');
@@ -1265,11 +1265,15 @@ fn run_codemode_blocking(
         }
 
         // Evaluate user code. The source is passed as a JSON string literal to
-        // an AsyncFunction constructor, so no `})()` sequence in user code can
-        // break out of the wrapper and skip the result checks below.
+        // an AsyncFunction constructor. The constructor re-evals a synthesized
+        // wrapper, so a balanced `})()` sequence in user code can break out of
+        // that wrapper and make the constructor return an attacker-chosen
+        // function instead of throwing. Capture a pristine toString first, then
+        // verify the constructed function's source is exactly the expected
+        // wrapper with our body before invoking it.
         let code_json = serde_json::to_string(code).unwrap_or_else(|_| "\"\"".to_string());
         let wrapped_code = format!(
-            "((__src) => {{ const AsyncFunction = Object.getPrototypeOf(async function() {{}}).constructor; return AsyncFunction(__src)(); }})({code_json})"
+            "((__src) => {{ const pristineToString = Function.prototype.toString; const AsyncFunction = Object.getPrototypeOf(async function() {{}}).constructor; const __f = AsyncFunction(__src); const __expected = \"async function anonymous(\\n) {{\\n\" + __src + \"\\n}}\"; if (pristineToString.call(__f) !== __expected) {{ throw new Error(\"Invalid async wrapper source\"); }} return __f(); }})({code_json})"
         );
         let eval_val: rquickjs::Value = match ctx.eval(wrapped_code.as_str()) {
             Ok(v) => v,

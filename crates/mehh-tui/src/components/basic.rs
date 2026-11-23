@@ -166,20 +166,16 @@ impl Component for BorderedBox {
         };
         lines.push(top_line);
 
-        // Child lines with vertical borders
+        // Child lines with vertical borders. Paint only the border glyphs:
+        // wrapping the whole line would tint plain child text (e.g. the prompt
+        // input) with the border color, which is nearly invisible in dark themes.
         let child_lines = self.child.render(inner_width);
         for line in child_lines {
             let line_w = crate::ansi::visible_width(&line);
             let pad = inner_width.saturating_sub(line_w);
-            let right_v = if self.border_color.is_empty() {
-                v.to_string()
-            } else {
-                format!("{}{v}", self.border_color)
-            };
-            lines.push(paint(
-                &self.border_color,
-                &format!("{v}{line}{}{right_v}", " ".repeat(pad)),
-            ));
+            let left = paint(&self.border_color, &v.to_string());
+            let right = paint(&self.border_color, &format!("{}{v}", " ".repeat(pad)));
+            lines.push(format!("{left}{line}{right}"));
         }
 
         // Bottom line
@@ -477,6 +473,19 @@ impl Component for SelectList {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bordered_box_child_text_does_not_inherit_border_color() {
+        let boxed = BorderedBox::new(Box::new(Text::new("hi")))
+            .with_border_color("\x1b[38;2;1;2;3m")
+            .with_title("T");
+        let lines = boxed.render(20);
+        let content = lines.iter().find(|l| l.contains("hi")).unwrap();
+        assert!(
+            content.contains("\x1b[0mhi"),
+            "child text must be painted with its own/default color, not the border color: {content:?}"
+        );
+    }
 
     #[test]
     fn bordered_box_uses_theme_colors_without_changing_width() {

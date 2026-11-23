@@ -55,6 +55,11 @@ pub use tool_inspection::*;
 pub use tool_search::*;
 pub use trust::*;
 
+/// Serializes tests that mutate process-global environment variables.
+#[cfg(test)]
+pub(crate) static ENV_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[cfg(test)]
 pub(crate) struct TempTestDir(std::path::PathBuf);
 

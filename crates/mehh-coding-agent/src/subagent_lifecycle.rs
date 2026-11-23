@@ -125,11 +125,11 @@ fn contains_word(text: &str, word: &str) -> bool {
         let before_ok = text[..idx]
             .chars()
             .next_back()
-            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
         let after_ok = text[idx + word.len()..]
             .chars()
             .next()
-            .map_or(true, |c| !c.is_alphanumeric() && c != '_');
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_');
         before_ok && after_ok
     })
 }

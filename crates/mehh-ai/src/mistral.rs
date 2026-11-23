@@ -429,6 +429,7 @@ impl LlmProvider for MistralProvider {
 struct ToolCallInProgress {
     content_index: usize,
     raw_args: String,
+    id_is_generated: bool,
 }
 
 /// Streaming state machine processing Mistral SSE chunks.
@@ -441,6 +442,7 @@ pub struct MistralStreamState {
     active_thinking_index: Option<usize>,
     active_text_index: Option<usize>,
     active_tool_calls: HashMap<usize, ToolCallInProgress>,
+    tool_call_id_normalizer: MistralToolCallIdNormalizer,
 }
 
 impl MistralStreamState {
@@ -455,6 +457,7 @@ impl MistralStreamState {
             active_thinking_index: None,
             active_text_index: None,
             active_tool_calls: HashMap::new(),
+            tool_call_id_normalizer: MistralToolCallIdNormalizer::new(),
         }
     }
 
@@ -620,11 +623,14 @@ impl MistralStreamState {
                 let args_opt = fn_obj.and_then(|f| f.get("arguments")).and_then(|v| v.as_str());
 
                 if !self.active_tool_calls.contains_key(&idx) {
-                    let id = id_opt
-                        .map(normalize_mistral_tool_call_id)
-                        .unwrap_or_else(|| {
-                            normalize_mistral_tool_call_id(&format!("call_{}_{}", now_ms(), idx))
-                        });
+                    let (id, id_is_generated) = match id_opt {
+                        Some(id) => (self.tool_call_id_normalizer.normalize(id), false),
+                        None => (
+                            self.tool_call_id_normalizer
+                                .normalize(&format!("call_{}_{}", now_ms(), idx)),
+                            true,
+                        ),
+                    };
                     let name = name_opt.unwrap_or("").to_string();
 
                     let tool_call = ToolCall {
@@ -644,6 +650,7 @@ impl MistralStreamState {
                         ToolCallInProgress {
                             content_index,
                             raw_args: String::new(),
+                            id_is_generated,
                         },
                     );
 
@@ -654,7 +661,21 @@ impl MistralStreamState {
                 }
 
                 if let Some(in_progress) = self.active_tool_calls.get_mut(&idx) {
-                    // Some proxies emit id and name in separate SSE chunks.
+                    // Some proxies emit id and name in separate SSE chunks. A
+                    // generated placeholder must give way to the real provider
+                    // id when it finally arrives; a provider id already in place
+                    // is never overwritten.
+                    if let Some(id) = id_opt {
+                        if in_progress.id_is_generated {
+                            let normalized = self.tool_call_id_normalizer.normalize(id);
+                            if let Some(AssistantContentBlock::ToolCall(tc)) =
+                                self.output.content.get_mut(in_progress.content_index)
+                            {
+                                tc.id = normalized;
+                                in_progress.id_is_generated = false;
+                            }
+                        }
+                    }
                     if let Some(name) = name_opt {
                         if !name.is_empty() {
                             if let Some(AssistantContentBlock::ToolCall(tc)) =
@@ -1258,5 +1279,133 @@ mod tests {
         let result = process_mistral_sse_events(&model, &sse_events, &sender);
         assert_eq!(result.stop_reason, StopReason::Error);
         assert_eq!(result.error_message.as_deref(), Some("Rate limit exceeded"));
+    }
+
+    #[test]
+    fn streamed_tool_call_ids_with_separator_variants_stay_distinct() {
+        let model = Model {
+            id: "mistral-large-latest".to_string(),
+            name: "Mistral Large".to_string(),
+            api: "mistral-conversations".to_string(),
+            provider: "mistral".to_string(),
+            base_url: "".to_string(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 4096,
+            headers: None,
+            ..Default::default()
+        };
+        let (sender, _stream) = create_event_stream();
+        let chunks = vec![
+            serde_json::json!({
+                "id": "cmpl-1",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [
+                            { "index": 0, "id": "ab-cd-ef-ghi", "type": "function",
+                              "function": { "name": "tool_a", "arguments": "" } },
+                            { "index": 1, "id": "ab_cd_ef_ghi", "type": "function",
+                              "function": { "name": "tool_b", "arguments": "" } }
+                        ]
+                    }
+                }]
+            })
+            .to_string(),
+            "[DONE]".to_string(),
+        ];
+        let sse_events: Vec<SseEvent> = chunks
+            .into_iter()
+            .map(|data| SseEvent { event: None, data })
+            .collect();
+        let result = process_mistral_sse_events(&model, &sse_events, &sender);
+        let ids: Vec<&str> = result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                AssistantContentBlock::ToolCall(tc) => Some(tc.id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2);
+        assert_ne!(
+            ids[0], ids[1],
+            "streamed IDs differing only by a separator collapsed into one"
+        );
+    }
+
+    #[test]
+    fn streamed_tool_call_adopts_provider_id_arriving_in_later_chunk() {
+        let model = Model {
+            id: "mistral-large-latest".to_string(),
+            name: "Mistral Large".to_string(),
+            api: "mistral-conversations".to_string(),
+            provider: "mistral".to_string(),
+            base_url: String::new(),
+            reasoning: false,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 128_000,
+            max_tokens: 4096,
+            headers: None,
+            ..Default::default()
+        };
+        let mut state = MistralStreamState::new(&model);
+        let mut events = Vec::new();
+
+        // Chunk 1 carries only the name, so a generated id is used initially.
+        state.process_chunk_into(
+            &serde_json::json!({
+                "id": "cmpl-1",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "function": { "name": "get_weather", "arguments": "" }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            &mut events,
+        );
+
+        // Chunk 2 delivers the real provider id on the same tool call index.
+        state.process_chunk_into(
+            &serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_real_123",
+                            "function": { "arguments": "{}" }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            &mut events,
+        );
+
+        state.finish_into(&mut events);
+
+        let end = events
+            .iter()
+            .find_map(|ev| match ev {
+                AssistantMessageEvent::ToolCallEnd { tool_call, .. } => Some(tool_call),
+                _ => None,
+            })
+            .expect("ToolCallEnd emitted");
+        assert_eq!(end.name, "get_weather");
+        assert_eq!(
+            end.id,
+            normalize_mistral_tool_call_id("call_real_123"),
+            "later provider id must replace the generated id, got {:?}",
+            end.id
+        );
     }
 }

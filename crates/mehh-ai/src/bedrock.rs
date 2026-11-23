@@ -13,6 +13,7 @@ use crate::retry::{
 use crate::stream::{create_event_stream, AssistantEventSender, AssistantEventStream, LlmProvider};
 use crate::streaming_json::ToolCallArgumentsStream;
 use crate::types::*;
+use crate::anthropic::MIN_ANSWER_TOKENS;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -710,9 +711,13 @@ pub fn build_bedrock_request(
         }
     }
 
-    if thinking_enabled {
+    // The API requires budget_tokens >= MIN_ANSWER_TOKENS and
+    // budget_tokens < maxTokens. If the ceiling cannot fit both, omit
+    // the thinking block entirely instead of emitting a sub-floor
+    // budget that makes every request fail with HTTP 400.
+    if thinking_enabled && max_tokens > MIN_ANSWER_TOKENS {
         let budget = match options.reasoning {
-            Some(ThinkingLevel::Minimal) => 1024,
+            Some(ThinkingLevel::Minimal) => MIN_ANSWER_TOKENS,
             Some(ThinkingLevel::Low) => 2048,
             Some(ThinkingLevel::Medium) => 8192,
             Some(ThinkingLevel::High) | Some(ThinkingLevel::Xhigh) | Some(ThinkingLevel::Max) => {
@@ -721,7 +726,10 @@ pub fn build_bedrock_request(
             _ => 2048,
         };
         // Bedrock caps budget_tokens at 32768 and requires it below maxTokens.
-        let budget = budget.min(32768).min(max_tokens.saturating_sub(1)).max(1);
+        let budget = budget
+            .min(32768)
+            .max(MIN_ANSWER_TOKENS)
+            .min(max_tokens - 1);
         req_map.insert(
             "additionalModelRequestFields".to_string(),
             serde_json::json!({
@@ -1007,7 +1015,11 @@ impl BedrockStreamState {
                 self.output.usage.output = output;
                 self.output.usage.cache_read = cache_read;
                 self.output.usage.cache_write = cache_write;
-                self.output.usage.total_tokens = if total > 0 { total } else { input + output };
+                self.output.usage.total_tokens = if total > 0 {
+                    total
+                } else {
+                    input.saturating_add(output)
+                };
                 self.output.usage.calculate_cost(&self.model.cost);
             }
         }
@@ -1948,5 +1960,94 @@ mod tests {
         assert_eq!(merged.len(), 2);
         assert_eq!(merged[0]["toolResult"]["content"][0]["text"], "tool output");
         assert_eq!(merged[1]["text"], "steering follow-up");
+    }
+
+    #[test]
+    fn build_request_omits_thinking_when_max_tokens_cannot_fit_budget() {
+        let model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            name: "Claude 3.7 Sonnet (Bedrock)".to_string(),
+            api: "bedrock-converse-stream".to_string(),
+            provider: "amazon-bedrock".to_string(),
+            base_url: String::new(),
+            reasoning: true,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 200_000,
+            max_tokens: 64_000,
+            headers: None,
+            ..Default::default()
+        };
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("hello".to_string()),
+                timestamp: 1,
+            })],
+            tools: None,
+        };
+
+        // A ceiling below the API floor cannot fit a valid budget, so the
+        // thinking block must be omitted instead of failing every request.
+        let opts = StreamOptions {
+            max_tokens: Some(500),
+            reasoning: Some(ThinkingLevel::Low),
+            ..Default::default()
+        };
+        let req = build_bedrock_request(&model, &context, &opts);
+        assert!(
+            req.get("additionalModelRequestFields").is_none(),
+            "sub-floor budget must not be emitted: {req}"
+        );
+
+        // Exactly at the floor is still too small: budget must be < max_tokens.
+        let opts = StreamOptions {
+            max_tokens: Some(MIN_ANSWER_TOKENS),
+            reasoning: Some(ThinkingLevel::Low),
+            ..Default::default()
+        };
+        let req = build_bedrock_request(&model, &context, &opts);
+        assert!(
+            req.get("additionalModelRequestFields").is_none(),
+            "budget cannot fit below max_tokens: {req}"
+        );
+
+        // Just above the floor, the budget is clamped into [floor, max_tokens - 1].
+        let opts = StreamOptions {
+            max_tokens: Some(1500),
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let req = build_bedrock_request(&model, &context, &opts);
+        let budget = req["additionalModelRequestFields"]["thinking"]["budget_tokens"]
+            .as_u64()
+            .expect("budget_tokens");
+        assert!(budget >= MIN_ANSWER_TOKENS, "budget below floor: {req}");
+        assert!(budget < 1500, "budget must be below max_tokens: {req}");
+    }
+
+    #[test]
+    fn bedrock_usage_saturates_overflowing_totals() {
+        let model = Model {
+            id: "bedrock-test".to_string(),
+            cost: ModelCost::default(),
+            ..Default::default()
+        };
+        let (sender, _stream) = create_event_stream();
+        let mut state = BedrockStreamState::new(&model);
+        // totalTokens omitted so the fallback input + output sum is exercised.
+        state.process_event(
+            &serde_json::json!({
+                "metadata": {
+                    "usage": {
+                        "inputTokens": u64::MAX,
+                        "outputTokens": u64::MAX
+                    }
+                }
+            }),
+            &sender,
+        );
+        let result = state.finish(&sender);
+        assert_eq!(result.usage.total_tokens, u64::MAX);
     }
 }

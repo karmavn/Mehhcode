@@ -307,6 +307,7 @@ pub struct Editor {
     pub cursor_col: usize,
     pub history: Vec<String>,
     pub history_idx: Option<usize>,
+    history_draft: Option<(Vec<String>, usize, usize)>,
     pub undo_stack: Vec<(Vec<String>, usize, usize)>,
     pub kill_ring: KillRing,
     pub last_action: Option<EditorLastAction>,
@@ -334,6 +335,7 @@ impl Editor {
             cursor_col: 0,
             history: Vec::new(),
             history_idx: None,
+            history_draft: None,
             undo_stack: Vec::new(),
             kill_ring: KillRing::default(),
             last_action: None,
@@ -469,6 +471,7 @@ impl Editor {
         self.pastes.clear();
         self.paste_counter = 0;
         self.history_idx = None;
+        self.history_draft = None;
         self.clear_autocomplete();
         self.last_action = None;
     }
@@ -787,6 +790,10 @@ impl Editor {
         if self.history.is_empty() {
             return;
         }
+        self.push_undo();
+        if self.history_idx.is_none() {
+            self.history_draft = Some((self.lines.clone(), self.cursor_row, self.cursor_col));
+        }
         let new_idx = match self.history_idx {
             None => self.history.len() - 1,
             Some(0) => 0,
@@ -816,7 +823,13 @@ impl Editor {
                 self.cursor_col = self.lines[self.cursor_row].chars().count();
             } else {
                 self.history_idx = None;
-                self.clear();
+                if let Some((lines, row, col)) = self.history_draft.take() {
+                    self.lines = lines;
+                    self.cursor_row = row;
+                    self.cursor_col = col;
+                } else {
+                    self.clear();
+                }
             }
         }
     }
@@ -857,6 +870,7 @@ impl Editor {
                         return EditorOutput::Changed(self.text());
                     } else {
                         self.clear_autocomplete();
+                        return EditorOutput::None;
                     }
                 }
                 "escape" => {
@@ -1083,7 +1097,7 @@ impl Editor {
         }
 
         // Single character input
-        if key.chars().count() == 1 && !key.contains('+') {
+        if key.chars().count() == 1 {
             self.last_action = Some(EditorLastAction::Other);
             self.insert_text(key);
             return EditorOutput::Changed(self.text());
@@ -1385,5 +1399,43 @@ mod tests {
 
         let _ = editor.handle_editor_key("pageup", &kb);
         assert_eq!(editor.autocomplete.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn plus_key_inserts_plus_character() {
+        let mut editor = Editor::new();
+        let kb = Keybindings::default_bindings();
+        let out = editor.handle_editor_key("+", &kb);
+        assert!(matches!(out, EditorOutput::Changed(_)), "output: {out:?}");
+        assert_eq!(editor.text(), "+");
+    }
+
+    #[test]
+    fn enter_with_empty_autocomplete_does_not_submit() {
+        let mut editor = Editor::new();
+        editor.set_text("draft");
+        editor.set_autocomplete(Vec::new());
+        let kb = Keybindings::default_bindings();
+
+        let out = editor.handle_editor_key("enter", &kb);
+        assert!(!matches!(out, EditorOutput::Submit(_)), "output: {out:?}");
+        assert!(editor.autocomplete.is_none());
+    }
+
+    #[test]
+    fn history_recall_restores_in_progress_draft() {
+        let mut editor = Editor::new();
+        let kb = Keybindings::default_bindings();
+        editor.history.push("old entry".to_string());
+        for c in "draft".chars() {
+            editor.handle_editor_key(&c.to_string(), &kb);
+        }
+        assert_eq!(editor.text(), "draft");
+
+        let _ = editor.handle_editor_key("up", &kb);
+        assert_eq!(editor.text(), "old entry");
+
+        let _ = editor.handle_editor_key("down", &kb);
+        assert_eq!(editor.text(), "draft");
     }
 }

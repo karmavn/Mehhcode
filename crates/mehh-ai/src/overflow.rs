@@ -52,7 +52,11 @@ pub fn is_context_overflow(message: &AssistantMessage, context_window: u64) -> b
     }
 
     if context_window > 0 && message.stop_reason == StopReason::Stop {
-        let input_tokens = message.usage.input.saturating_add(message.usage.cache_read);
+        let input_tokens = message
+            .usage
+            .input
+            .saturating_add(message.usage.cache_read)
+            .saturating_add(message.usage.cache_write);
         if input_tokens > context_window {
             return true;
         }
@@ -63,6 +67,7 @@ pub fn is_context_overflow(message: &AssistantMessage, context_window: u64) -> b
             .usage
             .input
             .saturating_add(message.usage.cache_read)
+            .saturating_add(message.usage.cache_write)
             .saturating_add(message.usage.output);
         if total >= context_window {
             return true;
@@ -146,5 +151,38 @@ mod tests {
         msg.usage.input = 100_000;
         msg.usage.cache_read = 50_000;
         assert!(!is_context_overflow(&msg, 200_000));
+    }
+
+    #[test]
+    fn test_silent_usage_overflow_includes_cache_write() {
+        let mut msg = AssistantMessage {
+            content: Vec::new(),
+            api: "test".to_string(),
+            provider: "test".to_string(),
+            model: "test-model".to_string(),
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: now_ms(),
+        };
+        // input_tokens alone excludes cache writes; the real prompt is the sum.
+        msg.usage.input = 10_000;
+        msg.usage.cache_write = 195_000;
+        msg.usage.cache_read = 0;
+        assert!(
+            is_context_overflow(&msg, 200_000),
+            "Stop path must count cache_write tokens"
+        );
+
+        msg.stop_reason = StopReason::Length;
+        msg.usage.input = 1_000;
+        msg.usage.cache_write = 199_000;
+        msg.usage.cache_read = 0;
+        msg.usage.output = 2_000;
+        assert!(
+            is_context_overflow(&msg, 200_000),
+            "Length path must count cache_write tokens"
+        );
     }
 }

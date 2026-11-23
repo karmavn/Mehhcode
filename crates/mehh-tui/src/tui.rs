@@ -1,4 +1,5 @@
-use crate::ansi::{slice_by_column, visible_width};
+use crate::ansi::{ansi_code_len, slice_by_column, visible_width};
+use unicode_segmentation::UnicodeSegmentation;
 
 pub const CURSOR_MARKER: &str = "\x1b_mehh:c\x07";
 
@@ -205,25 +206,38 @@ impl TuiRenderer {
 
         // Extract CURSOR_MARKER position
         let mut cursor_pos: Option<(usize, usize)> = None;
+        let mut cursor_byte: Option<(usize, usize)> = None;
         for (row_idx, line) in lines.iter_mut().enumerate() {
             if let Some(pos) = line.find(CURSOR_MARKER) {
                 let col = visible_width(&line[..pos]);
                 cursor_pos = Some((row_idx, col));
-                *line = line.replace(CURSOR_MARKER, "");
+                cursor_byte = Some((row_idx, pos));
+                *line = line.replacen(CURSOR_MARKER, "", 1);
                 break;
             }
         }
 
         // Fake reverse-video cursor when hardware cursor is disabled
         if !show_hardware_cursor {
-            if let Some((row, col)) = cursor_pos {
-                if row < lines.len() {
-                    let line = &lines[row];
-                    let before = slice_by_column(line, 0, col);
-                    let at = slice_by_column(line, col, col + 1);
-                    let after = slice_by_column(line, col + 1, visible_width(line));
-                    let cursor_char = if at.is_empty() { " " } else { &at };
-                    lines[row] = format!("{before}\x1b[7m{cursor_char}\x1b[27m{after}");
+            if let Some((row, byte_pos)) = cursor_byte {
+                if let Some(line) = lines.get_mut(row) {
+                    let byte_pos = byte_pos.min(line.len());
+                    // Keep ANSI codes at the cursor attached to the prefix.
+                    let mut style_end = byte_pos;
+                    while style_end < line.len() {
+                        let code_len = ansi_code_len(line, style_end);
+                        if code_len == 0 {
+                            break;
+                        }
+                        style_end += code_len;
+                    }
+                    let style = &line[byte_pos..style_end];
+                    let rest = &line[style_end..];
+                    let grapheme = rest.graphemes(true).next().unwrap_or("");
+                    let before = format!("{}{}", &line[..byte_pos], style);
+                    let after = &rest[grapheme.len()..];
+                    let cursor_char = if grapheme.is_empty() { " " } else { grapheme };
+                    *line = format!("{before}\x1b[7m{cursor_char}\x1b[27m{after}");
                 }
             }
         }
@@ -406,6 +420,22 @@ mod tests {
         assert!(out.contains("line0_new"));
         assert!(out.contains("\x1b[1;1H\x1b[2Kline0_new"), "changed row must use absolute positioning: {out:?}");
         assert!(!out.contains("\x1b[3A"), "no relative overshoot: {out:?}");
+    }
+
+    #[test]
+    fn fake_cursor_preserves_wide_character_after_marker() {
+        let mut term = MockTerminal::new(40, 3);
+        let mut renderer = TuiRenderer::new();
+        let line = format!("> {CURSOR_MARKER}世界👨‍👩‍👧‍👦!");
+        renderer.render_frame(&mut term, vec![line], false).unwrap();
+        let out = term.full_output();
+        assert!(out.contains('世'), "wide character dropped: {out:?}");
+        assert!(out.contains('界'), "wide character dropped: {out:?}");
+        assert!(
+            out.contains('👨') && out.contains('👩') && out.contains('👧') && out.contains('👦'),
+            "emoji sequence dropped: {out:?}"
+        );
+        assert!(out.contains('!'), "trailing character dropped: {out:?}");
     }
 }
 

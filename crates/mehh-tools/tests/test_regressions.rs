@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use mehh_agent::AgentTool;
+use mehh_tools::core::context::PathPolicy;
 use mehh_tools::{
     select_coding_tools, AnalyzeTool, EditTool, EditUndoStore, FindTool, GrepTool, ReadTool,
     UndoEditTool, WriteTool,
@@ -371,4 +372,134 @@ fn select_coding_tools_rejects_unknown_names() {
             "unexpected error: {err}"
         ),
     }
+}
+
+#[tokio::test]
+async fn write_through_two_hop_dangling_symlink_creates_final_target() {
+    let dir = TempDir::new("two_hop_symlink");
+    let final_target = dir.path().join("missing.txt");
+    let link2 = dir.path().join("link2.txt");
+    let link1 = dir.path().join("link1.txt");
+
+    // link1 -> link2 -> missing.txt; both links are dangling.
+    if let Err(e) = make_symlink(Path::new("missing.txt"), &link2) {
+        eprintln!("skipping two-hop symlink test: cannot create symlinks ({e})");
+        return;
+    }
+    if let Err(e) = make_symlink(Path::new("link2.txt"), &link1) {
+        eprintln!("skipping two-hop symlink test: cannot create symlinks ({e})");
+        return;
+    }
+
+    let tool = WriteTool::new(dir.path().to_path_buf());
+    let params = json!({ "path": "link1.txt", "content": "created" })
+        .as_object()
+        .unwrap()
+        .clone();
+    tool.execute("tc", params, CancellationToken::new(), None)
+        .await
+        .expect("write through two-hop dangling symlink");
+
+    assert_eq!(
+        std::fs::read_to_string(&final_target).unwrap(),
+        "created",
+        "write must land on the final target, not on link2"
+    );
+    assert!(
+        std::fs::symlink_metadata(&link2)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "link2 must still be a symlink"
+    );
+}
+
+#[tokio::test]
+async fn undo_creation_refuses_symlink_swap_to_unrelated_file() {
+    let dir = TempDir::new("undo_symlink_swap");
+    let original_target = dir.path().join("original.txt");
+    let link = dir.path().join("P.txt");
+    let unrelated = dir.path().join("Q.txt");
+    std::fs::write(&unrelated, b"unrelated").unwrap();
+
+    if let Err(e) = make_symlink(Path::new("original.txt"), &link) {
+        eprintln!("skipping undo symlink-swap test: cannot create symlinks ({e})");
+        return;
+    }
+
+    let store = Arc::new(EditUndoStore::new());
+    let write = WriteTool::new(dir.path().to_path_buf()).with_undo_store(store.clone());
+    let write_params = json!({ "path": "P.txt", "content": "created" })
+        .as_object()
+        .unwrap()
+        .clone();
+    write
+        .execute("write", write_params, CancellationToken::new(), None)
+        .await
+        .expect("write through dangling symlink");
+    assert_eq!(std::fs::read_to_string(&original_target).unwrap(), "created");
+
+    // Replace P with a symlink to an existing, unrelated file Q.
+    std::fs::remove_file(&link).unwrap();
+    if let Err(e) = make_symlink(Path::new("Q.txt"), &link) {
+        eprintln!("skipping undo symlink-swap test: cannot recreate symlink ({e})");
+        return;
+    }
+
+    let undo = UndoEditTool::new(dir.path().to_path_buf(), store.clone());
+    let mut undo_params = serde_json::Map::new();
+    undo_params.insert("path".to_string(), json!("P.txt"));
+    undo_params.insert(
+        mehh_agent::INSPECTED_TARGET_ARG.to_string(),
+        json!(original_target.to_string_lossy()),
+    );
+    let err = undo
+        .execute("undo", undo_params, CancellationToken::new(), None)
+        .await
+        .expect_err("undo must refuse after the target changed");
+    assert!(
+        err.contains("changed since it was inspected"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&unrelated).unwrap(),
+        "unrelated",
+        "undo must not delete the unrelated file Q"
+    );
+    assert!(
+        store.has_snapshot(&link),
+        "a refused undo must keep the snapshot for a later retry"
+    );
+}
+
+#[tokio::test]
+async fn write_rejects_resolved_target_outside_workspace() {
+    let ws = TempDir::new("policy_ws");
+    let outside_dir = TempDir::new("policy_outside");
+    let outside = outside_dir.path().join("outside.txt");
+    let link = ws.path().join("escape.txt");
+
+    if let Err(e) = make_symlink(&outside, &link) {
+        eprintln!("skipping workspace policy test: cannot create symlinks ({e})");
+        return;
+    }
+
+    let tool = WriteTool::new(ws.path().to_path_buf())
+        .with_path_policy(PathPolicy::WorkspaceOnly(vec![ws.path().to_path_buf()]));
+    let params = json!({ "path": "escape.txt", "content": "bad" })
+        .as_object()
+        .unwrap()
+        .clone();
+    let err = tool
+        .execute("tc", params, CancellationToken::new(), None)
+        .await
+        .expect_err("resolved target outside the workspace must be rejected");
+    assert!(
+        err.contains("outside the allowed workspace"),
+        "unexpected error: {err}"
+    );
+    assert!(
+        !outside.exists(),
+        "write must not create the file outside the workspace"
+    );
 }

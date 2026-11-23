@@ -66,9 +66,40 @@ pub fn parse_frontmatter(content: &str) -> (HashMap<String, String>, &str) {
     (map, body)
 }
 
+const MAX_SKILL_SCAN_DEPTH: usize = 32;
+
+/// Returns true for symlinks and other reparse points (e.g. Windows junctions).
+/// Following them would let a link cycle recurse forever, so they are skipped.
+fn is_link_entry(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return true;
+            }
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
+        // Fail closed: never follow an entry we cannot inspect.
+        Err(_) => true,
+    }
+}
+
 /// Recursively scans a directory for `SKILL.md` files, ignoring hidden dirs, `node_modules`, and `target`.
+/// Linked directories are never followed and recursion is depth-bounded so cycles cannot overflow the stack.
 fn scan_dir_for_skills(dir: &Path, out: &mut Vec<Skill>) {
-    if !dir.is_dir() {
+    scan_dir_for_skills_inner(dir, out, 0);
+}
+
+fn scan_dir_for_skills_inner(dir: &Path, out: &mut Vec<Skill>, depth: usize) {
+    if depth > MAX_SKILL_SCAN_DEPTH || !dir.is_dir() {
         return;
     }
 
@@ -80,12 +111,18 @@ fn scan_dir_for_skills(dir: &Path, out: &mut Vec<Skill>) {
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
+            // Only a linked directory can create a scan cycle. A linked
+            // SKILL.md is a leaf; skipping it loses legitimate skills (for
+            // example a SKILL.md symlinked from a dotfiles repository).
+            if is_link_entry(&path) {
+                continue;
+            }
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str.starts_with('.') || name_str == "node_modules" || name_str == "target" {
                 continue;
             }
-            scan_dir_for_skills(&path, out);
+            scan_dir_for_skills_inner(&path, out, depth + 1);
         } else if path.is_file() {
             if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
                 if file_name.eq_ignore_ascii_case("skill.md") {
@@ -222,9 +259,9 @@ pub fn expand_skill_command(input: &str, skills: &[Skill]) -> Option<String> {
 
     let skill_block = format!(
         "<skill name=\"{}\" location=\"{}\">\nReferences are relative to {}.\n\n{}\n</skill>",
-        skill.name,
-        norm_file,
-        norm_base,
+        escape_xml(&skill.name),
+        escape_xml(&norm_file),
+        escape_xml(&norm_base),
         body.trim()
     );
 
@@ -326,6 +363,114 @@ Use Clippy and avoid unnecessary allocations.
         assert!(non_skill_input.is_none());
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_expand_skill_command_escapes_name_and_paths() {
+        let dir = std::env::temp_dir().join(format!("mehh_skill_escape_{}", Uuid::now_v7()));
+        fs::create_dir_all(&dir).unwrap();
+        let skill_file = dir.join("SKILL.md");
+        fs::write(&skill_file, "---\ndescription: d\n---\nBody").unwrap();
+
+        let skills = vec![Skill {
+            name: "x\"on_error=\"bad".to_string(),
+            description: String::new(),
+            file_path: skill_file,
+            base_dir: dir.join("base_<weird>"),
+            disable_model_invocation: false,
+        }];
+
+        let expanded = expand_skill_command("/skill:x\"on_error=\"bad", &skills).unwrap();
+        assert!(
+            expanded.contains("name=\"x&quot;on_error=&quot;bad\""),
+            "raw attribute breakout: {expanded}"
+        );
+        assert!(
+            expanded.contains("&lt;weird&gt;"),
+            "raw '<' in location: {expanded}"
+        );
+        assert!(!expanded.contains("on_error=\"bad\""), "raw breakout: {expanded}");
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn create_dir_link(target: &Path, link: &Path) {
+        #[cfg(windows)]
+        {
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("run mklink /J");
+            assert!(output.status.success(), "mklink /J failed: {output:?}");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).expect("create symlink");
+        }
+    }
+
+    #[test]
+    fn test_scan_dir_for_skills_skips_links_and_loops() {
+        let dir = std::env::temp_dir().join(format!("mehh_skill_loop_{}", Uuid::now_v7()));
+        let skills_root = dir.join(".agents").join("skills");
+        let real_skill = skills_root.join("real-skill");
+        fs::create_dir_all(&real_skill).unwrap();
+        fs::write(
+            real_skill.join("SKILL.md"),
+            "---\nname: loop-skill\ndescription: Project skill\n---\nBody",
+        )
+        .unwrap();
+
+        // A link back to the scanned root forms a cycle; a link to the skill
+        // directory makes the same SKILL.md reachable twice.
+        create_dir_link(&skills_root, &skills_root.join("loop"));
+        create_dir_link(&real_skill, &skills_root.join("alias"));
+
+        let mut found = Vec::new();
+        scan_dir_for_skills(&skills_root, &mut found);
+
+        let names: Vec<&str> = found.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["loop-skill"],
+            "links/loops must be skipped; got {names:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    // On Windows a file symlink needs SeCreateSymbolicLinkPrivilege, which is
+    // unavailable in the test environment (verified: `mklink` exits 1). The
+    // behavior is platform-independent, so exercise it wherever symlinks work.
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_dir_for_skills_loads_symlinked_skill_file() {
+        let dir = std::env::temp_dir().join(format!("mehh_skill_file_link_{}", Uuid::now_v7()));
+        let skills_root = dir.join(".agents").join("skills");
+        let skill_dir = skills_root.join("linked-file-skill");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let dotfiles = dir.join("dotfiles");
+        fs::create_dir_all(&dotfiles).unwrap();
+        let real_skill = dotfiles.join("SKILL.md");
+        fs::write(
+            &real_skill,
+            "---\nname: linked-file-skill\ndescription: from dotfiles\n---\nBody",
+        )
+        .unwrap();
+
+        // Only the file is linked; the link guard exists for directory cycles.
+        create_dir_link(&real_skill, &skill_dir.join("SKILL.md"));
+
+        let mut found = Vec::new();
+        scan_dir_for_skills(&skills_root, &mut found);
+        assert!(
+            found.iter().any(|s| s.name == "linked-file-skill"),
+            "a symlinked SKILL.md must load, got {found:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

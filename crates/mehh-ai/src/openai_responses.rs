@@ -905,7 +905,7 @@ impl OpenAiResponsesStreamState {
                         let total = usage
                             .get("total_tokens")
                             .and_then(|v| v.as_u64())
-                            .unwrap_or(input + output);
+                            .unwrap_or_else(|| input.saturating_add(output));
                         let cached = usage
                             .get("input_tokens_details")
                             .and_then(|d| d.get("cached_tokens"))
@@ -917,7 +917,8 @@ impl OpenAiResponsesStreamState {
                             .and_then(|v| v.as_u64())
                             .unwrap_or(0);
 
-                        self.output.usage.input = input.saturating_sub(cached + cache_write);
+                        self.output.usage.input =
+                            input.saturating_sub(cached.saturating_add(cache_write));
                         self.output.usage.output = output;
                         self.output.usage.cache_read = cached;
                         self.output.usage.cache_write = cache_write;
@@ -955,7 +956,7 @@ impl OpenAiResponsesStreamState {
                         let total = usage
                             .get("total_tokens")
                             .and_then(|v| v.as_u64())
-                            .unwrap_or(input + output);
+                            .unwrap_or_else(|| input.saturating_add(output));
                         self.output.usage.input = input;
                         self.output.usage.output = output;
                         self.output.usage.total_tokens = total;
@@ -1721,5 +1722,33 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["type"], "input_image");
         assert_eq!(parts[0]["image_url"], "data:image/png;base64,iVBORw0KGgo=");
+    }
+
+    #[test]
+    fn response_usage_saturates_overflowing_totals() {
+        let model = test_responses_model();
+        let (sender, _stream) = create_event_stream();
+        // total_tokens is omitted to exercise input + output, and cached +
+        // cache_write overflows independently. Both must saturate in debug.
+        let data = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_overflow",
+                "status": "completed",
+                "usage": {
+                    "input_tokens": u64::MAX,
+                    "output_tokens": 1,
+                    "input_tokens_details": {
+                        "cached_tokens": u64::MAX,
+                        "cache_write_tokens": u64::MAX
+                    }
+                }
+            }
+        })
+        .to_string();
+        let events = vec![SseEvent { event: None, data }];
+        let result = process_openai_responses_sse_events(&model, &events, &sender);
+        assert_eq!(result.usage.input, 0);
+        assert_eq!(result.usage.total_tokens, u64::MAX);
     }
 }

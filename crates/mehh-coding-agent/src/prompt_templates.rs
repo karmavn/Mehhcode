@@ -22,7 +22,6 @@ pub fn parse_command_args(args_string: &str) -> Vec<String> {
     let mut current = String::new();
     let mut has_token = false;
     let mut in_quote: Option<char> = None;
-    let mut quote_start = 0;
     let chars: Vec<char> = args_string.chars().collect();
     let mut i = 0;
 
@@ -41,7 +40,6 @@ pub fn parse_command_args(args_string: &str) -> Vec<String> {
             }
         } else if (c == '"' || c == '\'') && !has_token {
             in_quote = Some(c);
-            quote_start = i;
             has_token = true;
         } else if c.is_whitespace() {
             if has_token {
@@ -55,10 +53,9 @@ pub fn parse_command_args(args_string: &str) -> Vec<String> {
         }
 
         if in_quote.is_some() && i == chars.len() - 1 {
-            in_quote = None;
-            current = chars[quote_start].to_string();
-            i = quote_start + 1;
-            continue;
+            // Unterminated quote: keep what was accumulated as the final token
+            // instead of replaying the string from the opening quote.
+            break;
         }
 
         i += 1;
@@ -144,6 +141,16 @@ pub fn substitute_args(content: &str, args: &[String]) -> String {
                             i = end + 1;
                             continue;
                         }
+                    } else if inner == "*" || inner == "ARGUMENTS" {
+                        result.push_str(&all_args);
+                        i = end + 1;
+                        continue;
+                    } else if let Ok(n) = inner.parse::<usize>() {
+                        if n > 0 && n <= args.len() {
+                            result.push_str(&args[n - 1]);
+                        }
+                        i = end + 1;
+                        continue;
                     }
                 }
             }
@@ -314,6 +321,16 @@ mod tests {
     }
 
     #[test]
+    fn unterminated_quote_flushes_remaining_text_without_stray_quote() {
+        assert_eq!(
+            parse_command_args(r#"foo "bar baz"#),
+            vec!["foo", "bar baz"]
+        );
+        assert_eq!(parse_command_args("'hello world"), vec!["hello world"]);
+        assert_eq!(parse_command_args(r#""unclosed"#), vec!["unclosed"]);
+    }
+
+    #[test]
     fn test_substitute_args() {
         let template = "Run on $1 with options $@. Fallback: ${2:-default_val}. Slice: ${@:2:2}.";
         let args = vec![
@@ -337,6 +354,26 @@ mod tests {
             &["a".to_string(), "b".to_string(), "c".to_string()],
         );
         assert_eq!(slice_rest, "Rest: b c");
+    }
+
+    #[test]
+    fn test_substitute_args_braced_numeric_and_all() {
+        assert_eq!(
+            substitute_args("Value: ${1}", &["x".to_string()]),
+            "Value: x"
+        );
+        assert_eq!(
+            substitute_args("Value: ${2}", &["x".to_string()]),
+            "Value: "
+        );
+        assert_eq!(
+            substitute_args("All: ${*} / ${ARGUMENTS}", &["a".to_string(), "b".to_string()]),
+            "All: a b / a b"
+        );
+        assert_eq!(
+            substitute_args("Keep: ${UNKNOWN}", &["a".to_string()]),
+            "Keep: ${UNKNOWN}"
+        );
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use mehh_ai::{
@@ -113,11 +114,17 @@ pub struct BeforeToolCallContext {
     pub context: AgentContext,
 }
 
+/// Reserved tool argument used to pass the path a security inspector approved.
+/// Injected after validation so tools can revalidate the exact target at write time.
+pub const INSPECTED_TARGET_ARG: &str = "__mehh_inspected_target";
+
 #[derive(Debug, Clone, Default)]
 pub struct BeforeToolCallResult {
     pub block: bool,
     pub reason: Option<String>,
     pub terminate: bool,
+    /// Canonical target approved by the inspector for a path-bearing tool.
+    pub approved_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

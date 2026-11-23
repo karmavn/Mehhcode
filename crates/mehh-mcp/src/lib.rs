@@ -300,7 +300,7 @@ mod tests {
                     "command": "python",
                     "args": ["server.py"],
                     "enabled": true,
-                    "timeout": 30
+                    "timeoutSecs": 30
                 }
             }
         });

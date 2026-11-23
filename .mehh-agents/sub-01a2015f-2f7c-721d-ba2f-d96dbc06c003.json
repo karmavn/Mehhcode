@@ -1,0 +1,474 @@
+{
+  "agent_id": "sub-01a2015f-2f7c-721d-ba2f-d96dbc06c003",
+  "mode": "research",
+  "model_id": "nvidia/nemotron-3.5-super-vl:free",
+  "status": "completed",
+  "created_at_ms": 1795319345020,
+  "completed_at_ms": 1795319386712,
+  "events": [
+    {
+      "kind": "started",
+      "at_ms": 1795319345020,
+      "detail": null
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319346036,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319346037,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319346048,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319346052,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319347127,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319347127,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319347128,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319347129,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319348500,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319348500,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319348544,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319348545,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319349528,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319349528,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319349530,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319349531,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319350490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319350495,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319353836,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353843,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353843,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353843,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353843,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353843,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353843,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353844,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353844,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353844,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319353844,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356490,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356497,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356497,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356497,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356497,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356497,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356498,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356498,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356498,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356498,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356498,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359319,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359327,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359336,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359344,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359345,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359346,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359346,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359347,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359348,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359348,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359353,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319363062,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319363062,
+      "detail": "grep"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319363062,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319363066,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319363097,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319363104,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319364572,
+      "detail": "grep"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319365734,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319367850,
+      "detail": "grep"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319368049,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319370370,
+      "detail": "grep"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319370600,
+      "detail": "completed"
+    },
+    {
+      "kind": "finished",
+      "at_ms": 1795319386712,
+      "detail": "Here is the structured research summary:\n\n---\n\n## Mehhcode Project Research Summary\n\n### Project Purpose & Architecture\n\nMehhcode is an AI coding agent workspace — a command-line tool that orchestrates LLM interactions with file editing, shell execution, and tool use. The primary implementation is a **pure Rust Cargo workspace** (`edition = \"2021\"`, 10 crates) located under `crates/`. A TypeScript reference implementation exists separately under `packages/` (referenced in docs and `.gitignore`, but **not present in this checkout** — confirmed by `OPTIMIZE_REPORT.md` which states \"No TypeScript packages/ directory exists in this checkout\"). The architecture ports TS behavior to Rust with an emphasis on behavioral parity.\n\n---\n\n## 1. Root AGENTS.md — Key Development Rules\n\n- **Conciseness**: Keep answers short, no emojis, no fluff, technical prose only. Define jargon before using it.\n- **TypeScript strictness**: No `any` unless absolutely necessary. `@ts-ignore` banned, `@ts-expect-error` requires same-line reason, no `as any`, no disabling lint rules. Use only erasable TS syntax (`erasableSyntaxOnly`).\n- **Error handling**: Let errors propagate (`throw` in TS, `Result`/`?` in Rust). No silent swallowing, no `.ok()`, no `unwrap_or_default()` without recovery strategy. Security checks fail closed, never open.\n- **Trust boundaries**: Validate unknown input once at decided boundaries (CLI args, wire/API payloads, schema, I/O); pass typed values inward.\n- **Imports**: No inline/dynamic imports (`await import()`). Top-level imports only.\n- **Testing**: Prove new tests fail (`RED`) before applying fix. Keep test logic flat, avoid tautological assertions. Aim edits at root causes; stop after 2 consecutive failed fix attempts.\n- **Git**: Never `git add -A`, `git reset --hard`, `git push --force`. Stage explicit paths only. Commit format: `{feat,fix,docs,refactor,chore}[(scope)]: <ASCII subject>`.\n\n---\n\n## 2. TypeScript Packages (`packages/`)\n\n**Status**: The `packages/` directory does not exist in this checkout. It is referenced as a separate TS reference checkout (`karmavn/Mehhcode@ts-reference`) for porting parity work. Per AGENTS.md and `OPTIMIZE_REPORT.md`, packages would include: `ai`, `agent`, `coding-agent`, `tui`, `mcp`, `codemode`, `schema`, `telemetry`. Some porting annotations exist in Rust source (e.g., `crates/mehh-tui/src/fuzzy.rs` says \"ported from TypeScript `packages/tui/src/fuzzy.ts`\"), but no TS source is present here to inspect.\n\n---\n\n## 3. Rust Crates (`crates/`)\n\n| Crate | Top-level src files | Responsibility |\n|-------|-------------------|----------------|\n| `mehh-ai` | `lib.rs` (modules: catalog, faux, overflow, retry, stream, streaming_json, transform_messages, types, unicode, validation, anthropic, azure_openai, bedrock, google, mistral, oauth, openai, openai_responses, sse) | LLM provider integrations (OpenAI, Anthropic, Google, Mistral, Azure, Bedrock), message transformation, model catalog, streaming, faux provider for testing. |\n| `mehh-agent` | `lib.rs` (modules: agent, agent_loop, types) | Core agent abstraction: `AgentTool` trait, agent loop, session types. |\n| `mehh-tools` | `lib.rs` (modules: analyze, bash, core, edit, file_mutation_queue, find, grep, ls, powershell, read, undo_edit, write) | File and shell tools (read, write, edit, bash, grep, find, ls, analyze) with undo store and CRLF/BOM preservation. |\n| `mehh-coding-agent` | `lib.rs` (modules: agent_session, auth, compaction, interactive, lead_worker, mcp_manager, modes, permissions, rpc, session, settings, skills, subagent, system_prompt, todo, trust, etc.) | Full coding agent session orchestration: session management (JSONL v3 with branching/compaction), auth, system prompt building, subagents, permissions, trust, MCP integration. |\n| `mehh-tui` | `lib.rs` (modules: ansi, components, fuzzy, keys, theme, tui, wheel_scroll) | Terminal UI rendering: ANSI stripping, text wrapping, fuzzy filtering, keybindings, themes, markdown view, editor component. |\n| `mehh-mcp` | `lib.rs` (modules: client, config, jsonrpc, oauth, tool_adapter, transport) | Model Context Protocol implementation: JSON-RPC framing, stdio/HTTP transports, MCP client, config loading, AgentTool adapters. |\n| `mehh-codemode` | `lib.rs` (modules: sandbox, tool) | QuickJS sandbox execution of user JS code with tool calling, KV store persistence, timeouts, output capture. |\n| `mehh-execpolicy` | `lib.rs` | Shell-aware permission policy evaluation: command prefix matching, verdict computation (Allow/Prompt/Deny), dangerous prefix detection, safe rule prefix extraction. |\n| `mehh-sandbox` | `lib.rs` | Kernel-level sandbox planning: bwrap (Linux), seatbelt (macOS), path protection, secret env scrubbing, violation detection. Reports degraded status when no backend available. |\n| `mehh-cli` | `main.rs` | CLI entry point: clap arg parsing, session resolution, model/provider resolution, MCP connection, interactive/print/RPC modes, tool selection. |\n\n---\n\n## 4. TypeScript ↔ Rust Relationship\n\n**Separate implementations with behavioral parity goal**, not FFI or shared code:\n\n- The `packages/` (TS) directory is **absent** from this checkout; it lives in a separate reference checkout (`karmavn/Mehhcode@ts-reference`).\n- Rust crates under `crates/` are **ports** of the TS packages. Porting is guided by a `ts-to-rust-parity` skill doc requiring \"behavioral and caller parity, not just core happy paths.\"\n- No FFI between TS and Rust — they are independent implementations. Rust source files carry comments like `// ported from TypeScript packages/tui/src/fuzzy.ts` to trace provenance.\n- Shared contracts: AGENTS.md instructs to grep callers across both `packages/` and `crates/` when changing shared signatures.\n\n---\n\n## 5. Test Directories & Setup\n\nTest locations found:\n\n| Path | Crate | Framework |\n|------|-------|-----------|\n| `crates/mehh-tools/tests/test_analyze.rs` | mehh-tools | Rust `#[cfg(test)]` / integration tests |\n| `crates/mehh-mcp/tests/test_annotations.rs` | mehh-mcp | Integration tests (mock transport) |\n| `crates/mehh-coding-agent/tests/*.rs` (17 files) | mehh-coding-agent | Integration tests (session governance, approval gate, permissions, subagents, tool inspection, etc.) |\n| `#[cfg(test)] mod tests` inline in each crate's `src/lib.rs` | All crates | Unit tests within library source |\n\n- Rust tests use `#[tokio::test]` for async, standard `assert!`/`assert_eq!`, and `TempTestDir` helper patterns for temp directory cleanup.\n- AGENTS.md specifies Rust commands: `cargo check`, `cargo clippy`, `cargo test -p <crate>`.\n- TS tests (not runnable here due to absent `node_modules`): Vitest for `packages/*` (except tui), `node --test` for `packages/tui`.\n\n---\n\n## 6. Git Status & Recent Activity\n\n**Git commands could not be executed** (no shell execution tool available). However, based on available evidence:\n\n- The `.git/` directory exists at the repo root with standard structure (`HEAD`, `refs/`, `objects/`, `index`, etc.).\n- The AGENTS.md and documentation reference recent activity including design specs dated `2026-11-13` through `2026-11-22` (strongest-rust-agent-design, ts-parity-waves-4-5-6, goose-parity-core, tui-ux-optimization, coding-agent-gap-design), suggesting active development in late November 2026.\n- The `target/` directory exists (cargo build artifacts present).\n- `docs/handoff/gemini-coding-agent-gaps/` contains extensive handoff documentation, indicating this is a porting/migration project from a TypeScript reference to Rust.\n\n---\n\n### Workspace Manifest\n\n`Cargo.toml` at root defines a workspace with 10 members:\n```\ncrates/mehh-ai, mehh-agent, mehh-tools, mehh-coding-agent, mehh-tui,\nmehh-mcp, mehh-codemode, mehh-execpolicy, mehh-sandbox, mehh-cli\n```\nAll at version `0.1.0`, edition 2021, MIT license. Shared dependencies include tokio, reqwest, serde, clap, crossterm, tracing, thiserror, anyhow, uuid, base64, sha2, regex, globset, ignore, similar.\n\n[subagent-meta] status=completed turns_used=13 tokens_in=95210 tokens_out=4548 cost_usd=0.000000 files_touched=-"
+    }
+  ],
+  "failure_class": null,
+  "derived_state": "finished_cleanable",
+  "result": "Here is the structured research summary:\n\n---\n\n## Mehhcode Project Research Summary\n\n### Project Purpose & Architecture\n\nMehhcode is an AI coding agent workspace — a command-line tool that orchestrates LLM interactions with file editing, shell execution, and tool use. The primary implementation is a **pure Rust Cargo workspace** (`edition = \"2021\"`, 10 crates) located under `crates/`. A TypeScript reference implementation exists separately under `packages/` (referenced in docs and `.gitignore`, but **not present in this checkout** — confirmed by `OPTIMIZE_REPORT.md` which states \"No TypeScript packages/ directory exists in this checkout\"). The architecture ports TS behavior to Rust with an emphasis on behavioral parity.\n\n---\n\n## 1. Root AGENTS.md — Key Development Rules\n\n- **Conciseness**: Keep answers short, no emojis, no fluff, technical prose only. Define jargon before using it.\n- **TypeScript strictness**: No `any` unless absolutely necessary. `@ts-ignore` banned, `@ts-expect-error` requires same-line reason, no `as any`, no disabling lint rules. Use only erasable TS syntax (`erasableSyntaxOnly`).\n- **Error handling**: Let errors propagate (`throw` in TS, `Result`/`?` in Rust). No silent swallowing, no `.ok()`, no `unwrap_or_default()` without recovery strategy. Security checks fail closed, never open.\n- **Trust boundaries**: Validate unknown input once at decided boundaries (CLI args, wire/API payloads, schema, I/O); pass typed values inward.\n- **Imports**: No inline/dynamic imports (`await import()`). Top-level imports only.\n- **Testing**: Prove new tests fail (`RED`) before applying fix. Keep test logic flat, avoid tautological assertions. Aim edits at root causes; stop after 2 consecutive failed fix attempts.\n- **Git**: Never `git add -A`, `git reset --hard`, `git push --force`. Stage explicit paths only. Commit format: `{feat,fix,docs,refactor,chore}[(scope)]: <ASCII subject>`.\n\n---\n\n## 2. TypeScript Packages (`packages/`)\n\n**Status**: The `packages/` directory does not exist in this checkout. It is referenced as a separate TS reference checkout (`karmavn/Mehhcode@ts-reference`) for porting parity work. Per AGENTS.md and `OPTIMIZE_REPORT.md`, packages would include: `ai`, `agent`, `coding-agent`, `tui`, `mcp`, `codemode`, `schema`, `telemetry`. Some porting annotations exist in Rust source (e.g., `crates/mehh-tui/src/fuzzy.rs` says \"ported from TypeScript `packages/tui/src/fuzzy.ts`\"), but no TS source is present here to inspect.\n\n---\n\n## 3. Rust Crates (`crates/`)\n\n| Crate | Top-level src files | Responsibility |\n|-------|-------------------|----------------|\n| `mehh-ai` | `lib.rs` (modules: catalog, faux, overflow, retry, stream, streaming_json, transform_messages, types, unicode, validation, anthropic, azure_openai, bedrock, google, mistral, oauth, openai, openai_responses, sse) | LLM provider integrations (OpenAI, Anthropic, Google, Mistral, Azure, Bedrock), message transformation, model catalog, streaming, faux provider for testing. |\n| `mehh-agent` | `lib.rs` (modules: agent, agent_loop, types) | Core agent abstraction: `AgentTool` trait, agent loop, session types. |\n| `mehh-tools` | `lib.rs` (modules: analyze, bash, core, edit, file_mutation_queue, find, grep, ls, powershell, read, undo_edit, write) | File and shell tools (read, write, edit, bash, grep, find, ls, analyze) with undo store and CRLF/BOM preservation. |\n| `mehh-coding-agent` | `lib.rs` (modules: agent_session, auth, compaction, interactive, lead_worker, mcp_manager, modes, permissions, rpc, session, settings, skills, subagent, system_prompt, todo, trust, etc.) | Full coding agent session orchestration: session management (JSONL v3 with branching/compaction), auth, system prompt building, subagents, permissions, trust, MCP integration. |\n| `mehh-tui` | `lib.rs` (modules: ansi, components, fuzzy, keys, theme, tui, wheel_scroll) | Terminal UI rendering: ANSI stripping, text wrapping, fuzzy filtering, keybindings, themes, markdown view, editor component. |\n| `mehh-mcp` | `lib.rs` (modules: client, config, jsonrpc, oauth, tool_adapter, transport) | Model Context Protocol implementation: JSON-RPC framing, stdio/HTTP transports, MCP client, config loading, AgentTool adapters. |\n| `mehh-codemode` | `lib.rs` (modules: sandbox, tool) | QuickJS sandbox execution of user JS code with tool calling, KV store persistence, timeouts, output capture. |\n| `mehh-execpolicy` | `lib.rs` | Shell-aware permission policy evaluation: command prefix matching, verdict computation (Allow/Prompt/Deny), dangerous prefix detection, safe rule prefix extraction. |\n| `mehh-sandbox` | `lib.rs` | Kernel-level sandbox planning: bwrap (Linux), seatbelt (macOS), path protection, secret env scrubbing, violation detection. Reports degraded status when no backend available. |\n| `mehh-cli` | `main.rs` | CLI entry point: clap arg parsing, session resolution, model/provider resolution, MCP connection, interactive/print/RPC modes, tool selection. |\n\n---\n\n## 4. TypeScript ↔ Rust Relationship\n\n**Separate implementations with behavioral parity goal**, not FFI or shared code:\n\n- The `packages/` (TS) directory is **absent** from this checkout; it lives in a separate reference checkout (`karmavn/Mehhcode@ts-reference`).\n- Rust crates under `crates/` are **ports** of the TS packages. Porting is guided by a `ts-to-rust-parity` skill doc requiring \"behavioral and caller parity, not just core happy paths.\"\n- No FFI between TS and Rust — they are independent implementations. Rust source files carry comments like `// ported from TypeScript packages/tui/src/fuzzy.ts` to trace provenance.\n- Shared contracts: AGENTS.md instructs to grep callers across both `packages/` and `crates/` when changing shared signatures.\n\n---\n\n## 5. Test Directories & Setup\n\nTest locations found:\n\n| Path | Crate | Framework |\n|------|-------|-----------|\n| `crates/mehh-tools/tests/test_analyze.rs` | mehh-tools | Rust `#[cfg(test)]` / integration tests |\n| `crates/mehh-mcp/tests/test_annotations.rs` | mehh-mcp | Integration tests (mock transport) |\n| `crates/mehh-coding-agent/tests/*.rs` (17 files) | mehh-coding-agent | Integration tests (session governance, approval gate, permissions, subagents, tool inspection, etc.) |\n| `#[cfg(test)] mod tests` inline in each crate's `src/lib.rs` | All crates | Unit tests within library source |\n\n- Rust tests use `#[tokio::test]` for async, standard `assert!`/`assert_eq!`, and `TempTestDir` helper patterns for temp directory cleanup.\n- AGENTS.md specifies Rust commands: `cargo check`, `cargo clippy`, `cargo test -p <crate>`.\n- TS tests (not runnable here due to absent `node_modules`): Vitest for `packages/*` (except tui), `node --test` for `packages/tui`.\n\n---\n\n## 6. Git Status & Recent Activity\n\n**Git commands could not be executed** (no shell execution tool available). However, based on available evidence:\n\n- The `.git/` directory exists at the repo root with standard structure (`HEAD`, `refs/`, `objects/`, `index`, etc.).\n- The AGENTS.md and documentation reference recent activity including design specs dated `2026-11-13` through `2026-11-22` (strongest-rust-agent-design, ts-parity-waves-4-5-6, goose-parity-core, tui-ux-optimization, coding-agent-gap-design), suggesting active development in late November 2026.\n- The `target/` directory exists (cargo build artifacts present).\n- `docs/handoff/gemini-coding-agent-gaps/` contains extensive handoff documentation, indicating this is a porting/migration project from a TypeScript reference to Rust.\n\n---\n\n### Workspace Manifest\n\n`Cargo.toml` at root defines a workspace with 10 members:\n```\ncrates/mehh-ai, mehh-agent, mehh-tools, mehh-coding-agent, mehh-tui,\nmehh-mcp, mehh-codemode, mehh-execpolicy, mehh-sandbox, mehh-cli\n```\nAll at version `0.1.0`, edition 2021, MIT license. Shared dependencies include tokio, reqwest, serde, clap, crossterm, tracing, thiserror, anyhow, uuid, base64, sha2, regex, globset, ignore, similar.\n\n[subagent-meta] status=completed turns_used=13 tokens_in=95210 tokens_out=4548 cost_usd=0.000000 files_touched=-",
+  "error": null
+}

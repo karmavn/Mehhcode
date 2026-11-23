@@ -11,11 +11,14 @@ use crate::sandbox::{
     CODEMODE_MAX_IMAGE_BYTES, CODEMODE_MAX_IMAGES,
 };
 
+/// Returns the path the inspector approved for this call, if any. The executor
+/// binds it into the nested call so path-bearing tools can revalidate at write
+/// time and close the inspection-to-execution (TOCTOU) gap.
 pub type ToolCallInterceptor = Arc<
     dyn Fn(
             &str,
             &serde_json::Map<String, serde_json::Value>,
-        ) -> futures::future::BoxFuture<'static, Result<(), String>>
+        ) -> futures::future::BoxFuture<'static, Result<Option<std::path::PathBuf>, String>>
         + Send
         + Sync,
 >;
@@ -206,11 +209,17 @@ impl AgentTool for CodemodeTool {
                         arguments_error: None,
                         thought_signature: None,
                     };
-                    let validated = mehh_ai::validation::validate_tool_arguments(def, &tool_call)?;
+                    let mut validated =
+                        mehh_ai::validation::validate_tool_arguments(def, &tool_call)?;
                     // Always pass the canonical tool name to the inspector: the
                     // argument may be a deduplicated JavaScript identifier.
                     if let Some(ref intercept) = interceptor {
-                        intercept(canonical_name, &validated).await?;
+                        if let Some(target) = intercept(canonical_name, &validated).await? {
+                            validated.insert(
+                                mehh_agent::INSPECTED_TARGET_ARG.to_string(),
+                                serde_json::Value::String(target.to_string_lossy().into_owned()),
+                            );
+                        }
                     }
                     let tool_res = tool
                         .execute(&nested_call_id, validated, call_cancel, None)
@@ -378,5 +387,77 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("boom"));
+    }
+
+    #[tokio::test]
+    async fn test_interceptor_approved_path_is_bound_into_nested_tool_args() {
+        // A path-bearing nested tool must receive the exact target the inspector
+        // approved, so it can revalidate before writing (TOCTOU binding).
+        struct SpyTool {
+            seen: Arc<Mutex<Option<serde_json::Map<String, serde_json::Value>>>>,
+        }
+
+        #[async_trait]
+        impl AgentTool for SpyTool {
+            fn name(&self) -> &str {
+                "write"
+            }
+
+            fn description(&self) -> &str {
+                "Writes a file."
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": { "path": { "type": "string" } },
+                    "required": ["path"]
+                })
+            }
+
+            async fn execute(
+                &self,
+                _tool_call_id: &str,
+                params: serde_json::Map<String, serde_json::Value>,
+                _cancel: CancellationToken,
+                _on_update: Option<AgentToolUpdateCallback>,
+            ) -> Result<AgentToolResult, String> {
+                *self.seen.lock().unwrap() = Some(params);
+                Ok(AgentToolResult::text("ok"))
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(None));
+        let nested = Arc::new(SpyTool { seen: seen.clone() });
+        let approved = std::path::PathBuf::from("/approved/target.txt");
+        let interceptor: ToolCallInterceptor = Arc::new(move |_name, _args| {
+            let approved = approved.clone();
+            Box::pin(async move { Ok(Some(approved)) })
+        });
+        let codemode = CodemodeTool::new(vec![nested]).with_interceptor(interceptor);
+
+        let params = serde_json::json!({
+            "code": "await tools.write({ path: 'link.txt' }); return 'done';"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let res = codemode
+            .execute("tc", params, CancellationToken::new(), None)
+            .await;
+        assert!(res.is_ok(), "codemode failed: {:?}", res.err());
+
+        let seen_args = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("nested tool must have been called");
+        assert_eq!(
+            seen_args
+                .get(mehh_agent::INSPECTED_TARGET_ARG)
+                .and_then(|v| v.as_str()),
+            Some("/approved/target.txt"),
+            "approved target must be bound into the nested tool call"
+        );
     }
 }

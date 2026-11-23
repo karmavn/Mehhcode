@@ -97,8 +97,17 @@ static DANGEROUS_SHELL_PATTERNS: &[(&str, &str)] = &[
         "Accessing agent credentials via Windows path",
     ),
     (
-        r#"(?i)(?:^|[\s"'])\.?\.env(?:\s|$|["'])"#,
+        // Match `.env` and `.env.*` (e.g. `.env.local`) with an optional `./`
+        // or `.\` prefix. Requiring plain delimiters on both sides let
+        // `cat ./.env` and `cat .env.local` slip through as auto-allowed reads.
+        r#"(?i)(?:^|[\s"'/\\])\.?\.env(?:\.[A-Za-z0-9_-]+)*(?:\s|$|["'])"#,
         "Reading an environment file",
+    ),
+    (
+        // A shell glob on a dotfile can expand to `.env` even though no
+        // literal `.env` text appears in the command (e.g. `cat .e*`).
+        r#"(?i)\b(?:cat|ls|echo)\b[^\r\n|;&<>]*?[\s"'/\\]\.[^\s"'/\\]*[*?\[][^\s"'/\\]*"#,
+        "Globbing a dotfile may read environment files",
     ),
     (
         r"(?i)\brm\s+(?:-[a-zA-Z]+\s+)+(?:/|~|\\|[A-Za-z]:\\\\)",
@@ -154,34 +163,66 @@ fn normalize_path_for_check(base: &Path, target: &str) -> PathBuf {
     }
 }
 
+/// Maximum symlink hops followed while resolving a path. A cycle or an
+/// excessively chained link fails closed rather than looping forever.
+const MAX_SYMLINK_HOPS: usize = 32;
+
 /// Resolves symlinks in the part of `target` that exists, then appends the
 /// remaining components. Returns `None` when resolution cannot be established,
 /// so callers can fail closed instead of checking a misleading lexical path.
-fn resolve_existing_path(base: &Path, target: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_existing_path(base: &Path, target: &str) -> Option<PathBuf> {
     let path = Path::new(target);
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         base.join(path)
     };
+    resolve_path_tail(joined.as_path(), Vec::new(), 0)
+}
 
-    let mut probe = joined.as_path();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-    loop {
-        match std::fs::canonicalize(probe) {
-            Ok(resolved) => {
-                let mut resolved = resolved;
-                for component in tail.iter().rev() {
-                    resolved.push(component);
-                }
-                return Some(resolved);
+/// Walks `probe` toward an existing ancestor, collecting missing components in
+/// `tail`. When a missing component is itself a dangling symlink, its target is
+/// resolved (relative targets against the link's parent) and the search
+/// continues from there, matching `mehh_tools::core::fs::resolve_write_target`.
+fn resolve_path_tail(
+    probe: &Path,
+    mut tail: Vec<std::ffi::OsString>,
+    hops: usize,
+) -> Option<PathBuf> {
+    if hops > MAX_SYMLINK_HOPS {
+        return None;
+    }
+    match std::fs::canonicalize(probe) {
+        Ok(resolved) => {
+            let mut resolved = resolved;
+            for component in tail.iter().rev() {
+                resolved.push(component);
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                tail.push(probe.file_name()?.to_os_string());
-                probe = probe.parent()?;
-            }
-            Err(_) => return None,
+            Some(resolved)
         }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            // The old code only pushed the link's own name, so a dangling
+            // symlink to a protected file looked benign. `read_link` reveals
+            // the real target; an unresolvable link fails closed below.
+            match std::fs::read_link(probe) {
+                Ok(link_target) => {
+                    let resolved_target = if link_target.is_absolute() {
+                        link_target
+                    } else {
+                        probe.parent()?.join(link_target)
+                    };
+                    resolve_path_tail(&resolved_target, tail, hops + 1)
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // An ordinary missing component, not a symlink: peel it.
+                    tail.push(probe.file_name()?.to_os_string());
+                    resolve_path_tail(probe.parent()?, tail, hops)
+                }
+                // A link we cannot read cannot be proven safe.
+                Err(_) => None,
+            }
+        }
+        Err(_) => None,
     }
 }
 
@@ -195,6 +236,19 @@ fn strip_verbatim_prefix(path: &str) -> &str {
 #[cfg(not(windows))]
 fn strip_verbatim_prefix(path: &str) -> &str {
     path
+}
+
+/// Canonical paths carry a `\\?\` prefix on Windows that does not compare
+/// equal to the lexical paths used in inspection results. Drop it while
+/// keeping the original `OsString` when no stripping is needed.
+fn displayable_path(path: PathBuf) -> PathBuf {
+    let text = path.to_string_lossy();
+    let stripped = strip_verbatim_prefix(&text);
+    if stripped == &*text {
+        path
+    } else {
+        PathBuf::from(stripped)
+    }
 }
 
 /// Priority 1 Inspector: Enforces invariant security constraints across ALL modes.
@@ -258,6 +312,10 @@ impl ToolInspector for SecurityInspector {
                 // Exact filename: `oauth.json` / `trust.json.bak` are not
                 // credential files. `.mehh` paths are already blocked above.
                 || matches!(basename, "auth.json" | "mcp-auth.json" | "trust.json")
+                // The shell pattern below denies `cat .env`; deny every
+                // `.env*` basename on the read route as well.
+                || basename == ".env"
+                || basename.starts_with(".env.")
             {
                 return InspectionVerdict::Deny {
                     reason: format!("Access to protected path '{path_val}' is blocked by security policy."),
@@ -385,6 +443,13 @@ impl PermissionInspector {
         }
         self.safe_commands.iter().any(|re| re.is_match(trimmed))
     }
+
+    /// Tools that only read or organize work, allowed without mutation rights.
+    fn is_exploration_only(ctx: &ToolInspectionContext) -> bool {
+        ctx.is_read_only == Some(true)
+            || ctx.tool_name == "todo"
+            || ctx.tool_name == "tool_search"
+    }
 }
 
 #[async_trait]
@@ -394,25 +459,25 @@ impl ToolInspector for PermissionInspector {
     }
 
     async fn inspect(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
-        // 0. Explicit rule matching from persisted permissions
+        // 0. Chat mode is a hard read-only gate. It must run before persisted
+        //    rules: an earlier AlwaysAllow grant must not re-enable a mutation
+        //    simply because the user switched into Chat mode.
+        if self.mode == PermissionMode::Chat && !Self::is_exploration_only(ctx) {
+            return InspectionVerdict::Deny {
+                reason: format!("Tool '{}' is blocked in Chat mode (only read-only exploration tools are permitted).", ctx.tool_name),
+            };
+        }
+
+        // 1. Explicit rule matching from persisted permissions
         if let Some(rule_verdict) = self.store.evaluate(ctx) {
             return rule_verdict;
         }
 
         match self.mode {
             PermissionMode::Auto => InspectionVerdict::Allow,
-            PermissionMode::Chat => {
-                if ctx.is_read_only == Some(true)
-                    || ctx.tool_name == "todo"
-                    || ctx.tool_name == "tool_search"
-                {
-                    InspectionVerdict::Allow
-                } else {
-                    InspectionVerdict::Deny {
-                        reason: format!("Tool '{}' is blocked in Chat mode (only read-only exploration tools are permitted).", ctx.tool_name),
-                    }
-                }
-            }
+            // The Chat gate above already rejected non-exploration tools;
+            // anything reaching here is read-only exploration.
+            PermissionMode::Chat => InspectionVerdict::Allow,
             PermissionMode::Approve => InspectionVerdict::RequireApproval {
                 reason: format!(
                     "Mode 'approve' requires confirmation for tool '{}'",
@@ -427,10 +492,7 @@ impl ToolInspector for PermissionInspector {
             },
             PermissionMode::SmartApprove => {
                 // Read-only tools proceed automatically
-                if ctx.is_read_only == Some(true)
-                    || ctx.tool_name == "todo"
-                    || ctx.tool_name == "tool_search"
-                {
+                if Self::is_exploration_only(ctx) {
                     return InspectionVerdict::Allow;
                 }
 
@@ -639,18 +701,37 @@ impl ToolInspectionManager {
         InspectionVerdict::Allow
     }
 
+    /// Resolve the exact target a path-bearing tool will write, while the
+    /// inspection decision is still being made. Passing this to the writer
+    /// closes the window between inspection and execution.
+    async fn approved_target(ctx: &ToolInspectionContext) -> Option<PathBuf> {
+        let raw = ctx.args.get("path")?.as_str()?;
+        // Use the same full symlink resolution as the security inspector so a
+        // symlink in ANY component is bound to its resolved target. Resolving
+        // only the final component let an intermediate link be retargeted after
+        // approval while the writer's revalidation still matched.
+        // `resolve_existing_path` fails closed, matching the inspector's rule.
+        let resolved = resolve_existing_path(&ctx.cwd, raw)?;
+        Some(displayable_path(resolved))
+    }
+
     /// Evaluates inspectors and queries the approval handler if `RequireApproval` is reached.
     pub async fn inspect_and_authorize(
         &self,
         ctx: &ToolInspectionContext,
         handler: Option<&dyn ApprovalHandler>,
     ) -> mehh_agent::BeforeToolCallResult {
+        let approved = Self::approved_target(ctx).await;
         match self.inspect(ctx).await {
-            InspectionVerdict::Allow => mehh_agent::BeforeToolCallResult::default(),
+            InspectionVerdict::Allow => mehh_agent::BeforeToolCallResult {
+                approved_path: approved.clone(),
+                ..Default::default()
+            },
             InspectionVerdict::Deny { reason } => mehh_agent::BeforeToolCallResult {
                 block: true,
                 reason: Some(reason),
                 terminate: false,
+                approved_path: None,
             },
             InspectionVerdict::RequireApproval { reason, preview } => {
                 if let Some(h) = handler {
@@ -662,7 +743,10 @@ impl ToolInspectionManager {
                         None => reason.clone(),
                     };
                     if h.request_approval(ctx, &labeled, preview.as_deref()).await {
-                        return mehh_agent::BeforeToolCallResult::default();
+                        return mehh_agent::BeforeToolCallResult {
+                            approved_path: approved.clone(),
+                            ..Default::default()
+                        };
                     }
                 }
                 mehh_agent::BeforeToolCallResult {
@@ -672,6 +756,7 @@ impl ToolInspectionManager {
                         ctx.tool_name, reason
                     )),
                     terminate: false,
+                    approved_path: None,
                 }
             }
         }
@@ -760,6 +845,19 @@ mod tests {
         }
     }
 
+    /// Creates a file symlink. Returns false when the OS denies symlink
+    /// creation (e.g. unprivileged Windows), so callers can skip the scenario.
+    fn create_file_link(link: &Path, target: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link).is_ok()
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
+
     #[tokio::test]
     async fn security_inspector_allows_edit_inside_symlinked_cwd_and_allows_project_oauth_json() {
         let dir = crate::TempTestDir::new("inspect_symlink_cwd");
@@ -810,6 +908,9 @@ mod tests {
             ("powershell", r"Get-Content C:\Users\x\.mehh\agent\auth.json", true),
             ("powershell", r"Get-Content ~\.ssh\id_rsa", true),
             ("bash", "cat .env", true),
+            ("bash", "cat ./.env", true),
+            ("bash", "cat .env.local", true),
+            ("bash", "cat ./.env.production", true),
             ("bash", "cat ~/.mehh/agent/mcp-auth.json", true),
             ("bash", "rm -r -f /", true),
             ("powershell", r"Remove-Item -Recurse -Force C:\", true),
@@ -827,6 +928,26 @@ mod tests {
                     "security policy must deny '{cmd}': {verdict:?}"
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn smart_approve_never_auto_allows_dotfile_glob_read() {
+        let cwd = std::env::current_dir().unwrap();
+        let mgr = ToolInspectionManager::new_with_store(
+            PermissionMode::SmartApprove,
+            cwd.clone(),
+            crate::permissions::PermissionStore::default(),
+        );
+
+        for cmd in ["cat .e*", "cat .*", "ls .e*", "echo .e*", "cat ./.e*"] {
+            let ctx = ctx_for("bash", Some(cmd), None, &cwd, false);
+            let verdict = mgr.inspect(&ctx).await;
+            assert_ne!(verdict, InspectionVerdict::Allow, "glob '{cmd}' must not be auto-allowed: {verdict:?}");
+            assert!(
+                matches!(verdict, InspectionVerdict::Deny { .. }),
+                "glob '{cmd}' must be denied by security policy: {verdict:?}"
+            );
         }
     }
 
@@ -856,6 +977,33 @@ mod tests {
             matches!(verdict, InspectionVerdict::RequireApproval { .. }),
             "symlink outside cwd must require approval, got {verdict:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn dangling_symlink_to_protected_file_is_denied() {
+        let dir = crate::TempTestDir::new("inspect_dangling_link");
+        let cwd = dir.path().join("cwd");
+        std::fs::create_dir_all(&cwd).unwrap();
+        // auth.json deliberately never exists, so both links are dangling.
+        let absolute_target = dir.path().join(".mehh").join("agent").join("auth.json");
+        let absolute_link = cwd.join("notes.txt");
+        let relative_link = cwd.join("relative.txt");
+        if !create_file_link(&absolute_link, &absolute_target)
+            || !create_file_link(&relative_link, Path::new("../.mehh/agent/auth.json"))
+        {
+            // Symlink creation needs elevated privilege on some Windows hosts.
+            return;
+        }
+
+        let inspector = SecurityInspector::new();
+        for path in ["notes.txt", "relative.txt"] {
+            let ctx = ctx_for("write", None, Some(path), &cwd, false);
+            let verdict = inspector.inspect(&ctx).await;
+            assert!(
+                matches!(verdict, InspectionVerdict::Deny { .. }),
+                "dangling link '{path}' to protected auth.json must be denied, got {verdict:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -913,6 +1061,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chat_mode_blocks_mutation_despite_prior_always_allow_rule() {
+        let cwd = std::env::current_dir().unwrap();
+        let store = crate::permissions::PermissionStore::new(
+            vec![crate::permissions::PermissionRule {
+                tool_name: "edit".to_string(),
+                arg_prefix: None,
+                path_glob: None,
+                action: crate::permissions::PermissionAction::AlwaysAllow,
+            }],
+            None,
+        );
+        let mgr = ToolInspectionManager::new_with_store(PermissionMode::Chat, cwd.clone(), store);
+
+        let edit = ctx_for("edit", None, Some("notes.txt"), &cwd, false);
+        let verdict = mgr.inspect(&edit).await;
+        assert!(
+            matches!(verdict, InspectionVerdict::Deny { .. }),
+            "Chat mode must block a mutating tool even with AlwaysAllow, got {verdict:?}"
+        );
+
+        let read = ctx_for("read", None, Some("notes.txt"), &cwd, true);
+        assert_eq!(
+            mgr.inspect(&read).await,
+            InspectionVerdict::Allow,
+            "read-only exploration must still be allowed in Chat mode"
+        );
+    }
+
+    #[tokio::test]
     async fn test_shell_whitelist_rejects_newline_and_substitution() {
         let cwd = std::env::current_dir().unwrap();
         let inspector = PermissionInspector::new(PermissionMode::SmartApprove);
@@ -949,5 +1126,91 @@ mod tests {
                 "shell chaining/redirection must not be auto-allowed: {payload} -> {verdict:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_read_env_file_is_denied_like_cat_env() {
+        let dir = crate::TempTestDir::new("inspect_env_read");
+        let cwd = dir.path();
+        std::fs::write(cwd.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(cwd.join(".env.local"), "SECRET=2\n").unwrap();
+        let mgr = ToolInspectionManager::new(PermissionMode::SmartApprove, cwd.to_path_buf());
+
+        for path in [".env", ".env.local"] {
+            let ctx = ctx_for("read", None, Some(path), cwd, true);
+            let verdict = mgr.inspect(&ctx).await;
+            assert!(
+                matches!(verdict, InspectionVerdict::Deny { .. }),
+                "read of {path} must be denied as the shell route is, got {verdict:?}"
+            );
+        }
+    }
+
+    struct ApproveAll;
+
+    #[async_trait::async_trait]
+    impl ApprovalHandler for ApproveAll {
+        async fn request_approval(
+            &self,
+            _ctx: &ToolInspectionContext,
+            _reason: &str,
+            _preview: Option<&str>,
+        ) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn approved_target_resolves_intermediate_symlink_not_just_final_component() {
+        let dir = crate::TempTestDir::new("approved_target_symlink");
+        let cwd = dir.path().join("cwd");
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        create_link(&cwd.join("link"), &outside);
+
+        let mgr = ToolInspectionManager::new_with_store(
+            PermissionMode::SmartApprove,
+            cwd.clone(),
+            crate::permissions::PermissionStore::new(Vec::new(), None),
+        );
+        let ctx = ctx_for("write", None, Some("link/sub/f.txt"), &cwd, false);
+        let result = mgr.inspect_and_authorize(&ctx, Some(&ApproveAll)).await;
+        assert!(!result.block, "approval was granted: {result:?}");
+
+        let approved = result
+            .approved_path
+            .expect("an approved target must be bound to the writer");
+        assert_ne!(
+            approved,
+            cwd.join("link").join("sub").join("f.txt"),
+            "approved path must not be the lexical path through the symlink"
+        );
+        assert_eq!(
+            approved,
+            displayable_path(outside.join("sub").join("f.txt")),
+            "approved path must be the fully resolved target so retargeting any component is detected"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_and_authorize_carries_the_inspected_target_to_the_writer() {
+        let dir = crate::TempTestDir::new("approved_target");
+        let file = dir.path().join("note.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mgr = ToolInspectionManager::new_with_store(
+            PermissionMode::Auto,
+            dir.path().to_path_buf(),
+            crate::permissions::PermissionStore::new(Vec::new(), None),
+        );
+
+        let ctx = ctx_for("write", None, Some("note.txt"), dir.path(), false);
+        let result = mgr.inspect_and_authorize(&ctx, None).await;
+        assert!(!result.block);
+        assert_eq!(
+            result.approved_path,
+            Some(file),
+            "the writer must receive the target resolved at inspection time"
+        );
     }
 }

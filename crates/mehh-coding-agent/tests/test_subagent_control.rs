@@ -183,7 +183,7 @@ async fn kill_stops_a_real_child_loop() {
         {
             if seen_clone.lock().unwrap().is_none() {
                 *seen_clone.lock().unwrap() = Some(id.to_string());
-                let _ = tx.send_modify(|v| *v = id.to_string());
+                tx.send_modify(|v| *v = id.to_string());
             }
         }
     });
@@ -301,7 +301,7 @@ async fn steer_message_reaches_child_context() {
         {
             if seen_clone.lock().unwrap().is_none() {
                 *seen_clone.lock().unwrap() = Some(id.to_string());
-                let _ = tx.send_modify(|v| *v = id.to_string());
+                tx.send_modify(|v| *v = id.to_string());
             }
         }
     });

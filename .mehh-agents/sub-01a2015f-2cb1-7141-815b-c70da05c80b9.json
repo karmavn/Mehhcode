@@ -1,0 +1,254 @@
+{
+  "agent_id": "sub-01a2015f-2cb1-7141-815b-c70da05c80b9",
+  "mode": "research",
+  "model_id": "nvidia/nemotron-3.5-super-vl:free",
+  "status": "completed",
+  "created_at_ms": 1795319344305,
+  "completed_at_ms": 1795319372193,
+  "events": [
+    {
+      "kind": "started",
+      "at_ms": 1795319344305,
+      "detail": null
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319345649,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319345649,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319345651,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319345715,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319346969,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319346969,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319346969,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319346971,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319346975,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319347018,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319348121,
+      "detail": "ls"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319348122,
+      "detail": "failed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319352345,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319352345,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319352345,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319352350,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319352408,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319352410,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319356252,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356263,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356263,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356263,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356263,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356263,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356263,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356264,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356264,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356264,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319356264,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319358439,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319358439,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319358439,
+      "detail": "find"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319358522,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319358526,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319358529,
+      "detail": "completed"
+    },
+    {
+      "kind": "tool_started",
+      "at_ms": 1795319359669,
+      "detail": "read"
+    },
+    {
+      "kind": "tool_finished",
+      "at_ms": 1795319359671,
+      "detail": "completed"
+    },
+    {
+      "kind": "finished",
+      "at_ms": 1795319372193,
+      "detail": "Here is the structured research summary.\n\n---\n\n## Root Overview\n\n**Path:** `D:/Mehhcode`\n\n**Root contents:**\n- `.agents/` — directory\n- `.git/` — git repository\n- `.github/` — directory\n- `.superpowers/` — directory\n- `.gitignore` — gitignore\n- `AGENTS.md` — development rules / agent instructions\n- `Cargo.lock` — Rust lockfile (gitignored)\n- `Cargo.toml` — Rust workspace manifest\n- `crates/` — directory containing 10 Rust crates\n- `docs/` — directory\n- `measure.ps1` — PowerShell script\n- `measurements/` — directory with JSON baseline/measurement files\n- `OPTIMIZE_REPORT.md` — optimization report\n- `target/` — Rust build output (gitignored)\n- `tui_display_code.txt` — text file\n\n**AGENTS.md:** Exists at root. Contains development rules covering conversational style, code quality, testing anti-thrashing, commands for Rust/TypeScript, file hygiene (UTF-8 no BOM), dependency security, git guidelines, and a workspace map. Notably, it references TypeScript packages under `packages/` (ai, agent, coding-agent, tui, mcp, codemode, schema, telemetry) but that directory does **not** currently exist — the workspace is Rust-only at this time.\n\n---\n\n## Packages (TypeScript)\n\nNo `packages/` directory exists at root. No `package.json` files were found anywhere in the tree (excluding the `docs/handoff/gemini-coding-agent-gaps/raw/` snapshot). According to AGENTS.md's Workspace Map, the planned TypeScript packages are: `ai`, `agent`, `coding-agent`, `tui`, `mcp`, `codemode`, `schema`, `telemetry`. These are not yet checked out.\n\n---\n\n## Crates (Rust Workspace)\n\nThe root `Cargo.toml` defines a workspace with 10 members under `crates/`. All share workspace version `0.1.0`, edition 2021, MIT license.\n\n| Crate | Description (from Cargo.toml / deps) | Key Dependencies |\n|---|---|---|\n| `mehh-ai` | AI integration layer: HTTP/LLM client with hashing, UUID, regex support. | tokio, reqwest, serde, serde_json, anyhow, uuid, base64, sha2, hmac, crc32fast, regex, async-trait |\n| `mehh-agent` | Agent orchestration: async task/agent primitives built on top of mehh-ai. | mehh-ai, tokio, tokio-util, futures, async-trait, serde, serde_json |\n| `mehh-tools` | Tool execution sandbox: file search/glob/regex/similarity utilities for agent tools. | mehh-ai, mehh-agent, mehh-sandbox, anyhow, tokio, async-trait, serde, base64, regex, globset, ignore, similar |\n| `mehh-sandbox` | Sandbox/isolation crate (no dependencies declared). | *(none)* |\n| `mehh-execpolicy` | Execution policy crate (no dependencies declared). | *(none)* |\n| `mehh-coding-agent` | Core coding agent: ties together AI, agent, tools, TUI, MCP, codemode, execpolicy with filesystem ignore/glob/regex. | mehh-ai, mehh-agent, mehh-tools, mehh-tui, mehh-mcp, mehh-codemode, mehh-execpolicy, crossterm, tokio, reqwest, serde, uuid, sha2, ignore, regex, globset |\n| `mehh-codemode` | Code transformation/execution mode using QuickJS (JavaScript engine embedded in Rust). | mehh-ai, mehh-agent, tokio, rquickjs (0.9), base64, serde, anyhow |\n| `mehh-mcp` | Model Context Protocol server/client implementation with tracing. | mehh-ai, mehh-agent, tokio, reqwest, serde, serde_json, anyhow, sha2, tracing, base64, uuid |\n| `mehh-tui` | Terminal UI rendering with crossterm, markdown (pulldown-cmark), unicode width/segmentation. | crossterm, unicode-width, unicode-segmentation, serde, serde_json, pulldown-cmark (0.12) |\n| `mehh-cli` | Binary entry point `mehh` — CLI that wires together ai, agent, tools, coding-agent with clap. | mehh-ai, mehh-agent, mehh-tools, mehh-coding-agent, tokio, clap, anyhow |\n\n---\n\n## Tech Stack\n\n**Primary languages:**\n- **Rust** (edition 2021) — the only language currently implemented; all 10 crates are Rust.\n- **TypeScript** — planned/referenced in AGENTS.md for `packages/` but not yet present in the checkout.\n\n**Build tools:**\n- `cargo` (Rust workspace) — `cargo check`, `cargo clippy`, `cargo test -p <crate>`\n- `npm` / `tsc` / `vitest` — planned for TypeScript packages (node_modules currently absent; AGENTS.md notes these cannot run until workspace package naming/lockfile setup is finished)\n\n**Test frameworks:**\n- Rust: built-in `cargo test`\n- TypeScript: `node:test` (for `packages/tui`), Vitest (for other packages, when hydrated)\n\n**Linting:** Biome (planned; `biome.json` not yet restored — AGENTS.md warns against running it with defaults)\n\n---\n\n## Notable Configuration Files\n\n| File | Status | Notes |\n|---|---|---|\n| `Cargo.toml` (root) | Present | Rust workspace manifest defining all 10 crate members and shared dependency versions |\n| `Cargo.lock` | Present | Gitignored Rust lockfile |\n| `tsconfig.json` | Absent | Not found anywhere in the tree |\n| `biome.json` | Absent | Not found; AGENTS.md says it must be restored before running `npx biome check` |\n| `package.json` | Absent | No `packages/` directory exists yet |\n| `.gitignore` | Present | Covers `node_modules`, `target/`, `Cargo.lock`, `packages/*/dist/`, editor env, `.env`, Rust artifacts |\n| `measure.ps1` | Present | PowerShell measurement script at root |\n| `OPTIMIZE_REPORT.md` | Present | Optimization report at root |\n\n---\n\n### Summary\n\nThe project is a **Rust-first workspace** (`mehh-*` crates) building what appears to be an AI-powered coding agent with CLI, TUI, MCP, and tooling components. TypeScript packages are planned (referenced in AGENTS.md and `.gitignore`) but not yet checked out — there is no `packages/` directory, no `package.json`, no `tsconfig.json`, and no `biome.json` at this time. The only build system currently usable is `cargo`.\n\n[subagent-meta] status=completed turns_used=8 tokens_in=25265 tokens_out=3365 cost_usd=0.000000 files_touched=-"
+    }
+  ],
+  "failure_class": null,
+  "derived_state": "finished_cleanable",
+  "result": "Here is the structured research summary.\n\n---\n\n## Root Overview\n\n**Path:** `D:/Mehhcode`\n\n**Root contents:**\n- `.agents/` — directory\n- `.git/` — git repository\n- `.github/` — directory\n- `.superpowers/` — directory\n- `.gitignore` — gitignore\n- `AGENTS.md` — development rules / agent instructions\n- `Cargo.lock` — Rust lockfile (gitignored)\n- `Cargo.toml` — Rust workspace manifest\n- `crates/` — directory containing 10 Rust crates\n- `docs/` — directory\n- `measure.ps1` — PowerShell script\n- `measurements/` — directory with JSON baseline/measurement files\n- `OPTIMIZE_REPORT.md` — optimization report\n- `target/` — Rust build output (gitignored)\n- `tui_display_code.txt` — text file\n\n**AGENTS.md:** Exists at root. Contains development rules covering conversational style, code quality, testing anti-thrashing, commands for Rust/TypeScript, file hygiene (UTF-8 no BOM), dependency security, git guidelines, and a workspace map. Notably, it references TypeScript packages under `packages/` (ai, agent, coding-agent, tui, mcp, codemode, schema, telemetry) but that directory does **not** currently exist — the workspace is Rust-only at this time.\n\n---\n\n## Packages (TypeScript)\n\nNo `packages/` directory exists at root. No `package.json` files were found anywhere in the tree (excluding the `docs/handoff/gemini-coding-agent-gaps/raw/` snapshot). According to AGENTS.md's Workspace Map, the planned TypeScript packages are: `ai`, `agent`, `coding-agent`, `tui`, `mcp`, `codemode`, `schema`, `telemetry`. These are not yet checked out.\n\n---\n\n## Crates (Rust Workspace)\n\nThe root `Cargo.toml` defines a workspace with 10 members under `crates/`. All share workspace version `0.1.0`, edition 2021, MIT license.\n\n| Crate | Description (from Cargo.toml / deps) | Key Dependencies |\n|---|---|---|\n| `mehh-ai` | AI integration layer: HTTP/LLM client with hashing, UUID, regex support. | tokio, reqwest, serde, serde_json, anyhow, uuid, base64, sha2, hmac, crc32fast, regex, async-trait |\n| `mehh-agent` | Agent orchestration: async task/agent primitives built on top of mehh-ai. | mehh-ai, tokio, tokio-util, futures, async-trait, serde, serde_json |\n| `mehh-tools` | Tool execution sandbox: file search/glob/regex/similarity utilities for agent tools. | mehh-ai, mehh-agent, mehh-sandbox, anyhow, tokio, async-trait, serde, base64, regex, globset, ignore, similar |\n| `mehh-sandbox` | Sandbox/isolation crate (no dependencies declared). | *(none)* |\n| `mehh-execpolicy` | Execution policy crate (no dependencies declared). | *(none)* |\n| `mehh-coding-agent` | Core coding agent: ties together AI, agent, tools, TUI, MCP, codemode, execpolicy with filesystem ignore/glob/regex. | mehh-ai, mehh-agent, mehh-tools, mehh-tui, mehh-mcp, mehh-codemode, mehh-execpolicy, crossterm, tokio, reqwest, serde, uuid, sha2, ignore, regex, globset |\n| `mehh-codemode` | Code transformation/execution mode using QuickJS (JavaScript engine embedded in Rust). | mehh-ai, mehh-agent, tokio, rquickjs (0.9), base64, serde, anyhow |\n| `mehh-mcp` | Model Context Protocol server/client implementation with tracing. | mehh-ai, mehh-agent, tokio, reqwest, serde, serde_json, anyhow, sha2, tracing, base64, uuid |\n| `mehh-tui` | Terminal UI rendering with crossterm, markdown (pulldown-cmark), unicode width/segmentation. | crossterm, unicode-width, unicode-segmentation, serde, serde_json, pulldown-cmark (0.12) |\n| `mehh-cli` | Binary entry point `mehh` — CLI that wires together ai, agent, tools, coding-agent with clap. | mehh-ai, mehh-agent, mehh-tools, mehh-coding-agent, tokio, clap, anyhow |\n\n---\n\n## Tech Stack\n\n**Primary languages:**\n- **Rust** (edition 2021) — the only language currently implemented; all 10 crates are Rust.\n- **TypeScript** — planned/referenced in AGENTS.md for `packages/` but not yet present in the checkout.\n\n**Build tools:**\n- `cargo` (Rust workspace) — `cargo check`, `cargo clippy`, `cargo test -p <crate>`\n- `npm` / `tsc` / `vitest` — planned for TypeScript packages (node_modules currently absent; AGENTS.md notes these cannot run until workspace package naming/lockfile setup is finished)\n\n**Test frameworks:**\n- Rust: built-in `cargo test`\n- TypeScript: `node:test` (for `packages/tui`), Vitest (for other packages, when hydrated)\n\n**Linting:** Biome (planned; `biome.json` not yet restored — AGENTS.md warns against running it with defaults)\n\n---\n\n## Notable Configuration Files\n\n| File | Status | Notes |\n|---|---|---|\n| `Cargo.toml` (root) | Present | Rust workspace manifest defining all 10 crate members and shared dependency versions |\n| `Cargo.lock` | Present | Gitignored Rust lockfile |\n| `tsconfig.json` | Absent | Not found anywhere in the tree |\n| `biome.json` | Absent | Not found; AGENTS.md says it must be restored before running `npx biome check` |\n| `package.json` | Absent | No `packages/` directory exists yet |\n| `.gitignore` | Present | Covers `node_modules`, `target/`, `Cargo.lock`, `packages/*/dist/`, editor env, `.env`, Rust artifacts |\n| `measure.ps1` | Present | PowerShell measurement script at root |\n| `OPTIMIZE_REPORT.md` | Present | Optimization report at root |\n\n---\n\n### Summary\n\nThe project is a **Rust-first workspace** (`mehh-*` crates) building what appears to be an AI-powered coding agent with CLI, TUI, MCP, and tooling components. TypeScript packages are planned (referenced in AGENTS.md and `.gitignore`) but not yet checked out — there is no `packages/` directory, no `package.json`, no `tsconfig.json`, and no `biome.json` at this time. The only build system currently usable is `cargo`.\n\n[subagent-meta] status=completed turns_used=8 tokens_in=25265 tokens_out=3365 cost_usd=0.000000 files_touched=-",
+  "error": null
+}

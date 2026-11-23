@@ -43,19 +43,129 @@ pub fn validate_tool_arguments(
         }
     }
 
-    // 3. Validate types of all present non-null properties
+    // 3. Validate types, constraints and nested schemas of all present properties.
     if let Some(props) = properties {
         for (prop_name, val) in &args {
-            if val.is_null() {
-                continue;
-            }
             if let Some(prop_schema) = props.get(prop_name) {
-                validate_type(prop_name, prop_schema, val, &tool.name)?;
+                validate_schema(prop_name, prop_schema, val, &tool.name)?;
+            }
+        }
+    }
+    check_additional_properties(&tool.parameters, properties, &args, &tool.name)?;
+
+    Ok(args)
+}
+
+/// Rejects undeclared properties when a schema sets `additionalProperties: false`,
+/// and validates them against a schema object when one is supplied.
+fn check_additional_properties(
+    schema: &Value,
+    properties: Option<&Map<String, Value>>,
+    map: &Map<String, Value>,
+    tool_name: &str,
+) -> Result<(), String> {
+    let additional = match schema.get("additionalProperties") {
+        Some(Value::Bool(false)) => {
+            if let Some(name) = map.keys().find(|name| {
+                !properties
+                    .map(|p| p.contains_key(*name))
+                    .unwrap_or(false)
+            }) {
+                return Err(format!(
+                    "Property \"{name}\" in tool \"{tool_name}\" is not allowed (additionalProperties: false)"
+                ));
+            }
+            return Ok(());
+        }
+        Some(schema @ Value::Object(_)) => schema,
+        _ => return Ok(()),
+    };
+    for (name, val) in map {
+        let declared = properties
+            .map(|p| p.contains_key(name))
+            .unwrap_or(false);
+        if !declared {
+            validate_schema(name, additional, val, tool_name)?;
+        }
+    }
+    Ok(())
+}
+
+/// Validates a value against every supported JSON Schema keyword used by tools.
+fn validate_schema(
+    path: &str,
+    schema: &Value,
+    val: &Value,
+    tool_name: &str,
+) -> Result<(), String> {
+    // A present `null` on an optional property means "not provided" for tools.
+    // Required properties already reject null in the caller's required check.
+    if val.is_null() {
+        return Ok(());
+    }
+    validate_type(path, schema, val, tool_name)?;
+
+    if let Some(allowed) = schema.get("enum").and_then(|e| e.as_array()) {
+        if !allowed.iter().any(|v| v == val) {
+            return Err(format!(
+                "Property \"{path}\" in tool \"{tool_name}\" has value {val} not in enum {allowed:?}"
+            ));
+        }
+    }
+
+    if let Some(number) = val.as_f64() {
+        if let Some(min) = schema.get("minimum").and_then(|m| m.as_f64()) {
+            if number < min {
+                return Err(format!(
+                    "Property \"{path}\" in tool \"{tool_name}\" is below minimum {min}: {number}"
+                ));
+            }
+        }
+        if let Some(max) = schema.get("maximum").and_then(|m| m.as_f64()) {
+            if number > max {
+                return Err(format!(
+                    "Property \"{path}\" in tool \"{tool_name}\" is above maximum {max}: {number}"
+                ));
             }
         }
     }
 
-    Ok(args)
+    if let Some(obj) = val.as_object() {
+        let nested_props = schema.get("properties").and_then(|p| p.as_object());
+        if let Some(nested_props) = nested_props {
+            for (name, child) in obj {
+                if let Some(child_schema) = nested_props.get(name) {
+                    let child_path = format!("{path}.{name}");
+                    validate_schema(&child_path, child_schema, child, tool_name)?;
+                }
+            }
+        }
+        // `required` applies to an object schema even when it declares no
+        // `properties` (e.g. `{"type":"object","required":["x"]}`).
+        if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+            for req in required {
+                if let Some(req_name) = req.as_str() {
+                    if !obj.get(req_name).is_some_and(|v| !v.is_null()) {
+                        return Err(format!(
+                            "Missing required property \"{req_name}\" in \"{path}\" for tool \"{tool_name}\""
+                        ));
+                    }
+                }
+            }
+        }
+        check_additional_properties(schema, nested_props, obj, tool_name)?;
+    }
+
+    if let Some(arr) = val.as_array() {
+        if let Some(items) = schema.get("items") {
+            for (index, item) in arr.iter().enumerate() {
+                let item_path = format!("{path}[{index}]");
+                validate_schema(&item_path, items, item, tool_name)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn coerce_value(schema: &Value, val: &mut Value) {
@@ -116,6 +226,28 @@ fn coerce_value(schema: &Value, val: &mut Value) {
                 *val = Value::Object(map);
             }
         }
+    }
+
+    // Coerce nested values too: models routinely stringify nested numbers and
+    // arrays, and the type check runs after this pass.
+    match val {
+        Value::Object(map) => {
+            if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+                for (name, child) in map {
+                    if let Some(child_schema) = props.get(name) {
+                        coerce_value(child_schema, child);
+                    }
+                }
+            }
+        }
+        Value::Array(arr) => {
+            if let Some(items) = schema.get("items") {
+                for item in arr {
+                    coerce_value(items, item);
+                }
+            }
+        }
+        _ => {}
     }
 }
 
@@ -277,5 +409,120 @@ mod tests {
 
         let err = validate_tool_arguments(&tool, &call).unwrap_err();
         assert!(err.contains("expected type"));
+    }
+
+    fn call_with(
+        name: &str,
+        parameters: serde_json::Value,
+        args: serde_json::Value,
+    ) -> Result<Map<String, Value>, String> {
+        let tool = ToolDefinition {
+            name: name.to_string(),
+            description: "test tool".to_string(),
+            parameters,
+        };
+        let call = ToolCall {
+            id: "call_constraints".to_string(),
+            name: name.to_string(),
+            arguments: args.as_object().cloned().unwrap_or_default(),
+            arguments_error: None,
+            thought_signature: None,
+        };
+        validate_tool_arguments(&tool, &call)
+    }
+
+    #[test]
+    fn validation_rejects_minimum_and_unknown_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "n": { "type": "integer", "minimum": 1 } },
+            "additionalProperties": false
+        });
+        let err = call_with("t", schema, serde_json::json!({ "n": 0, "extra": "x" })).unwrap_err();
+        assert!(
+            err.contains("minimum") || err.contains("additional"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_enum_mismatch() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": { "mode": { "type": "string", "enum": ["a", "b"] } }
+        });
+        let err = call_with("t", schema, serde_json::json!({ "mode": "c" })).unwrap_err();
+        assert!(err.contains("enum"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validation_rejects_nested_array_item_type_mismatch() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "items": { "type": "array", "items": { "type": "integer" } }
+            }
+        });
+        let err = call_with("t", schema, serde_json::json!({ "items": [1, "bad"] })).unwrap_err();
+        assert!(err.contains("expected type"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validation_treats_null_as_absent_for_optional_fields() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "name": { "type": "string" },
+                "id": { "type": "integer" }
+            },
+            "required": ["id"]
+        });
+        let ok = call_with("t", schema.clone(), serde_json::json!({ "name": null, "id": 1 }))
+            .unwrap();
+        assert!(ok.contains_key("name"), "optional null must stay present");
+
+        let err = call_with("t", schema, serde_json::json!({ "name": null, "id": null }))
+            .unwrap_err();
+        assert!(
+            err.contains("Missing required property"),
+            "required null must still be rejected: {err}"
+        );
+    }
+
+    #[test]
+    fn validation_coerces_nested_object_and_array_values() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config": {
+                    "type": "object",
+                    "properties": { "retries": { "type": "integer" } }
+                },
+                "ids": { "type": "array", "items": { "type": "integer" } }
+            }
+        });
+        let args = call_with(
+            "t",
+            schema,
+            serde_json::json!({ "config": { "retries": "3" }, "ids": ["1", "2"] }),
+        )
+        .unwrap();
+        assert_eq!(args["config"]["retries"], serde_json::json!(3));
+        assert_eq!(args["ids"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn validation_rejects_nested_required_without_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "config": { "type": "object", "required": ["token"] }
+            }
+        });
+        let err = call_with("t", schema, serde_json::json!({ "config": {} })).unwrap_err();
+        assert!(
+            err.contains("Missing required property \"token\""),
+            "unexpected error: {err}"
+        );
     }
 }

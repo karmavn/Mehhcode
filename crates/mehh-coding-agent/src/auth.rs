@@ -448,7 +448,11 @@ pub async fn resolve_api_key_async(
         } => {
             let now = now_ms();
             if now + 60_000 >= expires {
-                if let Some(kind) = oauth_kind_for_provider(provider) {
+                let Some(kind) = oauth_kind_for_provider(provider) else {
+                    // No refresh support: an expired token is not usable.
+                    return Ok(None);
+                };
+                {
                     let refreshed_cred = store
                         .modify(
                             provider,
@@ -467,9 +471,7 @@ pub async fn resolve_api_key_async(
                                         // Another task or process refreshed while we waited for lock
                                         return Ok(Some(current));
                                     }
-                                    let client = mehh_ai::default_http_client();
-                                    let refreshed =
-                                        refresh_oauth_credential(&client, kind, &current).await?;
+                                    let refreshed = refresh_oauth_credential(kind, &current).await?;
                                     Ok(Some(refreshed))
                                 })
                             }),
@@ -480,6 +482,9 @@ pub async fn resolve_api_key_async(
                         return Ok(Some(access));
                     }
                 }
+                // Refresh did not yield a usable token: never fall back to the
+                // expired one.
+                return Ok(None);
             }
             Ok(Some(access))
         }
@@ -634,6 +639,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_oauth_token_for_unknown_provider_is_not_returned() {
+        let dir = crate::TempTestDir::new("auth_expired_unknown_provider");
+        let auth_file = dir.path().join("auth.json");
+        let expired = StoredCredential::OAuth {
+            access: "stale-access-token".to_string(),
+            refresh: "refresh-token".to_string(),
+            expires: now_ms().saturating_sub(60_000),
+            client_id: None,
+            scopes: None,
+            available_model_ids: None,
+        };
+        save_credential("some-unknown-provider", &expired, Some(&auth_file)).unwrap();
+
+        let resolved = resolve_api_key_async("some-unknown-provider", None, Some(&auth_file))
+            .await
+            .unwrap();
+        assert_eq!(
+            resolved, None,
+            "an expired token with no refresh support must not be returned"
+        );
+    }
+
+    #[tokio::test]
     async fn file_credential_store_serializes_concurrent_refresh() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::Arc;
@@ -706,6 +734,8 @@ mod tests {
         // Set ANTHROPIC_TOKEN_URL to point to local mock using RAII guard
         let token_url = format!("http://127.0.0.1:{port}/token");
         let _env_guard = EnvVarGuard::set("ANTHROPIC_TOKEN_URL", &token_url);
+        // Test-only opt-in: the mock is plain HTTP on loopback.
+        let _insecure_guard = EnvVarGuard::set("MEHH_OAUTH_ALLOW_INSECURE_REFRESH", "1");
 
         let dir = crate::TempTestDir::new("auth_concurrent_refresh");
         let auth_path = dir.path().join("auth.json");

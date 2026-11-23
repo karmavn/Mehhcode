@@ -1,0 +1,5 @@
+[
+  "crates\\mehh-coding-agent\\src\\file_args.rs",
+  "crates\\mehh-coding-agent\\src\\file_complete.rs",
+  "crates\\mehh-coding-agent\\src\\lead_worker.rs"
+]
