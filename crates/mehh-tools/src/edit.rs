@@ -106,9 +106,34 @@ fn apply_replacements_to_original(original: &str, replacements: &[MatchedEdit]) 
                 continue;
             }
             match byte {
-                b'"' | b'\'' => {
+                b'"' => {
                     quote = Some(byte);
                     i += 1;
+                }
+                b'\'' => {
+                    // Closed same-line `'...'` covers Rust char literals ('"', '\'', '\n')
+                    // and JS/Python/SQL/Shell single-quoted strings ('say "hi').
+                    // Unclosed quotes (Rust lifetimes `&'a`, `<'a`, `'static`, labels
+                    // `'outer:`, comments `// don't`) stay literal so they never swallow `\n`.
+                    let is_rust_lifetime_prefix = i > line_start
+                        && matches!(bytes[i - 1], b'&' | b'<');
+                    let mut next_idx = i + 1;
+                    if !is_rust_lifetime_prefix {
+                        let mut j = i + 1;
+                        let mut esc = false;
+                        while j < bytes.len() && bytes[j] != b'\n' {
+                            if esc {
+                                esc = false;
+                            } else if bytes[j] == b'\\' {
+                                esc = true;
+                            } else if bytes[j] == b'\'' {
+                                next_idx = j + 1;
+                                break;
+                            }
+                            j += 1;
+                        }
+                    }
+                    i = next_idx;
                 }
                 b'\n' => {
                     return if i > line_start && bytes[i - 1] == b'\r' {
@@ -787,6 +812,52 @@ mod tests {
             !undo_err.contains("No previous edit history found"),
             "undo_edit must not report the old cryptic message, got: {}",
             undo_err
+        );
+    }
+
+    #[test]
+    fn apply_replacements_preserves_lf_on_rust_lifetime_line_followed_by_crlf_later() {
+        // Odd number of `'a` lifetimes on the target line itself must not bleed
+        // past `\n` into a later `\r\n` line and misclassify the line ending.
+        let original = "fn foo<'a>(s: &'a str, b: &'a str) {\n    println!(\"{s}\");\n}\n// trailing\r\n";
+        let needle = "b: &'a str";
+        let start = original.find(needle).unwrap();
+        let replacements = vec![MatchedEdit {
+            index: 0,
+            start,
+            end: start + needle.len(),
+            new_text: "b: &'a str,\n    c: &'a str".to_string(),
+        }];
+        let out = apply_replacements_to_original(original, &replacements);
+        assert!(
+            out.contains("b: &'a str,\n    c: &'a str"),
+            "must preserve LF, got: {out:?}"
+        );
+        assert!(
+            !out.contains("b: &'a str,\r\n"),
+            "must not convert LF to CRLF on lifetime line: {out:?}"
+        );
+    }
+
+    #[test]
+    fn apply_replacements_preserves_lf_on_single_quoted_string_with_double_quote() {
+        let original = "const s = 'say \"hello';\n// trailing\r\n";
+        let needle = "const s = 'say \"hello';";
+        let start = original.find(needle).unwrap();
+        let replacements = vec![MatchedEdit {
+            index: 0,
+            start,
+            end: start + needle.len(),
+            new_text: "const s = 'a';\nconst t = 'b';".to_string(),
+        }];
+        let out = apply_replacements_to_original(original, &replacements);
+        assert!(
+            out.contains("const s = 'a';\nconst t = 'b';"),
+            "must preserve LF after closed single-quoted string with inner double quote, got: {out:?}"
+        );
+        assert!(
+            !out.contains("const s = 'a';\r\nconst t = 'b';"),
+            "must not bleed past single-quoted string into later CRLF: {out:?}"
         );
     }
 }

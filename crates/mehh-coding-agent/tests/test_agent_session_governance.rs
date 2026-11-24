@@ -49,7 +49,7 @@ async fn test_agent_session_wires_before_tool_call() {
         },
         args,
         context: AgentContext {
-            messages: vec![],
+            messages: Arc::new(vec![]),
             tools: Some(session.tools.clone()),
         },
     };
@@ -104,7 +104,7 @@ async fn test_headless_deny_handler_fails_closed() {
         },
         args,
         context: AgentContext {
-            messages: vec![],
+            messages: Arc::new(vec![]),
             tools: Some(session.tools.clone()),
         },
     };

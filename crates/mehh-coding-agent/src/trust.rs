@@ -15,16 +15,37 @@ pub enum TrustLevel {
     Untrusted,
 }
 
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !matches!(
+                    out.components().next_back(),
+                    None | Some(Component::Prefix(_)) | Some(Component::RootDir)
+                ) {
+                    out.pop();
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Normalizes a project directory path into a canonical lookup key.
 pub fn normalize_project_key(cwd: &Path) -> String {
     let abs = cwd.canonicalize().unwrap_or_else(|_| {
-        if cwd.is_absolute() {
+        let joined = if cwd.is_absolute() {
             cwd.to_path_buf()
         } else {
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(cwd)
-        }
+        };
+        normalize_lexical_path(&joined)
     });
 
     let mut normalized = abs.to_string_lossy().replace('\\', "/");
@@ -53,6 +74,7 @@ pub fn normalize_project_key(cwd: &Path) -> String {
 pub fn has_local_trust_targets(cwd: &Path) -> bool {
     let mehh_dir = cwd.join(".mehh");
     mehh_dir.join("mcp.json").exists()
+        || mehh_dir.join("models.json").exists()
         || mehh_dir.join("settings.json").exists()
         || mehh_dir.join("permissions.json").exists()
         || mehh_dir.join("MOIM.md").exists()
@@ -212,6 +234,13 @@ mod tests {
     }
 
     #[test]
+    fn normalize_project_key_collapses_dotdot_when_path_does_not_exist() {
+        let k1 = normalize_project_key(Path::new("/nonexistent_root/a/b/../c"));
+        let k2 = normalize_project_key(Path::new("/nonexistent_root/a/c"));
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
     fn has_local_trust_targets_detects_agents_md_moim_and_permissions_json() {
         let dir = crate::TempTestDir::new("trust_targets");
         let cwd = dir.path();
@@ -222,6 +251,7 @@ mod tests {
             "AGENTS.override.md",
             "CLAUDE.md",
             ".mehh/MOIM.md",
+            ".mehh/models.json",
             ".mehh/permissions.json",
         ] {
             let full = cwd.join(rel);

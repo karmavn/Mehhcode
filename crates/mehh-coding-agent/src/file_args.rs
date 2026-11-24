@@ -1,8 +1,9 @@
 //! Expansion of `@path` prompt arguments into file content and image blocks.
 
+use std::io::Read;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mehh_ai::{ImageContent, TextContent, UserContentBlock};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13,6 +14,33 @@ pub struct ProcessedPromptArgs {
 
 const MAX_TEXT_FILE_BYTES: u64 = 1024 * 1024;
 const MAX_IMAGE_FILE_BYTES: u64 = 20 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;
+
+fn read_bounded_file(path: &Path, size_limit: u64, remaining_total: u64) -> Result<Vec<u8>> {
+    let effective_limit = size_limit.min(remaining_total);
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("Failed to open '{}'", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take(effective_limit.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("Failed to read '{}'", path.display()))?;
+    if (bytes.len() as u64) > effective_limit {
+        if remaining_total < size_limit {
+            anyhow::bail!(
+                "File '{}' exceeds the {} byte total attachment limit ({} bytes remaining)",
+                path.display(),
+                MAX_TOTAL_ATTACHMENT_BYTES,
+                remaining_total
+            );
+        }
+        anyhow::bail!(
+            "File '{}' exceeds the {} byte limit",
+            path.display(),
+            size_limit
+        );
+    }
+    Ok(bytes)
+}
 
 /// Escapes a path for use inside a double-quoted XML attribute so a file name
 /// cannot break out of the `<file name="…">` tag.
@@ -36,6 +64,7 @@ fn escape_xml_text(value: &str) -> String {
 pub fn process_file_arguments(cwd: &Path, args: &[String]) -> Result<ProcessedPromptArgs> {
     let mut text_parts = Vec::new();
     let mut blocks = Vec::new();
+    let mut total_bytes = 0u64;
 
     for arg in args {
         if let Some(path_str) = arg.strip_prefix('@') {
@@ -58,18 +87,17 @@ pub fn process_file_arguments(cwd: &Path, args: &[String]) -> Result<ProcessedPr
                 } else {
                     MAX_TEXT_FILE_BYTES
                 };
-                let size = std::fs::metadata(&full_path)?.len();
-                if size > size_limit {
+                let remaining_total = MAX_TOTAL_ATTACHMENT_BYTES.saturating_sub(total_bytes);
+                if remaining_total == 0 {
                     anyhow::bail!(
-                        "File '{}' is {} bytes, exceeding the {} byte limit",
-                        full_path.display(),
-                        size,
-                        size_limit
+                        "Total attachment size exceeds the {} byte limit",
+                        MAX_TOTAL_ATTACHMENT_BYTES
                     );
                 }
+                let bytes = read_bounded_file(&full_path, size_limit, remaining_total)?;
+                total_bytes = total_bytes.saturating_add(bytes.len() as u64);
 
                 if is_image {
-                    let bytes = std::fs::read(&full_path)?;
                     let mime_type = match ext.as_str() {
                         "png" => "image/png",
                         "jpg" | "jpeg" => "image/jpeg",
@@ -84,7 +112,6 @@ pub fn process_file_arguments(cwd: &Path, args: &[String]) -> Result<ProcessedPr
                     }));
                     continue;
                 } else {
-                    let bytes = std::fs::read(&full_path)?;
                     if bytes.contains(&0) {
                         anyhow::bail!(
                             "File '{}' appears to be binary; refusing to attach it as text",

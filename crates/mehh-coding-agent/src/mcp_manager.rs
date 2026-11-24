@@ -250,7 +250,7 @@ impl McpManager {
                     name,
                     url,
                     cfg.oauth_token_endpoint.clone(),
-                ));
+                )?);
                 let http_transport = StreamableHttpTransport::new(url.clone(), cfg.headers.clone())
                     .with_auth_provider(bearer_provider);
                 Ok(Arc::new(http_transport))
@@ -444,15 +444,8 @@ impl McpManager {
         results
     }
 
-    /// Performs OAuth 2.0 PKCE authentication flow for an HTTP MCP server.
-    pub async fn authenticate_server_with_prompt<F>(
-        &mut self,
-        name: &str,
-        on_url: F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnOnce(&str),
-    {
+    /// Extracts the server URL and shared auth store for background OAuth login.
+    pub fn prepare_server_oauth(&self, name: &str) -> anyhow::Result<(String, Arc<McpAuthStore>)> {
         let cfg = self
             .configs
             .get(name)
@@ -461,8 +454,20 @@ impl McpManager {
             .url
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Server '{name}' is not an HTTP server"))?;
+        Ok((url.clone(), self.auth_store.clone()))
+    }
 
-        let http_client = mehh_mcp::oauth::oauth_http_client();
+    /// Runs OAuth 2.0 PKCE discovery, loopback callback, and token exchange against `auth_store`.
+    pub async fn complete_server_oauth_flow<F>(
+        name: &str,
+        url: &str,
+        auth_store: &McpAuthStore,
+        on_url: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(&str),
+    {
+        let http_client = mehh_mcp::oauth::oauth_http_client()?;
         let meta = mehh_mcp::oauth::discover_oauth_metadata(&http_client, url).await?;
 
         // Bind an ephemeral loopback port for the OAuth callback
@@ -478,7 +483,7 @@ impl McpManager {
 
         let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-        let existing_entry = self.auth_store.get(name, url).await;
+        let existing_entry = auth_store.get(name, url).await;
         let (client_id, client_secret) = if let Some(ref entry) = existing_entry {
             if let Some(ref cid) = entry.client_id {
                 (cid.clone(), entry.client_secret.clone())
@@ -555,16 +560,29 @@ impl McpManager {
             .map(mehh_mcp::oauth::mcp_token_expiry_seconds);
 
         let auth_entry = McpAuthEntry {
-            server_url: url.clone(),
+            server_url: url.to_string(),
             client_id: Some(client_id),
             client_secret,
             tokens: Some(tokens),
             tokens_expire_at: expires_at,
         };
 
-        self.auth_store.set(name, url, auth_entry).await?;
-        self.reconnect_server(name).await?;
+        auth_store.set(name, url, auth_entry).await?;
+        Ok(())
+    }
 
+    /// Performs OAuth 2.0 PKCE authentication flow for an HTTP MCP server.
+    pub async fn authenticate_server_with_prompt<F>(
+        &mut self,
+        name: &str,
+        on_url: F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnOnce(&str),
+    {
+        let (url, auth_store) = self.prepare_server_oauth(name)?;
+        Self::complete_server_oauth_flow(name, &url, &auth_store, on_url).await?;
+        self.reconnect_server(name).await?;
         Ok(())
     }
 

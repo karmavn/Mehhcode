@@ -46,7 +46,7 @@ impl FauxProvider {
     }
 
     pub fn add_response(&self, message: AssistantMessage) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = crate::lock_recover(&self.inner);
         state.responses.push(FauxResponse::Message(message));
     }
 
@@ -54,17 +54,17 @@ impl FauxProvider {
         &self,
         handler: impl Fn(&Model, &Context, &StreamOptions) -> AssistantMessage + Send + Sync + 'static,
     ) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = crate::lock_recover(&self.inner);
         state.responses.push(FauxResponse::Handler(Box::new(handler)));
     }
 
     pub fn recorded_requests(&self) -> Vec<RecordedRequest> {
-        let state = self.inner.lock().unwrap();
+        let state = crate::lock_recover(&self.inner);
         state.requests.clone()
     }
 
     pub fn clear(&self) {
-        let mut state = self.inner.lock().unwrap();
+        let mut state = crate::lock_recover(&self.inner);
         state.responses.clear();
         state.requests.clear();
     }
@@ -96,7 +96,7 @@ impl LlmProvider for FauxProvider {
         }
 
         let message = {
-            let mut state = self.inner.lock().unwrap();
+            let mut state = crate::lock_recover(&self.inner);
             state.requests.push(RecordedRequest {
                 model: model.clone(),
                 context: context.clone(),

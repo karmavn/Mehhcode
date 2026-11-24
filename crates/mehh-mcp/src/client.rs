@@ -179,6 +179,17 @@ fn lock_std<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+const MAX_CONCURRENT_SERVER_REQUESTS: usize = 32;
+
+fn enqueue_response(
+    writer_tx: &tokio::sync::mpsc::Sender<JsonRpcMessage>,
+    resp: JsonRpcResponse,
+) {
+    if let Err(err) = writer_tx.try_send(JsonRpcMessage::Response(resp)) {
+        tracing::warn!("MCP writer queue full/closed; dropping response: {err}");
+    }
+}
+
 /// RAII cleanup for an in-flight request. If the caller's future is dropped
 /// (external timeout, `select!`, task cancellation), the pending entries are
 /// still removed and a best-effort `notifications/cancelled` is emitted.
@@ -304,6 +315,7 @@ impl McpClient {
         let closed_reader = closed.clone();
         let roots_reader = roots_arc.clone();
 
+        let incoming_permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SERVER_REQUESTS));
         let reader_handle = tokio::spawn(async move {
             while let Some(msg_res) = transport_reader.recv().await {
                 match msg_res {
@@ -326,23 +338,37 @@ impl McpClient {
                     }
                     Ok(JsonRpcMessage::Request(req)) => {
                         let handler = {
-                            let map = handlers_reader.lock().unwrap();
+                            let map = lock_std(&handlers_reader);
                             map.get(&req.method).cloned()
                         };
                         if let Some(h) = handler {
+                            let permit = match incoming_permits.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    let resp = JsonRpcResponse::error(
+                                        req.id,
+                                        -32000,
+                                        "Too many concurrent server requests",
+                                        None,
+                                    );
+                                    enqueue_response(&writer_tx, resp);
+                                    continue;
+                                }
+                            };
                             let cancel = tokio_util::sync::CancellationToken::new();
                             let key = id_to_key(&req.id);
                             {
-                                let mut inc = incoming_reader.lock().unwrap();
+                                let mut inc = lock_std(&incoming_reader);
                                 inc.insert(key.clone(), cancel.clone());
                             }
                             let writer_for_handler = writer_tx.clone();
                             let id_clone = req.id.clone();
                             let incoming_map = incoming_reader.clone();
                             tokio::spawn(async move {
+                                let _permit = permit;
                                 let res = h(req.params, cancel).await;
                                 {
-                                    let mut inc = incoming_map.lock().unwrap();
+                                    let mut inc = lock_std(&incoming_map);
                                     inc.remove(&key);
                                 }
                                 match res {
@@ -358,13 +384,13 @@ impl McpClient {
                             });
                         } else if req.method == "ping" {
                             let resp = JsonRpcResponse::success(req.id, serde_json::json!({}));
-                            let _ = writer_tx.send(JsonRpcMessage::Response(resp)).await;
+                            enqueue_response(&writer_tx, resp);
                         } else if req.method == "roots/list" {
                             let resp = JsonRpcResponse::success(
                                 req.id,
                                 serde_json::json!({ "roots": *roots_reader }),
                             );
-                            let _ = writer_tx.send(JsonRpcMessage::Response(resp)).await;
+                            enqueue_response(&writer_tx, resp);
                         } else {
                             let resp = JsonRpcResponse::error(
                                 req.id,
@@ -372,7 +398,7 @@ impl McpClient {
                                 format!("Method not found: {}", req.method),
                                 None,
                             );
-                            let _ = writer_tx.send(JsonRpcMessage::Response(resp)).await;
+                            enqueue_response(&writer_tx, resp);
                         }
                     }
                     Ok(JsonRpcMessage::Notification(notif)) => {
@@ -381,7 +407,7 @@ impl McpClient {
                                 if let Ok(prog) = serde_json::from_value::<McpProgressNotification>(params.clone()) {
                                     let key = id_to_key(&prog.progress_token);
                                     let tx = {
-                                        let map = progress_reader.lock().unwrap();
+                                        let map = lock_std(&progress_reader);
                                         map.get(&key).cloned()
                                     };
                                     if let Some(tx) = tx {
@@ -394,7 +420,7 @@ impl McpClient {
                                 if let Some(req_id) = params.get("requestId") {
                                     let key = id_to_key(req_id);
                                     let cancel_token = {
-                                        let mut inc = incoming_reader.lock().unwrap();
+                                        let mut inc = lock_std(&incoming_reader);
                                         inc.remove(&key)
                                     };
                                     if let Some(cancel) = cancel_token {
@@ -405,7 +431,7 @@ impl McpClient {
                         }
 
                         let listeners = {
-                            let map = notif_reader.lock().unwrap();
+                            let map = lock_std(&notif_reader);
                             map.get(&notif.method).cloned().unwrap_or_default()
                         };
                         for listener in listeners {
@@ -416,7 +442,7 @@ impl McpClient {
                         let err_msg = format!("MCP transport error: {e}");
                         tracing::warn!("{err_msg}");
                         let err_listeners = {
-                            let list = err_reader.lock().unwrap();
+                            let list = lock_std(&err_reader);
                             list.clone()
                         };
                         for listener in err_listeners {
@@ -433,7 +459,7 @@ impl McpClient {
             }
             if !was_closed {
                 let close_listeners = {
-                    let list = close_reader.lock().unwrap();
+                    let list = lock_std(&close_reader);
                     list.clone()
                 };
                 for listener in close_listeners {
@@ -525,25 +551,25 @@ impl McpClient {
 
     /// Registers a listener for notifications of a specific method.
     pub fn on_notification(&self, method: &str, listener: NotificationListener) {
-        let mut map = self.notification_listeners.lock().unwrap();
+        let mut map = lock_std(&self.notification_listeners);
         map.entry(method.to_string()).or_default().push(listener);
     }
 
     /// Registers a listener for transport or protocol errors.
     pub fn on_error(&self, listener: ErrorListener) {
-        let mut list = self.error_listeners.lock().unwrap();
+        let mut list = lock_std(&self.error_listeners);
         list.push(listener);
     }
 
     /// Registers a listener invoked when the connection closes.
     pub fn on_close(&self, listener: CloseListener) {
-        let mut list = self.close_listeners.lock().unwrap();
+        let mut list = lock_std(&self.close_listeners);
         list.push(listener);
     }
 
     /// Registers a custom request handler for server-to-client requests.
     pub fn set_request_handler(&self, method: &str, handler: RequestHandler) {
-        let mut map = self.request_handlers.lock().unwrap();
+        let mut map = lock_std(&self.request_handlers);
         map.insert(method.to_string(), handler);
     }
 
@@ -913,7 +939,7 @@ impl McpClient {
         }
         if !was_closed {
             let listeners = {
-                let list = self.close_listeners.lock().unwrap();
+                let list = lock_std(&self.close_listeners);
                 list.clone()
             };
             for listener in listeners {
@@ -925,7 +951,7 @@ impl McpClient {
 
     /// Returns a copy of the active incoming request cancellation tokens.
     pub fn incoming_cancellation_tokens(&self) -> HashMap<String, tokio_util::sync::CancellationToken> {
-        let map = self.incoming_requests.lock().unwrap();
+        let map = lock_std(&self.incoming_requests);
         map.clone()
     }
 

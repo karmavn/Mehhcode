@@ -226,7 +226,8 @@ impl Theme {
 
     fn theme_file_path(name: &str) -> Option<PathBuf> {
         let home = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
+            .filter(|s| !s.is_empty())
+            .or_else(|| std::env::var_os("HOME").filter(|s| !s.is_empty()))
             .map(PathBuf::from)?;
         let filename = if name.ends_with(".json") {
             name.to_string()

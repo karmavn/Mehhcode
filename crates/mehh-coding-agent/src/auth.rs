@@ -370,6 +370,62 @@ pub fn remove_credential(provider: &str, auth_file: Option<&Path>) -> anyhow::Re
     Ok(removed)
 }
 
+/// Async version of [`save_credential`] safe to call from Tokio worker threads.
+/// Uses [`FileCredentialStore`] (`get_path_lock_mutex` + `spawn_blocking` OS lock).
+pub async fn save_credential_async(
+    provider: &str,
+    cred: &StoredCredential,
+    auth_file: Option<&Path>,
+) -> anyhow::Result<()> {
+    let path = match auth_file {
+        Some(p) => p.to_path_buf(),
+        None => default_auth_path()?,
+    };
+    let store = FileCredentialStore::for_path(path);
+    let next_cred = cred.clone();
+    store
+        .modify(
+            provider,
+            Box::new(move |_| Box::pin(async move { Ok(Some(next_cred)) })),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Async version of [`remove_credential`] safe to call from Tokio worker threads.
+pub async fn remove_credential_async(
+    provider: &str,
+    auth_file: Option<&Path>,
+) -> anyhow::Result<bool> {
+    let path = match auth_file {
+        Some(p) => p.to_path_buf(),
+        None => default_auth_path()?,
+    };
+    let store = FileCredentialStore::for_path(path.clone());
+    let _lock = store.lock().await?;
+    let provider_owned = provider.to_string();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut entries = load_auth_entries(Some(&path))?;
+        let existing_key = entries
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(&provider_owned))
+            .cloned();
+        let Some(key) = existing_key else {
+            return Ok(false);
+        };
+        entries.remove(&key);
+        let json_str = serde_json::to_string_pretty(&entries)
+            .context("Failed to serialize auth credentials to JSON")?;
+        crate::settings::write_file_atomic(&path, json_str.as_bytes(), true)?;
+        Ok(true)
+    })
+    .await
+    .context("Credential removal task panicked")?
+}
+
 /// Resolves an API key for the requested provider following priority:
 /// 1. Explicit key argument
 /// 2. Provider environment variables

@@ -105,10 +105,7 @@ impl SubagentControl {
     pub fn steer(&self, agent_id: &str, text: &str) -> bool {
         let mut children = self.children.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(handle) = children.get_mut(agent_id) {
-            handle
-                .steering_queue
-                .lock()
-                .unwrap()
+            mehh_ai::lock_recover(&handle.steering_queue)
                 .push_back(Message::User(UserMessage {
                     content: UserContent::Text(text.to_string()),
                     timestamp: now_ms(),

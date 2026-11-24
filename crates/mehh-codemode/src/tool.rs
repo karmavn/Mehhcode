@@ -50,7 +50,7 @@ impl CodemodeTool {
             .into_iter()
             .filter(|t| t.name() != "codemode")
             .collect();
-        let mut guard = self.tools.write().unwrap();
+        let mut guard = mehh_ai::write_recover(&self.tools);
         *guard = filtered_tools;
     }
 
@@ -81,7 +81,7 @@ impl CodemodeTool {
     }
 
     pub fn tools(&self) -> Vec<Arc<dyn AgentTool>> {
-        self.tools.read().unwrap().clone()
+        mehh_ai::read_recover(&self.tools).clone()
     }
 
     /// Shared handle to the live tool list. Interceptors can read it on every
@@ -157,7 +157,7 @@ impl AgentTool for CodemodeTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: code".to_string())?;
 
-        let current_tools = self.tools.read().unwrap().clone();
+        let current_tools = mehh_ai::read_recover(&self.tools).clone();
         let tool_defs: Vec<ToolDefinition> = current_tools
             .iter()
             .map(|t| tool_to_definition(t.as_ref()))
@@ -184,9 +184,12 @@ impl AgentTool for CodemodeTool {
                 let tool_defs = executor_defs.clone();
                 let call_seq = call_seq.clone();
                 Box::pin(async move {
-                    let matching = tools.iter().find(|t| {
-                        t.name() == name_str || to_identifier(t.name()) == name_str
-                    });
+                    // Prefer an exact tool name match before sanitized JS identifier fallback
+                    // so e.g. `foo-bar` never shadows `foo_bar` when `foo_bar_2` is invoked.
+                    let matching = tools
+                        .iter()
+                        .find(|t| t.name() == name_str)
+                        .or_else(|| tools.iter().find(|t| to_identifier(t.name()) == name_str));
                     let tool = match matching {
                         Some(t) => t.clone(),
                         None => return Err(format!("Tool '{name_str}' not found")),
@@ -198,8 +201,8 @@ impl AgentTool for CodemodeTool {
                     };
                     let def = tool_defs
                         .iter()
-                        .find(|d| d.name == name_str || to_identifier(&d.name) == name_str)
-                        .ok_or_else(|| format!("No schema for tool '{name_str}'"))?;
+                        .find(|d| d.name == canonical_name)
+                        .ok_or_else(|| format!("No schema for tool '{canonical_name}'"))?;
                     let seq = call_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let nested_call_id = format!("{prefix}/{canonical_name}#{seq}");
                     let tool_call = ToolCall {
@@ -458,6 +461,58 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("/approved/target.txt"),
             "approved target must be bound into the nested tool call"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_colliding_sanitized_tool_names_dispatch_to_exact_tool() {
+        struct NamedTool {
+            tool_name: &'static str,
+            calls: Arc<Mutex<Vec<String>>>,
+        }
+
+        #[async_trait]
+        impl AgentTool for NamedTool {
+            fn name(&self) -> &str {
+                self.tool_name
+            }
+            fn description(&self) -> &str {
+                "named test tool"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object", "properties": {} })
+            }
+            async fn execute(
+                &self,
+                _tool_call_id: &str,
+                _params: serde_json::Map<String, serde_json::Value>,
+                _cancel: CancellationToken,
+                _on_update: Option<AgentToolUpdateCallback>,
+            ) -> Result<AgentToolResult, String> {
+                mehh_ai::lock_recover(&self.calls).push(self.tool_name.to_string());
+                Ok(AgentToolResult::text(self.tool_name))
+            }
+        }
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let t1 = Arc::new(NamedTool { tool_name: "foo-bar", calls: calls.clone() });
+        let t2 = Arc::new(NamedTool { tool_name: "foo_bar", calls: calls.clone() });
+        let codemode = CodemodeTool::new(vec![t1, t2]);
+
+        let params = serde_json::json!({
+            "code": "const a = await tools.foo_bar({}); const b = await tools.foo_bar_2({}); return [a, b];"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let res = codemode
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        assert_eq!(res.details, Some(serde_json::json!(["foo-bar", "foo_bar"])));
+        assert_eq!(
+            *mehh_ai::lock_recover(&calls),
+            vec!["foo-bar".to_string(), "foo_bar".to_string()]
         );
     }
 }

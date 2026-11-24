@@ -1,7 +1,0 @@
-[
-  {
-    "bugId": "BUG-1",
-    "response": "ACCEPT",
-    "analysisSummary": "Re-read both conversion sites and their full call paths. `OAuthTokens.expires_in` is `Option<u64>` (crates/mehh-mcp/src/oauth.rs:40) deserialized directly from the token endpoint response at oauth.rs:1125-1127 and at crates/mehh-coding-agent/src/mcp_manager.rs:520-523; there is no bound check, clamp, or validation anywhere before either conversion (repo-wide grep for expires_in shows only these two unchecked casts in the MCP crate). `exp as i64` is a defined wrapping cast for values above i64::MAX, and `now + wrapped` yields a past timestamp in release or an overflow panic in debug. `bearer_token()` at oauth.rs:1251-1272 compares that stored value to `now + 30`, so a hostile token endpoint returning u64::MAX makes every subsequent request re-enter the refresh path. The sibling implementation at crates/mehh-ai/src/oauth.rs:169-173 explicitly uses saturating arithmetic with a comment about hostile provider values, confirming the missing hardening. No checked defense blocks the claimed chain; impact is a wrong expiry value and attacker-triggered repeated refresh requests, matching the Medium claim."
-  }
-]

@@ -25,19 +25,19 @@ impl CancelHandle {
     }
 
     pub fn cancel(&self) {
-        self.token.read().unwrap().cancel();
+        mehh_ai::read_recover(&self.token).cancel();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.token.read().unwrap().is_cancelled()
+        mehh_ai::read_recover(&self.token).is_cancelled()
     }
 
     fn current(&self) -> CancellationToken {
-        self.token.read().unwrap().clone()
+        mehh_ai::read_recover(&self.token).clone()
     }
 
     fn reset_if_cancelled(&self) {
-        let mut guard = self.token.write().unwrap();
+        let mut guard = mehh_ai::write_recover(&self.token);
         if guard.is_cancelled() {
             *guard = CancellationToken::new();
         }
@@ -110,26 +110,26 @@ impl Agent {
 
     pub fn with_system_prompt(mut self, prompt: impl Into<String>) -> Self {
         let p = prompt.into();
-        self.state.write().unwrap().system_prompt = p.clone();
+        mehh_ai::write_recover(&self.state).system_prompt = p.clone();
         self.system_prompt = Some(p);
         self
     }
 
     pub fn with_tools(mut self, tools: Vec<Arc<dyn AgentTool>>) -> Self {
-        self.state.write().unwrap().tools = tools.clone();
+        mehh_ai::write_recover(&self.state).tools = tools.clone();
         self.tools = tools;
         self
     }
 
     pub fn with_stream_options(mut self, options: StreamOptions) -> Self {
-        self.state.write().unwrap().thinking_level = options.reasoning;
+        mehh_ai::write_recover(&self.state).thinking_level = options.reasoning;
         self.stream_options = options;
         self
     }
 
     pub fn with_thinking_level(mut self, level: Option<ThinkingLevel>) -> Self {
         self.stream_options.reasoning = level;
-        self.state.write().unwrap().thinking_level = level;
+        mehh_ai::write_recover(&self.state).thinking_level = level;
         self
     }
 
@@ -186,22 +186,22 @@ impl Agent {
     }
 
     pub fn set_system_prompt(&mut self, prompt: Option<String>) {
-        self.state.write().unwrap().system_prompt = prompt.clone().unwrap_or_default();
+        mehh_ai::write_recover(&self.state).system_prompt = prompt.clone().unwrap_or_default();
         self.system_prompt = prompt;
     }
 
     pub fn set_model(&mut self, model: Model) {
-        self.state.write().unwrap().model = model.clone();
+        mehh_ai::write_recover(&self.state).model = model.clone();
         self.model = model;
     }
 
     pub fn set_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) {
-        self.state.write().unwrap().tools = tools.clone();
+        mehh_ai::write_recover(&self.state).tools = tools.clone();
         self.tools = tools;
     }
 
     pub fn set_thinking_level(&mut self, level: Option<ThinkingLevel>) {
-        self.state.write().unwrap().thinking_level = level;
+        mehh_ai::write_recover(&self.state).thinking_level = level;
         self.stream_options.reasoning = level;
     }
 
@@ -244,31 +244,31 @@ impl Agent {
     }
 
     pub fn state(&self) -> AgentState {
-        self.state.read().unwrap().clone()
+        mehh_ai::read_recover(&self.state).clone()
     }
 
     pub fn with_state<R>(&self, f: impl FnOnce(&AgentState) -> R) -> R {
-        f(&self.state.read().unwrap())
+        f(&mehh_ai::read_recover(&self.state))
     }
 
     pub fn reset(&mut self) {
         self.clear_messages();
-        let mut st = self.state.write().unwrap();
+        let mut st = mehh_ai::write_recover(&self.state);
         st.messages.clear();
         st.is_streaming = false;
         st.streaming_message = None;
         st.pending_tool_calls.clear();
         st.error_message = None;
-        self.steering_queue.lock().unwrap().clear();
-        self.follow_up_queue.lock().unwrap().clear();
+        mehh_ai::lock_recover(&self.steering_queue).clear();
+        mehh_ai::lock_recover(&self.follow_up_queue).clear();
     }
 
     pub fn steer(&self, message: Message) {
-        self.steering_queue.lock().unwrap().push_back(message);
+        mehh_ai::lock_recover(&self.steering_queue).push_back(message);
     }
 
     pub fn follow_up(&self, message: Message) {
-        self.follow_up_queue.lock().unwrap().push_back(message);
+        mehh_ai::lock_recover(&self.follow_up_queue).push_back(message);
     }
 
     pub fn set_steering_mode(&mut self, mode: QueueMode) {
@@ -303,7 +303,7 @@ impl Agent {
 
     pub fn clear_messages(&mut self) {
         self.messages.clear();
-        self.state.write().unwrap().messages.clear();
+        mehh_ai::write_recover(&self.state).messages.clear();
     }
 
     pub fn steering_queue(&self) -> Arc<Mutex<VecDeque<Message>>> {
@@ -342,7 +342,7 @@ impl Agent {
         self.cancel.reset_if_cancelled();
 
         {
-            let mut st = self.state.write().unwrap();
+            let mut st = mehh_ai::write_recover(&self.state);
             st.is_streaming = true;
             st.streaming_message = None;
             st.error_message = None;
@@ -360,7 +360,7 @@ impl Agent {
         .await;
 
         {
-            let mut st = self.state.write().unwrap();
+            let mut st = mehh_ai::write_recover(&self.state);
             st.is_streaming = false;
             st.streaming_message = None;
             st.pending_tool_calls.clear();
@@ -399,7 +399,7 @@ impl Agent {
             self.listeners.iter().map(|(_, listener)| listener.clone()).collect();
         Some(Arc::new(move |event: AgentEvent| {
             {
-                let mut st = state_lock.write().unwrap();
+                let mut st = mehh_ai::write_recover(&state_lock);
                 match &event {
                     AgentEvent::MessageStart { message } => {
                         st.streaming_message = Some(message.clone());

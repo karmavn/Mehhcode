@@ -385,12 +385,29 @@ impl Component for SelectList {
     fn render(&self, width: usize) -> Vec<String> {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
-            return vec![truncate_to_width(
-                &format!("  {}", self.theme.fg(&self.theme.dim, "No matching items")),
-                width,
-                "...",
-                false,
-            )];
+            if self.filter.trim().is_empty() {
+                return vec![truncate_to_width(
+                    &format!("  {}", self.theme.fg(&self.theme.dim, "No matching items")),
+                    width,
+                    "...",
+                    false,
+                )];
+            }
+            let msg = format!(
+                "No match for '{}' · Backspace or Esc to clear",
+                self.filter.trim()
+            );
+            return wrap_text_with_ansi(&msg, width.saturating_sub(4).max(10))
+                .into_iter()
+                .map(|w| {
+                    truncate_to_width(
+                        &format!("  {}", self.theme.fg(&self.theme.dim, &w)),
+                        width,
+                        "...",
+                        false,
+                    )
+                })
+                .collect();
         }
 
         let total = filtered.len();
