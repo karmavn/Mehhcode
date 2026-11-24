@@ -49,7 +49,63 @@ pub enum SelectorKind {
     Resume,
     Settings,
     Login,
+    ConnectMethod,
+    ConnectInput,
     ToolApproval,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectInputKind {
+    ApiKey {
+        provider: String,
+        display_name: String,
+    },
+    CustomProviderId,
+    CustomBaseUrl {
+        provider_id: String,
+    },
+    CustomApiKey {
+        provider_id: String,
+        base_url: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectInputState {
+    pub kind: ConnectInputKind,
+    pub value: String,
+    pub masked: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClickAction {
+    OpenModelPicker,
+    OpenConnectProvider,
+    CycleThinking,
+    OpenThinkingPicker,
+    OpenModePicker,
+    OpenSessionSwitcher,
+    NewSession,
+    OpenSettings,
+    OpenHelp,
+    ScrollToBottom,
+    SelectModalRow(usize),
+    ClickSettingsRow {
+        filtered_idx: usize,
+        setting_id: String,
+    },
+    ApproveToolChoice(String),
+    SelectAutocompleteRow(usize),
+    CloseModal,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClickRegion {
+    pub row: usize,
+    pub col_start: usize,
+    pub col_end: usize,
+    pub action: ClickAction,
 }
 
 /// A picker overlay: the list of choices plus the context needed to apply one.
@@ -219,6 +275,22 @@ pub struct InteractiveState {
     pub settings_file: Option<PathBuf>,
     /// File that credentials are written to. `None` uses the default auth file.
     pub auth_file: Option<PathBuf>,
+    /// File that custom provider configs are loaded from/saved to. `None` uses default `models.json`.
+    pub models_file: Option<PathBuf>,
+    /// File that cached discovered provider models are stored in. `None` uses default `discovered-models.json`.
+    pub discovered_models_file: Option<PathBuf>,
+    /// Active inline modal input state (`SelectorKind::ConnectInput`).
+    pub connect_input: Option<ConnectInputState>,
+    /// Target provider ID selected in `/connect` when picking auth method (`SelectorKind::ConnectMethod`).
+    pub connect_provider_target: Option<String>,
+    /// Clickable UI regions collected during the most recent frame render.
+    pub click_regions: Mutex<Vec<ClickRegion>>,
+    /// Queued background model refresh provider triggered by slash commands.
+    pub pending_model_refresh: Option<String>,
+    /// Whether completing the pending model refresh should open `/model`.
+    pub pending_open_model_picker: bool,
+    /// Cached count of connected providers for frame rendering without disk polling.
+    pub connected_provider_count: usize,
     pub(super) transcript_cache: Mutex<TranscriptCache>,
     pub(super) cached_ctx_tokens: Mutex<Option<u64>>,
     /// Original theme saved while `/theme` picker previews choices live.
@@ -255,6 +327,14 @@ impl InteractiveState {
             last_turn_error: None,
             settings_file: None,
             auth_file: None,
+            models_file: None,
+            discovered_models_file: None,
+            connect_input: None,
+            connect_provider_target: None,
+            click_regions: Mutex::new(Vec::new()),
+            pending_model_refresh: None,
+            pending_open_model_picker: false,
+            connected_provider_count: 0,
             transcript_cache: Mutex::new(HashMap::new()),
             cached_ctx_tokens: Mutex::new(None),
             theme_preview_restore: None,

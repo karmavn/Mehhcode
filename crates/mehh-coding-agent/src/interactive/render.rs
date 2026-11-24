@@ -98,6 +98,135 @@ pub(super) fn compact_path(path: &Path, max_len: usize) -> String {
     }
 }
 
+pub(super) struct RenderedLine {
+    pub(super) text: String,
+    pub(super) regions: Vec<(usize, usize, ClickAction)>,
+}
+
+impl RenderedLine {
+    fn plain(text: String) -> Self {
+        Self {
+            text,
+            regions: Vec::new(),
+        }
+    }
+
+    fn with_action(mut self, col_start: usize, col_end: usize, action: ClickAction) -> Self {
+        if col_end > col_start {
+            self.regions.push((col_start, col_end, action));
+        }
+        self
+    }
+}
+
+struct SpanLineBuilder {
+    raw: String,
+    col: usize,
+    regions: Vec<(usize, usize, ClickAction)>,
+}
+
+impl SpanLineBuilder {
+    fn new() -> Self {
+        Self {
+            raw: String::new(),
+            col: 0,
+            regions: Vec::new(),
+        }
+    }
+
+    fn push_plain(&mut self, text: &str) {
+        self.raw.push_str(text);
+        self.col += mehh_tui::visible_width(text);
+    }
+
+    fn push_styled(&mut self, color: &str, text: &str, theme: &Theme) {
+        self.raw.push_str(&theme.fg(color, text));
+        self.col += mehh_tui::visible_width(text);
+    }
+
+    fn push_prestyled(&mut self, styled: &str) {
+        self.raw.push_str(styled);
+        self.col += mehh_tui::visible_width(styled);
+    }
+
+    fn push_clickable(&mut self, color: &str, text: &str, theme: &Theme, action: ClickAction) {
+        let start = self.col;
+        let w = mehh_tui::visible_width(text);
+        self.raw.push_str(&theme.fg(color, text));
+        self.col += w;
+        if w > 0 {
+            self.regions.push((start, start + w, action));
+        }
+    }
+
+    fn push_clickable_prestyled(&mut self, styled: &str, action: ClickAction) {
+        let start = self.col;
+        let w = mehh_tui::visible_width(styled);
+        self.raw.push_str(styled);
+        self.col += w;
+        if w > 0 {
+            self.regions.push((start, start + w, action));
+        }
+    }
+
+    fn finish(mut self, width: usize) -> RenderedLine {
+        let text = truncate_to_width(&self.raw, width, "...", false);
+        let max_w = mehh_tui::visible_width(&text).min(width);
+        self.regions.retain_mut(|(s, e, _)| {
+            if *s >= max_w {
+                return false;
+            }
+            *e = (*e).min(max_w);
+            *e > *s
+        });
+        RenderedLine {
+            text,
+            regions: self.regions,
+        }
+    }
+}
+
+fn left_right_rendered(
+    left: SpanLineBuilder,
+    right: SpanLineBuilder,
+    width: usize,
+) -> RenderedLine {
+    let right_text = truncate_to_width(&right.raw, width, "...", false);
+    let right_w = mehh_tui::visible_width(&right_text);
+    let left_budget = width.saturating_sub(right_w);
+    let left_text = truncate_to_width(&left.raw, left_budget, "...", false);
+    let left_w = mehh_tui::visible_width(&left_text);
+    let pad = width.saturating_sub(left_w + right_w);
+
+    let mut regions = Vec::with_capacity(left.regions.len() + right.regions.len());
+    for (s, e, action) in left.regions {
+        if s < left_w {
+            let clamped_e = e.min(left_w);
+            if clamped_e > s {
+                regions.push((s, clamped_e, action));
+            }
+        }
+    }
+    let shift = left_w + pad;
+    for (s, e, action) in right.regions {
+        let ns = s.saturating_add(shift);
+        let ne = e.saturating_add(shift).min(width);
+        if ns < width && ne > ns {
+            regions.push((ns, ne, action));
+        }
+    }
+
+    RenderedLine {
+        text: truncate_to_width(
+            &format!("{left_text}{}{right_text}", " ".repeat(pad)),
+            width,
+            "...",
+            false,
+        ),
+        regions,
+    }
+}
+
 pub(super) fn left_right(left: String, right: String, width: usize) -> String {
     let right_w = mehh_tui::visible_width(&right);
     let left_w = width.saturating_sub(right_w);
@@ -253,62 +382,182 @@ pub fn render_interactive_frame(
     let width = width.max(20);
     let height = height.max(5);
     let theme = &state.theme;
+    let is_faux = session.model.provider.eq_ignore_ascii_case("faux");
+    let no_provider = state.connected_provider_count == 0 && !is_faux;
 
     // 1. Header — a welcome card replaces the status strip on an empty session.
-    let header_lines: Vec<String> =
+    let header_lines: Vec<RenderedLine> =
         if state.items.is_empty() && editor.autocomplete.is_none() && state.selector.is_none() {
-        let cwd_str = session.cwd.to_string_lossy();
-        let rule = "─".repeat(width.saturating_sub(4).max(1));
-        vec![
-            String::new(),
-            format!(
-                "  {} v{}",
-                theme.fg(&theme.accent, "mehh"),
-                env!("CARGO_PKG_VERSION")
-            ),
-            format!(
-                "  {} {} {}",
-                theme.fg(&theme.text, &session.model.name),
-                permission_badge(effective_permission_mode(session), theme),
-                theme.fg(&theme.dim, &format!("· {cwd_str}"))
-            ),
-            String::new(),
-            theme.fg(
-                &theme.dim,
-                "  /help commands   @file attach   Shift+Enter newline",
-            ),
-            theme.fg(&theme.border_muted, &format!("  {rule}")),
-        ]
-        .into_iter()
-        .map(|line| truncate_to_width(&line, width, "...", false))
-        .collect()
-    } else {
-        let short_id: String = session.session().session_id().chars().take(8).collect();
-        let left = format!(
-            "{} {} {} {}",
-            theme.fg(&theme.accent, "mehh"),
-            theme.fg(&theme.text, &session.model.name),
-            theme.fg(&theme.dim, &format!("({})", session.model.provider)),
-            permission_badge(effective_permission_mode(session), theme),
-        );
-        let right = format!(
-            "session: {} · {}",
-            theme.fg(&theme.warning, &short_id),
-            compact_path(&session.cwd, 18)
-        );
-        let header_text = left_right(left, right, width);
-        let sep_line = theme.fg(&theme.border_muted, &"─".repeat(width));
-        vec![
-            truncate_to_width(&header_text, width, "...", false),
-            truncate_to_width(&sep_line, width, "", false),
-        ]
-    };
+            let cwd_str = session.cwd.to_string_lossy();
+            let rule = "─".repeat(width.saturating_sub(4).max(1));
 
-    // 2. Footer with a live context-window meter.
-    let thinking_str = session
-        .thinking_level()
-        .map(thinking_level_label)
-        .unwrap_or("off");
+            let mut row1 = SpanLineBuilder::new();
+            row1.push_plain("  ");
+            row1.push_styled(&theme.accent, "mehh", theme);
+            row1.push_plain(&format!(" v{}", env!("CARGO_PKG_VERSION")));
+
+            let mut row2 = SpanLineBuilder::new();
+            row2.push_plain("  ");
+            if no_provider {
+                row2.push_clickable(
+                    &theme.warning,
+                    "No provider connected",
+                    theme,
+                    ClickAction::OpenConnectProvider,
+                );
+            } else {
+                row2.push_clickable(
+                    &theme.text,
+                    &session.model.name,
+                    theme,
+                    ClickAction::OpenModelPicker,
+                );
+            }
+            row2.push_plain(" ");
+            row2.push_clickable_prestyled(
+                &permission_badge(effective_permission_mode(session), theme),
+                ClickAction::OpenModePicker,
+            );
+            row2.push_styled(&theme.dim, &format!(" · {cwd_str}"), theme);
+
+            let mut rows = vec![
+                RenderedLine::plain(String::new()),
+                row1.finish(width),
+                row2.finish(width),
+            ];
+
+            if no_provider {
+                let mut cta = SpanLineBuilder::new();
+                cta.push_plain("  ");
+                cta.push_styled(&theme.warning, "No provider connected · click ", theme);
+                cta.push_clickable(
+                    &theme.accent,
+                    "[Connect Provider]",
+                    theme,
+                    ClickAction::OpenConnectProvider,
+                );
+                cta.push_styled(&theme.dim, " or run /connect", theme);
+                rows.push(cta.finish(width));
+            } else {
+                rows.push(RenderedLine::plain(String::new()));
+            }
+
+            let mut quick = SpanLineBuilder::new();
+            quick.push_plain("  ");
+            quick.push_clickable(
+                &theme.accent,
+                "[Connect]",
+                theme,
+                ClickAction::OpenConnectProvider,
+            );
+            quick.push_styled(&theme.dim, " · ", theme);
+            quick.push_clickable(&theme.accent, "[Models]", theme, ClickAction::OpenModelPicker);
+            quick.push_styled(&theme.dim, " · ", theme);
+            quick.push_clickable(
+                &theme.accent,
+                "[Sessions]",
+                theme,
+                ClickAction::OpenSessionSwitcher,
+            );
+            quick.push_styled(&theme.dim, " · ", theme);
+            quick.push_clickable(
+                &theme.accent,
+                "[Settings]",
+                theme,
+                ClickAction::OpenSettings,
+            );
+            quick.push_styled(&theme.dim, " · ", theme);
+            quick.push_clickable(&theme.dim, "/help", theme, ClickAction::OpenHelp);
+            quick.push_styled(&theme.dim, "   @file attach   Shift+Enter newline", theme);
+            rows.push(quick.finish(width));
+
+            rows.push(RenderedLine::plain(truncate_to_width(
+                &theme.fg(&theme.border_muted, &format!("  {rule}")),
+                width,
+                "...",
+                false,
+            )));
+            rows
+        } else {
+            let short_id: String = session.session().session_id().chars().take(8).collect();
+            let sess_label = session
+                .session()
+                .session_name()
+                .map(|n| format!("session: {} ▾", n.chars().take(16).collect::<String>()))
+                .unwrap_or_else(|| format!("session: {short_id} ▾"));
+
+            let mut left = SpanLineBuilder::new();
+            left.push_styled(&theme.accent, "mehh", theme);
+            left.push_plain(" ");
+            if no_provider {
+                left.push_clickable(
+                    &theme.warning,
+                    "No provider connected",
+                    theme,
+                    ClickAction::OpenConnectProvider,
+                );
+            } else {
+                left.push_clickable(
+                    &theme.text,
+                    &session.model.name,
+                    theme,
+                    ClickAction::OpenModelPicker,
+                );
+                left.push_styled(
+                    &theme.dim,
+                    &format!(" ({})", session.model.provider),
+                    theme,
+                );
+            }
+            left.push_plain(" ");
+            left.push_clickable_prestyled(
+                &permission_badge(effective_permission_mode(session), theme),
+                ClickAction::OpenModePicker,
+            );
+            left.push_plain(" ");
+            left.push_clickable(
+                &theme.accent,
+                "[+ connect]",
+                theme,
+                ClickAction::OpenConnectProvider,
+            );
+
+            let mut right = SpanLineBuilder::new();
+            right.push_clickable(
+                &theme.warning,
+                &sess_label,
+                theme,
+                ClickAction::OpenSessionSwitcher,
+            );
+            right.push_plain(" ");
+            right.push_clickable(&theme.accent, "[+ new]", theme, ClickAction::NewSession);
+            right.push_styled(
+                &theme.dim,
+                &format!(" · {}", compact_path(&session.cwd, 14)),
+                theme,
+            );
+
+            let sep_line = theme.fg(&theme.border_muted, &"─".repeat(width));
+            vec![
+                left_right_rendered(left, right, width),
+                RenderedLine::plain(truncate_to_width(&sep_line, width, "", false)),
+            ]
+        };
+
+    // 2. Footer with a live context-window meter and clickable controls.
+    let thinking_profile = mehh_ai::model_thinking_profile(&session.model);
+    let thinking_str = if !thinking_profile.supported {
+        "n/a"
+    } else {
+        session
+            .thinking_level()
+            .map(thinking_level_label)
+            .unwrap_or("off")
+    };
+    let thinking_active = thinking_profile.supported
+        && session
+            .thinking_level()
+            .is_some_and(|l| l != ThinkingLevel::Off);
     let ctx_tokens = {
         let mut guard = state
             .cached_ctx_tokens
@@ -336,24 +585,37 @@ pub fn render_interactive_frame(
     } else {
         &theme.dim
     };
-    let left = format!(
-        "thinking: {} · ctx {} {}",
-        thinking_str,
-        theme.fg(ctx_display_color, &format!("{ctx_pct}%")),
-        ctx_bar(ctx_pct, theme)
+
+    let mut f_left = SpanLineBuilder::new();
+    f_left.push_clickable(
+        if thinking_active {
+            &theme.accent
+        } else {
+            &theme.dim
+        },
+        &format!("thinking: {thinking_str}"),
+        theme,
+        ClickAction::CycleThinking,
     );
-    let right = format!(
-        "{} in / {} out · ${:.4} · /help",
-        compact_count(state.total_input_tokens),
-        compact_count(state.total_output_tokens),
-        state.total_cost
+    f_left.push_styled(&theme.dim, " · ctx ", theme);
+    f_left.push_styled(ctx_display_color, &format!("{ctx_pct}%"), theme);
+    f_left.push_plain(" ");
+    f_left.push_prestyled(&ctx_bar(ctx_pct, theme));
+
+    let mut f_right = SpanLineBuilder::new();
+    f_right.push_styled(
+        &theme.dim,
+        &format!(
+            "{} in / {} out · ${:.4} · ",
+            compact_count(state.total_input_tokens),
+            compact_count(state.total_output_tokens),
+            state.total_cost
+        ),
+        theme,
     );
-    let footer_text = left_right(
-        theme.fg(&theme.dim, &left),
-        theme.fg(&theme.dim, &right),
-        width,
-    );
-    let footer_lines = vec![truncate_to_width(&footer_text, width, "...", false)];
+    f_right.push_clickable(&theme.accent, "/help", theme, ClickAction::OpenHelp);
+
+    let footer_lines = vec![left_right_rendered(f_left, f_right, width)];
 
     // 3. Bottom controls
     let mut busy_lines = Vec::new();
@@ -369,14 +631,17 @@ pub fn render_interactive_frame(
             theme.fg(&theme.text, &state.loader.label),
             theme.fg(&theme.dim, &elapsed)
         );
-        busy_lines = wrap_text_with_ansi(&loader_line, width);
+        busy_lines = wrap_text_with_ansi(&loader_line, width)
+            .into_iter()
+            .map(RenderedLine::plain)
+            .collect();
         if let Some(ref st) = state.status {
-            busy_lines.push(truncate_to_width(
+            busy_lines.push(RenderedLine::plain(truncate_to_width(
                 &format!("  {}", theme.fg(&theme.warning, st)),
                 width,
                 "...",
                 false,
-            ));
+            )));
         }
     }
 
@@ -391,12 +656,12 @@ pub fn render_interactive_frame(
         queued.push(format!("follow-up: {follow_up}"));
     }
     let queue_line = (!queued.is_empty()).then(|| {
-        truncate_to_width(
+        RenderedLine::plain(truncate_to_width(
             &format!("  {}", theme.fg(&theme.dim, &queued.join(" • "))),
             width,
             "...",
             false,
-        )
+        ))
     });
 
     let post_modal_rows =
@@ -405,7 +670,7 @@ pub fn render_interactive_frame(
         .saturating_sub(header_lines.len() + footer_lines.len() + 1)
         .max(1);
     let modal_budget = bottom_budget.saturating_sub(post_modal_rows).max(1);
-    let mut bottom_lines = Vec::new();
+    let mut bottom_lines: Vec<RenderedLine> = Vec::new();
     if let Some(ref selector) = state.selector {
         let mut preview_lines = Vec::new();
         if selector.kind == SelectorKind::ToolApproval {
@@ -436,76 +701,193 @@ pub fn render_interactive_frame(
             .saturating_sub(preview_lines.len())
             .saturating_sub(2)
             .max(1);
-        bottom_lines.extend(preview_lines);
+        bottom_lines.extend(preview_lines.into_iter().map(RenderedLine::plain));
 
-        let title = match selector.kind {
-            SelectorKind::Model => "Select Model",
-            SelectorKind::Mode => "Permission Mode",
-            SelectorKind::Thinking => "Thinking Effort",
-            SelectorKind::Theme => "Color Theme · live preview",
-            SelectorKind::Tree => "Session Branches",
-            SelectorKind::Resume => "Resume Session",
-            SelectorKind::Settings => "Settings",
-            SelectorKind::Login => "Provider Login",
-            SelectorKind::ToolApproval => {
-                "Tool Approval Required (y/Enter: allow · a: session · A: always · n/Esc: deny)"
-            }
-        };
-        let selector_border = if selector.kind == SelectorKind::ToolApproval {
-            &theme.warning
-        } else {
-            &theme.border_accent
-        };
-        let show_search = selector.kind != SelectorKind::ToolApproval;
-        let footer_hint = if !show_search || selector.kind == SelectorKind::Settings {
-            None
-        } else if !selector.list.filter.is_empty() {
-            Some("↑↓ Move · Enter Select · Backspace · Esc Clear filter")
-        } else if selector.kind == SelectorKind::Theme {
-            Some("↑↓ Preview · Enter Apply · Type to filter · Esc Cancel")
-        } else {
-            Some("↑↓ Move · Enter Select · Type to filter · Esc Close")
-        };
-
-        let search_rows = usize::from(show_search) * 2;
-        let (shown, total, body): (usize, usize, Box<dyn Component>) =
-            if selector.kind == SelectorKind::Settings {
-                if let Some(ref sl) = selector.settings_list {
-                    let mut fitted = sl.clone().with_theme(theme.clone());
-                    let shown = fitted.filtered_indices().len();
-                    let total = fitted.items.len();
-                    fitted.max_height = Some(inner_modal_budget.saturating_sub(search_rows).max(1));
-                    (shown, total, Box::new(fitted))
+        if selector.kind == SelectorKind::ConnectInput {
+            let input_state = state.connect_input.as_ref();
+            let (title, field_label, placeholder) = match input_state.map(|i| &i.kind) {
+                Some(ConnectInputKind::ApiKey { display_name, .. }) => (
+                    format!("Connect {display_name} · API Key"),
+                    "API Key:",
+                    "Paste or type your API key...",
+                ),
+                Some(ConnectInputKind::CustomProviderId) => (
+                    "Custom Provider · Step 1/3".to_string(),
+                    "Provider ID:",
+                    "e.g. ollama, vllm, lmstudio",
+                ),
+                Some(ConnectInputKind::CustomBaseUrl { provider_id }) => (
+                    format!("Custom Provider ({provider_id}) · Step 2/3"),
+                    "Base URL:",
+                    "e.g. http://localhost:11434/v1",
+                ),
+                Some(ConnectInputKind::CustomApiKey { provider_id, .. }) => (
+                    format!("Custom Provider ({provider_id}) · Step 3/3"),
+                    "API Key (optional):",
+                    "Leave blank for keyless local endpoint",
+                ),
+                None => (
+                    "Connect Provider".to_string(),
+                    "Input:",
+                    "Type value...",
+                ),
+            };
+            let display_val = if let Some(inp) = input_state {
+                if inp.value.is_empty() {
+                    theme.fg(&theme.dim, &format!("{placeholder}▌"))
+                } else if inp.masked {
+                    let count = inp.value.chars().count().min(48);
+                    theme.fg(&theme.text, &format!("{}▌", "•".repeat(count)))
                 } else {
-                    let shown = selector.list.filtered_indices().len();
-                    let total = selector.list.items.len();
-                    (shown, total, Box::new(selector.list.clone().with_theme(theme.clone())))
+                    theme.fg(&theme.text, &format!("{}▌", inp.value))
                 }
             } else {
-                let mut fitted = selector.list.clone().with_theme(theme.clone());
-                let shown = fitted.filtered_indices().len();
-                let total = fitted.items.len();
-                if show_search {
-                    let overhead = search_rows + usize::from(footer_hint.is_some()) * 2;
-                    let max_rows = inner_modal_budget.saturating_sub(overhead).clamp(1, 10);
-                    fitted.max_visible = fitted.max_visible.min(max_rows);
+                theme.fg(&theme.dim, "▌")
+            };
+            let mut body_text = format!(
+                "{}\n  {}\n",
+                theme.fg(&theme.muted, field_label),
+                display_val
+            );
+            if let Some(err) = input_state.and_then(|i| i.error.as_deref()) {
+                body_text.push_str(&format!("\n{}\n", theme.fg(&theme.error, &format!("✗ {err}"))));
+            }
+            body_text.push_str(&format!(
+                "\n{}",
+                theme.fg(
+                    &theme.dim,
+                    "Paste or type · Enter Confirm · Ctrl+U Clear · Esc Back"
+                )
+            ));
+            let boxed = BorderedBox::new(Box::new(Text::new(body_text)))
+                .with_title(title)
+                .with_style(BorderStyle::Rounded)
+                .with_border_color(&theme.border_accent)
+                .with_title_color(&theme.text);
+            bottom_lines.extend(boxed.render(width).into_iter().map(RenderedLine::plain));
+        } else {
+            let title = match selector.kind {
+                SelectorKind::Model => "Select Model",
+                SelectorKind::Mode => "Permission Mode",
+                SelectorKind::Thinking => "Thinking Effort",
+                SelectorKind::Theme => "Color Theme · live preview",
+                SelectorKind::Tree => "Session Branches",
+                SelectorKind::Resume => "Sessions",
+                SelectorKind::Settings => "Settings",
+                SelectorKind::Login => "Connect Provider",
+                SelectorKind::ConnectMethod => "Connection Method",
+                SelectorKind::ConnectInput => "Connect Provider",
+                SelectorKind::ToolApproval => {
+                    "Tool Approval Required (y/Enter: allow · a: session · A: always · n/Esc: deny)"
                 }
-                (shown, total, Box::new(fitted))
+            };
+            let selector_border = if selector.kind == SelectorKind::ToolApproval {
+                &theme.warning
+            } else {
+                &theme.border_accent
+            };
+            let show_search = selector.kind != SelectorKind::ToolApproval
+                && selector.kind != SelectorKind::ConnectMethod;
+            let footer_hint = if !show_search || selector.kind == SelectorKind::Settings {
+                None
+            } else if !selector.list.filter.is_empty() {
+                Some("↑↓ Move · Enter Select · Backspace · Esc Clear filter")
+            } else if selector.kind == SelectorKind::Theme {
+                Some("↑↓ Preview · Enter Apply · Type to filter · Esc Cancel")
+            } else {
+                Some("↑↓ Move · Enter Select · Type to filter · Esc Close")
             };
 
-        let modal = ModalPanel {
-            search_bar: show_search.then(|| (selector.list.filter.clone(), shown, total)),
-            body,
-            footer_hint,
-            max_height: Some(inner_modal_budget),
-            theme: theme.clone(),
-        };
-        let boxed = BorderedBox::new(Box::new(modal))
-            .with_title(title)
-            .with_style(BorderStyle::Rounded)
-            .with_border_color(selector_border)
-            .with_title_color(&theme.text);
-        bottom_lines.extend(boxed.render(width));
+            let search_rows = usize::from(show_search) * 2;
+            let inner_width = width.saturating_sub(2);
+            let mut row_actions: Vec<(usize, ClickAction)> = Vec::new();
+            let body_start_row = 1 + search_rows;
+
+            let (shown, total, body): (usize, usize, Box<dyn Component>) =
+                if selector.kind == SelectorKind::Settings {
+                    if let Some(ref sl) = selector.settings_list {
+                        let mut fitted = sl.clone().with_theme(theme.clone());
+                        let shown = fitted.filtered_indices().len();
+                        let total = fitted.items.len();
+                        fitted.max_height =
+                            Some(inner_modal_budget.saturating_sub(search_rows).max(1));
+                        let (settings_lines, row_map) = fitted.render_with_row_map(inner_width);
+                        for (i, mapping) in row_map.into_iter().enumerate() {
+                            if let Some((filtered_idx, setting_id)) = mapping {
+                                row_actions.push((
+                                    body_start_row + i,
+                                    ClickAction::ClickSettingsRow {
+                                        filtered_idx,
+                                        setting_id,
+                                    },
+                                ));
+                            }
+                        }
+                        (shown, total, Box::new(mehh_tui::RawLines { lines: settings_lines }))
+                    } else {
+                        let shown = selector.list.filtered_indices().len();
+                        let total = selector.list.items.len();
+                        (
+                            shown,
+                            total,
+                            Box::new(selector.list.clone().with_theme(theme.clone())),
+                        )
+                    }
+                } else {
+                    let mut fitted = selector.list.clone().with_theme(theme.clone());
+                    let shown = fitted.filtered_indices().len();
+                    let total = fitted.items.len();
+                    if show_search {
+                        let overhead = search_rows + usize::from(footer_hint.is_some()) * 2;
+                        let max_rows = inner_modal_budget.saturating_sub(overhead).clamp(1, 10);
+                        fitted.max_visible = fitted.max_visible.min(max_rows);
+                    }
+                    let (vis_start, vis_end, filtered) = fitted.visible_range();
+                    for (i, pos) in (vis_start..vis_end).enumerate() {
+                        let action = if selector.kind == SelectorKind::ToolApproval {
+                            ClickAction::ApproveToolChoice(fitted.items[filtered[pos]].id.clone())
+                        } else {
+                            ClickAction::SelectModalRow(pos)
+                        };
+                        row_actions.push((body_start_row + i, action));
+                    }
+                    (shown, total, Box::new(fitted))
+                };
+
+            let modal = ModalPanel {
+                search_bar: show_search.then(|| (selector.list.filter.clone(), shown, total)),
+                body,
+                footer_hint,
+                max_height: Some(inner_modal_budget),
+                theme: theme.clone(),
+            };
+            let boxed = BorderedBox::new(Box::new(modal))
+                .with_title(title)
+                .with_style(BorderStyle::Rounded)
+                .with_border_color(selector_border)
+                .with_title_color(&theme.text);
+            let rendered_box = boxed.render(width);
+            let mut box_rows: Vec<RenderedLine> =
+                rendered_box.into_iter().map(RenderedLine::plain).collect();
+            let col_end = width.saturating_sub(1);
+            let max_body_rows = if show_search {
+                inner_modal_budget
+                    .saturating_sub(search_rows + usize::from(footer_hint.is_some()) * 2)
+            } else {
+                inner_modal_budget
+            };
+            for (rel_row, action) in row_actions {
+                if rel_row < body_start_row + max_body_rows
+                    && rel_row + 1 < box_rows.len()
+                    && col_end > 1
+                {
+                    box_rows[rel_row]
+                        .regions
+                        .push((1, col_end, action));
+                }
+            }
+            bottom_lines.extend(box_rows);
+        }
     }
 
     bottom_lines.extend(busy_lines);
@@ -548,7 +930,24 @@ pub fn render_interactive_frame(
                 .with_style(BorderStyle::Single)
                 .with_border_color(theme.border_accent.as_str())
                 .with_title_color(theme.text.as_str());
-            bottom_lines.extend(panel.render(width));
+            let mut ac_box: Vec<RenderedLine> = panel
+                .render(width)
+                .into_iter()
+                .map(RenderedLine::plain)
+                .collect();
+            if let Some(ref ac) = themed_editor.autocomplete {
+                let (vis_start, vis_end, _) = ac.visible_range();
+                let col_end = width.saturating_sub(1);
+                for (i, pos) in (vis_start..vis_end).enumerate() {
+                    let rel_row = 1 + i;
+                    if rel_row + 1 < ac_box.len() && col_end > 1 {
+                        ac_box[rel_row]
+                            .regions
+                            .push((1, col_end, ClickAction::SelectAutocompleteRow(pos)));
+                    }
+                }
+            }
+            bottom_lines.extend(ac_box);
         }
         let mut dock_title = if state.is_busy {
             "Steer (Enter) · Follow-up (Alt+Enter) · Cancel (Esc)".to_string()
@@ -572,7 +971,7 @@ pub fn render_interactive_frame(
             .with_border_color(dock_border)
             .with_title_color(theme.text.as_str())
             .with_title(dock_title);
-        bottom_lines.extend(dock.render(width));
+        bottom_lines.extend(dock.render(width).into_iter().map(RenderedLine::plain));
     }
 
     // 4. Transcript — store cached Arc<[String]> segments and materialize only
@@ -777,12 +1176,15 @@ pub fn render_interactive_frame(
         let max_scroll = total_transcript_lines.saturating_sub(pre_height);
         state.last_max_scroll.store(max_scroll, Ordering::Relaxed);
         let pill = scroll_pill_text(anchored.min(max_scroll), max_scroll, anchor);
-        bottom_lines.push(truncate_to_width(
+        let pill_line = truncate_to_width(
             &theme.fg(&theme.warning, &pill),
             width,
             "...",
             false,
-        ));
+        );
+        bottom_lines.push(
+            RenderedLine::plain(pill_line).with_action(0, width, ClickAction::ScrollToBottom),
+        );
     }
 
     // Keep the assembled frame within the terminal height: drop optional panel
@@ -794,7 +1196,7 @@ pub fn render_interactive_frame(
         let mut excess = bottom_lines.len() - bottom_budget;
         let mut idx = 0;
         while excess > 0 && idx < bottom_lines.len().saturating_sub(3) {
-            let line = &bottom_lines[idx];
+            let line = &bottom_lines[idx].text;
             if line.contains("Allow") || line.contains("Deny") || line.contains("Suggestions") {
                 idx += 1;
                 continue;
@@ -843,11 +1245,67 @@ pub fn render_interactive_frame(
     let pad = available_height.saturating_sub(visible_transcript.len());
     visible_transcript.extend(vec![String::new(); pad]);
 
+    let has_dismissable_modal = state
+        .selector
+        .as_ref()
+        .is_some_and(|s| s.kind != SelectorKind::ToolApproval);
+
     let mut frame = Vec::with_capacity(height);
-    frame.extend(header_lines);
-    frame.extend(visible_transcript);
-    frame.extend(bottom_lines);
-    frame.extend(footer_lines);
+    let mut regions = Vec::new();
+
+    for hl in header_lines {
+        let row = frame.len();
+        for (col_start, col_end, action) in hl.regions {
+            regions.push(ClickRegion {
+                row,
+                col_start,
+                col_end,
+                action,
+            });
+        }
+        frame.push(hl.text);
+    }
+
+    for line in visible_transcript {
+        let row = frame.len();
+        if has_dismissable_modal {
+            regions.push(ClickRegion {
+                row,
+                col_start: 0,
+                col_end: width,
+                action: ClickAction::CloseModal,
+            });
+        }
+        frame.push(line);
+    }
+
+    for bl in bottom_lines {
+        let row = frame.len();
+        for (col_start, col_end, action) in bl.regions {
+            regions.push(ClickRegion {
+                row,
+                col_start,
+                col_end,
+                action,
+            });
+        }
+        frame.push(bl.text);
+    }
+
+    for fl in footer_lines {
+        let row = frame.len();
+        for (col_start, col_end, action) in fl.regions {
+            regions.push(ClickRegion {
+                row,
+                col_start,
+                col_end,
+                action,
+            });
+        }
+        frame.push(fl.text);
+    }
+
+    *state.click_regions.lock().unwrap_or_else(|e| e.into_inner()) = regions;
 
     frame
 }

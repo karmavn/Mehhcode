@@ -379,11 +379,26 @@ impl SelectList {
         let sel = self.selected.min(filtered.len() - 1);
         Some(&self.items[filtered[sel]])
     }
+
+    /// Returns `(start, end, filtered_indices)` for the currently visible viewport rows.
+    pub fn visible_range(&self) -> (usize, usize, Vec<usize>) {
+        let filtered = self.filtered_indices();
+        let total = filtered.len();
+        if total == 0 {
+            return (0, 0, filtered);
+        }
+        let selected = self.selected.min(total.saturating_sub(1));
+        let max_vis = self.max_visible.min(total);
+        let start = (selected as isize - (max_vis as isize / 2))
+            .clamp(0, (total as isize - max_vis as isize).max(0)) as usize;
+        let end = (start + max_vis).min(total);
+        (start, end, filtered)
+    }
 }
 
 impl Component for SelectList {
     fn render(&self, width: usize) -> Vec<String> {
-        let filtered = self.filtered_indices();
+        let (start, end, filtered) = self.visible_range();
         if filtered.is_empty() {
             if self.filter.trim().is_empty() {
                 return vec![truncate_to_width(
@@ -410,12 +425,7 @@ impl Component for SelectList {
                 .collect();
         }
 
-        let total = filtered.len();
-        let selected = self.selected.min(total.saturating_sub(1));
-        let max_vis = self.max_visible.min(total);
-        let start = (selected as isize - (max_vis as isize / 2))
-            .clamp(0, (total as isize - max_vis as isize).max(0)) as usize;
-        let end = (start + max_vis).min(total);
+        let selected = self.selected.min(filtered.len().saturating_sub(1));
 
         let max_label_width = filtered
             .iter()
@@ -597,5 +607,27 @@ mod tests {
 
         assert!(list.handle_key("pageup"));
         assert_eq!(list.selected, 0); // clamped to 0
+    }
+
+    #[test]
+    fn test_select_list_visible_range_tracks_scroll_and_filter() {
+        let items: Vec<SelectItem> = (0..8)
+            .map(|i| SelectItem::new(format!("id{i}"), format!("Option {i}")))
+            .collect();
+        let mut list = SelectList::new(items, 4);
+        list.selected = 5;
+        let (start, end, filtered) = list.visible_range();
+        assert_eq!((start, end), (3, 7));
+        let rendered = list.render(40);
+        assert_eq!(rendered.len(), 4);
+        for (row_idx, pos) in (start..end).enumerate() {
+            let expected = &list.items[filtered[pos]].label;
+            assert!(rendered[row_idx].contains(expected));
+        }
+
+        list.set_filter("Option 6");
+        let (fstart, fend, ffiltered) = list.visible_range();
+        assert_eq!((fstart, fend), (0, 1));
+        assert_eq!(ffiltered, vec![6]);
     }
 }

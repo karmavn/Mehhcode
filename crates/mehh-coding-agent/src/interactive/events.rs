@@ -407,6 +407,11 @@ pub(crate) enum AgentSignal {
         provider: String,
         result: Result<String, String>,
     },
+    ModelsDiscovered {
+        provider: String,
+        result: Result<Vec<mehh_ai::Model>, String>,
+        open_picker: bool,
+    },
     McpAuthCompleted {
         server: String,
         result: Result<(), String>,
@@ -540,6 +545,7 @@ pub(super) fn apply_agent_signal(
         AgentSignal::ReadyForTurn { .. }
         | AgentSignal::OverflowCompacted { .. }
         | AgentSignal::LoginCompleted { .. }
+        | AgentSignal::ModelsDiscovered { .. }
         | AgentSignal::McpAuthCompleted { .. } => false,
     }
 }
@@ -777,10 +783,64 @@ pub(super) async fn handle_agent_signal_async(
                             "{msg} (could not refresh the session key: {e})"
                         ))),
                     }
+                    refresh_connected_state(session, state);
+                    state.status = Some(format!("Fetching models for {provider}..."));
+                    trigger_model_refresh(&provider, session, state, true, agent_tx).await;
                 }
                 Err(e) => state
                     .items
                     .push(TranscriptItem::System(format!("Login failed: {e}"))),
+            }
+            SignalOutcome::Continuing
+        }
+        AgentSignal::ModelsDiscovered {
+            provider,
+            result,
+            open_picker,
+        } => {
+            state.status = None;
+            refresh_connected_state(session, state);
+            let (reg, _) = load_interactive_registry(state);
+            let (connected, _) = connected_providers_with_session(session, state, &reg);
+            let active_connected = connected
+                .iter()
+                .any(|c| c.provider_id.eq_ignore_ascii_case(&session.model.provider));
+            let is_faux = session.model.provider.eq_ignore_ascii_case("faux");
+
+            match result {
+                Ok(models) => {
+                    state.items.push(TranscriptItem::System(format!(
+                        "Loaded {} model{} for {}.",
+                        models.len(),
+                        if models.len() == 1 { "" } else { "s" },
+                        provider
+                    )));
+                    if let Some(first) = models.first() {
+                        if !is_faux && (session.api_key.is_none() || !active_connected) {
+                            let target = format!("{}/{}", provider, first.id);
+                            apply_interactive_model_switch(&target, session, state).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    state.items.push(TranscriptItem::System(format!(
+                        "Could not fetch live models for {provider}: {e} (using built-in catalog)"
+                    )));
+                    if !is_faux && (session.api_key.is_none() || !active_connected) {
+                        if let Some(fallback) = reg
+                            .models_for_connected_providers(&connected)
+                            .into_iter()
+                            .find(|m| m.provider.eq_ignore_ascii_case(&provider))
+                        {
+                            let target = format!("{}/{}", fallback.provider, fallback.id);
+                            apply_interactive_model_switch(&target, session, state).await;
+                        }
+                    }
+                }
+            }
+
+            if open_picker && state.selector.is_none() {
+                open_model_selector(session, state);
             }
             SignalOutcome::Continuing
         }
@@ -1304,6 +1364,367 @@ async fn cycle_active_setting_and_refresh(
     refresh_settings_selector_with_status(state, &snapshot, Some(id), Some(status));
 }
 
+/// Spawns background live model discovery for one provider and delivers [`AgentSignal::ModelsDiscovered`].
+fn spawn_model_discovery(
+    provider: String,
+    base_url: String,
+    api_key: Option<String>,
+    api_override: Option<String>,
+    discovered_file: Option<PathBuf>,
+    open_picker: bool,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
+) {
+    let tx = agent_tx.clone();
+    tokio::spawn(async move {
+        let client_res = mehh_ai::build_safe_http_client(
+            mehh_ai::DnsPolicy::AllowPrivate,
+            Duration::from_secs(10),
+            Some(Duration::from_secs(10)),
+        );
+        let result = match client_res {
+            Ok(client) => {
+                match mehh_ai::fetch_provider_models(
+                    &client,
+                    &provider,
+                    &base_url,
+                    api_key.as_deref(),
+                    api_override.as_deref(),
+                )
+                .await
+                {
+                    Ok(models) => {
+                        if let Err(e) = crate::models_config::save_discovered_provider_models(
+                            &provider,
+                            &models,
+                            discovered_file.as_deref(),
+                        ) {
+                            Err(format!(
+                                "Fetched {} models, failed to save cache: {e}",
+                                models.len()
+                            ))
+                        } else {
+                            Ok(models)
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e.to_string()),
+        };
+        let _ = tx.send(AgentSignal::ModelsDiscovered {
+            provider,
+            result,
+            open_picker,
+        });
+    });
+}
+
+/// Starts background model discovery for `"__all__"` connected providers or a specific provider.
+pub(super) async fn trigger_model_refresh(
+    target: &str,
+    session: &AgentSession,
+    state: &mut InteractiveState,
+    open_picker: bool,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
+) {
+    let (reg, _) = load_interactive_registry(state);
+    let providers: Vec<String> = if target == "__all__" {
+        let (connected, err) = connected_providers_with_session(session, state, &reg);
+        if let Some(e) = err {
+            state.items.push(TranscriptItem::System(e));
+        }
+        connected
+            .into_iter()
+            .filter(|c| !c.provider_id.eq_ignore_ascii_case("faux"))
+            .map(|c| c.provider_id)
+            .collect()
+    } else {
+        vec![target.trim().to_ascii_lowercase()]
+    };
+
+    if providers.is_empty() {
+        state.status = None;
+        if open_picker {
+            open_connect_provider_selector(session, state);
+        }
+        return;
+    }
+
+    let mut launched = 0usize;
+    let total = providers.len();
+    for (idx, prov) in providers.into_iter().enumerate() {
+        let cfg = reg.provider_config(&prov);
+        let base_url = cfg
+            .and_then(|c| c.base_url.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| mehh_ai::find_provider_spec(&prov).map(|s| s.default_base_url.to_string()))
+            .or_else(|| mehh_ai::default_base_url(&prov).map(str::to_string));
+
+        let Some(base_url) = base_url else {
+            state.items.push(TranscriptItem::System(format!(
+                "No base URL known for provider '{prov}'."
+            )));
+            continue;
+        };
+
+        let api_override = cfg
+            .and_then(|c| c.api.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+
+        let api_key = match crate::auth::resolve_api_key_async(
+            &prov,
+            None,
+            state.auth_file.as_deref(),
+        )
+        .await
+        {
+            Ok(Some(k)) => Some(k),
+            _ => reg.provider_api_key(&prov).map(str::to_string),
+        };
+
+        let open_last = open_picker && (idx + 1 == total);
+        launched += 1;
+        state.status = Some(format!("Fetching models for {prov}..."));
+        spawn_model_discovery(
+            prov,
+            base_url,
+            api_key,
+            api_override,
+            state.discovered_models_file.clone(),
+            open_last,
+            agent_tx,
+        );
+    }
+
+    if launched == 0 {
+        state.status = None;
+    }
+}
+
+async fn apply_tool_approval_decision(
+    decision: ToolApprovalDecision,
+    session: &mut AgentSession,
+    state: &mut InteractiveState,
+) {
+    state.selector = None;
+    if let Some(pending) = state.pending_approval.take() {
+        if decision.persist_rule || decision.session_rule {
+            let arg_prefix = pending
+                .args
+                .get("command")
+                .and_then(|v| v.as_str())
+                .and_then(mehh_execpolicy::safe_rule_prefix);
+            if mehh_execpolicy::is_shell_tool(&pending.tool_name) && arg_prefix.is_none() {
+                state.items.push(TranscriptItem::System(
+                    "No rule saved: command is compound or too broad to allow safely".to_string(),
+                ));
+            } else {
+                let rule = crate::permissions::PermissionRule {
+                    tool_name: pending.tool_name.clone(),
+                    arg_prefix,
+                    path_glob: None,
+                    action: crate::permissions::PermissionAction::AlwaysAllow,
+                };
+                let save_result = if decision.persist_rule {
+                    Some(session.inspection_manager.add_permission_rule(rule).await)
+                } else {
+                    session.inspection_manager.add_session_permission_rule(rule).await;
+                    None
+                };
+                state.items.push(TranscriptItem::System(
+                    permission_rule_status_message(
+                        decision.persist_rule,
+                        &pending.tool_name,
+                        save_result.as_ref(),
+                    ),
+                ));
+            }
+        }
+        let _ = pending.reply_tx.send(decision.allow);
+    }
+}
+
+/// Applies pasted text into the active `ConnectInput` modal without leaking secrets into `editor`.
+pub(super) fn handle_connect_input_paste(pasted: &str, state: &mut InteractiveState) -> bool {
+    let Some(ref mut inp) = state.connect_input else {
+        return false;
+    };
+    let clean: String = pasted
+        .chars()
+        .filter(|c| !c.is_control() && !matches!(c, '\r' | '\n'))
+        .collect();
+    let trimmed = clean.trim();
+    if !trimmed.is_empty() {
+        inp.value.push_str(trimmed);
+        inp.error = None;
+    }
+    true
+}
+
+/// Handles keyboard input inside `SelectorKind::ConnectInput`.
+pub(super) async fn handle_connect_input_key(
+    key_str: &str,
+    session: &mut AgentSession,
+    state: &mut InteractiveState,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
+) {
+    match key_str {
+        "escape" => {
+            state.connect_input = None;
+            open_connect_provider_selector(session, state);
+        }
+        "backspace" => {
+            if let Some(ref mut inp) = state.connect_input {
+                inp.value.pop();
+                inp.error = None;
+            }
+        }
+        "ctrl+u" => {
+            if let Some(ref mut inp) = state.connect_input {
+                inp.value.clear();
+                inp.error = None;
+            }
+        }
+        "enter" => {
+            let Some(inp) = state.connect_input.clone() else {
+                state.selector = None;
+                return;
+            };
+            let val = inp.value.trim().to_string();
+            match inp.kind {
+                ConnectInputKind::ApiKey { provider, .. } => {
+                    if val.is_empty() {
+                        if let Some(ref mut cur) = state.connect_input {
+                            cur.error = Some("API key must not be empty".to_string());
+                        }
+                        return;
+                    }
+                    match perform_login(&provider, Some(&val), state.auth_file.as_deref()).await {
+                        Ok(msg) => {
+                            let _ = refresh_session_api_key(
+                                session,
+                                &provider,
+                                state.auth_file.as_deref(),
+                            )
+                            .await;
+                            refresh_connected_state(session, state);
+                            state.connect_input = None;
+                            state.selector = None;
+                            state.items.push(TranscriptItem::System(msg));
+                            trigger_model_refresh(&provider, session, state, true, agent_tx).await;
+                        }
+                        Err(e) => {
+                            if let Some(ref mut cur) = state.connect_input {
+                                cur.error = Some(e.to_string());
+                            }
+                        }
+                    }
+                }
+                ConnectInputKind::CustomProviderId => {
+                    let id = val.to_ascii_lowercase();
+                    if id.is_empty()
+                        || id == "__custom__"
+                        || id.starts_with("__action:")
+                        || !id
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+                    {
+                        if let Some(ref mut cur) = state.connect_input {
+                            cur.error = Some(
+                                "Use letters, digits, '-', '_', or '.' (e.g. ollama)".to_string(),
+                            );
+                        }
+                        return;
+                    }
+                    state.connect_input = Some(ConnectInputState {
+                        kind: ConnectInputKind::CustomBaseUrl { provider_id: id },
+                        value: String::new(),
+                        masked: false,
+                        error: None,
+                    });
+                }
+                ConnectInputKind::CustomBaseUrl { provider_id } => {
+                    let parsed = match mehh_ai::normalize_and_validate_http_url(&val) {
+                        Ok(u) => u,
+                        Err(e) => {
+                            if let Some(ref mut cur) = state.connect_input {
+                                cur.error = Some(e);
+                            }
+                            return;
+                        }
+                    };
+                    if let Err(e) =
+                        mehh_ai::check_url_host_policy(mehh_ai::DnsPolicy::AllowPrivate, &parsed)
+                    {
+                        if let Some(ref mut cur) = state.connect_input {
+                            cur.error = Some(e);
+                        }
+                        return;
+                    }
+                    let base_url = parsed.as_str().trim_end_matches('/').to_string();
+                    state.connect_input = Some(ConnectInputState {
+                        kind: ConnectInputKind::CustomApiKey {
+                            provider_id,
+                            base_url,
+                        },
+                        value: String::new(),
+                        masked: true,
+                        error: None,
+                    });
+                }
+                ConnectInputKind::CustomApiKey {
+                    provider_id,
+                    base_url,
+                } => {
+                    if let Err(e) = crate::models_config::upsert_custom_provider(
+                        &provider_id,
+                        &base_url,
+                        None,
+                        state.models_file.as_deref(),
+                    ) {
+                        if let Some(ref mut cur) = state.connect_input {
+                            cur.error = Some(format!("Failed to save provider config: {e}"));
+                        }
+                        return;
+                    }
+                    if !val.is_empty() {
+                        if let Err(e) =
+                            perform_login(&provider_id, Some(&val), state.auth_file.as_deref()).await
+                        {
+                            if let Some(ref mut cur) = state.connect_input {
+                                cur.error = Some(format!("Failed to store API key: {e}"));
+                            }
+                            return;
+                        }
+                    }
+                    refresh_connected_state(session, state);
+                    state.connect_input = None;
+                    state.selector = None;
+                    state.items.push(TranscriptItem::System(format!(
+                        "Connected custom provider '{provider_id}' ({base_url})."
+                    )));
+                    trigger_model_refresh(&provider_id, session, state, true, agent_tx).await;
+                }
+            }
+        }
+        other => {
+            let mut chars = other.chars();
+            if let (Some(ch), None) = (chars.next(), chars.next()) {
+                if !ch.is_control() && !ch.is_whitespace() {
+                    if let Some(ref mut inp) = state.connect_input {
+                        inp.value.push(ch);
+                        inp.error = None;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Handles keyboard input while any non-approval selector modal is open.
 pub(super) async fn handle_non_approval_selector_key(
     key_str: &str,
@@ -1314,14 +1735,21 @@ pub(super) async fn handle_non_approval_selector_key(
 ) {
     if key_str != "escape" && keybindings.matches(key_str, TuiAction::Interrupt) {
         state.selector = None;
+        state.connect_input = None;
+        state.connect_provider_target = None;
         if let Some(orig) = state.theme_preview_restore.take() {
             state.theme = orig;
         }
         return;
     }
 
+    if state.selector.as_ref().map(|s| s.kind) == Some(SelectorKind::ConnectInput) {
+        handle_connect_input_key(key_str, session, state, agent_tx).await;
+        return;
+    }
+
     if let Some(sel) = state.selector.as_mut() {
-        if update_selector_filter(sel, key_str) {
+        if sel.kind != SelectorKind::ConnectMethod && update_selector_filter(sel, key_str) {
             sync_theme_preview(state);
             return;
         }
@@ -1358,7 +1786,13 @@ pub(super) async fn handle_non_approval_selector_key(
             }
             match kind {
                 Some(SelectorKind::Model) => {
-                    apply_interactive_model_switch(&item.id, session, state).await;
+                    if item.id == "__action:connect_provider" {
+                        open_connect_provider_selector(session, state);
+                    } else if item.id == "__action:refresh_models" {
+                        trigger_model_refresh("__all__", session, state, true, agent_tx).await;
+                    } else {
+                        apply_interactive_model_switch(&item.id, session, state).await;
+                    }
                 }
                 Some(SelectorKind::Mode) => {
                     match item.id.parse::<crate::tool_inspection::PermissionMode>() {
@@ -1404,24 +1838,179 @@ pub(super) async fn handle_non_approval_selector_key(
                     }
                 }
                 Some(SelectorKind::Resume) => {
-                    match SessionManager::open_file(PathBuf::from(&item.id), session.cwd.clone()) {
-                        Ok(mgr) => {
-                            session.session = mgr;
-                            state.items = rebuild_transcript_items(session);
-                            state.scroll_offset = 0;
-                            state.items.push(TranscriptItem::System(format!(
-                                "Resumed session {}",
-                                session.session.session_id()
-                            )));
+                    if item.id == "__action:new_session" {
+                        if state.is_busy {
+                            state.items.push(TranscriptItem::System(
+                                "Cannot start a new session while a turn is running.".to_string(),
+                            ));
+                        } else {
+                            let _ = handle_slash_command("/new", session, state, None, false).await;
                         }
-                        Err(e) => state.items.push(TranscriptItem::System(format!(
-                            "Failed to resume session: {e}"
-                        ))),
+                    } else if item.id == "__action:current_session" {
+                        // Already active; nothing to switch.
+                    } else if state.is_busy {
+                        state.items.push(TranscriptItem::System(
+                            "Cannot switch sessions while a turn is running.".to_string(),
+                        ));
+                    } else {
+                        match SessionManager::open_file(PathBuf::from(&item.id), session.cwd.clone())
+                        {
+                            Ok(mgr) => {
+                                session.session = mgr;
+                                state.invalidate_context_tokens();
+                                state.items = rebuild_transcript_items(session);
+                                state.scroll_offset = 0;
+                                state.items.push(TranscriptItem::System(format!(
+                                    "Resumed session {}",
+                                    session.session.session_id()
+                                )));
+                            }
+                            Err(e) => state.items.push(TranscriptItem::System(format!(
+                                "Failed to resume session: {e}"
+                            ))),
+                        }
                     }
                 }
                 Some(SelectorKind::Login) => {
-                    let auth_file = state.auth_file.clone();
-                    spawn_oauth_login(&item.id, auth_file, state, agent_tx);
+                    if item.id == "__custom__" {
+                        state.connect_input = Some(ConnectInputState {
+                            kind: ConnectInputKind::CustomProviderId,
+                            value: String::new(),
+                            masked: false,
+                            error: None,
+                        });
+                        state.selector = Some(Selector {
+                            kind: SelectorKind::ConnectInput,
+                            list: SelectList::new(Vec::new(), 1),
+                            settings_list: None,
+                        });
+                    } else {
+                        let prov_id = item.id.trim().to_ascii_lowercase();
+                        let supports_oauth =
+                            crate::auth::oauth_kind_for_provider(&prov_id).is_some();
+                        let (reg, _) = load_interactive_registry(state);
+                        let (connected, _) = connected_providers_with_session(session, state, &reg);
+                        let is_connected = connected
+                            .iter()
+                            .any(|c| c.provider_id.eq_ignore_ascii_case(&prov_id));
+
+                        if supports_oauth || is_connected {
+                            let mut methods = Vec::new();
+                            if supports_oauth {
+                                methods.push(
+                                    SelectItem::new("oauth", "OAuth Login")
+                                        .with_description("Sign in via browser or device code"),
+                                );
+                            }
+                            methods.push(
+                                SelectItem::new("api_key", "Paste API Key")
+                                    .with_description("Store an API key in ~/.mehh/agent/auth.json"),
+                            );
+                            if is_connected {
+                                methods.push(
+                                    SelectItem::new("refresh_models", "↻ Refresh Models")
+                                        .with_description("Fetch live models for this provider"),
+                                );
+                                methods.push(
+                                    SelectItem::new("disconnect", "Disconnect Provider")
+                                        .with_description("Remove stored credential and cached models")
+                                        .with_label_color(state.theme.error.clone()),
+                                );
+                            }
+                            state.connect_provider_target = Some(prov_id);
+                            state.selector = Some(Selector {
+                                kind: SelectorKind::ConnectMethod,
+                                list: SelectList::new(methods, 6)
+                                    .with_theme(state.theme.clone()),
+                                settings_list: None,
+                            });
+                        } else {
+                            let display = mehh_ai::find_provider_spec(&prov_id)
+                                .map(|s| s.display_name.to_string())
+                                .unwrap_or_else(|| prov_id.clone());
+                            state.connect_input = Some(ConnectInputState {
+                                kind: ConnectInputKind::ApiKey {
+                                    provider: prov_id,
+                                    display_name: display,
+                                },
+                                value: String::new(),
+                                masked: true,
+                                error: None,
+                            });
+                            state.selector = Some(Selector {
+                                kind: SelectorKind::ConnectInput,
+                                list: SelectList::new(Vec::new(), 1),
+                                settings_list: None,
+                            });
+                        }
+                    }
+                }
+                Some(SelectorKind::ConnectMethod) => {
+                    let target = state
+                        .connect_provider_target
+                        .take()
+                        .unwrap_or_default();
+                    if !target.is_empty() {
+                        match item.id.as_str() {
+                            "oauth" => {
+                                let auth_file = state.auth_file.clone();
+                                spawn_oauth_login(&target, auth_file, state, agent_tx);
+                            }
+                            "api_key" => {
+                                let display = mehh_ai::find_provider_spec(&target)
+                                    .map(|s| s.display_name.to_string())
+                                    .unwrap_or_else(|| target.clone());
+                                state.connect_input = Some(ConnectInputState {
+                                    kind: ConnectInputKind::ApiKey {
+                                        provider: target,
+                                        display_name: display,
+                                    },
+                                    value: String::new(),
+                                    masked: true,
+                                    error: None,
+                                });
+                                state.selector = Some(Selector {
+                                    kind: SelectorKind::ConnectInput,
+                                    list: SelectList::new(Vec::new(), 1),
+                                    settings_list: None,
+                                });
+                            }
+                            "refresh_models" => {
+                                trigger_model_refresh(&target, session, state, true, agent_tx)
+                                    .await;
+                            }
+                            "disconnect" => {
+                                match crate::auth::remove_credential_async(
+                                    &target,
+                                    state.auth_file.as_deref(),
+                                )
+                                .await
+                                {
+                                    Ok(removed) => {
+                                        let _ = crate::models_config::remove_discovered_provider_models(
+                                            &target,
+                                            state.discovered_models_file.as_deref(),
+                                        );
+                                        if session.model.provider.eq_ignore_ascii_case(&target) {
+                                            session.set_api_key(None);
+                                        }
+                                        refresh_connected_state(session, state);
+                                        state.items.push(TranscriptItem::System(if removed {
+                                            format!("Disconnected {target}.")
+                                        } else {
+                                            format!("Cleared cached models for {target}.")
+                                        }));
+                                    }
+                                    Err(e) => {
+                                        state.items.push(TranscriptItem::System(format!(
+                                            "Failed to disconnect {target}: {e}"
+                                        )));
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -1485,6 +2074,204 @@ pub(super) async fn handle_non_approval_selector_key(
     }
 }
 
+/// Handles direct mouse wheel and click interactions across the TUI frame.
+pub(super) async fn handle_mouse_event(
+    mouse: crossterm::event::MouseEvent,
+    session: &mut AgentSession,
+    state: &mut InteractiveState,
+    editor: &mut Editor,
+    wheel_accelerator: &mut WheelScrollAccelerator,
+    keybindings: &Keybindings,
+    agent_tx: &tokio::sync::mpsc::UnboundedSender<AgentSignal>,
+) -> bool {
+    match mouse.kind {
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            if let Some(ref mut sel) = state.selector {
+                if sel.kind != SelectorKind::ConnectInput {
+                    if sel.kind == SelectorKind::Settings {
+                        if let Some(ref mut sl) = sel.settings_list {
+                            if up {
+                                sl.move_up();
+                            } else {
+                                sl.move_down();
+                            }
+                            sl.clear_status();
+                            sel.list.selected = sl.selected;
+                        } else if up {
+                            sel.list.move_up();
+                        } else {
+                            sel.list.move_down();
+                        }
+                    } else if up {
+                        sel.list.move_up();
+                    } else {
+                        sel.list.move_down();
+                    }
+                    sync_theme_preview(state);
+                    return true;
+                }
+            }
+            let now_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0);
+            let lines = wheel_accelerator.next(if up { -1 } else { 1 }, now_ms);
+            let max_scroll = state.last_max_scroll.load(Ordering::Relaxed);
+            if up {
+                scroll_up_anchored(state, lines, max_scroll);
+            } else {
+                scroll_down_anchored(state, lines, max_scroll);
+            }
+            true
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+            let row = mouse.row as usize;
+            let col = mouse.column as usize;
+            let action = state
+                .click_regions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .rfind(|r| r.row == row && col >= r.col_start && col < r.col_end)
+                .map(|r| r.action.clone());
+
+            let Some(action) = action else {
+                return false;
+            };
+
+            match action {
+                ClickAction::OpenModelPicker => {
+                    open_model_selector(session, state);
+                }
+                ClickAction::OpenConnectProvider => {
+                    open_connect_provider_selector(session, state);
+                }
+                ClickAction::CycleThinking => {
+                    cycle_session_thinking(session, state);
+                }
+                ClickAction::OpenThinkingPicker => {
+                    let _ = handle_slash_command("/thinking", session, state, None, false).await;
+                }
+                ClickAction::OpenModePicker => {
+                    let _ = handle_slash_command("/mode", session, state, None, false).await;
+                }
+                ClickAction::OpenSessionSwitcher => {
+                    open_session_switcher(session, state);
+                }
+                ClickAction::NewSession => {
+                    if state.is_busy {
+                        state.items.push(TranscriptItem::System(
+                            "Cannot start a new session while a turn is running.".to_string(),
+                        ));
+                    } else {
+                        let _ = handle_slash_command("/new", session, state, None, false).await;
+                    }
+                }
+                ClickAction::OpenSettings => {
+                    let _ = handle_slash_command("/settings", session, state, None, false).await;
+                }
+                ClickAction::OpenHelp => {
+                    let _ = handle_slash_command("/help", session, state, None, false).await;
+                }
+                ClickAction::ScrollToBottom => {
+                    state.scroll_offset = 0;
+                    state.scroll_anchor.store(0, Ordering::Relaxed);
+                }
+                ClickAction::SelectModalRow(idx) => {
+                    if let Some(ref mut sel) = state.selector {
+                        sel.list.selected = idx;
+                    }
+                    handle_non_approval_selector_key("enter", keybindings, session, state, agent_tx)
+                        .await;
+                }
+                ClickAction::ClickSettingsRow {
+                    filtered_idx,
+                    setting_id,
+                } => {
+                    if let Some(ref mut sel) = state.selector {
+                        sel.list.selected = filtered_idx;
+                        if let Some(ref mut sl) = sel.settings_list {
+                            sl.selected = filtered_idx;
+                        }
+                    }
+                    cycle_active_setting_and_refresh(&setting_id, true, session, state).await;
+                }
+                ClickAction::ApproveToolChoice(choice_id) => {
+                    if let Some(decision) =
+                        tool_approval_decision("enter", keybindings, Some(&choice_id))
+                    {
+                        apply_tool_approval_decision(decision, session, state).await;
+                    }
+                }
+                ClickAction::SelectAutocompleteRow(idx) => {
+                    if let Some(ref mut ac) = editor.autocomplete {
+                        ac.selected = idx;
+                    }
+                    if let EditorOutput::Changed(current_text) =
+                        editor.handle_editor_key("tab", keybindings)
+                    {
+                        update_autocomplete_with_context(
+                            editor,
+                            &current_text,
+                            &session.cwd,
+                            Some(session),
+                            session
+                                .settings
+                                .theme
+                                .as_deref()
+                                .or(Some(state.theme.name.as_str())),
+                        );
+                    }
+                }
+                ClickAction::CloseModal => {
+                    if state
+                        .selector
+                        .as_ref()
+                        .is_some_and(|s| s.kind != SelectorKind::ToolApproval)
+                    {
+                        state.selector = None;
+                        state.connect_input = None;
+                        state.connect_provider_target = None;
+                        if let Some(orig) = state.theme_preview_restore.take() {
+                            state.theme = orig;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
+            let row = mouse.row as usize;
+            let col = mouse.column as usize;
+            let action = state
+                .click_regions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .rfind(|r| r.row == row && col >= r.col_start && col < r.col_end)
+                .map(|r| r.action.clone());
+
+            match action {
+                Some(ClickAction::CycleThinking) => {
+                    let _ = handle_slash_command("/thinking", session, state, None, false).await;
+                    true
+                }
+                Some(ClickAction::SelectModalRow(idx)) => {
+                    if let Some(ref mut sel) = state.selector {
+                        sel.list.selected = idx;
+                        sync_theme_preview(state);
+                        return true;
+                    }
+                    false
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Runs the full interactive TUI mode loop.
 pub async fn run_interactive_mode(
     session: &mut AgentSession,
@@ -1535,6 +2322,24 @@ pub async fn run_interactive_mode(
     let mut turn_running = false;
     let mut wheel_accelerator = WheelScrollAccelerator::default();
 
+    // Sync thinking and provider onboarding before the first frame
+    refresh_connected_state(session, &mut state);
+    if state.connected_provider_count == 0
+        && !session.model.provider.eq_ignore_ascii_case("faux")
+        && session.api_key.is_none()
+    {
+        open_connect_provider_selector(session, &mut state);
+    } else {
+        session.sync_thinking_for_model(false);
+        let (reg, _) = load_interactive_registry(&state);
+        if !session.model.provider.eq_ignore_ascii_case("faux")
+            && reg.discovered_models_for(&session.model.provider).is_none()
+        {
+            let active_prov = session.model.provider.clone();
+            trigger_model_refresh(&active_prov, session, &mut state, false, &agent_tx).await;
+        }
+    }
+
     // Render initial screen
     render_now(&state, &editor, session, &mut terminal, &mut renderer);
 
@@ -1547,30 +2352,26 @@ pub async fn run_interactive_mode(
                         renderer.reset();
                         render_now(&state, &editor, session, &mut terminal, &mut renderer);
                     }
-                    Event::Mouse(mouse) => match mouse.kind {
-                        MouseEventKind::ScrollUp => {
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs_f64() * 1000.0)
-                                .unwrap_or(0.0);
-                            let lines = wheel_accelerator.next(-1, now_ms);
-                            let max_scroll = state.last_max_scroll.load(Ordering::Relaxed);
-                            scroll_up_anchored(&mut state, lines, max_scroll);
+                    Event::Mouse(mouse) => {
+                        if handle_mouse_event(
+                            mouse,
+                            session,
+                            &mut state,
+                            &mut editor,
+                            &mut wheel_accelerator,
+                            &keybindings,
+                            &agent_tx,
+                        )
+                        .await
+                        {
                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
                         }
-                        MouseEventKind::ScrollDown => {
-                            let now_ms = std::time::SystemTime::now()
-                                .duration_since(std::time::UNIX_EPOCH)
-                                .map(|d| d.as_secs_f64() * 1000.0)
-                                .unwrap_or(0.0);
-                            let lines = wheel_accelerator.next(1, now_ms);
-                            let max_scroll = state.last_max_scroll.load(Ordering::Relaxed);
-                            scroll_down_anchored(&mut state, lines, max_scroll);
-                            render_now(&state, &editor, session, &mut terminal, &mut renderer);
-                        }
-                        _ => {}
-                    },
+                    }
                     Event::Paste(pasted) => {
+                        if handle_connect_input_paste(&pasted, &mut state) {
+                            render_now(&state, &editor, session, &mut terminal, &mut renderer);
+                            continue 'outer;
+                        }
                         editor.insert_text(&pasted);
                         let text = editor.text();
                         update_autocomplete_with_context(
@@ -1641,46 +2442,12 @@ pub async fn run_interactive_mode(
                                     }
 
                                     if let Some(decision) = decision {
-                                        state.selector = None;
-                                        if let Some(pending) = state.pending_approval.take() {
-                                            if decision.persist_rule || decision.session_rule {
-                                                let arg_prefix = pending
-                                                    .args
-                                                    .get("command")
-                                                    .and_then(|v| v.as_str())
-                                                    .and_then(mehh_execpolicy::safe_rule_prefix);
-                                                if mehh_execpolicy::is_shell_tool(&pending.tool_name)
-                                                    && arg_prefix.is_none()
-                                                {
-                                                    // An empty prefix would allow every command for
-                                                    // this shell. Refuse instead of widening policy.
-                                                    state.items.push(TranscriptItem::System(
-                                                        "No rule saved: command is compound or too broad to allow safely".to_string(),
-                                                    ));
-                                                } else {
-                                                    let rule = crate::permissions::PermissionRule {
-                                                        tool_name: pending.tool_name.clone(),
-                                                        arg_prefix,
-                                                        path_glob: None,
-                                                        action: crate::permissions::PermissionAction::AlwaysAllow,
-                                                    };
-                                                    let save_result = if decision.persist_rule {
-                                                        Some(session.inspection_manager.add_permission_rule(rule).await)
-                                                    } else {
-                                                        session.inspection_manager.add_session_permission_rule(rule).await;
-                                                        None
-                                                    };
-                                                    state.items.push(TranscriptItem::System(
-                                                        permission_rule_status_message(
-                                                            decision.persist_rule,
-                                                            &pending.tool_name,
-                                                            save_result.as_ref(),
-                                                        ),
-                                                    ));
-                                                }
-                                            }
-                                            let _ = pending.reply_tx.send(decision.allow);
-                                        }
+                                        apply_tool_approval_decision(
+                                            decision,
+                                            session,
+                                            &mut state,
+                                        )
+                                        .await;
                                     }
                                     render_now(&state, &editor, session, &mut terminal, &mut renderer);
                                     continue 'outer;
@@ -1790,6 +2557,21 @@ pub async fn run_interactive_mode(
                                             break 'outer;
                                         }
                                         SlashCommandOutcome::Handled => {
+                                            if let Some(refresh_target) =
+                                                state.pending_model_refresh.take()
+                                            {
+                                                let open_picker = std::mem::take(
+                                                    &mut state.pending_open_model_picker,
+                                                );
+                                                trigger_model_refresh(
+                                                    &refresh_target,
+                                                    session,
+                                                    &mut state,
+                                                    open_picker,
+                                                    &agent_tx,
+                                                )
+                                                .await;
+                                            }
                                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
                                         }
                                         SlashCommandOutcome::StartOAuthLogin(provider) => {
@@ -1842,6 +2624,27 @@ pub async fn run_interactive_mode(
                                             render_now(&state, &editor, session, &mut terminal, &mut renderer);
                                         }
                                         SlashCommandOutcome::NotACommand => {
+                                            if !session.model.provider.eq_ignore_ascii_case("faux")
+                                                && session.api_key.is_none()
+                                                && state.connected_provider_count == 0
+                                            {
+                                                state.items.push(TranscriptItem::System(
+                                                    "No provider connected yet. Connect a provider first:"
+                                                        .to_string(),
+                                                ));
+                                                open_connect_provider_selector(
+                                                    session,
+                                                    &mut state,
+                                                );
+                                                render_now(
+                                                    &state,
+                                                    &editor,
+                                                    session,
+                                                    &mut terminal,
+                                                    &mut renderer,
+                                                );
+                                                continue 'outer;
+                                            }
                                             if let Some(ref mut mgr) = mcp_manager {
                                                 if mgr.take_tools_dirty() {
                                                     if let Ok(true) = mgr.refresh_server_tools().await {
@@ -1930,7 +2733,9 @@ pub async fn run_interactive_mode(
                 }
                 let render_immediately = matches!(
                     sig,
-                    AgentSignal::SystemMessage(_) | AgentSignal::LoginCompleted { .. }
+                    AgentSignal::SystemMessage(_)
+                        | AgentSignal::LoginCompleted { .. }
+                        | AgentSignal::ModelsDiscovered { .. }
                 );
                 match handle_agent_signal_async(sig, session, &mut state, &agent_tx).await {
                     SignalOutcome::TurnEnded => {

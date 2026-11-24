@@ -71,6 +71,7 @@ pub struct AgentSession {
     pub api_key: Option<String>,
     has_explicit_api_key: bool,
     pub thinking_level: Option<ThinkingLevel>,
+    pub thinking_explicitly_off: bool,
     pub skills: Vec<Skill>,
     pub prompt_templates: Vec<PromptTemplate>,
     pub no_context_files: bool,
@@ -149,6 +150,7 @@ impl AgentSession {
         let prompt_templates =
             crate::prompt_templates::load_prompt_templates_with_trust(&cwd, trusted);
 
+        let thinking_explicitly_off = settings.default_thinking_level == Some(ThinkingLevel::Off);
         let thinking_level = settings.default_thinking_level;
         let default_mode = if model.provider == "faux" || model.api == "faux" {
             crate::tool_inspection::PermissionMode::Auto
@@ -257,6 +259,7 @@ impl AgentSession {
             api_key: None,
             has_explicit_api_key: false,
             thinking_level,
+            thinking_explicitly_off,
             skills,
             prompt_templates,
             no_context_files: false,
@@ -812,6 +815,77 @@ impl AgentSession {
         self.thinking_level
     }
 
+    /// Sets the thinking level explicitly from user action, tracking explicit Off choices.
+    pub fn set_thinking_level_explicit(&mut self, level: ThinkingLevel) {
+        self.thinking_explicitly_off = level == ThinkingLevel::Off;
+        self.thinking_level = if level == ThinkingLevel::Off {
+            None
+        } else {
+            Some(level)
+        };
+    }
+
+    /// Synchronizes `thinking_level` with the active model's thinking capability profile.
+    pub fn sync_thinking_for_model(&mut self, preserve_existing: bool) {
+        let profile = mehh_ai::model_thinking_profile(&self.model);
+        if !profile.supported {
+            self.thinking_level = None;
+            return;
+        }
+
+        let apply_default = |this: &mut Self| {
+            this.thinking_level = if profile.default_level == ThinkingLevel::Off {
+                None
+            } else {
+                Some(profile.default_level)
+            };
+        };
+
+        if preserve_existing {
+            if let Some(cur) = self.thinking_level {
+                if cur != ThinkingLevel::Off {
+                    if self.model.provider.eq_ignore_ascii_case("faux")
+                        || profile.levels.contains(&cur)
+                    {
+                        return;
+                    }
+                    let mapped = match cur {
+                        ThinkingLevel::Max | ThinkingLevel::Xhigh => {
+                            if profile.levels.contains(&ThinkingLevel::High) {
+                                ThinkingLevel::High
+                            } else {
+                                profile.default_level
+                            }
+                        }
+                        ThinkingLevel::Minimal => {
+                            if profile.levels.contains(&ThinkingLevel::Low) {
+                                ThinkingLevel::Low
+                            } else {
+                                profile.default_level
+                            }
+                        }
+                        _ => profile.default_level,
+                    };
+                    self.thinking_level = if mapped == ThinkingLevel::Off {
+                        None
+                    } else {
+                        Some(mapped)
+                    };
+                    return;
+                }
+            }
+            if self.thinking_explicitly_off && profile.can_disable {
+                self.thinking_level = None;
+                return;
+            }
+            apply_default(self);
+        } else if self.thinking_level.is_none()
+            && !(self.thinking_explicitly_off && profile.can_disable)
+        {
+            apply_default(self);
+        }
+    }
+
     /// Returns the slice of loaded skills.
     pub fn skills(&self) -> &[Skill] {
         &self.skills
@@ -927,7 +1001,26 @@ impl AgentSession {
                 config.stream_options.api_key = mgr.worker_api_key.clone();
             }
         }
-        config.stream_options.reasoning = self.thinking_level;
+        config.stream_options.reasoning = if let Some(lvl) = self.thinking_level {
+            if lvl == ThinkingLevel::Off && !config.model.reasoning {
+                None
+            } else {
+                Some(lvl)
+            }
+        } else if config.model.reasoning {
+            if self.thinking_explicitly_off {
+                Some(ThinkingLevel::Off)
+            } else {
+                let profile = mehh_ai::model_thinking_profile(&config.model);
+                if profile.supported && profile.default_level != ThinkingLevel::Off {
+                    Some(profile.default_level)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if let Some(t) = self.settings.temperature {
             config.stream_options.temperature = Some(t);
         }
@@ -2107,6 +2200,51 @@ mod tests {
             "worker tool must never receive the lead key"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sync_thinking_for_model_handles_reasoning_non_reasoning_and_explicit_off() {
+        let dir = crate::TempTestDir::new("sync_thinking_for_model");
+        let reg = crate::models_config::ModelRegistry::builtin_only();
+        let claude = reg.resolve("anthropic", Some("claude-sonnet-4-5")).unwrap();
+        let o3 = reg.resolve("openai", Some("o3")).unwrap();
+        let mut gpt41 = o3.clone();
+        gpt41.id = "gpt-4.1".to_string();
+        gpt41.reasoning = false;
+
+        let mut session = AgentSession::new_with_trust(
+            dir.path().to_path_buf(),
+            claude.clone(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(dir.path()),
+            Settings::default(),
+            false,
+        );
+        assert_eq!(session.thinking_level(), None);
+
+        // Switching to reasoning model without explicit Off activates Medium default
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
+
+        // Switching to non-reasoning model clears active level
+        session.set_model(gpt41, Arc::new(FauxProvider::new()));
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), None);
+
+        // Switching back restores Medium when user did not explicitly turn thinking off
+        session.set_model(claude.clone(), Arc::new(FauxProvider::new()));
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
+
+        // Explicit Off persists across disable-capable models (Claude), clamps to Medium on o3
+        session.set_thinking_level_explicit(ThinkingLevel::Off);
+        assert_eq!(session.thinking_level(), None);
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), None);
+
+        session.set_model(o3, Arc::new(FauxProvider::new()));
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
     }
 
     #[test]

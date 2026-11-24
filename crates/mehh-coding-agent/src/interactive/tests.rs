@@ -3392,3 +3392,594 @@ fn test_tool_execution_start_summarizes_web_fetch_url() {
         }) if name == "web_fetch" && args_summary == "https://docs.rs/reqwest"
     ));
 }
+
+fn mouse_event(
+    kind: crossterm::event::MouseEventKind,
+    row: usize,
+    col: usize,
+) -> crossterm::event::MouseEvent {
+    crossterm::event::MouseEvent {
+        kind,
+        column: col as u16,
+        row: row as u16,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    }
+}
+
+fn find_click_pos(
+    state: &InteractiveState,
+    pred: impl Fn(&ClickAction) -> bool,
+) -> (usize, usize) {
+    let regions = state.click_regions.lock().unwrap();
+    let region = regions
+        .iter()
+        .find(|r| pred(&r.action))
+        .expect("expected matching ClickRegion in frame");
+    (region.row, region.col_start)
+}
+
+#[tokio::test]
+async fn test_model_hides_unconnected_providers_and_opens_connect_when_empty() {
+    let dir = crate::TempTestDir::new("tui_connected_models");
+    let auth_file = dir.path().join("auth.json");
+    let models_file = dir.path().join("models.json");
+    let disc_file = dir.path().join("discovered-models.json");
+    let settings_file = dir.path().join("settings.json");
+
+    let reg = crate::models_config::ModelRegistry::builtin_only();
+    let claude = reg.resolve("anthropic", Some("claude-sonnet-4-5")).unwrap();
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        claude,
+        Arc::new(mehh_ai::FauxProvider::new()),
+        SessionManager::in_memory(dir.path()),
+        Settings::default(),
+        false,
+    );
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.auth_file = Some(auth_file.clone());
+    state.models_file = Some(models_file);
+    state.discovered_models_file = Some(disc_file.clone());
+    state.settings_file = Some(settings_file);
+
+    let base_connected = crate::auth::list_connected_providers(Some(&auth_file), &reg).unwrap();
+    if base_connected.is_empty() {
+        handle_slash_command("/model", &mut session, &mut state, None, false).await;
+        assert_eq!(
+            state.selector.as_ref().map(|s| s.kind),
+            Some(SelectorKind::Login),
+            "/model with 0 connected providers should open Connect Provider modal"
+        );
+    }
+
+    handle_slash_command(
+        "/login openrouter sk-or-test-key",
+        &mut session,
+        &mut state,
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(state.pending_model_refresh.as_deref(), Some("openrouter"));
+
+    crate::models_config::save_discovered_provider_models(
+        "openrouter",
+        &[
+            Model {
+                id: "anthropic/claude-opus-4.6".to_string(),
+                name: "Claude Opus 4.6".to_string(),
+                api: "openai-completions".to_string(),
+                provider: "openrouter".to_string(),
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                reasoning: true,
+                context_window: 200_000,
+                ..Default::default()
+            },
+            Model {
+                id: "meta-llama/llama-3.3-70b".to_string(),
+                name: "Llama 3.3 70B".to_string(),
+                api: "openai-completions".to_string(),
+                provider: "openrouter".to_string(),
+                base_url: "https://openrouter.ai/api/v1".to_string(),
+                reasoning: false,
+                context_window: 131_072,
+                ..Default::default()
+            },
+        ],
+        Some(&disc_file),
+    )
+    .unwrap();
+
+    state.selector = None;
+    handle_slash_command("/model", &mut session, &mut state, None, false).await;
+    let sel = state.selector.as_ref().expect("/model should open Model selector");
+    assert_eq!(sel.kind, SelectorKind::Model);
+    let ids: Vec<&str> = sel.list.items.iter().map(|i| i.id.as_str()).collect();
+    assert!(ids.contains(&"openrouter/anthropic/claude-opus-4.6"));
+    assert!(ids.contains(&"openrouter/meta-llama/llama-3.3-70b"));
+    assert!(ids.contains(&"__action:refresh_models"));
+    assert!(ids.contains(&"__action:connect_provider"));
+    if base_connected.is_empty() {
+        assert!(
+            !ids.contains(&"groq/llama-3.3-70b-versatile"),
+            "unconnected providers must be excluded from /model: {ids:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_connect_masked_input_paste_isolation_and_custom_provider() {
+    let dir = crate::TempTestDir::new("tui_connect_input");
+    let auth_file = dir.path().join("auth.json");
+    let models_file = dir.path().join("models.json");
+    let disc_file = dir.path().join("discovered-models.json");
+    let settings_file = dir.path().join("settings.json");
+
+    let mut session = make_test_session();
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.auth_file = Some(auth_file.clone());
+    state.models_file = Some(models_file.clone());
+    state.discovered_models_file = Some(disc_file);
+    state.settings_file = Some(settings_file);
+
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let editor = Editor::new();
+
+    handle_slash_command("/connect", &mut session, &mut state, None, false).await;
+    let google_pos = state
+        .selector
+        .as_ref()
+        .unwrap()
+        .list
+        .items
+        .iter()
+        .position(|i| i.id == "google")
+        .unwrap();
+    state.selector.as_mut().unwrap().list.selected = google_pos;
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::ConnectInput)
+    );
+
+    assert!(handle_connect_input_paste("AIzaSecretPaste\n", &mut state));
+    assert!(editor.is_empty());
+    let frame = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
+    let plain = mehh_tui::ansi::strip_ansi(&frame);
+    assert!(plain.contains("••••••••"), "API key should render masked");
+    assert!(!plain.contains("AIzaSecretPaste"));
+
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+    assert_eq!(
+        crate::auth::resolve_api_key("google", None, Some(&auth_file)).as_deref(),
+        Some("AIzaSecretPaste")
+    );
+
+    state.selector = None;
+    handle_slash_command("/connect", &mut session, &mut state, None, false).await;
+    let custom_pos = state
+        .selector
+        .as_ref()
+        .unwrap()
+        .list
+        .items
+        .iter()
+        .position(|i| i.id == "__custom__")
+        .unwrap();
+    state.selector.as_mut().unwrap().list.selected = custom_pos;
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+    assert!(handle_connect_input_paste("ollama", &mut state));
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+
+    assert!(handle_connect_input_paste("http://169.254.169.254/v1", &mut state));
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+    assert!(state.connect_input.as_ref().and_then(|c| c.error.as_ref()).is_some());
+
+    handle_non_approval_selector_key("ctrl+u", &kb, &mut session, &mut state, &agent_tx).await;
+    assert!(handle_connect_input_paste("http://localhost:11434/v1", &mut state));
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+
+    let reg = crate::models_config::ModelRegistry::load_with_path(&models_file).unwrap();
+    assert_eq!(
+        reg.provider_config("ollama")
+            .and_then(|c| c.base_url.as_deref()),
+        Some("http://localhost:11434/v1")
+    );
+}
+
+#[tokio::test]
+async fn test_model_switch_wires_thinking_and_persists_default_model() {
+    let dir = crate::TempTestDir::new("tui_thinking_wire");
+    let auth_file = dir.path().join("auth.json");
+    let models_file = dir.path().join("models.json");
+    let disc_file = dir.path().join("discovered-models.json");
+    let settings_file = dir.path().join("settings.json");
+
+    crate::auth::save_credential(
+        "anthropic",
+        &mehh_ai::StoredCredential::ApiKey {
+            key: Some("sk-ant-test".to_string()),
+            env: None,
+        },
+        Some(&auth_file),
+    )
+    .unwrap();
+    crate::auth::save_credential(
+        "openai",
+        &mehh_ai::StoredCredential::ApiKey {
+            key: Some("sk-openai-test".to_string()),
+            env: None,
+        },
+        Some(&auth_file),
+    )
+    .unwrap();
+
+    let mut session = make_test_session();
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.auth_file = Some(auth_file);
+    state.models_file = Some(models_file);
+    state.discovered_models_file = Some(disc_file);
+    state.settings_file = Some(settings_file.clone());
+
+    assert_eq!(session.thinking_level(), None);
+
+    apply_interactive_model_switch("anthropic/claude-sonnet-4-5", &mut session, &mut state).await;
+    assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
+    let saved = crate::settings::SettingsManager::load_file(&settings_file).unwrap();
+    assert_eq!(saved.default_provider.as_deref(), Some("anthropic"));
+    assert_eq!(saved.default_model.as_deref(), Some("claude-sonnet-4-5"));
+
+    apply_interactive_model_switch("openai/gpt-4o", &mut session, &mut state).await;
+    assert_eq!(session.thinking_level(), None);
+    state.selector = None;
+    handle_slash_command("/thinking", &mut session, &mut state, None, false).await;
+    assert!(state.selector.is_none());
+    assert!(state.items.iter().any(|it| {
+        matches!(it, TranscriptItem::System(s) if s.contains("does not support extended thinking"))
+    }));
+
+    apply_interactive_model_switch("anthropic/claude-sonnet-4-5", &mut session, &mut state).await;
+    assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
+}
+
+#[tokio::test]
+async fn test_session_switcher_lists_new_session_and_switches_saved_sessions() {
+    struct CleanSessionDir(PathBuf);
+    impl Drop for CleanSessionDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let dir = crate::TempTestDir::new("tui_session_switcher");
+    let _cleanup = CleanSessionDir(crate::session::session_dir_for_cwd(dir.path()).unwrap());
+
+    let mut s1 = SessionManager::create_default_file(dir.path()).unwrap();
+    let s1_id = s1.session_id().to_string();
+    s1.append_message(mehh_ai::Message::User(mehh_ai::UserMessage {
+        content: mehh_ai::UserContent::Text("First saved session".to_string()),
+        timestamp: mehh_ai::now_ms(),
+    }))
+    .unwrap();
+
+    let s2_path = crate::session::session_dir_for_cwd(dir.path())
+        .unwrap()
+        .join(format!("test_s2_{}.jsonl", uuid::Uuid::now_v7()));
+    let mut s2 = SessionManager::open_file(&s2_path, dir.path()).unwrap();
+    let s2_id = s2.session_id().to_string();
+    s2.append_message(mehh_ai::Message::User(mehh_ai::UserMessage {
+        content: mehh_ai::UserContent::Text("Second saved session".to_string()),
+        timestamp: mehh_ai::now_ms(),
+    }))
+    .unwrap();
+
+    let model = make_test_session().model;
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        model,
+        Arc::new(mehh_ai::FauxProvider::new()),
+        s1,
+        Settings::default(),
+        false,
+    );
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    handle_slash_command("/sessions", &mut session, &mut state, None, false).await;
+    let sel = state.selector.as_ref().expect("/sessions opens Resume selector");
+    assert_eq!(sel.kind, SelectorKind::Resume);
+    assert_eq!(sel.list.items[0].id, "__action:new_session");
+    assert!(sel.list.items.iter().any(|i| i.label.contains("(current)")));
+
+    let s2_name = s2_path.file_name().unwrap().to_string_lossy().to_string();
+    let s2_pos = sel
+        .list
+        .items
+        .iter()
+        .position(|i| i.id.contains(&s2_name))
+        .expect("s2 should appear in /sessions");
+    state.selector.as_mut().unwrap().list.selected = s2_pos;
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+    assert_eq!(session.session().session_id(), s2_id);
+    assert_ne!(session.session().session_id(), s1_id);
+    assert!(
+        state
+            .items
+            .iter()
+            .any(|it| matches!(it, TranscriptItem::User(u) if u == "Second saved session"))
+    );
+
+    handle_slash_command("/sessions", &mut session, &mut state, None, false).await;
+    state.selector.as_mut().unwrap().list.selected = 0;
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+    assert_ne!(session.session().session_id(), s2_id);
+}
+
+#[tokio::test]
+async fn test_mouse_clicks_across_header_footer_scroll_modal_settings_approval_and_autocomplete() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let dir = crate::TempTestDir::new("tui_mouse_clicks");
+    let mut session = make_test_session();
+    session.cwd = dir.path().to_path_buf();
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.auth_file = Some(dir.path().join("auth.json"));
+    state.models_file = Some(dir.path().join("models.json"));
+    state.discovered_models_file = Some(dir.path().join("discovered-models.json"));
+    state.settings_file = Some(dir.path().join("settings.json"));
+
+    let mut editor = Editor::new();
+    let mut wheel = WheelScrollAccelerator::default();
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (r, c) = find_click_pos(&state, |a| matches!(a, ClickAction::OpenConnectProvider));
+    assert!(
+        handle_mouse_event(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), r, c),
+            &mut session,
+            &mut state,
+            &mut editor,
+            &mut wheel,
+            &kb,
+            &agent_tx,
+        )
+        .await
+    );
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::Login)
+    );
+
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (cr, cc) = find_click_pos(&state, |a| matches!(a, ClickAction::CloseModal));
+    assert!(
+        handle_mouse_event(
+            mouse_event(MouseEventKind::Down(MouseButton::Left), cr, cc),
+            &mut session,
+            &mut state,
+            &mut editor,
+            &mut wheel,
+            &kb,
+            &agent_tx,
+        )
+        .await
+    );
+    assert!(state.selector.is_none());
+
+    state.items.push(TranscriptItem::User("hello".to_string()));
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+
+    // Header: model pill, mode pill, session pill, + new pill
+    let (mod_r, mod_c) = find_click_pos(&state, |a| matches!(a, ClickAction::OpenModelPicker));
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), mod_r, mod_c),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert!(state.selector.is_some());
+    state.selector = None;
+
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (mr, mc) = find_click_pos(&state, |a| matches!(a, ClickAction::OpenModePicker));
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), mr, mc),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::Mode)
+    );
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (row_r, row_c) = find_click_pos(&state, |a| matches!(a, ClickAction::SelectModalRow(_)));
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), row_r, row_c),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert!(state.selector.is_none());
+
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (sr, sc) = find_click_pos(&state, |a| matches!(a, ClickAction::OpenSessionSwitcher));
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), sr, sc),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::Resume)
+    );
+    state.selector = None;
+
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (nr, nc) = find_click_pos(&state, |a| matches!(a, ClickAction::NewSession));
+    let before_id = session.session().session_id().to_string();
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), nr, nc),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert_ne!(session.session().session_id(), before_id);
+
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (tr, tc) = find_click_pos(&state, |a| matches!(a, ClickAction::CycleThinking));
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), tr, tc),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(session.thinking_level(), Some(ThinkingLevel::Low));
+
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Right), tr, tc),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::Thinking)
+    );
+    state.selector = None;
+
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (hr, hc) = find_click_pos(&state, |a| matches!(a, ClickAction::OpenHelp));
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), hr, hc),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert!(
+        state
+            .items
+            .iter()
+            .any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Commands:")))
+    );
+
+    for i in 0..40 {
+        state.items.push(TranscriptItem::System(format!("line {i}")));
+    }
+    state.scroll_offset = 5;
+    render_interactive_frame(&state, &editor, &session, 100, 24);
+    let (pr, pc) = find_click_pos(&state, |a| matches!(a, ClickAction::ScrollToBottom));
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), pr, pc),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(state.scroll_offset, 0);
+
+    handle_slash_command("/settings", &mut session, &mut state, None, false).await;
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (set_r, set_c) = find_click_pos(&state, |a| {
+        matches!(a, ClickAction::ClickSettingsRow { setting_id, .. } if setting_id == "hide_thinking_block")
+    });
+    let prev_hide = session.settings.hide_thinking_block;
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), set_r, set_c),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert_ne!(session.settings.hide_thinking_block, prev_hide);
+    state.selector = None;
+
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    apply_agent_signal(
+        AgentSignal::ToolApprovalRequest(PendingApproval {
+            tool_name: "bash".to_string(),
+            args: serde_json::Map::new(),
+            reason: "Check".to_string(),
+            preview: Some("echo hi".to_string()),
+            reply_tx,
+        }),
+        &mut session,
+        &mut state,
+    );
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (ar, ac) = find_click_pos(&state, |a| {
+        matches!(a, ClickAction::ApproveToolChoice(id) if id == "allow_once")
+    });
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), ar, ac),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(reply_rx.try_recv().ok(), Some(true));
+    assert!(state.selector.is_none());
+
+    editor.set_text("/con");
+    update_autocomplete_with_context(&mut editor, "/con", &session.cwd, Some(&session), None);
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (acr, acc) = find_click_pos(&state, |a| matches!(a, ClickAction::SelectAutocompleteRow(_)));
+    handle_mouse_event(
+        mouse_event(MouseEventKind::Down(MouseButton::Left), acr, acc),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert!(editor.text().starts_with("/connect"));
+}

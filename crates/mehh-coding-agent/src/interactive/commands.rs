@@ -3,6 +3,8 @@ use super::*;
 /// Built-in slash commands offered for autocomplete and help.
 pub fn builtin_slash_commands() -> Vec<SelectItem> {
     vec![
+        SelectItem::new("/connect", "/connect")
+            .with_description("Connect a provider (OAuth, API key, or custom endpoint)"),
         SelectItem::new("/settings", "/settings")
             .with_description("Open settings panel (or filter/set: /settings <query|key val>)"),
         SelectItem::new("/mode", "/mode")
@@ -16,6 +18,8 @@ pub fn builtin_slash_commands() -> Vec<SelectItem> {
             .with_description("Configure models for quick cycling"),
         SelectItem::new("/help", "/help").with_description("Show commands and shortcuts"),
         SelectItem::new("/new", "/new").with_description("Start a fresh session"),
+        SelectItem::new("/sessions", "/sessions")
+            .with_description("Switch session or start a new session"),
         SelectItem::new("/resume", "/resume").with_description("Resume a saved session"),
         SelectItem::new("/compact", "/compact").with_description("Summarize older history"),
         SelectItem::new("/tree", "/tree").with_description("Browse and switch session branches"),
@@ -48,6 +52,8 @@ pub fn builtin_slash_commands() -> Vec<SelectItem> {
 /// project and are never overwritten by an interactive toggle.
 pub fn copy_toggle(target: &mut Settings, source: &Settings, key: &str) {
     match key {
+        "default_provider" => target.default_provider = source.default_provider.clone(),
+        "default_model" => target.default_model = source.default_model.clone(),
         "permission_mode" => target.permission_mode = source.permission_mode,
         "theme" => target.theme = source.theme.clone(),
         "steering_mode" => target.steering_mode = source.steering_mode,
@@ -458,11 +464,19 @@ fn available_themes_with_current(current: &str) -> Vec<String> {
 }
 
 pub(super) fn set_session_thinking_level(session: &mut AgentSession, level: ThinkingLevel) {
-    session.set_thinking_level(if level == ThinkingLevel::Off {
-        None
-    } else {
-        Some(level)
-    });
+    session.set_thinking_level_explicit(level);
+}
+
+fn thinking_levels_for_model(model: &mehh_ai::Model, current: ThinkingLevel) -> Vec<ThinkingLevel> {
+    let profile = mehh_ai::model_thinking_profile(model);
+    let mut levels = profile.levels;
+    if profile.supported
+        && !levels.contains(&current)
+        && (model.provider.eq_ignore_ascii_case("faux") || current != ThinkingLevel::Off)
+    {
+        levels.push(current);
+    }
+    levels
 }
 
 pub(super) fn parse_thinking_level_str(raw: &str) -> Option<ThinkingLevel> {
@@ -1116,22 +1130,410 @@ pub(super) fn sync_mcp_tools(
     session.sync_mcp_tools(mcp_tools, codemode_enabled);
 }
 
+/// Loads `ModelRegistry` with optional discovered-models cache, surfacing non-fatal warnings.
+pub(super) fn load_interactive_registry(
+    state: &InteractiveState,
+) -> (crate::models_config::ModelRegistry, Option<String>) {
+    match crate::models_config::ModelRegistry::load_with_discovered(
+        state.models_file.as_deref(),
+        state.discovered_models_file.as_deref(),
+    ) {
+        Ok(reg) => (reg, None),
+        Err(disc_err) => {
+            let base_res = match state.models_file.as_deref() {
+                Some(p) => crate::models_config::ModelRegistry::load_with_path(p),
+                None => crate::models_config::ModelRegistry::load_default(),
+            };
+            match base_res {
+                Ok(reg) => (
+                    reg,
+                    Some(format!(
+                        "Discovered models cache could not be read: {disc_err}"
+                    )),
+                ),
+                Err(base_err) => (
+                    crate::models_config::ModelRegistry::builtin_only(),
+                    Some(format!("Failed to load models registry: {base_err}")),
+                ),
+            }
+        }
+    }
+}
+
+/// Computes connected providers from disk/env/config plus any active session credential.
+pub(super) fn connected_providers_with_session(
+    session: &AgentSession,
+    state: &InteractiveState,
+    reg: &crate::models_config::ModelRegistry,
+) -> (Vec<crate::auth::ConnectedProvider>, Option<String>) {
+    let mut warn = None;
+    let mut connected = match crate::auth::list_connected_providers(state.auth_file.as_deref(), reg) {
+        Ok(list) => list,
+        Err(e) => {
+            warn = Some(format!("Failed to read stored credentials: {e}"));
+            Vec::new()
+        }
+    };
+
+    let active_provider = session.model.provider.trim().to_ascii_lowercase();
+    let has_active_key = session
+        .api_key
+        .as_deref()
+        .is_some_and(|k| !k.trim().is_empty());
+    if (active_provider == "faux" || has_active_key)
+        && !active_provider.is_empty()
+        && !connected
+            .iter()
+            .any(|p| p.provider_id.eq_ignore_ascii_case(&active_provider))
+    {
+        connected.push(crate::auth::ConnectedProvider {
+            provider_id: active_provider,
+            source: crate::auth::CredentialSource::AuthFile,
+            has_oauth: false,
+        });
+    }
+
+    (connected, warn)
+}
+
+/// Refreshes `state.connected_provider_count` from auth/env/models configuration.
+pub(super) fn refresh_connected_state(session: &AgentSession, state: &mut InteractiveState) {
+    let (reg, _warn) = load_interactive_registry(state);
+    let (connected, _auth_warn) = connected_providers_with_session(session, state, &reg);
+    state.connected_provider_count = connected
+        .iter()
+        .filter(|p| !p.provider_id.eq_ignore_ascii_case("faux"))
+        .count();
+}
+
+/// Opens the unified `/connect` provider selector modal.
+pub(super) fn open_connect_provider_selector(
+    session: &AgentSession,
+    state: &mut InteractiveState,
+) {
+    let (reg, _warn) = load_interactive_registry(state);
+    let (connected, auth_err) = connected_providers_with_session(session, state, &reg);
+    if let Some(err) = auth_err {
+        state.items.push(TranscriptItem::System(err));
+    }
+
+    let mut items = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut selected_idx = 0usize;
+
+    for spec in mehh_ai::KNOWN_PROVIDERS {
+        let lower_id = spec.id.to_ascii_lowercase();
+        seen.insert(lower_id.clone());
+        let conn = connected
+            .iter()
+            .find(|c| c.provider_id.eq_ignore_ascii_case(spec.id));
+        let auth_methods = if spec
+            .auth_methods
+            .contains(&mehh_ai::ProviderAuthMethod::OAuth)
+            && spec
+                .auth_methods
+                .contains(&mehh_ai::ProviderAuthMethod::ApiKey)
+        {
+            "OAuth · API key"
+        } else if spec
+            .auth_methods
+            .contains(&mehh_ai::ProviderAuthMethod::OAuth)
+        {
+            "OAuth"
+        } else {
+            "API key"
+        };
+
+        let is_active_provider = session.model.provider.eq_ignore_ascii_case(spec.id);
+        let (label, desc) = if let Some(c) = conn {
+            let src = if c.has_oauth {
+                "OAuth"
+            } else {
+                auth_methods
+            };
+            (
+                format!("{} ✓ connected", spec.display_name),
+                format!("{} · {} · connected", spec.id, src),
+            )
+        } else {
+            (
+                spec.display_name.to_string(),
+                format!("{} · {}", spec.id, auth_methods),
+            )
+        };
+        let mut item = SelectItem::new(spec.id, label).with_description(desc);
+        if conn.is_some() {
+            item = item.with_label_color(state.theme.success.clone());
+        }
+        if is_active_provider && conn.is_some() {
+            selected_idx = items.len();
+        }
+        items.push(item);
+    }
+
+    let mut custom_ids: Vec<String> = reg
+        .provider_configs()
+        .keys()
+        .filter(|k| !seen.contains(&k.trim().to_ascii_lowercase()))
+        .cloned()
+        .collect();
+    custom_ids.sort();
+    for id in custom_ids {
+        let base_desc = reg
+            .provider_config(&id)
+            .and_then(|c| c.base_url.as_deref())
+            .unwrap_or("custom endpoint");
+        let is_conn = connected
+            .iter()
+            .any(|c| c.provider_id.eq_ignore_ascii_case(&id));
+        let label = if is_conn {
+            format!("{id} ✓ connected")
+        } else {
+            id.clone()
+        };
+        let mut item =
+            SelectItem::new(id.clone(), label).with_description(format!("Custom · {base_desc}"));
+        if is_conn {
+            item = item.with_label_color(state.theme.success.clone());
+        }
+        items.push(item);
+    }
+
+    items.push(
+        SelectItem::new(
+            "__custom__",
+            "+ Custom OpenAI-compatible (Ollama / vLLM / Proxy)",
+        )
+        .with_description("Configure custom base URL and optional API key")
+        .with_label_color(state.theme.accent.clone()),
+    );
+
+    state.connect_input = None;
+    state.connect_provider_target = None;
+    state.selector = Some(Selector {
+        kind: SelectorKind::Login,
+        list: select_list_preselected(items, 10, selected_idx),
+        settings_list: None,
+    });
+}
+
+/// Opens `/model` listing ONLY models from connected providers, or redirects to `/connect` when none are connected.
+pub(super) fn open_model_selector(session: &AgentSession, state: &mut InteractiveState) {
+    let (reg, warn) = load_interactive_registry(state);
+    if let Some(w) = warn {
+        state.items.push(TranscriptItem::System(w));
+    }
+    let (connected, auth_err) = connected_providers_with_session(session, state, &reg);
+    if let Some(err) = auth_err {
+        state.items.push(TranscriptItem::System(err));
+    }
+
+    if connected.is_empty() {
+        state.items.push(TranscriptItem::System(
+            "No provider connected yet. Connect a provider to load its models.".to_string(),
+        ));
+        open_connect_provider_selector(session, state);
+        return;
+    }
+
+    let models = reg.models_for_connected_providers(&connected);
+    if models.is_empty() {
+        state.items.push(TranscriptItem::System(
+            "No models available yet. Connect a provider or refresh models.".to_string(),
+        ));
+        open_connect_provider_selector(session, state);
+        return;
+    }
+
+    let mut items: Vec<SelectItem> = Vec::with_capacity(models.len() + 2);
+    let mut selected_idx = 0usize;
+    for m in &models {
+        let is_current = m.provider.eq_ignore_ascii_case(&session.model.provider)
+            && m.id.eq_ignore_ascii_case(&session.model.id);
+        if is_current {
+            selected_idx = items.len();
+        }
+        let ctx_k = m.context_window / 1000;
+        let prof = mehh_ai::model_thinking_profile(m);
+        let mut desc = if m.reasoning {
+            if ctx_k > 0 {
+                format!(
+                    "{} · {}k ctx · thinking ({})",
+                    m.id,
+                    ctx_k,
+                    thinking_level_label(prof.default_level)
+                )
+            } else {
+                format!(
+                    "{} · thinking ({})",
+                    m.id,
+                    thinking_level_label(prof.default_level)
+                )
+            }
+        } else if ctx_k > 0 {
+            format!("{} · {}k ctx", m.id, ctx_k)
+        } else {
+            m.id.clone()
+        };
+        if is_current {
+            desc.push_str(" (current)");
+        }
+        let label = if is_current {
+            format!("{} ({}) (current)", m.name, m.provider)
+        } else {
+            format!("{} ({})", m.name, m.provider)
+        };
+        let mut item =
+            SelectItem::new(format!("{}/{}", m.provider, m.id), label).with_description(desc);
+        if is_current {
+            item = item.with_label_color(state.theme.accent.clone());
+        }
+        items.push(item);
+    }
+
+    items.push(
+        SelectItem::new(
+            "__action:refresh_models",
+            "↻ Refresh models from connected providers",
+        )
+        .with_description("Fetch latest models from provider APIs")
+        .with_label_color(state.theme.accent.clone()),
+    );
+    items.push(
+        SelectItem::new("__action:connect_provider", "+ Connect another provider...")
+            .with_description("Add OAuth, API key, or custom endpoint")
+            .with_label_color(state.theme.accent.clone()),
+    );
+
+    state.selector = Some(Selector {
+        kind: SelectorKind::Model,
+        list: select_list_preselected(items, 10, selected_idx),
+        settings_list: None,
+    });
+}
+
+/// Opens the session switcher modal with `+ New session` at the top and current session highlighted.
+pub(super) fn open_session_switcher(session: &AgentSession, state: &mut InteractiveState) {
+    state.invalidate_context_tokens();
+    let mut items = vec![
+        SelectItem::new("__action:new_session", "+ New session")
+            .with_description("Start a fresh blank conversation")
+            .with_label_color(state.theme.accent.clone()),
+    ];
+    let mut selected_idx = 0usize;
+    let cur_id = session.session().session_id();
+    let cur_path = session.session().file_path().map(|p| p.to_path_buf());
+
+    match crate::session::list_sessions(&session.cwd) {
+        Ok(sessions) => {
+            if sessions.is_empty() {
+                let short_id: String = cur_id.chars().take(8).collect();
+                let name = session
+                    .session()
+                    .session_name()
+                    .unwrap_or_else(|| format!("session {short_id}"));
+                items.push(
+                    SelectItem::new("__action:current_session", format!("{name} (current)"))
+                        .with_description("Current active session (not yet saved to disk)")
+                        .with_label_color(state.theme.accent.clone()),
+                );
+                selected_idx = 1;
+            } else {
+                for summary in &sessions {
+                    let is_current = cur_path
+                        .as_ref()
+                        .is_some_and(|p| p == &summary.path)
+                        || summary.id == cur_id;
+                    if is_current {
+                        selected_idx = items.len();
+                    }
+                    let base_label = summary
+                        .name
+                        .as_deref()
+                        .or(summary.first_prompt.as_deref())
+                        .map(|s| s.chars().take(50).collect::<String>())
+                        .unwrap_or_else(|| summary.id.chars().take(12).collect());
+                    let label = if is_current {
+                        format!("{base_label} (current)")
+                    } else {
+                        base_label
+                    };
+                    let desc = format!(
+                        "{} · {} msgs · {}",
+                        summary.id.chars().take(8).collect::<String>(),
+                        summary.entry_count,
+                        summary.timestamp.chars().take(19).collect::<String>()
+                    );
+                    let mut item = SelectItem::new(
+                        summary.path.to_string_lossy().to_string(),
+                        label,
+                    )
+                    .with_description(desc);
+                    if is_current {
+                        item = item.with_label_color(state.theme.accent.clone());
+                    }
+                    items.push(item);
+                }
+            }
+        }
+        Err(e) => {
+            state
+                .items
+                .push(TranscriptItem::System(format!("Failed to list sessions: {e}")));
+        }
+    }
+
+    state.selector = Some(Selector {
+        kind: SelectorKind::Resume,
+        list: select_list_preselected(items, 10, selected_idx),
+        settings_list: None,
+    });
+}
+
+/// Cycles the active model's supported thinking levels directly (e.g., clicking `thinking:` pill).
+pub(super) fn cycle_session_thinking(session: &mut AgentSession, state: &mut InteractiveState) {
+    let profile = mehh_ai::model_thinking_profile(&session.model);
+    if !profile.supported || profile.levels.is_empty() {
+        state.items.push(TranscriptItem::System(format!(
+            "Model '{}' does not support extended thinking.",
+            session.model.id
+        )));
+        return;
+    }
+    let current = session.thinking_level().unwrap_or(ThinkingLevel::Off);
+    let idx = profile
+        .levels
+        .iter()
+        .position(|&lvl| lvl == current)
+        .unwrap_or(0);
+    let next = profile.levels[(idx + 1) % profile.levels.len()];
+    session.set_thinking_level_explicit(next);
+    state.status = None;
+    let label = thinking_level_label(next);
+    state.items.push(TranscriptItem::System(if next == ThinkingLevel::Off {
+        "Thinking disabled for this session.".to_string()
+    } else {
+        format!("Thinking level set to: {label}")
+    }));
+}
+
 /// Switches the session's model via [`ModelRegistry`] and asynchronously refreshes credentials.
 pub(super) async fn apply_interactive_model_switch(
     target: &str,
     session: &mut AgentSession,
     state: &mut InteractiveState,
 ) {
-    let reg = match crate::models_config::ModelRegistry::load_default() {
-        Ok(r) => r,
-        Err(e) => {
-            state.items.push(TranscriptItem::System(format!(
-                "Failed to load models registry: {e}"
-            )));
-            return;
-        }
-    };
-    let Some(m) = reg.resolve(target, None) else {
+    let (reg, warn) = load_interactive_registry(state);
+    if let Some(w) = warn {
+        state.items.push(TranscriptItem::System(w));
+    }
+    let resolved = reg.resolve(target, None).or_else(|| {
+        reg.models()
+            .iter()
+            .find(|m| m.id.eq_ignore_ascii_case(target.trim()))
+            .cloned()
+    });
+    let Some(m) = resolved else {
         state
             .items
             .push(TranscriptItem::System(format!("Unknown model: '{target}'")));
@@ -1163,8 +1565,43 @@ pub(super) async fn apply_interactive_model_switch(
             session.set_api_key(Some(key));
         }
     }
+    session.sync_thinking_for_model(true);
+    refresh_connected_state(session, state);
+
+    if !m.provider.eq_ignore_ascii_case("faux") {
+        session.settings.default_provider = Some(m.provider.clone());
+        session.settings.default_model = Some(m.id.clone());
+        if let Err(e) = persist_settings(
+            &session.settings,
+            "default_provider",
+            state.settings_file.as_deref(),
+        ) {
+            state.items.push(TranscriptItem::System(format!(
+                "Warning: could not persist default provider: {e}"
+            )));
+        }
+        if let Err(e) = persist_settings(
+            &session.settings,
+            "default_model",
+            state.settings_file.as_deref(),
+        ) {
+            state.items.push(TranscriptItem::System(format!(
+                "Warning: could not persist default model: {e}"
+            )));
+        }
+    }
+
+    let profile = mehh_ai::model_thinking_profile(&session.model);
+    let thinking_note = if profile.supported {
+        format!(
+            "thinking: {}",
+            thinking_level_label(session.thinking_level().unwrap_or(ThinkingLevel::Off))
+        )
+    } else {
+        "thinking: n/a".to_string()
+    };
     state.items.push(TranscriptItem::System(format!(
-        "Switched model to {} ({})",
+        "Switched model to {} ({}) · {thinking_note}",
         m.name, m.provider
     )));
 }
@@ -1241,8 +1678,9 @@ Commands:
     /scoped-models [list]          Configure models for quick cycling
 
   Session & Branching:
+    /connect                       Connect a provider (OAuth, API key, or custom URL)
     /new                           Start a fresh session
-    /resume                        Resume a saved session
+    /sessions (or /resume)         Switch session or start a new one
     /tree [entry_id]               Browse and switch session branches
     /fork [entry_id]               Fork the session into a new one
     /clone                         Clone the current session
@@ -1256,6 +1694,7 @@ Commands:
     /tools                         List all active tools
     /mcp [status|reconnect|auth|resources]
                                    Inspect and manage MCP servers
+    /connect                       Connect a provider (OAuth, API key, or custom URL)
     /login [provider] [key]        Log in to a provider (OAuth or API key)
     /logout <provider>             Remove a stored provider credential
     /follow-up <text>              Queue a message for after the current turn
@@ -1363,84 +1802,59 @@ Keybindings:
         }
         "/model" => {
             if let Some(target) = arg {
-                apply_interactive_model_switch(target, session, state).await;
-            } else {
-                match crate::models_config::ModelRegistry::load_default() {
-                    Ok(reg) => {
-                        let models = reg.models();
-                        let selected_idx = models
-                            .iter()
-                            .position(|m| {
-                                m.provider == session.model.provider && m.id == session.model.id
-                            })
-                            .unwrap_or(0);
-                        let items: Vec<SelectItem> = models
-                            .iter()
-                            .map(|m| {
-                                let is_current = m.provider == session.model.provider
-                                    && m.id == session.model.id;
-                                let ctx_k = m.context_window / 1000;
-                                let mut desc = if ctx_k > 0 {
-                                    format!("{} · {}k ctx", m.id, ctx_k)
-                                } else {
-                                    m.id.clone()
-                                };
-                                if m.reasoning {
-                                    desc.push_str(" · reasoning");
-                                }
-                                let label = if is_current {
-                                    format!("{} ({}) (current)", m.name, m.provider)
-                                } else {
-                                    format!("{} ({})", m.name, m.provider)
-                                };
-                                let mut item = SelectItem::new(
-                                    format!("{}/{}", m.provider, m.id),
-                                    label,
-                                )
-                                .with_description(desc);
-                                if is_current {
-                                    item = item.with_label_color(state.theme.accent.clone());
-                                }
-                                item
-                            })
-                            .collect();
-                        state.selector = Some(Selector {
-                            kind: SelectorKind::Model,
-                            list: select_list_preselected(items, 8, selected_idx),
-                            settings_list: None,
-                        });
-                    }
-                    Err(e) => {
-                        state.items.push(TranscriptItem::System(format!(
-                            "Failed to load models registry: {e}"
-                        )));
-                    }
+                if target.eq_ignore_ascii_case("refresh") {
+                    state.pending_model_refresh = Some("__all__".to_string());
+                    state.pending_open_model_picker = true;
+                    state.status =
+                        Some("Refreshing models from connected providers...".to_string());
+                } else {
+                    apply_interactive_model_switch(target, session, state).await;
                 }
+            } else {
+                open_model_selector(session, state);
             }
             SlashCommandOutcome::Handled
         }
         "/thinking" => {
+            let profile = mehh_ai::model_thinking_profile(&session.model);
             if let Some(level_str) = arg {
                 if let Some(level) = parse_thinking_level_str(level_str) {
-                    set_session_thinking_level(session, level);
-                    let msg = if level == ThinkingLevel::Off {
-                        "Thinking disabled (this session; use /settings to save default)"
-                            .to_string()
+                    if !profile.supported && level != ThinkingLevel::Off {
+                        state.items.push(TranscriptItem::System(format!(
+                            "Model '{}' does not support extended thinking.",
+                            session.model.id
+                        )));
+                    } else if level == ThinkingLevel::Off && !profile.can_disable {
+                        state.items.push(TranscriptItem::System(format!(
+                            "Model '{}' requires thinking and cannot be disabled.",
+                            session.model.id
+                        )));
                     } else {
-                        format!(
-                            "Thinking set to {} (this session; use /settings to save default)",
-                            thinking_level_label(level)
-                        )
-                    };
-                    state.items.push(TranscriptItem::System(msg));
+                        set_session_thinking_level(session, level);
+                        let msg = if level == ThinkingLevel::Off {
+                            "Thinking disabled (this session; use /settings to save default)"
+                                .to_string()
+                        } else {
+                            format!(
+                                "Thinking set to {} (this session; use /settings to save default)",
+                                thinking_level_label(level)
+                            )
+                        };
+                        state.items.push(TranscriptItem::System(msg));
+                    }
                 } else {
                     state.items.push(TranscriptItem::System(format!(
                         "Unknown thinking level: '{level_str}'. Choose from: off, low, medium, high"
                     )));
                 }
+            } else if !profile.supported {
+                state.items.push(TranscriptItem::System(format!(
+                    "Model '{}' does not support extended thinking.",
+                    session.model.id
+                )));
             } else {
                 let current = session.thinking_level().unwrap_or(ThinkingLevel::Off);
-                let levels = thinking_levels_for_current(current);
+                let levels = thinking_levels_for_model(&session.model, current);
                 let selected_idx = levels.iter().position(|&l| l == current).unwrap_or(0);
                 let items: Vec<SelectItem> = levels
                     .iter()
@@ -1815,27 +2229,12 @@ Keybindings:
             }
             SlashCommandOutcome::Handled
         }
-        "/resume" => {
-            state.invalidate_context_tokens();
-            match crate::session::list_sessions(&session.cwd) {
-                Ok(sessions) => {
-                    if sessions.is_empty() {
-                        state.items.push(TranscriptItem::System(
-                            "No saved sessions found for this directory.".to_string(),
-                        ));
-                    } else {
-                        let items = resume_selector_items(&sessions);
-                        state.selector = Some(Selector {
-                            kind: SelectorKind::Resume,
-                            list: SelectList::new(items, 10),
-                            settings_list: None,
-                        });
-                    }
-                }
-                Err(e) => state.items.push(TranscriptItem::System(format!(
-                    "Failed to list sessions: {e}"
-                ))),
-            }
+        "/connect" => {
+            open_connect_provider_selector(session, state);
+            SlashCommandOutcome::Handled
+        }
+        "/sessions" | "/resume" => {
+            open_session_switcher(session, state);
             SlashCommandOutcome::Handled
         }
         "/login" => {
@@ -1861,29 +2260,41 @@ Keybindings:
                                         "{msg} (could not refresh the session key: {e})"
                                     ))),
                                 }
+                                refresh_connected_state(session, state);
+                                state.pending_model_refresh =
+                                    Some(provider.trim().to_ascii_lowercase());
                             }
                             Err(e) => state
                                 .items
                                 .push(TranscriptItem::System(format!("Login failed: {e}"))),
                         }
                         SlashCommandOutcome::Handled
-                    } else {
+                    } else if crate::auth::oauth_kind_for_provider(provider).is_some() {
                         SlashCommandOutcome::StartOAuthLogin(provider.to_string())
+                    } else {
+                        let prov_lower = provider.trim().to_ascii_lowercase();
+                        let display = mehh_ai::find_provider_spec(&prov_lower)
+                            .map(|s| s.display_name.to_string())
+                            .unwrap_or_else(|| prov_lower.clone());
+                        state.connect_input = Some(crate::interactive::ConnectInputState {
+                            kind: crate::interactive::ConnectInputKind::ApiKey {
+                                provider: prov_lower,
+                                display_name: display,
+                            },
+                            value: String::new(),
+                            masked: true,
+                            error: None,
+                        });
+                        state.selector = Some(Selector {
+                            kind: SelectorKind::ConnectInput,
+                            list: SelectList::new(Vec::new(), 1),
+                            settings_list: None,
+                        });
+                        SlashCommandOutcome::Handled
                     }
                 }
                 None => {
-                    let items = vec![
-                        SelectItem::new("anthropic", "anthropic")
-                            .with_description("Claude (OAuth)"),
-                        SelectItem::new("openai", "openai").with_description("ChatGPT (OAuth)"),
-                        SelectItem::new("github-copilot", "github-copilot")
-                            .with_description("GitHub Copilot (device code)"),
-                    ];
-                    state.selector = Some(Selector {
-                        kind: SelectorKind::Login,
-                        list: SelectList::new(items, 8),
-                        settings_list: None,
-                    });
+                    open_connect_provider_selector(session, state);
                     SlashCommandOutcome::Handled
                 }
             }
@@ -1891,9 +2302,16 @@ Keybindings:
         "/logout" => {
             match arg {
                 Some(provider) => match crate::auth::remove_credential_async(provider, state.auth_file.as_deref()).await {
-                    Ok(true) => state.items.push(TranscriptItem::System(format!(
-                        "Removed stored credential for {provider}"
-                    ))),
+                    Ok(true) => {
+                        let _ = crate::models_config::remove_discovered_provider_models(
+                            provider,
+                            state.discovered_models_file.as_deref(),
+                        );
+                        refresh_connected_state(session, state);
+                        state.items.push(TranscriptItem::System(format!(
+                            "Removed stored credential for {provider}"
+                        )));
+                    }
                     Ok(false) => state.items.push(TranscriptItem::System(format!(
                         "No stored credential for {provider}"
                     ))),
@@ -2134,23 +2552,6 @@ Keybindings:
     }
 }
 
-/// Builds the picker entries for the session resume screen.
-fn resume_selector_items(sessions: &[SessionSummary]) -> Vec<SelectItem> {
-    sessions
-        .iter()
-        .map(|s| {
-            let label = s
-                .name
-                .clone()
-                .or_else(|| s.first_prompt.clone())
-                .unwrap_or_else(|| s.id.clone());
-            SelectItem::new(s.path.display().to_string(), label)
-                .with_description(format!("{} • {} entries", s.timestamp, s.entry_count))
-        })
-        .collect()
-}
-
-
 fn mode_autocomplete_items(session: Option<&AgentSession>) -> Vec<SelectItem> {
     let current = session.map(effective_permission_mode);
     PERMISSION_MODES
@@ -2169,16 +2570,15 @@ fn mode_autocomplete_items(session: Option<&AgentSession>) -> Vec<SelectItem> {
 
 fn thinking_autocomplete_items(session: Option<&AgentSession>) -> Vec<SelectItem> {
     let current = session.map(|s| s.thinking_level().unwrap_or(ThinkingLevel::Off));
-    let levels = current
-        .map(thinking_levels_for_current)
-        .unwrap_or_else(|| {
-            vec![
-                ThinkingLevel::Off,
-                ThinkingLevel::Low,
-                ThinkingLevel::Medium,
-                ThinkingLevel::High,
-            ]
-        });
+    let levels = match (session, current) {
+        (Some(s), Some(cur)) => thinking_levels_for_model(&s.model, cur),
+        _ => vec![
+            ThinkingLevel::Off,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+        ],
+    };
     levels
         .iter()
         .map(|&lvl| {
@@ -2357,7 +2757,7 @@ fn slash_argument_candidates(
                 })
             }
         }
-        "/mode" | "/thinking" | "/theme" | "/mcp" | "/login" | "/logout" => {
+        "/mode" | "/thinking" | "/theme" | "/mcp" | "/connect" | "/login" | "/logout" => {
             if trimmed_after.chars().any(char::is_whitespace) {
                 return Some(ArgAutocompletePlan {
                     candidates: Vec::new(),
@@ -2381,12 +2781,12 @@ fn slash_argument_candidates(
                     SelectItem::new("resources", "resources")
                         .with_description("List resources exposed by MCP servers"),
                 ],
-                "/login" => vec![
-                    SelectItem::new("anthropic", "anthropic").with_description("Claude (OAuth)"),
-                    SelectItem::new("openai", "openai").with_description("ChatGPT (OAuth)"),
-                    SelectItem::new("github-copilot", "github-copilot")
-                        .with_description("GitHub Copilot (device code)"),
-                ],
+                "/connect" | "/login" => mehh_ai::KNOWN_PROVIDERS
+                    .iter()
+                    .map(|spec| {
+                        SelectItem::new(spec.id, spec.id).with_description(spec.display_name)
+                    })
+                    .collect(),
                 "/logout" => vec![
                     SelectItem::new("anthropic", "anthropic")
                         .with_description("Remove stored credential"),

@@ -281,22 +281,25 @@ impl SettingsList {
         lines
     }
 
-    fn render_with_layout(
+    fn render_with_layout_and_map(
         &self,
         width: usize,
         max_visible: usize,
         include_categories: bool,
         include_description: bool,
-    ) -> Vec<String> {
+    ) -> (Vec<String>, Vec<Option<(usize, String)>>) {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
             if self.filter.trim().is_empty() {
-                return vec![truncate_to_width(
-                    "  No matching settings",
-                    width,
-                    "...",
-                    false,
-                )];
+                return (
+                    vec![truncate_to_width(
+                        "  No matching settings",
+                        width,
+                        "...",
+                        false,
+                    )],
+                    vec![None],
+                );
             }
             let msg = format!(
                 "No match for '{}' · Backspace or Esc to clear",
@@ -327,7 +330,8 @@ impl SettingsList {
                 "...",
                 false,
             ));
-            return lines;
+            let row_map = vec![None; lines.len()];
+            return (lines, row_map);
         }
 
         let total = filtered.len();
@@ -348,6 +352,7 @@ impl SettingsList {
         let show_categories = include_categories && self.filter.trim().is_empty();
         let mut last_category: Option<&str> = None;
         let mut lines = Vec::new();
+        let mut row_map: Vec<Option<(usize, String)>> = Vec::new();
         for (vis_idx, &item_idx) in filtered[start..end].iter().enumerate() {
             let actual_idx = start + vis_idx;
             let item = &self.items[item_idx];
@@ -360,6 +365,7 @@ impl SettingsList {
                             "...",
                             false,
                         ));
+                        row_map.push(None);
                         last_category = Some(cat);
                     }
                 }
@@ -399,6 +405,7 @@ impl SettingsList {
                 )
             };
             lines.push(truncate_to_width(&row, width, "...", false));
+            row_map.push(Some((actual_idx, item.id.clone())));
         }
 
         if total > max_vis {
@@ -414,6 +421,7 @@ impl SettingsList {
                 "...",
                 false,
             ));
+            row_map.push(None);
         }
 
         let selected_item = self.selected_item();
@@ -434,11 +442,15 @@ impl SettingsList {
                 "...",
                 false,
             ));
+            row_map.push(None);
         }
 
         if let Some(item) = selected_item {
             if !item.values.is_empty() {
-                lines.extend(self.render_option_chips(item, width));
+                let chip_lines = self.render_option_chips(item, width);
+                let count = chip_lines.len();
+                lines.extend(chip_lines);
+                row_map.extend(std::iter::repeat_n(None, count));
             }
 
             if include_description {
@@ -451,6 +463,7 @@ impl SettingsList {
                             "...",
                             false,
                         ));
+                        row_map.push(None);
                     }
                 }
             }
@@ -465,6 +478,7 @@ impl SettingsList {
                         "...",
                         false,
                     ));
+                    row_map.push(None);
                 }
             }
         }
@@ -481,6 +495,7 @@ impl SettingsList {
                 "...",
                 false,
             ));
+            row_map.push(None);
         }
 
         let controls = if !self.filter.is_empty() {
@@ -494,50 +509,66 @@ impl SettingsList {
             "...",
             false,
         ));
+        row_map.push(None);
 
-        lines
+        (lines, row_map)
+    }
+
+    /// Renders the settings list together with a 1-to-1 line map of `(filtered_pos, setting_id)`
+    /// for clickable setting rows (headers, chips, descriptions, and status lines map to `None`).
+    pub fn render_with_row_map(&self, width: usize) -> (Vec<String>, Vec<Option<(usize, String)>>) {
+        let Some(budget) = self.max_height else {
+            return self.render_with_layout_and_map(width, self.max_visible, true, true);
+        };
+        let total = self.filtered_indices().len();
+        if total == 0 {
+            let (mut lines, mut row_map) =
+                self.render_with_layout_and_map(width, self.max_visible, true, true);
+            if lines.len() > budget {
+                let last_line = lines.pop();
+                let last_map = row_map.pop();
+                let keep = budget.saturating_sub(usize::from(last_line.is_some()));
+                lines.truncate(keep);
+                row_map.truncate(keep);
+                if let (Some(c), Some(m)) = (last_line, last_map) {
+                    if budget > 0 {
+                        lines.push(c);
+                        row_map.push(m);
+                    }
+                }
+            }
+            return (lines, row_map);
+        }
+        let start_vis = self.max_visible.min(total);
+        for (cats, desc) in [(true, true), (true, false), (false, false)] {
+            for vis in (1..=start_vis).rev() {
+                let (lines, row_map) = self.render_with_layout_and_map(width, vis, cats, desc);
+                if lines.len() <= budget {
+                    return (lines, row_map);
+                }
+            }
+        }
+        let (mut lines, mut row_map) = self.render_with_layout_and_map(width, 1, false, false);
+        if lines.len() > budget {
+            let last_line = lines.pop();
+            let last_map = row_map.pop();
+            let keep = budget.saturating_sub(usize::from(last_line.is_some()));
+            lines.truncate(keep);
+            row_map.truncate(keep);
+            if let (Some(c), Some(m)) = (last_line, last_map) {
+                if budget > 0 {
+                    lines.push(c);
+                    row_map.push(m);
+                }
+            }
+        }
+        (lines, row_map)
     }
 }
 
 impl Component for SettingsList {
     fn render(&self, width: usize) -> Vec<String> {
-        let Some(budget) = self.max_height else {
-            return self.render_with_layout(width, self.max_visible, true, true);
-        };
-        let total = self.filtered_indices().len();
-        if total == 0 {
-            let mut lines = self.render_with_layout(width, self.max_visible, true, true);
-            if lines.len() > budget {
-                let last = lines.pop();
-                lines.truncate(budget.saturating_sub(usize::from(last.is_some())));
-                if let Some(c) = last {
-                    if budget > 0 {
-                        lines.push(c);
-                    }
-                }
-            }
-            return lines;
-        }
-        let start_vis = self.max_visible.min(total);
-        for (cats, desc) in [(true, true), (true, false), (false, false)] {
-            for vis in (1..=start_vis).rev() {
-                let lines = self.render_with_layout(width, vis, cats, desc);
-                if lines.len() <= budget {
-                    return lines;
-                }
-            }
-        }
-        let mut lines = self.render_with_layout(width, 1, false, false);
-        if lines.len() > budget {
-            let controls = lines.pop();
-            lines.truncate(budget.saturating_sub(usize::from(controls.is_some())));
-            if let Some(c) = controls {
-                if budget > 0 {
-                    lines.push(c);
-                }
-            }
-        }
-        lines
+        self.render_with_row_map(width).0
     }
 
     fn handle_key(&mut self, key: &str) -> bool {
@@ -809,5 +840,46 @@ mod tests {
         );
         let bounded_plain = crate::ansi::strip_ansi(&bounded.join("\n"));
         assert!(bounded_plain.contains("Esc Close"), "{bounded_plain}");
+    }
+
+    #[test]
+    fn test_settings_list_render_with_row_map_tracks_exact_clickable_rows() {
+        let items = vec![
+            SettingItem::new("mode", "Permission mode", "smart_approve")
+                .with_category("SAFETY")
+                .with_description("Control tool approvals"),
+            SettingItem::new("theme", "Color theme", "dark")
+                .with_category("APPEARANCE"),
+            SettingItem::new("compact", "Auto compact", "on")
+                .with_category("APPEARANCE"),
+        ];
+        let mut list = SettingsList::new(items, 8);
+        let (lines, map) = list.render_with_row_map(60);
+        assert_eq!(lines.len(), map.len());
+        // Line 0: SAFETY header -> None
+        assert_eq!(map[0], None);
+        // Line 1: mode -> Some((0, "mode"))
+        assert_eq!(map[1], Some((0, "mode".to_string())));
+        // Line 2: APPEARANCE header -> None
+        assert_eq!(map[2], None);
+        // Line 3: theme -> Some((1, "theme"))
+        assert_eq!(map[3], Some((1, "theme".to_string())));
+        // Line 4: compact -> Some((2, "compact"))
+        assert_eq!(map[4], Some((2, "compact".to_string())));
+
+        // With filter active, category headers disappear and filtered_pos resets cleanly
+        list.set_filter("APPEARANCE");
+        let (flines, fmap) = list.render_with_row_map(60);
+        assert_eq!(flines.len(), fmap.len());
+        assert_eq!(fmap[0], Some((0, "theme".to_string())));
+        assert_eq!(fmap[1], Some((1, "compact".to_string())));
+
+        // With tight max_height, map length stays aligned with lines
+        list.set_filter("");
+        list.max_height = Some(6);
+        let (blines, bmap) = list.render_with_row_map(60);
+        assert_eq!(blines.len(), bmap.len());
+        assert!(blines.len() <= 6);
+        assert!(bmap.iter().flatten().any(|(idx, id)| *idx == 0 && id == "mode"));
     }
 }
