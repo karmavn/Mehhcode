@@ -242,10 +242,27 @@ pub fn is_oauth_token(api_key: &str) -> bool {
     api_key.contains("sk-ant-oat")
 }
 
+fn equals_ignoring_underscores_ascii(a: &str, b: &str) -> bool {
+    let ia = a
+        .bytes()
+        .filter(|c| *c != b'_')
+        .map(|c| c.to_ascii_lowercase());
+    let ib = b
+        .bytes()
+        .filter(|c| *c != b'_')
+        .map(|c| c.to_ascii_lowercase());
+    ia.eq(ib)
+}
+
 /// Converts a tool name to its Claude Code canonical casing if matched.
 pub fn to_claude_code_name(name: &str) -> String {
     for &tool in CLAUDE_CODE_TOOLS {
         if tool.eq_ignore_ascii_case(name) {
+            return tool.to_string();
+        }
+    }
+    for &tool in CLAUDE_CODE_TOOLS {
+        if equals_ignoring_underscores_ascii(tool, name) {
             return tool.to_string();
         }
     }
@@ -256,6 +273,11 @@ pub fn to_claude_code_name(name: &str) -> String {
 pub fn from_claude_code_name(name: &str, declared_tools: &[ToolDefinition]) -> String {
     for tool in declared_tools {
         if tool.name.eq_ignore_ascii_case(name) {
+            return tool.name.clone();
+        }
+    }
+    for tool in declared_tools {
+        if equals_ignoring_underscores_ascii(&tool.name, name) {
             return tool.name.clone();
         }
     }
@@ -2385,5 +2407,26 @@ event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,
         );
         assert_eq!(max_tokens, 8_192);
         assert_eq!(thinking_budget, 8_192 - MIN_ANSWER_TOKENS);
+    }
+
+    #[test]
+    fn test_claude_code_name_roundtrip_snake_case() {
+        assert_eq!(to_claude_code_name("web_search"), "WebSearch");
+        assert_eq!(to_claude_code_name("web_fetch"), "WebFetch");
+
+        let declared = vec![
+            ToolDefinition {
+                name: "web_search".to_string(),
+                description: "Search".to_string(),
+                parameters: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "web_fetch".to_string(),
+                description: "Fetch".to_string(),
+                parameters: serde_json::json!({}),
+            },
+        ];
+        assert_eq!(from_claude_code_name("WebSearch", &declared), "web_search");
+        assert_eq!(from_claude_code_name("WebFetch", &declared), "web_fetch");
     }
 }

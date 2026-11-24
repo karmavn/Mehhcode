@@ -882,7 +882,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "uuid",
- "windows-sys",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -927,11 +927,13 @@ dependencies = [
  "mehh-ai",
  "mehh-sandbox",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "similar",
  "tokio",
  "tokio-util",
+ "uuid",
 ]
 
 [[package]]

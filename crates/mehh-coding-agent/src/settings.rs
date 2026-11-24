@@ -16,25 +16,25 @@ fn restrict_to_current_user_windows(path: &Path) -> anyhow::Result<()> {
         TRUSTEE_IS_SID, TRUSTEE_IS_USER, TRUSTEE_W,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
-        TOKEN_QUERY, TOKEN_USER,
+        GetTokenInformation, TokenUser, DACL_SECURITY_INFORMATION,
+        PROTECTED_DACL_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
     };
     use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     unsafe {
-        let mut token: HANDLE = 0;
+        let mut token: HANDLE = std::ptr::null_mut();
         if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
             anyhow::bail!("OpenProcessToken failed");
         }
         let mut len = 0u32;
-        let _ = GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut len);
+        let _ = GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut len);
         if len == 0 {
             CloseHandle(token);
             anyhow::bail!("GetTokenInformation returned no token size");
         }
         let mut buf = vec![0u8; len as usize];
-        let ok = GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr().cast(), len, &mut len);
+        let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
         CloseHandle(token);
         if ok == 0 {
             anyhow::bail!("GetTokenInformation failed");
@@ -169,6 +169,52 @@ use serde::{Deserialize, Serialize};
 
 use mehh_ai::ThinkingLevel;
 
+/// Validated web search/fetch provider selection in `settings.json`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebProviderSetting {
+    Auto,
+    Disabled,
+    Exa,
+    Parallel,
+    Firecrawl,
+    Tavily,
+    TinyFish,
+    Keenable,
+}
+
+impl From<WebProviderSetting> for mehh_tools::web::WebProviderChoice {
+    fn from(value: WebProviderSetting) -> Self {
+        use mehh_tools::web::{ProviderId, WebProviderChoice};
+        match value {
+            WebProviderSetting::Auto => WebProviderChoice::Auto,
+            WebProviderSetting::Disabled => WebProviderChoice::Disabled,
+            WebProviderSetting::Exa => WebProviderChoice::Fixed(ProviderId::Exa),
+            WebProviderSetting::Parallel => WebProviderChoice::Fixed(ProviderId::Parallel),
+            WebProviderSetting::Firecrawl => WebProviderChoice::Fixed(ProviderId::Firecrawl),
+            WebProviderSetting::Tavily => WebProviderChoice::Fixed(ProviderId::Tavily),
+            WebProviderSetting::TinyFish => WebProviderChoice::Fixed(ProviderId::TinyFish),
+            WebProviderSetting::Keenable => WebProviderChoice::Fixed(ProviderId::Keenable),
+        }
+    }
+}
+
+/// Web search & web fetch configuration under `"web"` in `settings.json`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<WebProviderSetting>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_private_urls: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fetch_fallback: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+}
+
 /// Application and session settings.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -199,6 +245,33 @@ pub struct Settings {
     pub worker_model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lead_turns: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web: Option<WebSettings>,
+}
+
+impl Settings {
+    /// Converts `settings.web` into `WebConfig` for building web tools.
+    pub fn to_web_config(&self) -> mehh_tools::web::WebConfig {
+        let mut cfg = mehh_tools::web::WebConfig::default();
+        if let Some(ref web) = self.web {
+            if let Some(enabled) = web.enabled {
+                cfg.enabled = enabled;
+            }
+            if let Some(provider) = web.provider {
+                cfg.provider = provider.into();
+            }
+            if let Some(allow_private) = web.allow_private_urls {
+                cfg.allow_private_urls = allow_private;
+            }
+            if let Some(fetch_fallback) = web.fetch_fallback {
+                cfg.fetch_fallback = fetch_fallback;
+            }
+            if let Some(timeout_seconds) = web.timeout_seconds {
+                cfg.timeout_seconds = timeout_seconds;
+            }
+        }
+        cfg
+    }
 }
 
 /// Settings loader and merger.
@@ -281,6 +354,7 @@ impl SettingsManager {
             permission_mode: overlay.permission_mode.or(base.permission_mode),
             worker_model: overlay.worker_model.or(base.worker_model),
             lead_turns: overlay.lead_turns.or(base.lead_turns),
+            web: merge_web_settings(base.web, overlay.web),
         }
     }
 
@@ -319,7 +393,59 @@ impl SettingsManager {
                 local.permission_mode = None;
             }
         }
+        enforce_web_escalation_guard(&global.web, &mut local.web);
         Ok(Self::merge(global, local))
+    }
+}
+
+fn merge_web_settings(
+    base: Option<WebSettings>,
+    overlay: Option<WebSettings>,
+) -> Option<WebSettings> {
+    match (base, overlay) {
+        (None, None) => None,
+        (Some(b), None) => Some(b),
+        (None, Some(o)) => Some(o),
+        (Some(b), Some(o)) => Some(WebSettings {
+            enabled: o.enabled.or(b.enabled),
+            provider: o.provider.or(b.provider),
+            allow_private_urls: o.allow_private_urls.or(b.allow_private_urls),
+            fetch_fallback: o.fetch_fallback.or(b.fetch_fallback),
+            timeout_seconds: o.timeout_seconds.or(b.timeout_seconds),
+        }),
+    }
+}
+
+fn web_provider_rank(provider: WebProviderSetting) -> u8 {
+    match provider {
+        WebProviderSetting::Disabled => 0,
+        WebProviderSetting::Auto => 2,
+        _ => 1,
+    }
+}
+
+fn enforce_web_escalation_guard(global: &Option<WebSettings>, local: &mut Option<WebSettings>) {
+    let Some(ref mut proj) = local else {
+        return;
+    };
+    let g = global.as_ref();
+    let global_allow_private = g.and_then(|w| w.allow_private_urls).unwrap_or(false);
+    if proj.allow_private_urls == Some(true) && !global_allow_private {
+        proj.allow_private_urls = None;
+    }
+    if proj.enabled == Some(true) && g.and_then(|w| w.enabled) == Some(false) {
+        proj.enabled = None;
+    }
+    if proj.fetch_fallback == Some(true) && g.and_then(|w| w.fetch_fallback) == Some(false) {
+        proj.fetch_fallback = None;
+    }
+    if let Some(proj_prov) = proj.provider {
+        let base_prov = g.and_then(|w| w.provider).unwrap_or(WebProviderSetting::Auto);
+        let proj_rank = web_provider_rank(proj_prov);
+        let base_rank = web_provider_rank(base_prov);
+        if proj_rank > base_rank || (proj_rank == 1 && base_rank == 1 && proj_prov != base_prov) {
+            proj.provider = None;
+        }
     }
 }
 
@@ -359,6 +485,7 @@ mod tests {
             permission_mode: Some(crate::tool_inspection::PermissionMode::SmartApprove),
             worker_model: None,
             lead_turns: None,
+            web: None,
         };
 
         SettingsManager::save_file(&file_path, &settings).unwrap();
@@ -386,6 +513,7 @@ mod tests {
             permission_mode: Some(crate::tool_inspection::PermissionMode::SmartApprove),
             worker_model: Some("gemini-2.5-flash".to_string()),
             lead_turns: Some(2),
+            web: None,
         };
 
         let overlay = Settings {
@@ -402,6 +530,7 @@ mod tests {
             permission_mode: Some(crate::tool_inspection::PermissionMode::Auto),
             worker_model: None,
             lead_turns: None,
+            web: None,
         };
 
         let merged = SettingsManager::merge(base, overlay);
@@ -532,6 +661,95 @@ mod tests {
         assert_eq!(
             loaded2.permission_mode,
             Some(crate::tool_inspection::PermissionMode::SmartApprove)
+        );
+    }
+
+    #[test]
+    fn test_web_settings_roundtrip_and_merge() {
+        let dir = crate::TempTestDir::new("web_settings");
+        let path = dir.path().join("settings.json");
+        let json_raw = r#"{
+            "web": {
+                "enabled": true,
+                "provider": "exa",
+                "allowPrivateUrls": false,
+                "fetchFallback": true,
+                "timeoutSeconds": 45
+            }
+        }"#;
+        std::fs::write(&path, json_raw).unwrap();
+        let loaded = SettingsManager::load_file(&path).unwrap();
+        let cfg = loaded.to_web_config();
+        assert!(cfg.enabled);
+        assert_eq!(
+            cfg.provider,
+            mehh_tools::web::WebProviderChoice::Fixed(mehh_tools::web::ProviderId::Exa)
+        );
+        assert!(!cfg.allow_private_urls);
+        assert!(cfg.fetch_fallback);
+        assert_eq!(cfg.timeout_seconds, 45);
+
+        // Unknown provider fails JSON parse closed
+        std::fs::write(&path, r#"{"web":{"provider":"unknown_vendor"}}"#).unwrap();
+        assert!(SettingsManager::load_file(&path).is_err());
+
+        // Field-by-field merge
+        let merged = SettingsManager::merge(
+            loaded,
+            Settings {
+                web: Some(WebSettings {
+                    timeout_seconds: Some(60),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        );
+        let merged_cfg = merged.to_web_config();
+        assert_eq!(merged_cfg.timeout_seconds, 60);
+        assert_eq!(
+            merged_cfg.provider,
+            mehh_tools::web::WebProviderChoice::Fixed(mehh_tools::web::ProviderId::Exa)
+        );
+    }
+
+    #[test]
+    fn test_web_settings_project_escalation_guard() {
+        let dir = crate::TempTestDir::new("web_settings_guard");
+        let global = dir.path().join("global.json");
+        let project = dir.path().join("project.json");
+
+        std::fs::write(
+            &global,
+            r#"{"web":{"enabled":false,"provider":"disabled","allowPrivateUrls":false,"fetchFallback":false}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &project,
+            r#"{"web":{"enabled":true,"provider":"auto","allowPrivateUrls":true,"fetchFallback":true}}"#,
+        )
+        .unwrap();
+        let res = SettingsManager::try_load_from_paths(&global, &project, true).unwrap();
+        let w = res.web.unwrap();
+        assert_eq!(w.enabled, Some(false));
+        assert_eq!(w.provider, Some(WebProviderSetting::Disabled));
+        assert_eq!(w.allow_private_urls, Some(false));
+        assert_eq!(w.fetch_fallback, Some(false));
+
+        // Pinned vendor cannot be switched or widened to auto, but can be tightened to disabled
+        std::fs::write(&global, r#"{"web":{"provider":"exa"}}"#).unwrap();
+        std::fs::write(&project, r#"{"web":{"provider":"keenable"}}"#).unwrap();
+        let switch_attempt =
+            SettingsManager::try_load_from_paths(&global, &project, true).unwrap();
+        assert_eq!(
+            switch_attempt.web.unwrap().provider,
+            Some(WebProviderSetting::Exa)
+        );
+
+        std::fs::write(&project, r#"{"web":{"provider":"disabled"}}"#).unwrap();
+        let tighten = SettingsManager::try_load_from_paths(&global, &project, true).unwrap();
+        assert_eq!(
+            tighten.web.unwrap().provider,
+            Some(WebProviderSetting::Disabled)
         );
     }
 }
