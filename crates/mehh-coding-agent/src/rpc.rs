@@ -157,13 +157,13 @@ where
 
     match cmd {
         "abort" => {
-            if let Some(tok) = cancel_slot.lock().unwrap().take() {
+            if let Some(tok) = mehh_ai::lock_recover(cancel_slot).take() {
                 tok.cancel();
             }
             output.send_success(id, "abort", None).await?;
         }
         "abort_bash" => {
-            if let Some(tok) = bash_cancel_slot.lock().unwrap().take() {
+            if let Some(tok) = mehh_ai::lock_recover(bash_cancel_slot).take() {
                 tok.cancel();
             }
             output.send_success(id, "abort_bash", None).await?;
@@ -179,7 +179,7 @@ where
             } else {
                 follow_queue
             };
-            queue.lock().unwrap().push_back(Message::User(UserMessage {
+            mehh_ai::lock_recover(queue).push_back(Message::User(UserMessage {
                 content: UserContent::Text(msg.to_string()),
                 timestamp: now_ms(),
             }));
@@ -669,7 +669,7 @@ where
             "bash" => {
                 let command = val.get("command").and_then(|v| v.as_str()).unwrap_or("");
                 let cancel = CancellationToken::new();
-                *session.active_bash_cancel.lock().unwrap() = Some(cancel.clone());
+                *mehh_ai::lock_recover(&session.active_bash_cancel) = Some(cancel.clone());
 
                 // The RPC route must go through the same governance chain as
                 // agent tool calls: security denies, persisted rules and
@@ -689,7 +689,7 @@ where
                     .inspect_and_authorize(&inspect_ctx, session.approval_handler.as_deref())
                     .await;
                 if decision.block {
-                    *session.active_bash_cancel.lock().unwrap() = None;
+                    *mehh_ai::lock_recover(&session.active_bash_cancel) = None;
                     let reason = decision
                         .reason
                         .unwrap_or_else(|| "Tool blocked by security policy".to_string());
@@ -745,7 +745,7 @@ where
                             }
                         }
                     };
-                    *session.active_bash_cancel.lock().unwrap() = None;
+                    *mehh_ai::lock_recover(&session.active_bash_cancel) = None;
 
                     match res {
                         Ok(tool_res) => {

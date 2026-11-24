@@ -446,15 +446,30 @@ pub fn build_openai_request(
     }
 
     if is_reasoning {
+        let is_openrouter = model.provider.eq_ignore_ascii_case("openrouter");
         if let Some(level) = &options.reasoning {
-            if *level != ThinkingLevel::Off {
+            if *level == ThinkingLevel::Off {
+                if is_openrouter {
+                    req_map.insert(
+                        "reasoning".to_string(),
+                        serde_json::json!({ "enabled": false }),
+                    );
+                }
+            } else {
                 let effort = match level {
                     ThinkingLevel::Minimal | ThinkingLevel::Low => "low",
                     ThinkingLevel::Medium => "medium",
                     ThinkingLevel::High | ThinkingLevel::Xhigh | ThinkingLevel::Max => "high",
                     ThinkingLevel::Off => "low",
                 };
-                req_map.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+                if is_openrouter {
+                    req_map.insert(
+                        "reasoning".to_string(),
+                        serde_json::json!({ "effort": effort }),
+                    );
+                } else {
+                    req_map.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+                }
             }
         }
     }
@@ -1471,5 +1486,37 @@ mod tests {
             result.error_message.as_deref(),
             Some("Rate limit exceeded: 500 requests per minute")
         );
+    }
+
+    #[test]
+    fn test_openrouter_reasoning_request_fields() {
+        let mut model = test_model();
+        model.provider = "openrouter".to_string();
+        model.id = "anthropic/claude-sonnet-4.5".to_string();
+        model.reasoning = true;
+        let ctx = Context::default();
+
+        let opts_high = StreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+        let req_high = build_openai_request(&model, &ctx, &opts_high);
+        assert_eq!(req_high["reasoning"], serde_json::json!({ "effort": "high" }));
+        assert!(req_high.get("reasoning_effort").is_none());
+
+        let opts_off = StreamOptions {
+            reasoning: Some(ThinkingLevel::Off),
+            ..Default::default()
+        };
+        let req_off = build_openai_request(&model, &ctx, &opts_off);
+        assert_eq!(req_off["reasoning"], serde_json::json!({ "enabled": false }));
+        assert!(req_off.get("reasoning_effort").is_none());
+
+        // Non-OpenRouter providers retain `reasoning_effort`
+        model.provider = "openai".to_string();
+        model.id = "o3".to_string();
+        let req_o3 = build_openai_request(&model, &ctx, &opts_high);
+        assert_eq!(req_o3["reasoning_effort"], serde_json::json!("high"));
+        assert!(req_o3.get("reasoning").is_none());
     }
 }

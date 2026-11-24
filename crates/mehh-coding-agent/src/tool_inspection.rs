@@ -487,6 +487,8 @@ impl ToolInspector for PermissionInspector {
                     .args
                     .get("command")
                     .or_else(|| ctx.args.get("path"))
+                    .or_else(|| ctx.args.get("url"))
+                    .or_else(|| ctx.args.get("query"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
             },
@@ -664,6 +666,11 @@ impl ToolInspectionManager {
         *self.mode.lock().await
     }
 
+    /// Non-blocking snapshot of the active permission mode for synchronous UI rendering.
+    pub fn try_mode(&self) -> Option<PermissionMode> {
+        self.mode.try_lock().ok().map(|g| *g)
+    }
+
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
@@ -699,6 +706,26 @@ impl ToolInspectionManager {
         }
 
         InspectionVerdict::Allow
+    }
+
+    /// Evaluates persisted/session `NeverAllow` rules for `web_fetch` against candidate URLs
+    /// (initial target, redirect hops, and Stage 2 post-redirect `final_url`).
+    pub async fn check_url_not_denied(&self, url: &str) -> Result<(), String> {
+        let mut args = serde_json::Map::new();
+        args.insert("url".to_string(), serde_json::Value::String(url.to_string()));
+        let ctx = ToolInspectionContext {
+            tool_call_id: "web_url_policy".to_string(),
+            tool_name: "web_fetch".to_string(),
+            args,
+            is_read_only: Some(true),
+            cwd: self.cwd.clone(),
+            origin: None,
+        };
+        let guard = self.permission.lock().await;
+        if let Some(InspectionVerdict::Deny { reason }) = guard.store().evaluate(&ctx) {
+            return Err(reason);
+        }
+        Ok(())
     }
 
     /// Resolve the exact target a path-bearing tool will write, while the
@@ -760,6 +787,13 @@ impl ToolInspectionManager {
                 }
             }
         }
+    }
+}
+
+#[async_trait]
+impl mehh_tools::web::UrlPolicyChecker for ToolInspectionManager {
+    async fn check_url(&self, url: &str) -> Result<(), String> {
+        self.check_url_not_denied(url).await
     }
 }
 
@@ -1212,5 +1246,54 @@ mod tests {
             Some(file),
             "the writer must receive the target resolved at inspection time"
         );
+    }
+
+    #[tokio::test]
+    async fn test_web_tools_permission_modes_and_url_policy_checker() {
+        let dir = crate::TempTestDir::new("web_perm_modes");
+        let store = crate::permissions::PermissionStore::new(
+            vec![crate::permissions::PermissionRule {
+                tool_name: "web_fetch".to_string(),
+                arg_prefix: Some("https://blocked.example".to_string()),
+                path_glob: None,
+                action: crate::permissions::PermissionAction::NeverAllow,
+            }],
+            None,
+        );
+
+        let mgr = ToolInspectionManager::new_with_store(
+            PermissionMode::SmartApprove,
+            dir.path().to_path_buf(),
+            store,
+        );
+
+        let mut ws_args = serde_json::Map::new();
+        ws_args.insert("query".into(), serde_json::json!("rust async"));
+        let ws_ctx = ToolInspectionContext {
+            tool_call_id: "ws1".into(),
+            tool_name: "web_search".into(),
+            args: ws_args,
+            is_read_only: Some(true),
+            cwd: dir.path().to_path_buf(),
+            origin: None,
+        };
+        assert_eq!(mgr.inspect(&ws_ctx).await, InspectionVerdict::Allow);
+
+        // Chat allows read-only web_search
+        mgr.set_mode(PermissionMode::Chat).await;
+        assert_eq!(mgr.inspect(&ws_ctx).await, InspectionVerdict::Allow);
+
+        // Approve requires confirmation and shows query/url preview
+        mgr.set_mode(PermissionMode::Approve).await;
+        match mgr.inspect(&ws_ctx).await {
+            InspectionVerdict::RequireApproval { preview, .. } => {
+                assert_eq!(preview.as_deref(), Some("rust async"));
+            }
+            other => panic!("expected RequireApproval, got {other:?}"),
+        }
+
+        // check_url_not_denied blocks NeverAllow URL regardless of mode
+        assert!(mgr.check_url_not_denied("https://blocked.example/secret").await.is_err());
+        assert!(mgr.check_url_not_denied("https://docs.rs/reqwest").await.is_ok());
     }
 }

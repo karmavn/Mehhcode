@@ -10,9 +10,11 @@ use crate::tui::Component;
 pub struct SettingItem {
     pub id: String,
     pub label: String,
+    pub category: Option<String>,
     pub description: Option<String>,
     pub current_value: String,
     pub values: Vec<String>,
+    pub value_descriptions: Vec<(String, String)>,
 }
 
 impl SettingItem {
@@ -24,10 +26,17 @@ impl SettingItem {
         Self {
             id: id.into(),
             label: label.into(),
+            category: None,
             description: None,
             current_value: current_value.into(),
             values: Vec::new(),
+            value_descriptions: Vec::new(),
         }
+    }
+
+    pub fn with_category(mut self, category: impl Into<String>) -> Self {
+        self.category = Some(category.into());
+        self
     }
 
     pub fn with_description(mut self, desc: impl Into<String>) -> Self {
@@ -39,6 +48,19 @@ impl SettingItem {
         self.values = values;
         self
     }
+
+    pub fn with_value_descriptions(mut self, descriptions: Vec<(String, String)>) -> Self {
+        self.value_descriptions = descriptions;
+        self
+    }
+
+    /// Returns the per-value explanation for the active value, when defined.
+    pub fn current_value_description(&self) -> Option<&str> {
+        self.value_descriptions
+            .iter()
+            .find(|(val, _)| val == &self.current_value)
+            .map(|(_, desc)| desc.as_str())
+    }
 }
 
 /// Two-column interactive settings list.
@@ -47,8 +69,10 @@ pub struct SettingsList {
     pub items: Vec<SettingItem>,
     pub selected: usize,
     pub max_visible: usize,
+    pub max_height: Option<usize>,
     pub filter: String,
     pub theme: Theme,
+    pub status_message: Option<(String, bool)>,
 }
 
 impl SettingsList {
@@ -57,14 +81,26 @@ impl SettingsList {
             items,
             selected: 0,
             max_visible: max_visible.max(1),
+            max_height: None,
             filter: String::new(),
             theme: Theme::default(),
+            status_message: None,
         }
     }
 
     pub fn with_theme(mut self, theme: Theme) -> Self {
         self.theme = theme;
         self
+    }
+
+    /// Sets an inline feedback banner (`is_error = true` renders with error styling).
+    pub fn set_status(&mut self, msg: impl Into<String>, is_error: bool) {
+        self.status_message = Some((msg.into(), is_error));
+    }
+
+    /// Clears the inline feedback banner.
+    pub fn clear_status(&mut self) {
+        self.status_message = None;
     }
 
     pub fn set_items(&mut self, items: Vec<SettingItem>) {
@@ -88,11 +124,21 @@ impl SettingsList {
             return (0..self.items.len()).collect();
         }
         fuzzy_filter_indexed(&self.items, &self.filter, |item| {
-            if let Some(desc) = &item.description {
-                format!("{} {} {} {}", item.label, item.id, item.current_value, desc)
-            } else {
-                format!("{} {} {}", item.label, item.id, item.current_value)
+            let values_joined = item.values.join(" ");
+            let mut parts = vec![item.label.as_str(), item.id.as_str()];
+            if let Some(cat) = &item.category {
+                parts.push(cat.as_str());
             }
+            if let Some(desc) = &item.description {
+                parts.push(desc.as_str());
+            }
+            if !values_joined.is_empty() {
+                parts.push(values_joined.as_str());
+            }
+            if !item.values.contains(&item.current_value) {
+                parts.push(item.current_value.as_str());
+            }
+            parts.join(" ")
         })
         .into_iter()
         .map(|(idx, _)| idx)
@@ -156,9 +202,7 @@ impl SettingsList {
         self.items.get_mut(idx)
     }
 
-    /// Cycle the currently selected item's value to the next in `values`.
-    /// Returns `Some((id, new_value))` if a cycle occurred.
-    pub fn cycle_current(&mut self) -> Option<(String, String)> {
+    fn cycle_with_delta(&mut self, forward: bool) -> Option<(String, String)> {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
             return None;
@@ -176,28 +220,123 @@ impl SettingsList {
             .iter()
             .position(|v| v == &item.current_value)
             .unwrap_or(0);
-        let next_idx = (curr_idx + 1) % item.values.len();
+        let next_idx = if forward {
+            (curr_idx + 1) % item.values.len()
+        } else if curr_idx == 0 {
+            item.values.len() - 1
+        } else {
+            curr_idx - 1
+        };
         let new_val = item.values[next_idx].clone();
         item.current_value = new_val.clone();
         Some((item.id.clone(), new_val))
     }
-}
 
-impl Component for SettingsList {
-    fn render(&self, width: usize) -> Vec<String> {
+    /// Cycle the currently selected item's value forward to the next in `values`.
+    /// Returns `Some((id, new_value))` if a cycle occurred.
+    pub fn cycle_current(&mut self) -> Option<(String, String)> {
+        self.cycle_with_delta(true)
+    }
+
+    /// Cycle the currently selected item's value backward to the previous in `values`.
+    /// Returns `Some((id, new_value))` if a cycle occurred.
+    pub fn cycle_prev(&mut self) -> Option<(String, String)> {
+        self.cycle_with_delta(false)
+    }
+    fn render_option_chips(&self, item: &SettingItem, width: usize) -> Vec<String> {
+        let label_prefix = format!("  {} ", self.theme.fg(&self.theme.muted, "Options:"));
+        let cont_prefix = "           ";
+        let prefix_width = 11usize;
+        let mut lines = Vec::new();
+        let mut current = label_prefix;
+        let mut cur_width = prefix_width;
+        let mut has_chip_on_line = false;
+
+        for v in &item.values {
+            let is_active = v == &item.current_value;
+            let plain_len = visible_width(v) + if is_active { 2 } else { 0 };
+            let styled = if is_active {
+                format!("\x1b[1m{}[{}]\x1b[0m", self.theme.accent, v)
+            } else {
+                self.theme.fg(&self.theme.dim, v)
+            };
+            let gap = if has_chip_on_line { 2 } else { 0 };
+            if has_chip_on_line && cur_width + gap + plain_len > width {
+                lines.push(truncate_to_width(&current, width, "...", false));
+                current = format!("{cont_prefix}{styled}");
+                cur_width = prefix_width + plain_len;
+            } else {
+                if has_chip_on_line {
+                    current.push_str("  ");
+                    cur_width += 2;
+                }
+                current.push_str(&styled);
+                cur_width += plain_len;
+                has_chip_on_line = true;
+            }
+        }
+        if has_chip_on_line {
+            lines.push(truncate_to_width(&current, width, "...", false));
+        }
+        lines
+    }
+
+    fn render_with_layout_and_map(
+        &self,
+        width: usize,
+        max_visible: usize,
+        include_categories: bool,
+        include_description: bool,
+    ) -> (Vec<String>, Vec<Option<(usize, String)>>) {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
-            return vec![truncate_to_width(
-                "  No matching settings",
+            if self.filter.trim().is_empty() {
+                return (
+                    vec![truncate_to_width(
+                        "  No matching settings",
+                        width,
+                        "...",
+                        false,
+                    )],
+                    vec![None],
+                );
+            }
+            let msg = format!(
+                "No match for '{}' · Backspace or Esc to clear",
+                self.filter.trim()
+            );
+            let mut lines: Vec<String> =
+                wrap_text_with_ansi(&msg, width.saturating_sub(4).max(10))
+                    .into_iter()
+                    .map(|w| {
+                        truncate_to_width(
+                            &format!("  {}", self.theme.fg(&self.theme.dim, &w)),
+                            width,
+                            "...",
+                            false,
+                        )
+                    })
+                    .collect();
+            lines.push(String::new());
+            lines.push(truncate_to_width(
+                &format!(
+                    "  {}",
+                    self.theme.fg(
+                        &self.theme.dim,
+                        "↑↓ Move · ←→/Enter Change · Backspace · Esc Clear filter",
+                    )
+                ),
                 width,
                 "...",
                 false,
-            )];
+            ));
+            let row_map = vec![None; lines.len()];
+            return (lines, row_map);
         }
 
         let total = filtered.len();
         let selected = self.selected.min(total.saturating_sub(1));
-        let max_vis = self.max_visible.min(total);
+        let max_vis = max_visible.max(1).min(total);
         let start = (selected as isize - (max_vis as isize / 2))
             .clamp(0, (total as isize - max_vis as isize).max(0)) as usize;
         let end = (start + max_vis).min(total);
@@ -210,15 +349,37 @@ impl Component for SettingsList {
             .unwrap_or(12)
             .clamp(10, 36);
 
+        let show_categories = include_categories && self.filter.trim().is_empty();
+        let mut last_category: Option<&str> = None;
         let mut lines = Vec::new();
+        let mut row_map: Vec<Option<(usize, String)>> = Vec::new();
         for (vis_idx, &item_idx) in filtered[start..end].iter().enumerate() {
             let actual_idx = start + vis_idx;
             let item = &self.items[item_idx];
+            if show_categories {
+                if let Some(cat) = item.category.as_deref() {
+                    if last_category != Some(cat) {
+                        lines.push(truncate_to_width(
+                            &format!("  {}", self.theme.fg(&self.theme.muted, cat)),
+                            width,
+                            "...",
+                            false,
+                        ));
+                        row_map.push(None);
+                        last_category = Some(cat);
+                    }
+                }
+            }
             let is_selected = actual_idx == selected;
 
+            let val_display = if is_selected && item.values.len() > 1 {
+                format!("‹ {} ›", item.current_value)
+            } else {
+                item.current_value.clone()
+            };
             let label_len = visible_width(&item.label);
             let pad = " ".repeat(max_label_width.saturating_sub(label_len));
-            let value_len = visible_width(&item.current_value);
+            let value_len = visible_width(&val_display);
             let used = 2 + label_len + pad.len() + 2 + value_len;
             let tail_pad = " ".repeat(width.saturating_sub(used));
             let reset = "\x1b[0m";
@@ -227,63 +388,187 @@ impl Component for SettingsList {
 
             let row = if is_selected {
                 format!(
-                    "{bg}{accent}▎ {reset}{rebg}\x1b[1m{label}{pad}  {reset}{rebg}{value_color}{value}{tail_pad}{reset}",
+                    "{bg}{accent}▎ {reset}{rebg}\x1b[1m{label}{pad}  {reset}{rebg}{value_color}{val_display}{tail_pad}{reset}",
                     accent = self.theme.accent,
                     label = item.label,
                     value_color = self.theme.accent,
-                    value = item.current_value,
                 )
             } else {
+                let val_color = match item.current_value.as_str() {
+                    "auto" => &self.theme.warning,
+                    "off" | "hide" | "false" => &self.theme.dim,
+                    _ => &self.theme.text,
+                };
                 format!(
-                    "  {label}{pad}  {reset}{dim}{value}{tail_pad}{reset}",
+                    "  {label}{pad}  {reset}{val_color}{val_display}{tail_pad}{reset}",
                     label = item.label,
-                    dim = self.theme.dim,
-                    value = item.current_value,
                 )
             };
             lines.push(truncate_to_width(&row, width, "...", false));
+            row_map.push(Some((actual_idx, item.id.clone())));
         }
 
         if total > max_vis {
             lines.push(truncate_to_width(
                 &format!(
                     "  {}",
-                    self.theme
-                        .fg(&self.theme.dim, &format!("({}/{})", selected + 1, total))
+                    self.theme.fg(
+                        &self.theme.dim,
+                        &format!("({}/{}) · ↑↓ scroll", selected + 1, total)
+                    )
                 ),
                 width,
                 "...",
                 false,
             ));
+            row_map.push(None);
         }
 
         let selected_item = self.selected_item();
-        if let Some(desc) = selected_item.and_then(|it| it.description.as_deref()) {
-            lines.push(String::new());
-            let wrapped = wrap_text_with_ansi(desc, width.saturating_sub(4).max(10));
-            for w in wrapped {
-                lines.push(truncate_to_width(
-                    &format!("  {}", self.theme.fg(&self.theme.dim, &w)),
-                    width,
-                    "...",
-                    false,
-                ));
+        let has_inspector = selected_item.is_some_and(|it| {
+            !it.values.is_empty()
+                || (include_description && it.description.is_some())
+                || it.current_value_description().is_some()
+        }) || self.status_message.is_some();
+
+        if has_inspector {
+            let sep_len = width.saturating_sub(4).clamp(1, 60);
+            lines.push(truncate_to_width(
+                &format!(
+                    "  {}",
+                    self.theme.fg(&self.theme.border_muted, &"─".repeat(sep_len))
+                ),
+                width,
+                "...",
+                false,
+            ));
+            row_map.push(None);
+        }
+
+        if let Some(item) = selected_item {
+            if !item.values.is_empty() {
+                let chip_lines = self.render_option_chips(item, width);
+                let count = chip_lines.len();
+                lines.extend(chip_lines);
+                row_map.extend(std::iter::repeat_n(None, count));
+            }
+
+            if include_description {
+                if let Some(desc) = item.description.as_deref() {
+                    let wrapped = wrap_text_with_ansi(desc, width.saturating_sub(4).max(10));
+                    for w in wrapped {
+                        lines.push(truncate_to_width(
+                            &format!("  {}", self.theme.fg(&self.theme.muted, &w)),
+                            width,
+                            "...",
+                            false,
+                        ));
+                        row_map.push(None);
+                    }
+                }
+            }
+
+            if let Some(val_desc) = item.current_value_description() {
+                let wrapped = wrap_text_with_ansi(val_desc, width.saturating_sub(6).max(10));
+                for (idx, w) in wrapped.into_iter().enumerate() {
+                    let prefix = if idx == 0 { "  ▸ " } else { "    " };
+                    lines.push(truncate_to_width(
+                        &format!("{prefix}{}", self.theme.fg(&self.theme.dim, &w)),
+                        width,
+                        "...",
+                        false,
+                    ));
+                    row_map.push(None);
+                }
             }
         }
 
-        lines.push(String::new());
+        if let Some((ref msg, is_err)) = self.status_message {
+            let (icon, color) = if is_err {
+                ("✗", &self.theme.error)
+            } else {
+                ("✓", &self.theme.success)
+            };
+            lines.push(truncate_to_width(
+                &format!("  {}", self.theme.fg(color, &format!("{icon} {msg}"))),
+                width,
+                "...",
+                false,
+            ));
+            row_map.push(None);
+        }
+
+        let controls = if !self.filter.is_empty() {
+            "↑↓ Move · ←→/Enter Change · Backspace · Esc Clear filter"
+        } else {
+            "↑↓ Move · ←→ / Enter Change · Type to filter · Esc Close"
+        };
         lines.push(truncate_to_width(
-            &format!(
-                "  {}",
-                self.theme
-                    .fg(&self.theme.dim, "Enter/Space to change · Esc to close")
-            ),
+            &format!("  {}", self.theme.fg(&self.theme.dim, controls)),
             width,
             "...",
             false,
         ));
+        row_map.push(None);
 
-        lines
+        (lines, row_map)
+    }
+
+    /// Renders the settings list together with a 1-to-1 line map of `(filtered_pos, setting_id)`
+    /// for clickable setting rows (headers, chips, descriptions, and status lines map to `None`).
+    pub fn render_with_row_map(&self, width: usize) -> (Vec<String>, Vec<Option<(usize, String)>>) {
+        let Some(budget) = self.max_height else {
+            return self.render_with_layout_and_map(width, self.max_visible, true, true);
+        };
+        let total = self.filtered_indices().len();
+        if total == 0 {
+            let (mut lines, mut row_map) =
+                self.render_with_layout_and_map(width, self.max_visible, true, true);
+            if lines.len() > budget {
+                let last_line = lines.pop();
+                let last_map = row_map.pop();
+                let keep = budget.saturating_sub(usize::from(last_line.is_some()));
+                lines.truncate(keep);
+                row_map.truncate(keep);
+                if let (Some(c), Some(m)) = (last_line, last_map) {
+                    if budget > 0 {
+                        lines.push(c);
+                        row_map.push(m);
+                    }
+                }
+            }
+            return (lines, row_map);
+        }
+        let start_vis = self.max_visible.min(total);
+        for (cats, desc) in [(true, true), (true, false), (false, false)] {
+            for vis in (1..=start_vis).rev() {
+                let (lines, row_map) = self.render_with_layout_and_map(width, vis, cats, desc);
+                if lines.len() <= budget {
+                    return (lines, row_map);
+                }
+            }
+        }
+        let (mut lines, mut row_map) = self.render_with_layout_and_map(width, 1, false, false);
+        if lines.len() > budget {
+            let last_line = lines.pop();
+            let last_map = row_map.pop();
+            let keep = budget.saturating_sub(usize::from(last_line.is_some()));
+            lines.truncate(keep);
+            row_map.truncate(keep);
+            if let (Some(c), Some(m)) = (last_line, last_map) {
+                if budget > 0 {
+                    lines.push(c);
+                    row_map.push(m);
+                }
+            }
+        }
+        (lines, row_map)
+    }
+}
+
+impl Component for SettingsList {
+    fn render(&self, width: usize) -> Vec<String> {
+        self.render_with_row_map(width).0
     }
 
     fn handle_key(&mut self, key: &str) -> bool {
@@ -304,7 +589,8 @@ impl Component for SettingsList {
                 self.page_down();
                 true
             }
-            "enter" | " " | "return" => self.cycle_current().is_some(),
+            "left" => self.cycle_prev().is_some(),
+            "right" | "enter" | " " | "return" => self.cycle_current().is_some(),
             _ => false,
         }
     }
@@ -426,5 +712,174 @@ mod tests {
 
         assert!(list.handle_key("pageup"));
         assert_eq!(list.selected, 0);
+    }
+
+    #[test]
+    fn test_settings_list_left_right_cycle_and_wrap() {
+        let items = vec![SettingItem::new("mode", "Permission mode", "smart_approve")
+            .with_values(vec![
+                "smart_approve".into(),
+                "approve".into(),
+                "auto".into(),
+                "chat".into(),
+            ])];
+        let mut list = SettingsList::new(items, 5);
+        assert!(list.handle_key("left"));
+        assert_eq!(list.items[0].current_value, "chat");
+        assert!(list.handle_key("right"));
+        assert_eq!(list.items[0].current_value, "smart_approve");
+        assert_eq!(
+            list.cycle_prev(),
+            Some(("mode".to_string(), "chat".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_settings_list_categories_options_value_desc_and_status() {
+        let items = vec![
+            SettingItem::new("permission_mode", "Permission mode", "smart_approve")
+                .with_category("SAFETY & AGENT")
+                .with_description("Controls tool approval prompts")
+                .with_values(vec!["smart_approve".into(), "chat".into()])
+                .with_value_descriptions(vec![
+                    ("smart_approve".into(), "Asks before edits".into()),
+                    ("chat".into(), "Read-only exploration".into()),
+                ]),
+            SettingItem::new("theme", "Color theme", "dark")
+                .with_category("APPEARANCE")
+                .with_values(vec!["dark".into(), "light".into()]),
+        ];
+        let mut list = SettingsList::new(items, 8);
+        list.set_status("Saved: Permission mode -> smart_approve", false);
+        let plain = crate::ansi::strip_ansi(&list.render(76).join("\n"));
+        assert!(plain.contains("SAFETY & AGENT"), "{plain}");
+        assert!(plain.contains("APPEARANCE"), "{plain}");
+        assert!(plain.contains("‹ smart_approve ›"), "{plain}");
+        assert!(plain.contains("Options: [smart_approve]  chat"), "{plain}");
+        assert!(plain.contains("▸ Asks before edits"), "{plain}");
+        assert!(plain.contains("✓ Saved: Permission mode -> smart_approve"), "{plain}");
+
+        // Active filter hides category headers and shows clear-filter hint
+        list.set_filter("chat");
+        let filtered_plain = crate::ansi::strip_ansi(&list.render(76).join("\n"));
+        assert!(!filtered_plain.contains("SAFETY & AGENT"), "{filtered_plain}");
+        assert!(filtered_plain.contains("Permission mode"), "{filtered_plain}");
+        assert!(filtered_plain.contains("Esc Clear filter"), "{filtered_plain}");
+
+        // Empty filter result shows helpful recovery prompt without clipping at narrow widths
+        list.set_filter("zzzzz");
+        let empty_plain = crate::ansi::strip_ansi(&list.render(58).join("\n"));
+        assert!(
+            empty_plain.contains("No match for 'zzzzz'"),
+            "{empty_plain}"
+        );
+        assert!(
+            empty_plain.contains("Esc to clear"),
+            "empty filter hint must not clip at 58 cols: {empty_plain}"
+        );
+        assert!(
+            empty_plain.contains("Esc Clear filter"),
+            "controls hint must stay visible on empty filter: {empty_plain}"
+        );
+    }
+
+    #[test]
+    fn test_settings_list_option_chips_wrap_cleanly_and_respect_max_height() {
+        let items = vec![
+            SettingItem::new("permission_mode", "Permission mode", "smart_approve")
+                .with_category("SAFETY & AGENT")
+                .with_description("Controls when the agent asks before running tools or shell commands")
+                .with_values(vec![
+                    "chat".into(),
+                    "approve".into(),
+                    "smart_approve".into(),
+                    "auto".into(),
+                ])
+                .with_value_descriptions(vec![
+                    ("smart_approve".into(), "Asks before edits or risky commands".into()),
+                ]),
+            SettingItem::new("theme", "Color theme", "dark")
+                .with_category("APPEARANCE")
+                .with_values(vec!["dark".into(), "light".into()]),
+        ];
+        let mut list = SettingsList::new(items, 8);
+        list.set_status("Saved: Permission mode -> smart_approve", false);
+
+        // Narrow width forces Options chips onto two lines without truncating any chip
+        let chip_lines = list.render(38);
+        let chip_plain = crate::ansi::strip_ansi(&chip_lines.join("\n"));
+        assert!(chip_plain.contains("[smart_approve]"), "{chip_plain}");
+        assert!(chip_plain.contains("auto"), "{chip_plain}");
+        let chip_text_lines: Vec<&str> = chip_plain.lines().collect();
+        let options_idx = chip_text_lines
+            .iter()
+            .position(|line| line.contains("Options:"))
+            .expect("Options line should render");
+        for line in chip_text_lines[options_idx..]
+            .iter()
+            .take_while(|line| line.contains("Options:") || line.starts_with("           "))
+        {
+            assert!(!line.contains("..."), "chips must wrap, not truncate: {line}");
+        }
+        for line in &chip_lines {
+            assert!(
+                visible_width(line) <= 38,
+                "option line exceeded width 38: {:?}",
+                crate::ansi::strip_ansi(line)
+            );
+        }
+
+        // max_height tightly bounds output even with categories, descriptions, and status
+        list.max_height = Some(10);
+        let bounded = list.render(58);
+        assert!(
+            bounded.len() <= 10,
+            "max_height=10 exceeded ({}): {:?}",
+            bounded.len(),
+            bounded
+        );
+        let bounded_plain = crate::ansi::strip_ansi(&bounded.join("\n"));
+        assert!(bounded_plain.contains("Esc Close"), "{bounded_plain}");
+    }
+
+    #[test]
+    fn test_settings_list_render_with_row_map_tracks_exact_clickable_rows() {
+        let items = vec![
+            SettingItem::new("mode", "Permission mode", "smart_approve")
+                .with_category("SAFETY")
+                .with_description("Control tool approvals"),
+            SettingItem::new("theme", "Color theme", "dark")
+                .with_category("APPEARANCE"),
+            SettingItem::new("compact", "Auto compact", "on")
+                .with_category("APPEARANCE"),
+        ];
+        let mut list = SettingsList::new(items, 8);
+        let (lines, map) = list.render_with_row_map(60);
+        assert_eq!(lines.len(), map.len());
+        // Line 0: SAFETY header -> None
+        assert_eq!(map[0], None);
+        // Line 1: mode -> Some((0, "mode"))
+        assert_eq!(map[1], Some((0, "mode".to_string())));
+        // Line 2: APPEARANCE header -> None
+        assert_eq!(map[2], None);
+        // Line 3: theme -> Some((1, "theme"))
+        assert_eq!(map[3], Some((1, "theme".to_string())));
+        // Line 4: compact -> Some((2, "compact"))
+        assert_eq!(map[4], Some((2, "compact".to_string())));
+
+        // With filter active, category headers disappear and filtered_pos resets cleanly
+        list.set_filter("APPEARANCE");
+        let (flines, fmap) = list.render_with_row_map(60);
+        assert_eq!(flines.len(), fmap.len());
+        assert_eq!(fmap[0], Some((0, "theme".to_string())));
+        assert_eq!(fmap[1], Some((1, "compact".to_string())));
+
+        // With tight max_height, map length stays aligned with lines
+        list.set_filter("");
+        list.max_height = Some(6);
+        let (blines, bmap) = list.render_with_row_map(60);
+        assert_eq!(blines.len(), bmap.len());
+        assert!(blines.len() <= 6);
+        assert!(bmap.iter().flatten().any(|(idx, id)| *idx == 0 && id == "mode"));
     }
 }

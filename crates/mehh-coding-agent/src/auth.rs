@@ -370,6 +370,62 @@ pub fn remove_credential(provider: &str, auth_file: Option<&Path>) -> anyhow::Re
     Ok(removed)
 }
 
+/// Async version of [`save_credential`] safe to call from Tokio worker threads.
+/// Uses [`FileCredentialStore`] (`get_path_lock_mutex` + `spawn_blocking` OS lock).
+pub async fn save_credential_async(
+    provider: &str,
+    cred: &StoredCredential,
+    auth_file: Option<&Path>,
+) -> anyhow::Result<()> {
+    let path = match auth_file {
+        Some(p) => p.to_path_buf(),
+        None => default_auth_path()?,
+    };
+    let store = FileCredentialStore::for_path(path);
+    let next_cred = cred.clone();
+    store
+        .modify(
+            provider,
+            Box::new(move |_| Box::pin(async move { Ok(Some(next_cred)) })),
+        )
+        .await?;
+    Ok(())
+}
+
+/// Async version of [`remove_credential`] safe to call from Tokio worker threads.
+pub async fn remove_credential_async(
+    provider: &str,
+    auth_file: Option<&Path>,
+) -> anyhow::Result<bool> {
+    let path = match auth_file {
+        Some(p) => p.to_path_buf(),
+        None => default_auth_path()?,
+    };
+    let store = FileCredentialStore::for_path(path.clone());
+    let _lock = store.lock().await?;
+    let provider_owned = provider.to_string();
+    tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        if !path.exists() {
+            return Ok(false);
+        }
+        let mut entries = load_auth_entries(Some(&path))?;
+        let existing_key = entries
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case(&provider_owned))
+            .cloned();
+        let Some(key) = existing_key else {
+            return Ok(false);
+        };
+        entries.remove(&key);
+        let json_str = serde_json::to_string_pretty(&entries)
+            .context("Failed to serialize auth credentials to JSON")?;
+        crate::settings::write_file_atomic(&path, json_str.as_bytes(), true)?;
+        Ok(true)
+    })
+    .await
+    .context("Credential removal task panicked")?
+}
+
 /// Resolves an API key for the requested provider following priority:
 /// 1. Explicit key argument
 /// 2. Provider environment variables
@@ -489,6 +545,109 @@ pub async fn resolve_api_key_async(
             Ok(Some(access))
         }
     }
+}
+
+/// Source where a provider's credentials or endpoint configuration came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource {
+    AuthFile,
+    EnvVar,
+    ModelsConfig,
+}
+
+/// Metadata describing a connected provider available to the user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectedProvider {
+    pub provider_id: String,
+    pub source: CredentialSource,
+    pub has_oauth: bool,
+}
+
+fn is_stored_credential_connected(cred: &StoredCredential) -> (bool, bool) {
+    match cred {
+        StoredCredential::ApiKey { key, env } => {
+            let has_key = key.as_deref().is_some_and(|k| !k.trim().is_empty());
+            let has_env = env.as_ref().is_some_and(|m| {
+                m.values()
+                    .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
+            });
+            (has_key || has_env, false)
+        }
+        StoredCredential::OAuth {
+            access, refresh, ..
+        } => {
+            let active = !access.trim().is_empty() || !refresh.trim().is_empty();
+            (active, active)
+        }
+    }
+}
+
+/// Lists all connected providers across `auth.json`, environment variables, and `models.json`.
+/// Fails closed on corrupt `auth.json`.
+pub fn list_connected_providers(
+    auth_file: Option<&Path>,
+    registry: &crate::models_config::ModelRegistry,
+) -> anyhow::Result<Vec<ConnectedProvider>> {
+    let entries = load_auth_entries(auth_file)?;
+
+    let mut candidates: Vec<String> = mehh_ai::KNOWN_PROVIDERS
+        .iter()
+        .map(|spec| spec.id.to_string())
+        .collect();
+
+    let mut extra_entries: Vec<String> = entries.keys().cloned().collect();
+    extra_entries.sort();
+    candidates.extend(extra_entries);
+
+    let mut extra_cfg: Vec<String> = registry.provider_configs().keys().cloned().collect();
+    extra_cfg.sort();
+    candidates.extend(extra_cfg);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut connected = Vec::new();
+
+    for raw in candidates {
+        let id = raw.trim().to_ascii_lowercase();
+        if id.is_empty() || !seen.insert(id.clone()) {
+            continue;
+        }
+
+        if let Some(cred) = entries.get(&id) {
+            let (ok, has_oauth) = is_stored_credential_connected(cred);
+            if ok {
+                connected.push(ConnectedProvider {
+                    provider_id: id,
+                    source: CredentialSource::AuthFile,
+                    has_oauth,
+                });
+                continue;
+            }
+        }
+
+        if resolve_provider_env_var(&id).is_some() {
+            connected.push(ConnectedProvider {
+                provider_id: id,
+                source: CredentialSource::EnvVar,
+                has_oauth: false,
+            });
+            continue;
+        }
+
+        let has_cfg_key = registry.provider_api_key(&id).is_some();
+        let has_custom_base = registry
+            .provider_config(&id)
+            .and_then(|cfg| cfg.base_url.as_deref())
+            .is_some_and(|u| !u.trim().is_empty());
+        if has_cfg_key || has_custom_base {
+            connected.push(ConnectedProvider {
+                provider_id: id,
+                source: CredentialSource::ModelsConfig,
+                has_oauth: false,
+            });
+        }
+    }
+
+    Ok(connected)
 }
 
 #[cfg(test)]
@@ -775,5 +934,59 @@ mod tests {
         );
 
         let _ = server_task.await;
+    }
+
+    #[test]
+    fn test_list_connected_providers_across_sources() {
+        let dir = crate::TempTestDir::new("connected_providers");
+        let auth_file = dir.path().join("auth.json");
+        let models_file = dir.path().join("models.json");
+
+        // Custom keyless Ollama endpoint in models.json + auth.json entries
+        std::fs::write(
+            &models_file,
+            r#"{"providers":{"ollama":{"baseUrl":"http://localhost:11434/v1","models":[{"id":"qwen3:8b"}]}}}"#,
+        )
+        .unwrap();
+        let reg = crate::models_config::ModelRegistry::load_with_path(&models_file).unwrap();
+
+        // Save empty-key entry (must not appear) + valid API key + OAuth entry
+        save_credential(
+            "anthropic",
+            &StoredCredential::OAuth {
+                access: "sk-ant-oat-1".to_string(),
+                refresh: "ref-1".to_string(),
+                expires: 1_900_000_000_000,
+                client_id: None,
+                scopes: None,
+                available_model_ids: None,
+            },
+            Some(&auth_file),
+        )
+        .unwrap();
+        save_credential(
+            "groq",
+            &StoredCredential::ApiKey {
+                key: Some("".to_string()),
+                env: None,
+            },
+            Some(&auth_file),
+        )
+        .unwrap();
+
+        let list = list_connected_providers(Some(&auth_file), &reg).unwrap();
+        let anthropic = list.iter().find(|p| p.provider_id == "anthropic").unwrap();
+        assert_eq!(anthropic.source, CredentialSource::AuthFile);
+        assert!(anthropic.has_oauth);
+
+        let ollama = list.iter().find(|p| p.provider_id == "ollama").unwrap();
+        assert_eq!(ollama.source, CredentialSource::ModelsConfig);
+        assert!(!ollama.has_oauth);
+
+        assert!(!list.iter().any(|p| p.provider_id == "groq" && p.source == CredentialSource::AuthFile));
+
+        // Corrupt auth.json fails closed
+        std::fs::write(&auth_file, b"{corrupt").unwrap();
+        assert!(list_connected_providers(Some(&auth_file), &reg).is_err());
     }
 }

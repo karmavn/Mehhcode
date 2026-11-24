@@ -81,7 +81,7 @@ fn split_commands(input: &str) -> Option<Vec<Vec<String>>> {
     let mut token = String::new();
     let mut has_token = false;
     let mut quote: Option<char> = None;
-    let mut chars = input.chars();
+    let mut chars = input.chars().peekable();
 
     while let Some(ch) = chars.next() {
         match quote {
@@ -89,7 +89,16 @@ fn split_commands(input: &str) -> Option<Vec<Vec<String>>> {
                 if ch == q {
                     quote = None;
                 } else if ch == '\\' && q == '"' {
-                    token.push(chars.next()?);
+                    if cfg!(windows) {
+                        // In PowerShell double quotes, `\` is literal, NOT an escape.
+                        // Fail closed on `\"` to prevent parser differential with PowerShell.
+                        if chars.peek() == Some(&'"') {
+                            return None;
+                        }
+                        token.push('\\');
+                    } else {
+                        token.push(chars.next()?);
+                    }
                 } else if q == '"' && (ch == '$' || ch == '`') {
                     // The shell still expands these inside double quotes, so
                     // the command cannot be scored as literal text.
@@ -105,7 +114,12 @@ fn split_commands(input: &str) -> Option<Vec<Vec<String>>> {
                     has_token = true;
                 }
                 '\\' => {
-                    token.push(chars.next()?);
+                    if cfg!(windows) {
+                        // On Windows/PowerShell, `\` is a literal path separator, never an escape.
+                        token.push('\\');
+                    } else {
+                        token.push(chars.next()?);
+                    }
                     has_token = true;
                 }
                 '$' => return None,
@@ -114,7 +128,7 @@ fn split_commands(input: &str) -> Option<Vec<Vec<String>>> {
                 // `echo hi` cover `echo hi (Start-Process calc)`.
                 '(' | ')' => return None,
                 '`' | '>' | '<' => return None,
-                ';' | '&' | '|' | '\n' => {
+                ';' | '&' | '|' | '\n' | '\r' => {
                     if has_token {
                         if !push_token(&mut current, &mut token) {
                             return None;
@@ -141,7 +155,7 @@ fn split_commands(input: &str) -> Option<Vec<Vec<String>>> {
         }
     }
 
-    if quote.is_some() || (!input.is_empty() && input.ends_with('\\')) {
+    if quote.is_some() || (!cfg!(windows) && !input.is_empty() && input.ends_with('\\')) {
         return None;
     }
     if has_token && !push_token(&mut current, &mut token) {
@@ -244,32 +258,42 @@ pub fn is_dangerous_prefix(prefix: &str) -> bool {
         return true;
     }
     let key = executable_key(&argv[0]);
-    if matches!(
-        key.as_str(),
-        "bash"
-            | "sh"
-            | "zsh"
-            | "dash"
-            | "cmd"
-            | "pwsh"
-            | "powershell"
-            | "python"
-            | "python3"
-            | "node"
-            | "ruby"
-            | "perl"
-            | "php"
-            | "find"
-            | "xargs"
-            | "eval"
-            | "exec"
-            | "sudo"
-            | "env"
-            | "npx"
-            | "npm"
-            | "cargo"
-            | "make"
-    ) {
+    let is_versioned_interpreter = ["python", "ruby", "perl", "php", "node", "pwsh"]
+        .iter()
+        .any(|base| {
+            key.strip_prefix(base)
+                .is_some_and(|rest| rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        });
+    if is_versioned_interpreter
+        || matches!(
+            key.as_str(),
+            "bash"
+                | "sh"
+                | "zsh"
+                | "dash"
+                | "cmd"
+                | "powershell"
+                | "deno"
+                | "bun"
+                | "awk"
+                | "gawk"
+                | "sed"
+                | "find"
+                | "xargs"
+                | "eval"
+                | "exec"
+                | "sudo"
+                | "env"
+                | "ssh"
+                | "docker"
+                | "kubectl"
+                | "tar"
+                | "npx"
+                | "npm"
+                | "cargo"
+                | "make"
+        )
+    {
         return true;
     }
     let second = argv[1].to_lowercase();
@@ -367,8 +391,12 @@ mod tests {
             assert!(!eval.all_covered, "{cmd} must not be covered by a rule");
             assert_eq!(verdict_for(eval, true), Verdict::Prompt, "{cmd}");
         }
-        // An escaped dollar inside double quotes is literal and stays scorable.
-        assert!(check_prefix("echo", "echo \"\\$HOME\"").safe_parse);
+        // On POSIX, an escaped dollar inside double quotes is literal and stays scorable.
+        // On Windows PowerShell, `\` does not escape `$`, so `\$HOME` still expands.
+        assert_eq!(
+            check_prefix("echo", "echo \"\\$HOME\"").safe_parse,
+            !cfg!(windows)
+        );
     }
 
     #[test]
@@ -448,5 +476,40 @@ mod tests {
     fn safe_prefix_is_kept() {
         assert_eq!(safe_rule_prefix("git status --short"), Some("git status".into()));
         assert_eq!(safe_rule_prefix("ls -la"), Some("ls -la".into()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_backslash_never_escapes_command_separator() {
+        let eval = check_prefix("git status", r"git status C:\; calc.exe");
+        assert!(!eval.all_covered, "semicolon after backslash must split subcommands on Windows");
+        assert_eq!(verdict_for(eval, true), Verdict::Prompt);
+
+        let quoted = check_prefix("git status", r#"git status "foo\"; calc.exe; echo \""#);
+        assert!(!quoted.safe_parse, "ambiguous quote+backslash must fail closed on Windows");
+        assert_eq!(verdict_for(quoted, true), Verdict::Prompt);
+
+        let trailing = check_prefix("dir", r"dir C:\");
+        assert!(trailing.safe_parse && trailing.all_covered);
+        assert_eq!(verdict_for(trailing, true), Verdict::Allow);
+    }
+
+    #[test]
+    fn versioned_interpreters_and_exec_tools_are_dangerous_prefixes() {
+        for cmd in [
+            "python3.12 script.py",
+            "ruby3.3 app.rb",
+            "awk -f prog.awk",
+            "awk 'BEGIN{system(\"id\")}'",
+            "sed 's/a/b/e' file",
+            "ssh user@host id",
+            "docker run alpine id",
+            "deno run main.ts",
+        ] {
+            assert!(
+                safe_rule_prefix(cmd).is_none(),
+                "must not persist a rule for {cmd}"
+            );
+        }
     }
 }

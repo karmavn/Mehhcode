@@ -94,16 +94,32 @@ pub(crate) async fn kill_process_tree(child: &mut Child, pid: Option<u32>) {
     // background children too instead of leaving them holding the output pipe.
     #[cfg(unix)]
     if let Some(pid) = pid {
-        let script = format!("kill -KILL -{pid}");
-        let _ = tokio::task::spawn_blocking(move || {
-            let _ = std::process::Command::new("sh")
-                .args(["-c", &script])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        })
-        .await;
+        let pgid = format!("-{pid}");
+        // BSD/macOS `/bin/kill` treats `--` after `-s KILL` as an invalid PID,
+        // whereas GNU/util-linux `/bin/kill` uses `--` before a negative PGID.
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        ))]
+        let args: &[&str] = &["-s", "KILL", &pgid];
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "openbsd",
+            target_os = "netbsd",
+            target_os = "dragonfly"
+        )))]
+        let args: &[&str] = &["-s", "KILL", "--", &pgid];
+        let _ = tokio::process::Command::new("kill")
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
     }
 
     let _ = child.kill().await;
@@ -323,6 +339,12 @@ pub(crate) async fn run_shell(
         if rx_closed && exit_status.is_some() {
             break;
         }
+    }
+
+    // Drain chunks already buffered before break (timeout, cancel, or pipe grace)
+    // so partial output emitted just before termination is never lost.
+    while let Ok(chunk) = rx.try_recv() {
+        captured.extend(&chunk);
     }
 
     let mut text = format_bash_output(&captured.to_vec());

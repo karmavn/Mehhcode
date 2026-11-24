@@ -79,7 +79,7 @@ impl DeferredToolCatalog {
 
     /// Replaces the registered deferred tools in the catalog.
     pub fn replace_deferred(&self, deferred: Vec<Arc<dyn AgentTool>>) {
-        let mut guard = self.deferred.write().unwrap();
+        let mut guard = mehh_ai::write_recover(&self.deferred);
         *guard = deferred;
     }
 
@@ -90,12 +90,12 @@ impl DeferredToolCatalog {
 
     /// Returns the number of deferred tools registered in the catalog.
     pub fn len(&self) -> usize {
-        self.deferred.read().unwrap().len()
+        mehh_ai::read_recover(&self.deferred).len()
     }
 
     /// Returns true if no deferred tools are registered.
     pub fn is_empty(&self) -> bool {
-        self.deferred.read().unwrap().is_empty()
+        mehh_ai::read_recover(&self.deferred).is_empty()
     }
 
     /// Helper to register a test tool into the deferred catalog.
@@ -132,7 +132,7 @@ impl DeferredToolCatalog {
             }
         }
 
-        let mut guard = self.deferred.write().unwrap();
+        let mut guard = mehh_ai::write_recover(&self.deferred);
         guard.push(Arc::new(TestDeferredTool {
             name,
             desc,
@@ -148,7 +148,7 @@ impl DeferredToolCatalog {
         let query_norm = q.to_ascii_lowercase();
         let query_tokens = tokenize_terms(&query_norm);
 
-        let deferred_guard = self.deferred.read().unwrap();
+        let deferred_guard = mehh_ai::read_recover(&self.deferred);
         if deferred_guard.is_empty() {
             return Vec::new();
         }
@@ -272,7 +272,7 @@ impl DeferredToolCatalog {
     /// Activates the given tools inside `active_tools` without creating duplicates.
     /// Returns the names of tools newly added on this call.
     pub fn activate(&self, tools: &[Arc<dyn AgentTool>]) -> Vec<String> {
-        let mut guard = self.active_tools.write().unwrap();
+        let mut guard = mehh_ai::write_recover(&self.active_tools);
         let mut added = Vec::new();
         for tool in tools {
             let name = tool.name();
@@ -288,7 +288,7 @@ impl DeferredToolCatalog {
     pub fn activate_by_names(&self, names: &[String]) -> (Vec<String>, Vec<String>) {
         let mut found = Vec::new();
         let mut missing = Vec::new();
-        let deferred_guard = self.deferred.read().unwrap();
+        let deferred_guard = mehh_ai::read_recover(&self.deferred);
         for name in names {
             if let Some(tool) = deferred_guard
                 .iter()

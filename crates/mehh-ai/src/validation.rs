@@ -157,6 +157,14 @@ fn validate_schema(
     }
 
     if let Some(arr) = val.as_array() {
+        if let Some(max_items) = schema.get("maxItems").and_then(|m| m.as_u64()) {
+            if arr.len() as u64 > max_items {
+                return Err(format!(
+                    "Property \"{path}\" in tool \"{tool_name}\" has {} items, exceeding maxItems {max_items}",
+                    arr.len()
+                ));
+            }
+        }
         if let Some(items) = schema.get("items") {
             for (index, item) in arr.iter().enumerate() {
                 let item_path = format!("{path}[{index}]");
@@ -215,7 +223,6 @@ fn coerce_value(schema: &Value, val: &mut Value) {
         if let Value::String(s) = val {
             if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(s) {
                 *val = Value::Array(arr);
-                return;
             }
         }
     }
@@ -509,6 +516,40 @@ mod tests {
         .unwrap();
         assert_eq!(args["config"]["retries"], serde_json::json!(3));
         assert_eq!(args["ids"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn validation_coerces_stringified_array_and_its_items() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ids": { "type": "array", "items": { "type": "integer" } }
+            }
+        });
+        let args = call_with(
+            "t",
+            schema,
+            serde_json::json!({ "ids": "[\"1\", \"2\"]" }),
+        )
+        .unwrap();
+        assert_eq!(args["ids"], serde_json::json!([1, 2]));
+    }
+
+    #[test]
+    fn validation_rejects_array_exceeding_max_items() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "tasks": { "type": "array", "items": { "type": "string" }, "maxItems": 2 }
+            }
+        });
+        let err = call_with(
+            "subagent",
+            schema,
+            serde_json::json!({ "tasks": ["a", "b", "c"] }),
+        )
+        .unwrap_err();
+        assert!(err.contains("maxItems"), "unexpected error: {err}");
     }
 
     #[test]

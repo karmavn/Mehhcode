@@ -1,4 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+const MAX_UNDO_SNAPSHOTS: usize = 100;
+const TYPING_COALESCE_WINDOW: Duration = Duration::from_millis(500);
 
 use crate::ansi::wrap_text_with_ansi;
 use crate::components::basic::{SelectItem, SelectList};
@@ -308,7 +312,8 @@ pub struct Editor {
     pub history: Vec<String>,
     pub history_idx: Option<usize>,
     history_draft: Option<(Vec<String>, usize, usize)>,
-    pub undo_stack: Vec<(Vec<String>, usize, usize)>,
+    pub undo_stack: VecDeque<(Vec<String>, usize, usize)>,
+    last_typing_undo: Option<(Instant, usize, usize)>,
     pub kill_ring: KillRing,
     pub last_action: Option<EditorLastAction>,
     pub autocomplete: Option<SelectList>,
@@ -336,7 +341,8 @@ impl Editor {
             history: Vec::new(),
             history_idx: None,
             history_draft: None,
-            undo_stack: Vec::new(),
+            undo_stack: VecDeque::new(),
+            last_typing_undo: None,
             kill_ring: KillRing::default(),
             last_action: None,
             autocomplete: None,
@@ -474,26 +480,53 @@ impl Editor {
         self.history_draft = None;
         self.clear_autocomplete();
         self.last_action = None;
+        self.last_typing_undo = None;
     }
 
     pub fn push_undo(&mut self) {
+        self.last_typing_undo = None;
         self.undo_stack
-            .push((self.lines.clone(), self.cursor_row, self.cursor_col));
-        if self.undo_stack.len() > 100 {
-            self.undo_stack.remove(0);
+            .push_back((self.lines.clone(), self.cursor_row, self.cursor_col));
+        if self.undo_stack.len() > MAX_UNDO_SNAPSHOTS {
+            self.undo_stack.pop_front();
         }
     }
 
     pub fn undo(&mut self) -> bool {
-        if let Some((lines, row, col)) = self.undo_stack.pop() {
+        if let Some((lines, row, col)) = self.undo_stack.pop_back() {
             self.lines = lines;
             self.cursor_row = row.min(self.lines.len().saturating_sub(1));
             self.cursor_col = col.min(self.lines[self.cursor_row].chars().count());
             self.last_action = None;
+            self.last_typing_undo = None;
             true
         } else {
             false
         }
+    }
+
+    /// Inserts a single typed character, coalescing consecutive word characters
+    /// within [`TYPING_COALESCE_WINDOW`] so typing does not deep-clone the buffer on every key.
+    fn insert_typed_char(&mut self, key: &str) {
+        let Some(ch) = key.chars().next() else {
+            return;
+        };
+        let is_word_char = !ch.is_whitespace() && !is_punctuation_char(ch);
+        let can_coalesce = is_word_char
+            && self.last_typing_undo.is_some_and(|(ts, row, col)| {
+                row == self.cursor_row
+                    && col == self.cursor_col
+                    && ts.elapsed() <= TYPING_COALESCE_WINDOW
+            });
+        if !can_coalesce {
+            self.push_undo();
+        }
+        self.insert_text_internal(key);
+        self.last_typing_undo = if is_word_char {
+            Some((Instant::now(), self.cursor_row, self.cursor_col))
+        } else {
+            None
+        };
     }
 
     /// Insert text at cursor, collapsing multi-line pastes > 10 lines into `[paste #N +L lines]`.
@@ -1099,7 +1132,7 @@ impl Editor {
         // Single character input
         if key.chars().count() == 1 {
             self.last_action = Some(EditorLastAction::Other);
-            self.insert_text(key);
+            self.insert_typed_char(key);
             return EditorOutput::Changed(self.text());
         }
 
@@ -1437,5 +1470,32 @@ mod tests {
 
         let _ = editor.handle_editor_key("down", &kb);
         assert_eq!(editor.text(), "draft");
+    }
+
+    #[test]
+    fn typing_coalesces_word_chars_into_single_undo_and_caps_stack() {
+        let mut editor = Editor::new();
+        let kb = Keybindings::default_bindings();
+
+        for ch in "hello".chars() {
+            editor.handle_editor_key(&ch.to_string(), &kb);
+        }
+        assert_eq!(editor.text(), "hello");
+        assert_eq!(editor.undo_stack.len(), 1);
+
+        editor.handle_editor_key(" ", &kb);
+        for ch in "world".chars() {
+            editor.handle_editor_key(&ch.to_string(), &kb);
+        }
+        assert_eq!(editor.text(), "hello world");
+        assert_eq!(editor.undo_stack.len(), 3);
+
+        assert!(editor.undo());
+        assert_eq!(editor.text(), "hello ");
+
+        for i in 0..(MAX_UNDO_SNAPSHOTS + 25) {
+            editor.set_text(&format!("v{i}"));
+        }
+        assert_eq!(editor.undo_stack.len(), MAX_UNDO_SNAPSHOTS);
     }
 }

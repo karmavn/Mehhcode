@@ -74,6 +74,49 @@ fn canonical_rule_paths(ctx: &ToolInspectionContext, raw: &str) -> Option<Vec<St
     Some(candidates)
 }
 
+fn url_matches_prefix(raw_url: &str, raw_prefix: &str) -> bool {
+    let Ok(target) = mehh_ai::http_safety::normalize_and_validate_http_url(raw_url) else {
+        return false;
+    };
+    let Ok(prefix) = mehh_ai::http_safety::normalize_and_validate_http_url(raw_prefix) else {
+        return false;
+    };
+    if target.scheme() != prefix.scheme()
+        || target.host_str() != prefix.host_str()
+        || target.port_or_known_default() != prefix.port_or_known_default()
+    {
+        return false;
+    }
+
+    let p_path = prefix.path();
+    let t_path = target.path();
+    if p_path != "/" || prefix.query().is_some() {
+        if let Some(pq) = prefix.query() {
+            if t_path != p_path {
+                return false;
+            }
+            let tq = target.query().unwrap_or("");
+            if !pq.is_empty()
+                && tq != pq
+                && !tq.strip_prefix(pq).is_some_and(|rest| rest.starts_with('&'))
+            {
+                return false;
+            }
+        } else if p_path.ends_with('/') {
+            if !t_path.starts_with(p_path) {
+                return false;
+            }
+        } else if t_path != p_path
+            && !t_path
+                .strip_prefix(p_path)
+                .is_some_and(|rest| rest.starts_with('/'))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 impl PermissionStore {
     pub fn new(rules: Vec<PermissionRule>, user_rules_path: Option<PathBuf>) -> Self {
         Self {
@@ -132,9 +175,9 @@ impl PermissionStore {
         let file: PermissionsFile = serde_json::from_str(clean)
             .with_context(|| format!("Failed to parse permissions JSON in '{}'", path.display()))?;
 
-        // A malformed glob would silently turn a NeverAllow rule into a no-op
-        // during evaluate(). Reject the whole file instead so load_fail_closed
-        // can substitute a deny-all store.
+        // A malformed glob (or malformed URL arg_prefix on web_fetch) would
+        // silently turn a NeverAllow rule into a no-op during evaluate().
+        // Reject the whole file instead so load_fail_closed can substitute a deny-all store.
         for rule in &file.rules {
             if let Some(ref pattern) = rule.path_glob {
                 GlobBuilder::new(pattern)
@@ -147,6 +190,17 @@ impl PermissionStore {
                             path.display()
                         )
                     })?;
+            }
+            if rule.tool_name.eq_ignore_ascii_case("web_fetch") {
+                if let Some(ref prefix) = rule.arg_prefix {
+                    mehh_ai::http_safety::normalize_and_validate_http_url(prefix).map_err(|err| {
+                        anyhow::anyhow!(
+                            "Invalid URL arg_prefix '{}' in permissions file '{}': {err}",
+                            prefix,
+                            path.display()
+                        )
+                    })?;
+                }
             }
         }
 
@@ -195,6 +249,15 @@ impl PermissionStore {
     /// Specific rules (those with arg_prefix or path_glob, longer prefix, or exact tool names)
     /// take precedence over broad rules (generic tool or global wildcard '*').
     pub fn evaluate(&self, ctx: &ToolInspectionContext) -> Option<InspectionVerdict> {
+        let is_shell = mehh_execpolicy::is_shell_tool(&ctx.tool_name);
+        let shell_cmd = if is_shell {
+            ctx.args.get("command").and_then(|v| v.as_str())
+        } else {
+            None
+        };
+        let shell_safe_parse =
+            shell_cmd.is_none_or(|cmd| mehh_execpolicy::check_prefix("x", cmd).safe_parse);
+        let mut matched_shell_never_allow = false;
         let mut best_match: Option<(RuleSpecificity, &PermissionRule)> = None;
 
         for rule in &self.rules {
@@ -220,6 +283,8 @@ impl PermissionStore {
                                     || candidate.starts_with(pfx.trim())
                             })
                         })
+                    } else if let Some(url) = ctx.args.get("url").and_then(|v| v.as_str()) {
+                        url_matches_prefix(url, pfx)
                     } else {
                         false
                     };
@@ -250,10 +315,23 @@ impl PermissionStore {
                 }
             }
 
+            if is_shell && shell_cmd.is_some() && rule.action == PermissionAction::NeverAllow {
+                matched_shell_never_allow = true;
+            }
+
             let is_filtered = rule.arg_prefix.is_some() || rule.path_glob.is_some();
             let both_filtered = rule.arg_prefix.is_some() && rule.path_glob.is_some();
             let exact_tool = !rule.tool_name.eq_ignore_ascii_case("*");
-            let prefix_len = rule.arg_prefix.as_ref().map_or(0, |s| s.len());
+            let is_url_arg = ctx.args.get("url").and_then(|v| v.as_str()).is_some();
+            let prefix_len = rule.arg_prefix.as_ref().map_or(0, |s| {
+                if is_url_arg {
+                    mehh_ai::http_safety::normalize_and_validate_http_url(s)
+                        .map(|u| u.as_str().len())
+                        .unwrap_or(s.len())
+                } else {
+                    s.len()
+                }
+            });
             // Strictest action wins at equal specificity.
             let action_rank = match rule.action {
                 PermissionAction::NeverAllow => 2,
@@ -277,6 +355,12 @@ impl PermissionStore {
             }
         }
 
+        if !shell_safe_parse && matched_shell_never_allow {
+            return Some(InspectionVerdict::Deny {
+                reason: format!("Permission rule forbids tool '{}'", ctx.tool_name),
+            });
+        }
+
         let (_, rule) = best_match?;
 
         // Shell rules are decided by the whole parsed command line, not by a
@@ -284,12 +368,10 @@ impl PermissionStore {
         // allow rule applies; anything unparseable fails closed to a prompt.
         // AskBefore is not an allow/deny decision: its `false` would become a
         // hard deny in `verdict_for`, so let the action match below handle it.
-        if rule.action != PermissionAction::AskBefore
-            && mehh_execpolicy::is_shell_tool(&ctx.tool_name)
-        {
+        if rule.action != PermissionAction::AskBefore && is_shell {
             if let (Some(pfx), Some(cmd)) = (
                 rule.arg_prefix.as_deref(),
-                ctx.args.get("command").and_then(|v| v.as_str()),
+                shell_cmd,
             ) {
                 let eval = mehh_execpolicy::check_prefix(pfx, cmd);
                 let prompt = || InspectionVerdict::RequireApproval {
@@ -316,11 +398,36 @@ impl PermissionStore {
                 );
                 return Some(match verdict {
                     mehh_execpolicy::Verdict::Allow => InspectionVerdict::Allow,
-                    mehh_execpolicy::Verdict::Prompt => prompt(),
+                    mehh_execpolicy::Verdict::Prompt => {
+                        if matched_shell_never_allow {
+                            InspectionVerdict::Deny {
+                                reason: format!(
+                                    "Permission rule forbids tool '{}': '{cmd}'",
+                                    ctx.tool_name
+                                ),
+                            }
+                        } else {
+                            prompt()
+                        }
+                    }
                     mehh_execpolicy::Verdict::Deny => InspectionVerdict::Deny {
                         reason: format!("Permission rule forbids tool '{}': '{cmd}'", ctx.tool_name),
                     },
                 });
+            }
+        }
+
+        if is_shell && matched_shell_never_allow && rule.action == PermissionAction::AskBefore {
+            if let Some(cmd) = shell_cmd {
+                let uncovered = match rule.arg_prefix.as_deref() {
+                    Some(pfx) => !mehh_execpolicy::check_prefix(pfx, cmd).all_covered,
+                    None => rule.path_glob.is_some(),
+                };
+                if uncovered {
+                    return Some(InspectionVerdict::Deny {
+                        reason: format!("Permission rule forbids tool '{}': '{cmd}'", ctx.tool_name),
+                    });
+                }
             }
         }
 
@@ -335,6 +442,8 @@ impl PermissionStore {
                     .args
                     .get("command")
                     .or_else(|| ctx.args.get("path"))
+                    .or_else(|| ctx.args.get("url"))
+                    .or_else(|| ctx.args.get("query"))
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
             }),
@@ -840,5 +949,222 @@ mod tests {
         // Windows-style backslashes
         let ctx = make_ctx("edit", None, Some(r"src\sub\test.rs"));
         assert_eq!(store.evaluate(&ctx), Some(InspectionVerdict::Allow));
+    }
+
+    #[test]
+    fn never_allow_beats_longer_always_allow_on_unparseable_and_chained_shell_commands() {
+        let store = PermissionStore::new(
+            vec![
+                PermissionRule {
+                    tool_name: "bash".to_string(),
+                    arg_prefix: Some("git status".to_string()),
+                    path_glob: None,
+                    action: PermissionAction::AlwaysAllow,
+                },
+                PermissionRule {
+                    tool_name: "bash".to_string(),
+                    arg_prefix: Some("rm".to_string()),
+                    path_glob: None,
+                    action: PermissionAction::NeverAllow,
+                },
+            ],
+            None,
+        );
+
+        let safe_git = make_ctx("bash", Some("git status --short"), None);
+        assert_eq!(store.evaluate(&safe_git), Some(InspectionVerdict::Allow));
+
+        let unparseable_rm = make_ctx("bash", Some("rm -rf / $(id)"), None);
+        assert!(
+            matches!(store.evaluate(&unparseable_rm), Some(InspectionVerdict::Deny { .. })),
+            "unparseable rm must remain Deny even when longer AlwaysAllow exists"
+        );
+
+        let chained_rm = make_ctx("bash", Some("git status && rm -rf /"), None);
+        assert!(
+            matches!(store.evaluate(&chained_rm), Some(InspectionVerdict::Deny { .. })),
+            "chained NeverAllow command must be Deny, not Prompt"
+        );
+
+        let blanket_deny = PermissionStore::new(
+            vec![
+                PermissionRule {
+                    tool_name: "bash".to_string(),
+                    arg_prefix: Some("git status".to_string()),
+                    path_glob: None,
+                    action: PermissionAction::AlwaysAllow,
+                },
+                PermissionRule {
+                    tool_name: "bash".to_string(),
+                    arg_prefix: None,
+                    path_glob: None,
+                    action: PermissionAction::NeverAllow,
+                },
+            ],
+            None,
+        );
+        let unparseable_git = make_ctx("bash", Some("git status $(id)"), None);
+        assert!(
+            matches!(blanket_deny.evaluate(&unparseable_git), Some(InspectionVerdict::Deny { .. })),
+            "blanket NeverAllow must deny unparseable input despite filtered AlwaysAllow"
+        );
+        #[cfg(windows)]
+        {
+            let win_quote = make_ctx("bash", Some(r#"git status "x\""#), None);
+            assert!(
+                matches!(blanket_deny.evaluate(&win_quote), Some(InspectionVerdict::Deny { .. })),
+                "blanket NeverAllow must deny ambiguous Windows quote+backslash input"
+            );
+        }
+
+        let ask_vs_never = PermissionStore::new(
+            vec![
+                PermissionRule {
+                    tool_name: "bash".to_string(),
+                    arg_prefix: Some("git status".to_string()),
+                    path_glob: None,
+                    action: PermissionAction::AskBefore,
+                },
+                PermissionRule {
+                    tool_name: "bash".to_string(),
+                    arg_prefix: Some("rm".to_string()),
+                    path_glob: None,
+                    action: PermissionAction::NeverAllow,
+                },
+            ],
+            None,
+        );
+        let chained_ask = make_ctx("bash", Some("git status && rm -rf /"), None);
+        assert!(
+            matches!(ask_vs_never.evaluate(&chained_ask), Some(InspectionVerdict::Deny { .. })),
+            "AskBefore + NeverAllow on chained command must Deny, not prompt"
+        );
+        let safe_ask = make_ctx("bash", Some("git status --short"), None);
+        assert!(
+            matches!(
+                ask_vs_never.evaluate(&safe_ask),
+                Some(InspectionVerdict::RequireApproval { .. })
+            ),
+            "safe AskBefore command must still require approval"
+        );
+
+        let wildcard_deny_with_bash_ask = PermissionStore::new(
+            vec![
+                PermissionRule {
+                    tool_name: "*".to_string(),
+                    arg_prefix: None,
+                    path_glob: None,
+                    action: PermissionAction::NeverAllow,
+                },
+                PermissionRule {
+                    tool_name: "bash".to_string(),
+                    arg_prefix: None,
+                    path_glob: None,
+                    action: PermissionAction::AskBefore,
+                },
+            ],
+            None,
+        );
+        assert!(
+            matches!(
+                wildcard_deny_with_bash_ask.evaluate(&make_ctx("bash", Some("echo hi"), None)),
+                Some(InspectionVerdict::RequireApproval { .. })
+            ),
+            "unfiltered bash AskBefore override must still beat wildcard NeverAllow"
+        );
+    }
+
+    #[test]
+    fn test_url_arg_prefix_boundary_matching() {
+        let make_url_ctx = |url: &str| {
+            let mut args = serde_json::Map::new();
+            args.insert("url".to_string(), serde_json::Value::String(url.to_string()));
+            ToolInspectionContext {
+                tool_call_id: "u1".to_string(),
+                tool_name: "web_fetch".to_string(),
+                args,
+                is_read_only: Some(true),
+                cwd: PathBuf::from("."),
+                origin: None,
+            }
+        };
+
+        let store = PermissionStore::new(
+            vec![
+                PermissionRule {
+                    tool_name: "web_fetch".to_string(),
+                    arg_prefix: Some("https://docs.rs".to_string()),
+                    path_glob: None,
+                    action: PermissionAction::AlwaysAllow,
+                },
+                PermissionRule {
+                    tool_name: "web_fetch".to_string(),
+                    arg_prefix: Some("https://docs.rs/reqwest".to_string()),
+                    path_glob: None,
+                    action: PermissionAction::NeverAllow,
+                },
+            ],
+            None,
+        );
+
+        assert!(matches!(
+            store.evaluate(&make_url_ctx("https://docs.rs")),
+            Some(InspectionVerdict::Allow)
+        ));
+        assert!(matches!(
+            store.evaluate(&make_url_ctx("https://docs.rs/tokio")),
+            Some(InspectionVerdict::Allow)
+        ));
+        // docs.rs/reqwest-evil must match docs.rs (Allow), NOT docs.rs/reqwest (NeverAllow)
+        assert!(matches!(
+            store.evaluate(&make_url_ctx("https://docs.rs/reqwest-evil")),
+            Some(InspectionVerdict::Allow)
+        ));
+        assert!(matches!(
+            store.evaluate(&make_url_ctx("https://docs.rs/reqwest")),
+            Some(InspectionVerdict::Deny { .. })
+        ));
+        assert!(matches!(
+            store.evaluate(&make_url_ctx("HTTPS://DOCS.RS:443/reqwest/latest#sec")),
+            Some(InspectionVerdict::Deny { .. })
+        ));
+
+        // Redundant default port :443 on a broader AlwaysAllow rule must not outrank narrower NeverAllow
+        let port_store = PermissionStore::new(
+            vec![
+                PermissionRule {
+                    tool_name: "web_fetch".to_string(),
+                    arg_prefix: Some("https://docs.rs:443/".to_string()),
+                    path_glob: None,
+                    action: PermissionAction::AlwaysAllow,
+                },
+                PermissionRule {
+                    tool_name: "web_fetch".to_string(),
+                    arg_prefix: Some("https://docs.rs/reqwest".to_string()),
+                    path_glob: None,
+                    action: PermissionAction::NeverAllow,
+                },
+            ],
+            None,
+        );
+        assert!(matches!(
+            port_store.evaluate(&make_url_ctx("https://docs.rs/reqwest")),
+            Some(InspectionVerdict::Deny { .. })
+        ));
+
+        // Domain boundary bypasses must NOT match
+        assert!(store.evaluate(&make_url_ctx("https://docs.rs.evil.com")).is_none());
+        assert!(store.evaluate(&make_url_ctx("https://docs.rs:8443/x")).is_none());
+        assert!(store.evaluate(&make_url_ctx("http://docs.rs")).is_none());
+
+        // Malformed web_fetch arg_prefix on disk fails closed
+        let dir = crate::TempTestDir::new("perm_bad_url_rule");
+        let path = dir.path().join("permissions.json");
+        std::fs::write(
+            &path,
+            r#"{"rules":[{"tool_name":"web_fetch","arg_prefix":"not-a-valid-url","action":"never_allow"}]}"#,
+        )
+        .unwrap();
+        assert!(PermissionStore::read_rules_from_file(&path).is_err());
     }
 }

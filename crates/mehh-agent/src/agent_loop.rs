@@ -73,10 +73,7 @@ impl AgentLoopConfig {
 fn resolve_tools(config: &AgentLoopConfig) -> Vec<Arc<dyn AgentTool>> {
     let mut tools = config.tools.clone();
     if let Some(ref dynamic_lock) = config.dynamic_tools {
-        let dyn_snapshot = dynamic_lock
-            .read()
-            .expect("dynamic_tools RwLock poisoned")
-            .clone();
+        let dyn_snapshot = mehh_ai::read_recover(dynamic_lock).clone();
         let mut names: HashSet<String> = tools.iter().map(|t| t.name().to_string()).collect();
         for tool in dyn_snapshot {
             if names.insert(tool.name().to_string()) {
@@ -88,7 +85,7 @@ fn resolve_tools(config: &AgentLoopConfig) -> Vec<Arc<dyn AgentTool>> {
 }
 
 fn drain_queue(queue: &Mutex<VecDeque<Message>>, mode: QueueMode) -> Vec<Message> {
-    let mut q = queue.lock().unwrap();
+    let mut q = mehh_ai::lock_recover(queue);
     match mode {
         QueueMode::All => q.drain(..).collect(),
         QueueMode::OneAtATime => q.pop_front().into_iter().collect(),
@@ -165,7 +162,7 @@ pub async fn run_agent_loop(
                 if let Some(ref hook) = config.prepare_next_turn {
                     if let Some(update) = hook(turn_ctx, config.cancel.clone()).await {
                         if let Some(ctx) = update.context {
-                            current_messages = ctx.messages;
+                            current_messages = Arc::unwrap_or_clone(ctx.messages);
                         }
                         if let Some(msgs) = update.messages {
                             for msg in msgs {
@@ -220,20 +217,25 @@ pub async fn run_agent_loop(
             let mut active_tools = resolve_tools(&config);
 
             if let Some(ref hook) = config.prepare_request {
+                let shared = Arc::new(std::mem::take(&mut current_messages));
                 let req_ctx = crate::types::PrepareRequestContext {
                     context: crate::types::AgentContext {
-                        messages: current_messages.clone(),
+                        messages: Arc::clone(&shared),
                         tools: Some(active_tools.clone()),
                     },
                     model: current_model.clone(),
                     thinking_level: current_thinking_level,
                 };
-                if let Some(update) = hook(req_ctx, config.cancel.clone()).await {
+                let update = hook(req_ctx, config.cancel.clone()).await;
+                if let Some(update) = update {
                     if let Some(ctx) = update.context {
-                        current_messages = ctx.messages;
+                        drop(shared);
+                        current_messages = Arc::unwrap_or_clone(ctx.messages);
                         if let Some(tools) = ctx.tools {
                             active_tools = tools;
                         }
+                    } else {
+                        current_messages = Arc::unwrap_or_clone(shared);
                     }
                     if let Some(m) = update.model {
                         current_model = m;
@@ -247,6 +249,8 @@ pub async fn run_agent_loop(
                     if let Some(tl) = update.thinking_level {
                         current_thinking_level = tl;
                     }
+                } else {
+                    current_messages = Arc::unwrap_or_clone(shared);
                 }
             }
 
@@ -274,7 +278,7 @@ pub async fn run_agent_loop(
                 if let Some(ref hook) = config.finish_turn {
                     let turn_ctx = crate::types::AgentTurnContext {
                         turn_index: turns_completed,
-                        messages: current_messages.clone(),
+                        messages: Arc::new(current_messages.clone()),
                         assistant_message: assistant_message.clone(),
                         tool_results: Vec::new(),
                     };
@@ -328,7 +332,7 @@ pub async fn run_agent_loop(
                         if let Some(ref hook) = config.finish_turn {
                             let turn_ctx = crate::types::AgentTurnContext {
                                 turn_index: turns_completed,
-                                messages: current_messages.clone(),
+                                messages: Arc::new(current_messages.clone()),
                                 assistant_message: error_msg.clone(),
                                 tool_results: tool_results.clone(),
                             };
@@ -364,11 +368,18 @@ pub async fn run_agent_loop(
                 }
             }
 
+            let shared_turn_messages =
+                if config.finish_turn.is_some() || config.prepare_next_turn.is_some() {
+                    Some(Arc::new(current_messages.clone()))
+                } else {
+                    None
+                };
+
             let mut finish_decision = None;
             if let Some(ref hook) = config.finish_turn {
                 let turn_ctx = crate::types::AgentTurnContext {
                     turn_index: turns_completed,
-                    messages: current_messages.clone(),
+                    messages: Arc::clone(shared_turn_messages.as_ref().expect("built above")),
                     assistant_message: assistant_message.clone(),
                     tool_results: tool_results.clone(),
                 };
@@ -399,7 +410,7 @@ pub async fn run_agent_loop(
             if config.prepare_next_turn.is_some() {
                 last_completed_turn = Some(crate::types::AgentTurnContext {
                     turn_index: turns_completed,
-                    messages: current_messages.clone(),
+                    messages: shared_turn_messages.expect("built above"),
                     assistant_message: assistant_message.clone(),
                     tool_results: tool_results.clone(),
                 });
@@ -715,7 +726,7 @@ async fn execute_single_tool(
     assistant_message: &AssistantMessage,
     tool_call: &ToolCall,
     tools: &[Arc<dyn AgentTool>],
-    current_messages: &[Message],
+    shared_messages: Option<&Arc<Vec<Message>>>,
     config: &AgentLoopConfig,
     on_event: &Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
 ) -> SingleToolOutcome {
@@ -731,7 +742,9 @@ async fn execute_single_tool(
 
     let agent_ctx = if config.before_tool_call.is_some() || config.after_tool_call.is_some() {
         Some(crate::types::AgentContext {
-            messages: current_messages.to_vec(),
+            messages: shared_messages
+                .map(Arc::clone)
+                .unwrap_or_else(|| Arc::new(Vec::new())),
             tools: Some(tools.to_vec()),
         })
     } else {
@@ -961,6 +974,8 @@ async fn execute_tool_calls_sequential(
 
     let mut outcomes = Vec::new();
     let mut messages = Vec::new();
+    let shared_messages = (config.before_tool_call.is_some() || config.after_tool_call.is_some())
+        .then(|| Arc::new(current_messages.to_vec()));
 
     for (idx, tc) in tool_calls.iter().enumerate() {
         if config.cancel.is_cancelled() {
@@ -979,7 +994,15 @@ async fn execute_tool_calls_sequential(
             args: tc.arguments.clone(),
         });
 
-        let outcome = execute_single_tool(assistant_message, tc, tools, current_messages, config, on_event).await;
+        let outcome = execute_single_tool(
+            assistant_message,
+            tc,
+            tools,
+            shared_messages.as_ref(),
+            config,
+            on_event,
+        )
+        .await;
 
         emit(AgentEvent::MessageStart {
             message: Message::ToolResult(outcome.tool_result_message.clone()),
@@ -988,14 +1011,20 @@ async fn execute_tool_calls_sequential(
             message: Message::ToolResult(outcome.tool_result_message.clone()),
         });
 
+        let should_terminate = outcome.terminate;
         messages.push(outcome.tool_result_message.clone());
         outcomes.push(outcome);
 
-        if config.cancel.is_cancelled() {
+        if should_terminate || config.cancel.is_cancelled() {
             if idx + 1 < tool_calls.len() {
+                let reason = if should_terminate {
+                    "Tool call skipped because a previous tool terminated the turn"
+                } else {
+                    "Tool call aborted because operation was cancelled"
+                };
                 let remaining = emit_synthetic_tool_errors(
                     &tool_calls[idx + 1..],
-                    |_| "Tool call aborted because operation was cancelled".to_string(),
+                    |_| reason.to_string(),
                     on_event,
                 );
                 messages.extend(remaining);
@@ -1004,7 +1033,7 @@ async fn execute_tool_calls_sequential(
         }
     }
 
-    let terminate = !outcomes.is_empty() && outcomes.iter().all(|o| o.terminate);
+    let terminate = outcomes.iter().any(|o| o.terminate);
     (messages, terminate)
 }
 
@@ -1030,9 +1059,18 @@ async fn execute_tool_calls_parallel(
         });
     }
 
-    let futures = tool_calls
-        .iter()
-        .map(|tc| execute_single_tool(assistant_message, tc, tools, current_messages, config, on_event));
+    let shared_messages = (config.before_tool_call.is_some() || config.after_tool_call.is_some())
+        .then(|| Arc::new(current_messages.to_vec()));
+    let futures = tool_calls.iter().map(|tc| {
+        execute_single_tool(
+            assistant_message,
+            tc,
+            tools,
+            shared_messages.as_ref(),
+            config,
+            on_event,
+        )
+    });
 
     let outcomes = futures::future::join_all(futures).await;
 
@@ -1047,7 +1085,7 @@ async fn execute_tool_calls_parallel(
         messages.push(outcome.tool_result_message.clone());
     }
 
-    let terminate = !outcomes.is_empty() && outcomes.iter().all(|o| o.terminate);
+    let terminate = outcomes.iter().any(|o| o.terminate);
     (messages, terminate)
 }
 
@@ -1476,7 +1514,7 @@ mod tests {
         config.before_tool_call = Some(Arc::new(move |ctx, _cancel| {
             let seen = context_seen_clone.clone();
             Box::pin(async move {
-                seen.lock().unwrap().extend(ctx.context.messages.clone());
+                seen.lock().unwrap().extend(ctx.context.messages.iter().cloned());
                 crate::types::BeforeToolCallResult::default()
             })
         }));
@@ -1931,7 +1969,7 @@ mod tests {
             &assistant,
             &tool_call,
             &config.tools,
-            &[],
+            None,
             &config,
             &None,
         )
@@ -1961,5 +1999,57 @@ mod tests {
             .options
             .reasoning
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn sequential_tool_terminate_stops_remaining_calls_and_parallel_uses_any() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let second_execs = Arc::new(AtomicUsize::new(0));
+        let second_execs_clone = second_execs.clone();
+
+        let mut config = AgentLoopConfig::new(faux_model(), Arc::new(FauxProvider::new()));
+        config.tools = vec![
+            Arc::new(DummyTool {
+                tool_name: "first".to_string(),
+                mode: ToolExecutionMode::Sequential,
+                on_exec: None,
+            }),
+            Arc::new(DummyTool {
+                tool_name: "second".to_string(),
+                mode: ToolExecutionMode::Sequential,
+                on_exec: Some(Arc::new(move || {
+                    second_execs_clone.fetch_add(1, Ordering::SeqCst);
+                })),
+            }),
+        ];
+        config.before_tool_call = Some(Arc::new(|ctx, _cancel| {
+            let terminate = ctx.tool_call.name == "first";
+            Box::pin(async move {
+                crate::types::BeforeToolCallResult {
+                    terminate,
+                    ..Default::default()
+                }
+            })
+        }));
+
+        let assistant = faux_assistant_message("tools");
+        let calls = vec![
+            faux_tool_call("c1", "first", serde_json::json!({})),
+            faux_tool_call("c2", "second", serde_json::json!({})),
+        ];
+
+        let (msgs, terminate) =
+            execute_tool_calls_sequential(&assistant, &calls, &config.tools, &[], &config, &None)
+                .await;
+        assert!(terminate);
+        assert_eq!(second_execs.load(Ordering::SeqCst), 0);
+        assert_eq!(msgs.len(), 2);
+        assert!(msgs[1].is_error);
+
+        let (_p_msgs, p_terminate) =
+            execute_tool_calls_parallel(&assistant, &calls, &config.tools, &[], &config, &None)
+                .await;
+        assert!(p_terminate, "parallel batch must terminate if any tool terminates");
     }
 }

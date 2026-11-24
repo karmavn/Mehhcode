@@ -108,118 +108,21 @@ pub fn validate_oauth_url(raw: &str) -> anyhow::Result<reqwest::Url> {
     }
 }
 
-/// DNS resolver that rejects private/local addresses at connection time.
-///
-/// Checking DNS before sending a request is vulnerable to rebinding: the
-/// second resolution performed by reqwest can return a different address.
-/// Resolving inside the connector makes validation and connection atomic.
-pub(crate) struct SafeDnsResolver;
-
-impl reqwest::dns::Resolve for SafeDnsResolver {
-    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
-        Box::pin(async move {
-            let host = name.as_str();
-            let clean = host
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .trim_end_matches('.');
-            let addresses: Vec<std::net::SocketAddr> = tokio::net::lookup_host((clean, 0))
-                .await
-                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?
-                .collect();
-            if addresses.is_empty() {
-                return Err("DNS resolution returned no addresses".into());
-            }
-            if !is_loopback_host(clean) {
-                for addr in &addresses {
-                    if is_private_or_local_ip(addr.ip()) {
-                        return Err(format!(
-                            "DNS rebinding blocked: '{host}' resolved to private/local IP {}",
-                            addr.ip()
-                        )
-                        .into());
-                    }
-                }
-            }
-            let addrs: reqwest::dns::Addrs = Box::new(addresses.into_iter());
-            Ok(addrs)
-        })
-    }
-}
+use mehh_ai::http_safety::{
+    build_safe_http_client, is_local_or_internal_hostname, is_loopback_host,
+    is_private_or_local_ip, DnsPolicy,
+};
 
 /// Builds an HTTP client for OAuth requests with timeouts, no redirects and SSRF-safe DNS.
 /// Fails closed if the client cannot be built instead of falling back to an
 /// insecure default client.
-pub fn oauth_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .timeout(OAUTH_HTTP_TIMEOUT)
-        .redirect(reqwest::redirect::Policy::none())
-        .dns_resolver(std::sync::Arc::new(SafeDnsResolver))
-        .build()
-        .expect("failed to build hardened OAuth HTTP client")
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let clean = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim_end_matches('.');
-    if clean.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    if let Ok(ip) = clean.parse::<std::net::IpAddr>() {
-        return ip.is_loopback();
-    }
-    false
-}
-
-fn is_local_or_internal_hostname(host: &str) -> bool {
-    let clean = host
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim_end_matches('.');
-    let lower = clean.to_ascii_lowercase();
-    lower == "localhost"
-        || lower.ends_with(".localhost")
-        || lower == "localhost.localdomain"
-        || lower.ends_with(".localhost.localdomain")
-}
-
-fn is_private_or_local_ip(ip: std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            let octets = v4.octets();
-            let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
-            let is_this_net = octets[0] == 0;
-            v4.is_loopback()
-                || v4.is_private()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_broadcast()
-                || v4.is_multicast()
-                || is_cgnat
-                || is_this_net
-        }
-        std::net::IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
-                return true;
-            }
-            let segs = v6.segments();
-            // ::ffff:0:0/96 (IPv4-mapped IPv6) or ::0.0.0.0/96 (IPv4-compatible IPv6)
-            if segs[0..5] == [0, 0, 0, 0, 0] && (segs[5] == 0xffff || segs[5] == 0) {
-                let v4 = std::net::Ipv4Addr::new(
-                    (segs[6] >> 8) as u8,
-                    segs[6] as u8,
-                    (segs[7] >> 8) as u8,
-                    segs[7] as u8,
-                );
-                return is_private_or_local_ip(std::net::IpAddr::V4(v4));
-            }
-            // fc00::/7 (ULA) or fe80::/10 (link-local)
-            (segs[0] & 0xfe00) == 0xfc00 || (segs[0] & 0xffc0) == 0xfe80
-        }
-    }
+pub fn oauth_http_client() -> anyhow::Result<reqwest::Client> {
+    build_safe_http_client(
+        DnsPolicy::PublicAndLoopback,
+        Duration::from_secs(15),
+        Some(OAUTH_HTTP_TIMEOUT),
+    )
+    .context("failed to build hardened OAuth HTTP client")
 }
 
 fn is_disallowed_discovery_redirect(parent_url: &reqwest::Url, target_url: &reqwest::Url) -> bool {
@@ -1162,16 +1065,16 @@ impl StoredMcpBearerProvider {
         server_name: impl Into<String>,
         server_url: impl Into<String>,
         token_endpoint: Option<String>,
-    ) -> Self {
-        let client = oauth_http_client();
-        Self {
+    ) -> anyhow::Result<Self> {
+        let client = oauth_http_client()?;
+        Ok(Self {
             auth_store,
             server_name: server_name.into(),
             server_url: server_url.into(),
             client,
             token_endpoint: Arc::new(RwLock::new(token_endpoint)),
             refresh_lock: Mutex::new(()),
-        }
+        })
     }
 
     /// Returns the refreshed access token when a refresh was performed.
@@ -1265,17 +1168,33 @@ impl McpBearerProvider for StoredMcpBearerProvider {
         if !fresh.tokens_expire_at.is_some_and(|exp| exp <= now + 30) {
             return Ok(fresh.tokens.map(|t| t.access_token));
         }
-        if let Ok(Some(refreshed)) = self.do_refresh(&fresh).await {
-            return Ok(Some(refreshed));
+        match self.do_refresh(&fresh).await {
+            Ok(Some(refreshed)) => Ok(Some(refreshed)),
+            Ok(None) => {
+                // No refresh_token/client_id available: only return if not expired.
+                if fresh.tokens_expire_at.is_some_and(|exp| exp <= now) {
+                    Ok(None)
+                } else {
+                    Ok(fresh.tokens.map(|t| t.access_token))
+                }
+            }
+            Err(refresh_err) => {
+                // Re-read once in case a peer rotated the token concurrently;
+                // never return an already-expired token.
+                let now_after = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
+                if let Some(latest) = self.auth_store.get(&self.server_name, &self.server_url).await {
+                    if !latest.tokens_expire_at.is_some_and(|exp| exp <= now_after) {
+                        if let Some(tok) = latest.tokens {
+                            return Ok(Some(tok.access_token));
+                        }
+                    }
+                }
+                Err(refresh_err)
+            }
         }
-        // Refresh failed (e.g. another caller rotated the refresh token).
-        // Re-read once more so a concurrent refresh becomes visible rather
-        // than returning the expired access token from `fresh`.
-        Ok(self
-            .auth_store
-            .get(&self.server_name, &self.server_url)
-            .await
-            .and_then(|e| e.tokens.map(|t| t.access_token)))
     }
 
     async fn on_unauthorized(
@@ -1413,7 +1332,7 @@ mod tests {
         assert!(is_disallowed_discovery_redirect(&pub_parent, &sub_localhost));
         assert!(is_disallowed_discovery_redirect(&pub_parent, &dot_localhost));
         assert!(!is_disallowed_discovery_redirect(&pub_parent, &pub_target));
-        let _no_redirect_client = oauth_http_client();
+        let _no_redirect_client = oauth_http_client().unwrap();
     }
 
     #[tokio::test]
@@ -1634,7 +1553,8 @@ mod tests {
             "srv",
             "https://example.test/mcp",
             Some(format!("http://127.0.0.1:{port}/token")),
-        );
+        )
+        .unwrap();
         let token = provider.bearer_token().await.unwrap();
         server.abort();
 
@@ -1678,7 +1598,8 @@ mod tests {
             "srv",
             "https://example.com/mcp",
             None,
-        );
+        )
+        .unwrap();
         let token = provider.bearer_token().await.unwrap();
         assert_eq!(token.as_deref(), Some("valid-token"));
         assert_eq!(
@@ -1719,14 +1640,17 @@ mod tests {
             .unwrap();
         let loads_after_setup = store.load_count.load(Ordering::SeqCst);
 
-        let provider = Arc::new(StoredMcpBearerProvider::new(
-            store.clone(),
-            "srv",
-            "https://example.com/mcp",
-            // Loopback port with no listener: if the stale entry is refreshed
-            // the request fails fast, which is exactly the rotating-token case.
-            Some("http://127.0.0.1:1/token".to_string()),
-        ));
+        let provider = Arc::new(
+            StoredMcpBearerProvider::new(
+                store.clone(),
+                "srv",
+                "https://example.com/mcp",
+                // Loopback port with no listener: if the stale entry is refreshed
+                // the request fails fast, which is exactly the rotating-token case.
+                Some("http://127.0.0.1:1/token".to_string()),
+            )
+            .unwrap(),
+        );
 
         // Hold the refresh lock so bearer_token() loads the stale entry, then
         // blocks before deciding how to refresh it.
@@ -1955,7 +1879,8 @@ mod tests {
             "srv",
             "https://example.test/mcp",
             Some(format!("http://127.0.0.1:{port}/token")),
-        );
+        )
+        .unwrap();
         let first = provider.bearer_token().await.unwrap();
         let second = provider.bearer_token().await.unwrap();
         server.abort();
@@ -1972,6 +1897,62 @@ mod tests {
             stored.tokens_expire_at,
             Some(i64::MAX),
             "extreme expires_in must be stored as a saturated future expiry"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_validate_oauth_request_url_blocks_nat64_6to4_teredo_and_reserved() {
+        for url in [
+            "https://[64:ff9b::169.254.169.254]/token",
+            "https://[64:ff9b:1::10.0.0.1]/token",
+            "https://[2002::1]/token",
+            "https://[2001::1]/token",
+            "https://198.18.0.1/token",
+            "https://240.0.0.1/token",
+        ] {
+            assert!(
+                validate_oauth_request_url(url).await.is_err(),
+                "must reject internal/tunnel/reserved IP: {url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_bearer_token_fails_closed_when_refresh_errors_on_expired_token() {
+        let dir = crate::TempTestDir::new("oauth_bearer_expired_err");
+        let store = Arc::new(
+            McpAuthStore::try_with_path(dir.path().join("mcp-auth.json")).unwrap(),
+        );
+        let entry = McpAuthEntry {
+            server_url: "https://example.com/mcp".to_string(),
+            client_id: Some("client-id".to_string()),
+            client_secret: None,
+            tokens: Some(OAuthTokens {
+                access_token: "expired-access-token".to_string(),
+                refresh_token: Some("bad-refresh-token".to_string()),
+                expires_in: Some(60),
+                token_type: None,
+                scope: None,
+            }),
+            tokens_expire_at: Some(1), // expired
+        };
+        store
+            .set("srv", "https://example.com/mcp", entry)
+            .await
+            .unwrap();
+
+        let provider = StoredMcpBearerProvider::new(
+            store,
+            "srv",
+            "https://example.com/mcp",
+            Some("http://127.0.0.1:1/token".to_string()),
+        )
+        .unwrap();
+        let res = provider.bearer_token().await;
+        assert!(
+            res.is_err(),
+            "failed refresh must propagate error instead of returning expired token, got: {:?}",
+            res
         );
     }
 }

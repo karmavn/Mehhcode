@@ -402,7 +402,11 @@ impl StreamableHttpTransport {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(15))
             .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(std::sync::Arc::new(crate::oauth::SafeDnsResolver))
+            .dns_resolver(std::sync::Arc::new(
+                mehh_ai::http_safety::SafeDnsResolver::new(
+                    mehh_ai::http_safety::DnsPolicy::PublicAndLoopback,
+                ),
+            ))
             .build()
             .expect("failed to build hardened MCP HTTP transport client");
         Self {

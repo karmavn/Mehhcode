@@ -217,6 +217,14 @@ pub fn resolve_cli_tools(
     args: &CliArgs,
     cwd: PathBuf,
 ) -> anyhow::Result<Vec<Arc<dyn mehh_agent::AgentTool>>> {
+    resolve_cli_tools_with_web(args, cwd, mehh_tools::WebConfig::default())
+}
+
+pub fn resolve_cli_tools_with_web(
+    args: &CliArgs,
+    cwd: PathBuf,
+    web: mehh_tools::WebConfig,
+) -> anyhow::Result<Vec<Arc<dyn mehh_agent::AgentTool>>> {
     if args.no_tools || args.no_builtin_tools {
         return Ok(Vec::new());
     }
@@ -226,7 +234,51 @@ pub fn resolve_cli_tools(
         .as_deref()
         .map(parse_tool_list)
         .unwrap_or_default();
-    mehh_tools::select_coding_tools(cwd, include.as_deref(), &exclude)
+    mehh_tools::select_coding_tools_with_web(cwd, include.as_deref(), &exclude, web)
+}
+
+/// Attaches `subagent` without widening the parent session's `--tools` or `--exclude-tools` filter.
+pub fn configure_cli_subagent(
+    args: &CliArgs,
+    cwd: &Path,
+    agent_session: &mut AgentSession,
+) -> anyhow::Result<()> {
+    let exclude = args
+        .exclude_tools
+        .as_deref()
+        .map(parse_tool_list)
+        .unwrap_or_default();
+    let parsed_include = args.tools.as_deref().map(parse_tool_list);
+    // With `--tools subagent`, `parsed_include` is `Some([])`; fall back to
+    // non-excluded built-in tools for child subagents while keeping parent empty.
+    let child_include = parsed_include.as_deref().filter(|v| !v.is_empty());
+
+    let mut child_tools: Vec<Arc<dyn mehh_agent::AgentTool>> = Vec::new();
+    if !args.no_tools && !args.no_builtin_tools {
+        let web_cfg = agent_session
+            .settings
+            .to_web_config()
+            .with_url_policy_checker(agent_session.inspection_manager.clone());
+        child_tools.extend(mehh_tools::select_coding_tools_with_web(
+            cwd.to_path_buf(),
+            child_include,
+            &exclude,
+            web_cfg,
+        )?);
+    }
+    let mut seen: std::collections::HashSet<String> =
+        child_tools.iter().map(|t| t.name().to_string()).collect();
+    for tool in agent_session
+        .tools()
+        .iter()
+        .filter(|t| t.name() != "subagent" && t.name() != "codemode")
+    {
+        if seen.insert(tool.name().to_string()) {
+            child_tools.push(tool.clone());
+        }
+    }
+    agent_session.set_subagent_with_child_tools(child_tools);
+    Ok(())
 }
 
 
@@ -338,8 +390,46 @@ pub fn apply_cli_thinking_override(
     cli_thinking: Option<ThinkingLevel>,
 ) {
     if let Some(level) = cli_thinking {
-        session.set_thinking_level(Some(level));
+        session.set_thinking_level_explicit(level);
     }
+}
+
+/// Resolves the initial startup model cleanly, preferring connected providers on zero-config launch.
+pub fn select_startup_model(
+    registry: &ModelRegistry,
+    args: &CliArgs,
+    settings: &Settings,
+    connected: &[mehh_coding_agent::ConnectedProvider],
+) -> Option<Model> {
+    if args.model.is_some()
+        || args.provider.is_some()
+        || settings.default_model.is_some()
+        || settings.default_provider.is_some()
+    {
+        let (model_arg, provider_arg) = select_cli_model_and_provider(
+            args.model.as_deref(),
+            args.provider.as_deref(),
+            settings,
+        );
+        return resolve_or_custom_model_with_registry(
+            registry,
+            model_arg,
+            provider_arg,
+            settings.default_provider.as_deref(),
+        );
+    }
+
+    if let Some(first_connected) = registry
+        .models_for_connected_providers(connected)
+        .into_iter()
+        .next()
+    {
+        return Some(first_connected);
+    }
+
+    registry
+        .resolve("claude-sonnet-4-5", None)
+        .or_else(|| registry.models().first().cloned())
 }
 
 /// Resolves a model from the built-in catalog or constructs a fallback custom `Model`.
@@ -681,7 +771,14 @@ async fn main() -> anyhow::Result<()> {
         return handle_export(export_input, export_output, &cwd);
     }
 
-    let model_registry = ModelRegistry::load_default()?;
+    let model_registry = match ModelRegistry::load_with_discovered(None, None) {
+        Ok(reg) => reg,
+        Err(disc_err) => {
+            let base = ModelRegistry::load_default()?;
+            eprintln!("Warning: could not load discovered models cache: {disc_err}");
+            base
+        }
+    };
     if args.list_models {
         for m in model_registry.models() {
             println!(
@@ -738,25 +835,22 @@ async fn main() -> anyhow::Result<()> {
             ));
             (model, Arc::new(faux_prov))
         } else {
-            let (model_arg, provider_arg) = select_cli_model_and_provider(
-                args.model.as_deref(),
-                args.provider.as_deref(),
-                &settings,
-            );
-
-            let model = resolve_or_custom_model_with_registry(
-                &model_registry,
-                model_arg,
-                provider_arg,
-                settings.default_provider.as_deref(),
-            )
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Failed to resolve model (model: {:?}, provider: {:?})",
-                    args.model,
-                    args.provider
-                )
-            })?;
+            let connected = match mehh_coding_agent::list_connected_providers(None, &model_registry)
+            {
+                Ok(list) => list,
+                Err(e) => {
+                    eprintln!("Warning: could not inspect auth credentials: {e}");
+                    Vec::new()
+                }
+            };
+            let model = select_startup_model(&model_registry, &args, &settings, &connected)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Failed to resolve model (model: {:?}, provider: {:?})",
+                        args.model,
+                        args.provider
+                    )
+                })?;
 
             let provider = AgentSession::default_provider_for_model(&model);
             (model, provider)
@@ -791,41 +885,33 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Subagent tools are built after MCP connection so child agents see MCP tools.
-    let subagent_models = if args.no_tools || args.no_builtin_tools {
-        None
+    let exclude_contains = |name: &str| {
+        args.exclude_tools
+            .as_deref()
+            .unwrap_or("")
+            .split(',')
+            .any(|s| s.trim() == name)
+    };
+    let include_subagent = if args.no_tools || args.no_builtin_tools || exclude_contains("subagent") {
+        false
     } else {
-        let enabled = match args.tools.as_deref() {
+        match args.tools.as_deref() {
             Some(inc) => inc.split(',').any(|s| s.trim() == "subagent"),
-            None => !args
-                .exclude_tools
-                .as_deref()
-                .unwrap_or("")
-                .split(',')
-                .any(|s| s.trim() == "subagent"),
-        };
-        if enabled {
-            let lw = agent_session.lead_worker.lock().unwrap();
-            Some((
-                lw.worker_model().cloned().unwrap_or_else(|| model.clone()),
-                lw.worker_provider().cloned().unwrap_or_else(|| provider.clone()),
-            ))
-        } else {
-            None
+            None => true,
         }
     };
     if args.no_tools || args.no_builtin_tools || args.tools.is_some() || args.exclude_tools.is_some() {
-        let mut cli_tools = resolve_cli_tools(&args, cwd.clone())?;
-        let should_include_todo = if args.no_tools || args.no_builtin_tools {
+        let web_cfg = agent_session
+            .settings
+            .to_web_config()
+            .with_url_policy_checker(agent_session.inspection_manager.clone());
+        let mut cli_tools = resolve_cli_tools_with_web(&args, cwd.clone(), web_cfg)?;
+        let should_include_todo = if args.no_tools || args.no_builtin_tools || exclude_contains("todo") {
             false
         } else if let Some(ref inc) = args.tools {
             inc.split(',').any(|s| s.trim() == "todo")
         } else {
-            !args
-                .exclude_tools
-                .as_deref()
-                .unwrap_or("")
-                .split(',')
-                .any(|s| s.trim() == "todo")
+            true
         };
         if should_include_todo {
             cli_tools.push(Arc::new(mehh_coding_agent::todo::TodoTool::new(agent_session.todo_state.clone())));
@@ -910,6 +996,7 @@ async fn main() -> anyhow::Result<()> {
         agent_session.set_api_key(api_key);
     }
     apply_cli_thinking_override(&mut agent_session, cli_thinking);
+    agent_session.sync_thinking_for_model(true);
 
     let mut mcp_manager = mcp_manager;
     let mcp_tools = if let Some(ref mgr) = mcp_manager {
@@ -932,35 +1019,8 @@ async fn main() -> anyhow::Result<()> {
         agent_session.enable_mcp_and_codemode(mcp_tools, args.codemode);
     }
 
-    if let Some((sub_model, sub_provider)) = subagent_models {
-        // Rebuild the subagent tool with a usable tool set. The --tools include
-        // list filters out "subagent" itself, so with `--tools subagent` the
-        // parent has no builtin tools at all; children must not inherit that.
-        let mut tools: Vec<Arc<dyn mehh_agent::AgentTool>> = Vec::new();
-        if !args.no_tools && !args.no_builtin_tools {
-            tools.extend(mehh_tools::select_coding_tools(cwd.clone(), None, &[]));
-        }
-        let mut seen: std::collections::HashSet<String> =
-            tools.iter().map(|t| t.name().to_string()).collect();
-        for tool in agent_session.tools.iter().filter(|t| t.name() != "subagent") {
-            if seen.insert(tool.name().to_string()) {
-                tools.push(tool.clone());
-            }
-        }
-        let subagent = Arc::new(
-            mehh_coding_agent::subagent::SubagentTool::new(
-                cwd.clone(),
-                sub_model,
-                sub_provider,
-                None,
-                tools.clone(),
-                0,
-            )
-            .with_inspection_manager(agent_session.inspection_manager.clone())
-            .with_approval_handler(agent_session.approval_handler.clone()),
-        );
-        tools.push(subagent);
-        agent_session.set_tools(tools);
+    if include_subagent {
+        configure_cli_subagent(&args, &cwd, &mut agent_session)?;
     }
 
     agent_session.set_custom_system_prompt(
@@ -1761,6 +1821,55 @@ mod tests {
     }
 
     #[test]
+    fn test_select_startup_model_prefers_connected_provider_over_hardcoded_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "mehh_cli_startup_model_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let disc_path = dir.join("discovered-models.json");
+        let models_path = dir.join("models.json");
+        mehh_coding_agent::models_config::save_discovered_provider_models(
+            "google",
+            &[Model {
+                id: "gemini-2.5-pro".to_string(),
+                name: "Gemini 2.5 Pro".to_string(),
+                api: "google-generative-ai".to_string(),
+                provider: "google".to_string(),
+                base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
+                reasoning: true,
+                ..Default::default()
+            }],
+            Some(&disc_path),
+        )
+        .unwrap();
+        let registry =
+            ModelRegistry::load_with_discovered(Some(&models_path), Some(&disc_path)).unwrap();
+        let args = CliArgs::parse_from(["mehh"]);
+        let settings = Settings::default();
+        let connected = vec![mehh_coding_agent::ConnectedProvider {
+            provider_id: "google".to_string(),
+            source: mehh_coding_agent::CredentialSource::AuthFile,
+            has_oauth: false,
+        }];
+
+        let chosen = select_startup_model(&registry, &args, &settings, &connected).unwrap();
+        assert_eq!(chosen.provider, "google");
+        assert_eq!(chosen.id, "gemini-2.5-pro");
+
+        let explicit_args = CliArgs::parse_from(["mehh", "--model", "gpt-4o"]);
+        let explicit =
+            select_startup_model(&registry, &explicit_args, &settings, &connected).unwrap();
+        assert_eq!(explicit.provider, "openai");
+        assert_eq!(explicit.id, "gpt-4o");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn cli_rejects_conflicting_approve_and_no_approve() {
         let args1 = CliArgs::try_parse_from(["mehh", "--approve", "--no-approve"]).unwrap();
         assert!(args1.validate().is_err());
@@ -1793,10 +1902,10 @@ mod tests {
     fn tool_selection_flags_respect_tools_exclude_tools_and_no_builtin_tools() {
         let temp_dir = make_temp_dir("mehh_tools_test");
 
-        // 1. Default tools (9 tools with analyze and undo_edit, powershell is opt-in)
+        // 1. Default tools (11 tools including web_search and web_fetch; powershell is opt-in)
         let args_def = CliArgs::try_parse_from(["mehh"]).unwrap();
         let tools_def = resolve_cli_tools(&args_def, temp_dir.clone()).unwrap();
-        assert_eq!(tools_def.len(), 9);
+        assert_eq!(tools_def.len(), 11);
         assert!(!tools_def.iter().any(|t| t.name() == "powershell"));
 
         // 2. Opt-in powershell via --tools
@@ -1808,7 +1917,7 @@ mod tests {
         // 3. Exclude tools
         let args_ex = CliArgs::try_parse_from(["mehh", "--exclude-tools", "bash,edit"]).unwrap();
         let tools_ex = resolve_cli_tools(&args_ex, temp_dir.clone()).unwrap();
-        assert_eq!(tools_ex.len(), 7);
+        assert_eq!(tools_ex.len(), 9);
         assert!(!tools_ex.iter().any(|t| t.name() == "bash" || t.name() == "edit"));
 
         // 4. --no-builtin-tools
@@ -1835,11 +1944,38 @@ mod tests {
         assert!(!tools
             .iter()
             .any(|t| t.name() == "subagent" || t.name() == "todo"));
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
 
         // Unknown names must still be rejected.
         let bogus = CliArgs::try_parse_from(["mehh", "--tools", "bogus"]).unwrap();
         assert!(resolve_cli_tools(&bogus, temp_dir.clone()).is_err());
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_resolve_cli_tools_with_web_respects_disabled_settings() {
+        let temp_dir = make_temp_dir("mehh_web_cli_cfg");
+        let args = CliArgs::try_parse_from(["mehh"]).unwrap();
+
+        let web_disabled = mehh_tools::WebConfig {
+            enabled: false,
+            ..Default::default()
+        };
+        let tools = resolve_cli_tools_with_web(&args, temp_dir.clone(), web_disabled).unwrap();
+        assert_eq!(tools.len(), 9);
+        assert!(!tools
+            .iter()
+            .any(|t| t.name() == "web_search" || t.name() == "web_fetch"));
+
+        let args_ex = CliArgs::try_parse_from(["mehh", "--exclude-tools", "web_search,web_fetch"]).unwrap();
+        let tools_ex =
+            resolve_cli_tools_with_web(&args_ex, temp_dir.clone(), mehh_tools::WebConfig::default())
+                .unwrap();
+        assert_eq!(tools_ex.len(), 9);
+        assert!(!tools_ex
+            .iter()
+            .any(|t| t.name() == "web_search" || t.name() == "web_fetch"));
 
         let _ = std::fs::remove_dir_all(temp_dir);
     }
@@ -1925,6 +2061,36 @@ mod tests {
 
         let m_claude = resolve_or_custom_model(Some("Claude-3-7-sonnet"), Some("anthropic"), None).unwrap();
         assert!(m_claude.reasoning, "Claude-3-7-sonnet must have reasoning: true regardless of casing");
+    }
+
+    #[test]
+    fn configure_cli_subagent_preserves_parent_exclude_tools() {
+        let temp_dir = make_temp_dir("mehh_subagent_exclude");
+        let args = CliArgs::try_parse_from(["mehh", "--exclude-tools", "bash,write"]).unwrap();
+        let cli_tools = resolve_cli_tools(&args, temp_dir.clone()).unwrap();
+        let model = faux::faux_model();
+        let provider = Arc::new(faux::FauxProvider::new());
+        let session_mgr = SessionManager::in_memory(&temp_dir);
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            model,
+            provider,
+            session_mgr,
+            Settings::default(),
+        );
+        session.set_tools(cli_tools);
+
+        configure_cli_subagent(&args, &temp_dir, &mut session).unwrap();
+
+        assert!(
+            !session.tools().iter().any(|t| t.name() == "bash" || t.name() == "write"),
+            "parent tools must not regain excluded tools when subagent is configured"
+        );
+        assert!(
+            session.tools().iter().any(|t| t.name() == "subagent"),
+            "subagent tool must be attached"
+        );
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }
 

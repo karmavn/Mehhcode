@@ -442,9 +442,7 @@ impl SubagentTool {
             .ok()
             .flatten();
         if key.is_some() {
-            self.api_key_cache
-                .lock()
-                .unwrap()
+            mehh_ai::lock_recover(&self.api_key_cache)
                 .insert(provider.to_string(), key.clone());
         }
         key
@@ -467,7 +465,8 @@ impl SubagentTool {
                 "tasks": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional list of independent tasks to execute concurrently (up to 4 in parallel; coding tasks run sequentially on the shared working tree). Batch tasks share a scratchpad via note_write/note_read."
+                    "maxItems": MAX_BATCH_TASKS,
+                    "description": "Optional list of independent tasks to execute concurrently (up to 16 tasks, 4 in parallel; coding tasks run sequentially on the shared working tree). Batch tasks share a scratchpad via note_write/note_read."
                 },
                 "system_prompt": {
                     "type": "string",
@@ -2024,7 +2023,10 @@ mod tests {
         assert!(sub
             .filter_tools_for_mode("research")
             .iter()
-            .all(|t| matches!(t.name(), "read" | "grep" | "find" | "ls" | "analyze")));
+            .all(|t| matches!(
+                t.name(),
+                "read" | "grep" | "find" | "ls" | "analyze" | "web_search" | "web_fetch"
+            )));
 
         let mut params = Map::new();
         params.insert(

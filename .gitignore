@@ -51,3 +51,9 @@ packages/agent/docs/extensions/mehh-server-artifact/index.md
 /target
 Cargo.lock
 
+# Local agent & audit artifacts
+.bug-hunter/
+.mehh-agents/
+.superpowers/
+measurements/
+

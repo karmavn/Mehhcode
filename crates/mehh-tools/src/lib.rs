@@ -9,6 +9,7 @@ pub mod ls;
 pub mod powershell;
 pub mod read;
 pub mod undo_edit;
+pub mod web;
 pub mod write;
 
 pub use analyze::AnalyzeTool;
@@ -21,6 +22,10 @@ pub use ls::LsTool;
 pub use powershell::PowerShellTool;
 pub use read::ReadTool;
 pub use undo_edit::{EditUndoStore, FileSnapshot, UndoEditTool};
+pub use web::{
+    ProviderId, UrlPolicyChecker, WebConfig, WebFetchTool, WebProviderChoice, WebRuntime,
+    WebSearchTool,
+};
 pub use write::WriteTool;
 
 use std::path::PathBuf;
@@ -28,38 +33,32 @@ use std::sync::Arc;
 use mehh_agent::AgentTool;
 
 pub fn create_coding_tools(cwd: PathBuf) -> Vec<Arc<dyn AgentTool>> {
-    let undo_store = Arc::new(EditUndoStore::new());
-    vec![
-        Arc::new(ReadTool::new(cwd.clone())),
-        Arc::new(WriteTool::new(cwd.clone()).with_undo_store(undo_store.clone())),
-        Arc::new(EditTool::new(cwd.clone()).with_undo_store(undo_store.clone())),
-        Arc::new(UndoEditTool::new(cwd.clone(), undo_store)),
-        Arc::new(BashTool::new(cwd.clone())),
-        Arc::new(GrepTool::new(cwd.clone())),
-        Arc::new(FindTool::new(cwd.clone())),
-        Arc::new(LsTool::new(cwd.clone())),
-        Arc::new(AnalyzeTool::new(cwd)),
-    ]
+    create_coding_tools_with_web(cwd, WebConfig::default())
+}
+
+pub fn create_coding_tools_with_web(cwd: PathBuf, web: WebConfig) -> Vec<Arc<dyn AgentTool>> {
+    select_coding_tools_with_web(cwd, None, &[], web).expect("built-in tool list is valid")
 }
 
 pub fn create_all_tools(cwd: PathBuf) -> Vec<Arc<dyn AgentTool>> {
-    let undo_store = Arc::new(EditUndoStore::new());
-    vec![
-        Arc::new(ReadTool::new(cwd.clone())),
-        Arc::new(WriteTool::new(cwd.clone()).with_undo_store(undo_store.clone())),
-        Arc::new(EditTool::new(cwd.clone()).with_undo_store(undo_store.clone())),
-        Arc::new(UndoEditTool::new(cwd.clone(), undo_store)),
-        Arc::new(BashTool::new(cwd.clone())),
-        Arc::new(GrepTool::new(cwd.clone())),
-        Arc::new(FindTool::new(cwd.clone())),
-        Arc::new(LsTool::new(cwd.clone())),
-        Arc::new(PowerShellTool::new(cwd.clone())),
-        Arc::new(AnalyzeTool::new(cwd)),
-    ]
+    let all: Vec<String> = ALL_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect();
+    select_coding_tools_with_web(cwd, Some(&all), &[], WebConfig::default())
+        .expect("built-in tool list is valid")
 }
 
 const ALL_TOOL_NAMES: &[&str] = &[
-    "read", "write", "edit", "undo_edit", "bash", "grep", "find", "ls", "analyze", "powershell",
+    "read",
+    "write",
+    "edit",
+    "undo_edit",
+    "bash",
+    "grep",
+    "find",
+    "ls",
+    "analyze",
+    "powershell",
+    "web_search",
+    "web_fetch",
 ];
 
 /// Build only the requested tools and reject unknown names instead of silently
@@ -68,6 +67,16 @@ pub fn select_coding_tools(
     cwd: PathBuf,
     include: Option<&[String]>,
     exclude: &[String],
+) -> anyhow::Result<Vec<Arc<dyn AgentTool>>> {
+    select_coding_tools_with_web(cwd, include, exclude, WebConfig::default())
+}
+
+/// Variant of [`select_coding_tools`] parameterized with [`WebConfig`].
+pub fn select_coding_tools_with_web(
+    cwd: PathBuf,
+    include: Option<&[String]>,
+    exclude: &[String],
+    web: WebConfig,
 ) -> anyhow::Result<Vec<Arc<dyn AgentTool>>> {
     for name in include.into_iter().flatten().chain(exclude.iter()) {
         if !ALL_TOOL_NAMES.contains(&name.as_str()) {
@@ -83,7 +92,12 @@ pub fn select_coding_tools(
         Some(names) => names.iter().cloned().collect(),
         None => ALL_TOOL_NAMES
             .iter()
-            .filter(|name| **name != "powershell")
+            .filter(|name| match **name {
+                "powershell" => false,
+                "web_search" => web.enabled && web.provider != WebProviderChoice::Disabled,
+                "web_fetch" => web.enabled,
+                _ => true,
+            })
             .map(|name| (*name).to_string())
             .collect(),
     };
@@ -128,6 +142,18 @@ pub fn select_coding_tools(
     }
     if wants("analyze") {
         selected.push(Arc::new(AnalyzeTool::new(cwd)));
+    }
+
+    if wants("web_search") || wants("web_fetch") {
+        let runtime = WebRuntime::try_new(web)
+            .map(Arc::new)
+            .map_err(|e| e.to_string());
+        if wants("web_search") {
+            selected.push(Arc::new(WebSearchTool::new(runtime.clone())));
+        }
+        if wants("web_fetch") {
+            selected.push(Arc::new(WebFetchTool::new(runtime)));
+        }
     }
 
     // Keep a stable order regardless of include ordering.
@@ -540,12 +566,22 @@ mod tests {
     #[test]
     fn test_create_coding_tools() {
         let tools = create_coding_tools(PathBuf::from("."));
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 11);
         let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
         assert_eq!(
             names,
             vec![
-                "read", "write", "edit", "undo_edit", "bash", "grep", "find", "ls", "analyze"
+                "read",
+                "write",
+                "edit",
+                "undo_edit",
+                "bash",
+                "grep",
+                "find",
+                "ls",
+                "analyze",
+                "web_search",
+                "web_fetch",
             ]
         );
     }
@@ -553,11 +589,11 @@ mod tests {
     #[test]
     fn create_coding_tools_excludes_powershell_while_create_all_tools_includes_it() {
         let default_tools = create_coding_tools(PathBuf::from("."));
-        assert_eq!(default_tools.len(), 9);
+        assert_eq!(default_tools.len(), 11);
         assert!(!default_tools.iter().any(|t| t.name() == "powershell"));
 
         let all_tools = create_all_tools(PathBuf::from("."));
-        assert_eq!(all_tools.len(), 10);
+        assert_eq!(all_tools.len(), 12);
         assert!(all_tools.iter().any(|t| t.name() == "powershell"));
 
         // select_coding_tools with include
@@ -576,8 +612,32 @@ mod tests {
             &["bash".to_string()],
         )
         .unwrap();
-        assert_eq!(without_bash.len(), 8);
+        assert_eq!(without_bash.len(), 10);
         assert!(!without_bash.iter().any(|t| t.name() == "bash"));
+    }
+
+    #[test]
+    fn test_web_config_omits_disabled_tools() {
+        let disabled_all = create_coding_tools_with_web(
+            PathBuf::from("."),
+            WebConfig {
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        assert_eq!(disabled_all.len(), 9);
+        assert!(!disabled_all.iter().any(|t| t.name() == "web_search" || t.name() == "web_fetch"));
+
+        let disabled_provider = create_coding_tools_with_web(
+            PathBuf::from("."),
+            WebConfig {
+                provider: WebProviderChoice::Disabled,
+                ..Default::default()
+            },
+        );
+        assert_eq!(disabled_provider.len(), 10);
+        assert!(!disabled_provider.iter().any(|t| t.name() == "web_search"));
+        assert!(disabled_provider.iter().any(|t| t.name() == "web_fetch"));
     }
 
     #[tokio::test]

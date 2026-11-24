@@ -43,11 +43,13 @@
 - Prove new bugfix or feature tests fail (`RED`) before applying the fix, or verify that breaking the guard turns the test red.
 - Keep test logic flat and avoid tautological assertions: assert on observable state or output rather than trivial mocks, anchor regex patterns, and verify cut/slice bounds (`idx > -1`).
 - Aim edits at root causes. If 2 consecutive fix attempts fail, stop and report the roadblock instead of churning files.
-- Never report "verified" or "done" without running the relevant checks after the final edit and citing the exact command output.
+- Never report "verified" or "done" without running the relevant checks after the final edit and citing the exact command output. For Rust changes, verify locally with targeted tests (`cargo test -p <crate>`) or `cargo check -p <crate>`. Full release builds and release binary generation (`mehh.exe`) are delegated to GitHub Actions (`.github/workflows/ci.yml`).
 
 ## Commands
 
-- Rust workspace (`crates/*`, runnable directly): `cargo check`, `cargo clippy`, `cargo test -p <crate>`.
+- **Rust workspace (`crates/*`):**
+  - **Local testing & check:** Targeted commands only: `cargo check -p <crate>`, `cargo test -p <crate> <test_name>`.
+  - **Heavy builds & release:** Do NOT run full-workspace or release builds (`cargo build --release`) locally on low-resource machines. Windows release binary builds (`mehh.exe`) and full CI checks are handled by GitHub Actions (`.github/workflows/ci.yml`).
 - `packages/tui` (`node:test`, run from `packages/tui` for tests without unhydrated npm deps): `node --test test/specific.test.ts`.
 - TypeScript checks requiring hydrated `node_modules` (currently absent until workspace package naming/lockfile setup is finished):
   - Typecheck: `npx tsc --noEmit` (uses root `tsconfig.json`).

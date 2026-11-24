@@ -124,6 +124,13 @@ pub fn copy_to_clipboard(text: &str) -> Result<()> {
     Ok(())
 }
 
+/// Non-blocking async wrapper around [`copy_to_clipboard`] for Tokio callers.
+pub async fn copy_to_clipboard_async(text: String) -> Result<()> {
+    tokio::task::spawn_blocking(move || copy_to_clipboard(&text))
+        .await
+        .map_err(|e| anyhow::anyhow!("Clipboard task panicked: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

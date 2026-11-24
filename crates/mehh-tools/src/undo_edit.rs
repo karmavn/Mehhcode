@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use async_trait::async_trait;
@@ -46,7 +46,7 @@ struct SnapshotEntry {
 struct EditUndoStoreInner {
     snapshots: HashMap<String, Vec<SnapshotEntry>>,
     total_bytes: usize,
-    order: Vec<String>,
+    order: VecDeque<String>,
 }
 
 #[derive(Debug, Default)]
@@ -82,8 +82,10 @@ impl EditUndoStore {
         let key = get_mutation_queue_key(path);
         let mut inner = self.lock_inner();
 
-        while inner.total_bytes + size > MAX_TOTAL_UNDO_BYTES && !inner.order.is_empty() {
-            let oldest_key = inner.order.remove(0);
+        while inner.total_bytes + size > MAX_TOTAL_UNDO_BYTES {
+            let Some(oldest_key) = inner.order.pop_front() else {
+                break;
+            };
             if let Some(history) = inner.snapshots.get_mut(&oldest_key) {
                 if !history.is_empty() {
                     let evicted = history.remove(0);
@@ -103,9 +105,12 @@ impl EditUndoStore {
 
         if let Some(es) = evicted_size {
             inner.total_bytes = inner.total_bytes.saturating_sub(es);
+            if let Some(pos) = inner.order.iter().position(|k| k == &key) {
+                inner.order.remove(pos);
+            }
         }
         inner.total_bytes += size;
-        inner.order.push(key);
+        inner.order.push_back(key);
         true
     }
 
@@ -362,6 +367,25 @@ mod tests {
             !store.has_snapshot(path),
             "oversized snapshot must not be stored"
         );
+    }
+
+    #[test]
+    fn push_snapshot_keeps_order_bounded_when_evicting_per_file_cap() {
+        let store = EditUndoStore::new();
+        let path = Path::new("repeated.rs");
+        for i in 0..(MAX_SNAPSHOTS_PER_FILE + 10) {
+            assert!(store.push_snapshot(
+                path,
+                FileSnapshot::Existed {
+                    bytes: vec![i as u8; 100],
+                    timestamp_ms: i as i64,
+                    target: path.to_path_buf(),
+                },
+            ));
+        }
+        let inner = store.lock_inner();
+        assert_eq!(inner.order.len(), MAX_SNAPSHOTS_PER_FILE);
+        assert_eq!(inner.total_bytes, MAX_SNAPSHOTS_PER_FILE * 100);
     }
 
     #[tokio::test]

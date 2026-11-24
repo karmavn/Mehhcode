@@ -93,7 +93,7 @@ pub fn tool_to_definition(tool: &dyn AgentTool) -> ToolDefinition {
 
 #[derive(Clone)]
 pub struct AgentContext {
-    pub messages: Vec<Message>,
+    pub messages: Arc<Vec<Message>>,
     pub tools: Option<Vec<Arc<dyn AgentTool>>>,
 }
 
@@ -172,7 +172,7 @@ pub struct FinishTurnDecision {
 #[derive(Debug, Clone)]
 pub struct AgentTurnContext {
     pub turn_index: usize,
-    pub messages: Vec<Message>,
+    pub messages: Arc<Vec<Message>>,
     pub assistant_message: AssistantMessage,
     pub tool_results: Vec<ToolResultMessage>,
 }

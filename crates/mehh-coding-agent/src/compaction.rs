@@ -363,8 +363,9 @@ pub fn prepare_compaction(
                 ..
             } = &entries[pos].kind
             {
-                // Entries kept by the previous compaction are still live
-                // context; the next summary must cover them too.
+                // Entries kept by the previous compaction are still live context; the
+                // next summary must cover them too. Match `SessionManager::build_context_messages()`
+                // fallback to `0` when `first_kept_entry_id` cannot be found.
                 let prev_kept_pos = entries[..pos]
                     .iter()
                     .position(|e| e.id == *first_kept_entry_id)
@@ -540,16 +541,48 @@ pub async fn compact_with_provider(
 ) -> Result<String> {
     let mut serialized_conv = serialize_conversation(&prep.messages_to_summarize);
     // A reactive overflow compaction starts from a context that is already too
-    // large. Clamp the summarization payload so the summary request itself
-    // cannot overflow the same window.
-    let budget_chars = (model.context_window as usize)
+    // large. Clamp the summarization payload (including previous summary and
+    // custom instructions) so the summary request itself cannot overflow.
+    let total_budget_chars = (model.context_window as usize)
         .saturating_sub(8192)
         .saturating_mul(3)
         .max(4096);
-    if serialized_conv.chars().count() > budget_chars {
+
+    let prev_summary_capped: Option<String> = prep.previous_summary.as_ref().map(|prev| {
+        let max_prev_chars = total_budget_chars.saturating_mul(2) / 5;
+        if prev.chars().count() > max_prev_chars {
+            let mut clipped = prev
+                .char_indices()
+                .nth(max_prev_chars)
+                .map(|(idx, _)| prev[..idx].to_string())
+                .unwrap_or_else(|| prev.clone());
+            clipped.push_str("\n[... previous summary truncated]");
+            clipped
+        } else {
+            prev.clone()
+        }
+    });
+
+    let instructions_text = custom_instructions
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let prompt_template = if prev_summary_capped.is_some() {
+        UPDATE_SUMMARIZATION_PROMPT
+    } else {
+        SUMMARIZATION_PROMPT
+    };
+    let overhead_chars = SUMMARIZATION_SYSTEM_PROMPT.chars().count()
+        + prompt_template.chars().count()
+        + prev_summary_capped
+            .as_ref()
+            .map_or(0, |s| s.chars().count() + 48)
+        + instructions_text.map_or(0, |s| s.chars().count() + 32);
+    let conv_budget_chars = total_budget_chars.saturating_sub(overhead_chars).max(1024);
+
+    if serialized_conv.chars().count() > conv_budget_chars {
         // Keep the newest tail: a chronological transcript truncated at the head
         // would drop the most recent context while claiming to drop the oldest.
-        if let Some((byte_start, _)) = serialized_conv.char_indices().rev().nth(budget_chars - 1) {
+        if let Some((byte_start, _)) = serialized_conv.char_indices().rev().nth(conv_budget_chars - 1) {
             let newest = serialized_conv[byte_start..].to_string();
             serialized_conv =
                 format!("[... older history truncated for summarization]\n\n{newest}");
@@ -557,7 +590,7 @@ pub async fn compact_with_provider(
     }
 
     let mut user_prompt = String::new();
-    if let Some(prev) = &prep.previous_summary {
+    if let Some(prev) = &prev_summary_capped {
         user_prompt.push_str(&format!(
             "<previous-summary>\n{prev}\n</previous-summary>\n\n"
         ));
@@ -565,17 +598,10 @@ pub async fn compact_with_provider(
 
     user_prompt.push_str(&serialized_conv);
     user_prompt.push_str("\n\n");
+    user_prompt.push_str(prompt_template);
 
-    if prep.previous_summary.is_some() {
-        user_prompt.push_str(UPDATE_SUMMARIZATION_PROMPT);
-    } else {
-        user_prompt.push_str(SUMMARIZATION_PROMPT);
-    }
-
-    if let Some(ci) = custom_instructions {
-        if !ci.trim().is_empty() {
-            user_prompt.push_str(&format!("\n\nCustom Instructions:\n{}", ci.trim()));
-        }
+    if let Some(ci) = instructions_text {
+        user_prompt.push_str(&format!("\n\nCustom Instructions:\n{ci}"));
     }
 
     let context = Context {

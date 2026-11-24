@@ -71,6 +71,7 @@ pub struct AgentSession {
     pub api_key: Option<String>,
     has_explicit_api_key: bool,
     pub thinking_level: Option<ThinkingLevel>,
+    pub thinking_explicitly_off: bool,
     pub skills: Vec<Skill>,
     pub prompt_templates: Vec<PromptTemplate>,
     pub no_context_files: bool,
@@ -91,6 +92,20 @@ pub struct AgentSession {
     pub todo_state: Arc<tokio::sync::RwLock<crate::todo::TodoState>>,
     pub lead_worker: Arc<Mutex<crate::lead_worker::LeadWorkerManager>>,
     pub subagent_control: Arc<SubagentControl>,
+    /// Custom child toolset set by CLI (`--tools subagent`); preserved across
+    /// `refresh_subagent_tool` (e.g. `set_approval_handler`, `set_api_key`, `set_model`).
+    subagent_child_tools: Option<Vec<Arc<dyn AgentTool>>>,
+}
+
+fn strip_mcp_tools(tools: &mut Vec<Arc<dyn AgentTool>>) {
+    tools.retain(|t| {
+        !t.name().starts_with("mcp__")
+            && t.name() != "list_mcp_resources"
+            && t.name() != "list_mcp_resource_templates"
+            && t.name() != "read_mcp_resource"
+            && t.name() != "tool_search"
+            && t.name() != "codemode"
+    });
 }
 
 /// Resolves the credential that a cross-provider subagent worker must use.
@@ -134,8 +149,8 @@ impl AgentSession {
         let skills = crate::skills::load_skills_with_trust(&cwd, trusted);
         let prompt_templates =
             crate::prompt_templates::load_prompt_templates_with_trust(&cwd, trusted);
-        let mut tools = mehh_tools::create_coding_tools(cwd.clone());
 
+        let thinking_explicitly_off = settings.default_thinking_level == Some(ThinkingLevel::Off);
         let thinking_level = settings.default_thinking_level;
         let default_mode = if model.provider == "faux" || model.api == "faux" {
             crate::tool_inspection::PermissionMode::Auto
@@ -151,6 +166,10 @@ impl AgentSession {
                 perm_store,
             ),
         );
+        let web_config = settings
+            .to_web_config()
+            .with_url_policy_checker(inspection_manager.clone());
+        let mut tools = mehh_tools::create_coding_tools_with_web(cwd.clone(), web_config);
 
         let (worker_model, worker_provider) = if let Some(ref wm) = settings.worker_model {
             if let Ok(reg) = crate::models_config::ModelRegistry::load_default() {
@@ -187,18 +206,17 @@ impl AgentSession {
         lw_mgr.set_worker_api_key(worker_api_key.clone());
         let lead_worker = Arc::new(Mutex::new(lw_mgr));
 
-        let subagent_model = lead_worker
-            .lock()
-            .unwrap()
-            .worker_model()
-            .cloned()
-            .unwrap_or_else(|| model.clone());
-        let subagent_provider = lead_worker
-            .lock()
-            .unwrap()
-            .worker_provider()
-            .cloned()
-            .unwrap_or_else(|| provider.clone());
+        let (subagent_model, subagent_provider) = {
+            let lw = mehh_ai::lock_recover(&lead_worker);
+            (
+                lw.worker_model()
+                    .cloned()
+                    .unwrap_or_else(|| model.clone()),
+                lw.worker_provider()
+                    .cloned()
+                    .unwrap_or_else(|| provider.clone()),
+            )
+        };
         let subagent_key = if subagent_model.provider == model.provider {
             None
         } else {
@@ -241,6 +259,7 @@ impl AgentSession {
             api_key: None,
             has_explicit_api_key: false,
             thinking_level,
+            thinking_explicitly_off,
             skills,
             prompt_templates,
             no_context_files: false,
@@ -259,6 +278,7 @@ impl AgentSession {
             todo_state,
             lead_worker,
             subagent_control,
+            subagent_child_tools: None,
         }
     }
 
@@ -268,7 +288,7 @@ impl AgentSession {
             content: UserContent::Text(text.into()),
             timestamp: now_ms(),
         });
-        self.steering_queue.lock().unwrap().push_back(msg);
+        mehh_ai::lock_recover(&self.steering_queue).push_back(msg);
     }
 
     /// Queues a follow-up user message to be processed once the current turn completes.
@@ -277,23 +297,23 @@ impl AgentSession {
             content: UserContent::Text(text.into()),
             timestamp: now_ms(),
         });
-        self.follow_up_queue.lock().unwrap().push_back(msg);
+        mehh_ai::lock_recover(&self.follow_up_queue).push_back(msg);
     }
 
     /// Returns the number of pending steering messages.
     pub fn pending_steering_count(&self) -> usize {
-        self.steering_queue.lock().unwrap().len()
+        mehh_ai::lock_recover(&self.steering_queue).len()
     }
 
     /// Returns the number of pending follow-up messages.
     pub fn pending_follow_up_count(&self) -> usize {
-        self.follow_up_queue.lock().unwrap().len()
+        mehh_ai::lock_recover(&self.follow_up_queue).len()
     }
 
     /// Clears both steering and follow-up queues.
     pub fn clear_queues(&self) {
-        self.steering_queue.lock().unwrap().clear();
-        self.follow_up_queue.lock().unwrap().clear();
+        mehh_ai::lock_recover(&self.steering_queue).clear();
+        mehh_ai::lock_recover(&self.follow_up_queue).clear();
     }
 
     /// Aborts any currently active running prompt loop. Returns true if a cancel was triggered.
@@ -302,7 +322,7 @@ impl AgentSession {
     /// `prepare_prompt_content` inherit the cancellation when Ctrl+C lands in
     /// the handoff window after the UI already checked the preparation token.
     pub fn abort(&self) -> bool {
-        let guard = self.active_cancel.lock().unwrap();
+        let guard = mehh_ai::lock_recover(&self.active_cancel);
         match guard.as_ref() {
             Some(c) => {
                 let was_active = !c.is_cancelled();
@@ -315,9 +335,7 @@ impl AgentSession {
 
     /// Returns whether a prompt execution is currently in progress and not cancelled.
     pub fn is_active(&self) -> bool {
-        self.active_cancel
-            .lock()
-            .unwrap()
+        mehh_ai::lock_recover(&self.active_cancel)
             .as_ref()
             .map(|c| !c.is_cancelled())
             .unwrap_or(false)
@@ -363,7 +381,7 @@ impl AgentSession {
 
     /// Aborts any currently running bash tool command.
     pub fn abort_bash(&self) {
-        if let Some(tok) = self.active_bash_cancel.lock().unwrap().take() {
+        if let Some(tok) = mehh_ai::lock_recover(&self.active_bash_cancel).take() {
             tok.cancel();
         }
     }
@@ -394,13 +412,14 @@ impl AgentSession {
         handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
     ) {
         self.approval_handler = handler;
-        *self.approval_handler_slot.write().unwrap() = self.approval_handler.clone();
+        *mehh_ai::write_recover(&self.approval_handler_slot) = self.approval_handler.clone();
         self.refresh_subagent_tool();
     }
 
     /// Overrides active tools for the session.
     pub fn set_tools(&mut self, tools: Vec<Arc<dyn AgentTool>>) {
         self.tools = tools;
+        self.subagent_child_tools = None;
         self.refresh_subagent_tool();
         if let Some(ref codemode) = self.codemode_tool {
             codemode.replace_tools(self.tools.clone());
@@ -474,10 +493,16 @@ impl AgentSession {
                     eager.push(tool);
                 }
             }
+            if let Some(ref mut custom) = self.subagent_child_tools {
+                custom.extend(eager.iter().cloned());
+            }
             self.tools.extend(eager);
             self.enable_deferred_mcp_tools(deferred);
             self.refresh_subagent_tool();
         } else {
+            if let Some(ref mut custom) = self.subagent_child_tools {
+                custom.extend(mcp_tools.iter().cloned());
+            }
             self.tools.extend(mcp_tools);
             if enable_codemode {
                 let codemode_tool = self.create_codemode_tool(self.tools.clone());
@@ -552,14 +577,10 @@ impl AgentSession {
 
     /// Synchronizes updated MCP tools into the session, updating deferred catalog and codemode bindings in-place.
     pub fn sync_mcp_tools(&mut self, mcp_tools: Vec<Arc<dyn AgentTool>>, enable_codemode: bool) {
-        self.tools.retain(|t| {
-            !t.name().starts_with("mcp__")
-                && t.name() != "list_mcp_resources"
-                && t.name() != "list_mcp_resource_templates"
-                && t.name() != "read_mcp_resource"
-                && t.name() != "tool_search"
-                && t.name() != "codemode"
-        });
+        strip_mcp_tools(&mut self.tools);
+        if let Some(ref mut custom) = self.subagent_child_tools {
+            strip_mcp_tools(custom);
+        }
 
         let mcp_server_tool_count = mcp_tools
             .iter()
@@ -577,12 +598,18 @@ impl AgentSession {
                     eager.push(tool);
                 }
             }
+            if let Some(ref mut custom) = self.subagent_child_tools {
+                custom.extend(eager.iter().cloned());
+            }
             self.tools.extend(eager);
             self.enable_deferred_mcp_tools(deferred);
             self.refresh_subagent_tool();
         } else {
             if self.deferred_catalog.is_some() {
                 self.clear_deferred_mcp_tools();
+            }
+            if let Some(ref mut custom) = self.subagent_child_tools {
+                custom.extend(mcp_tools.iter().cloned());
             }
             self.tools.extend(mcp_tools);
             if enable_codemode {
@@ -614,9 +641,12 @@ impl AgentSession {
 
     /// Clears deferred `tool_search` tools prior to resynchronizing MCP tools.
     pub fn clear_deferred_mcp_tools(&mut self) {
-        self.dynamic_tools.write().unwrap().clear();
+        mehh_ai::write_recover(&self.dynamic_tools).clear();
         self.deferred_catalog = None;
         self.tools.retain(|t| t.name() != "tool_search");
+        if let Some(ref mut custom) = self.subagent_child_tools {
+            custom.retain(|t| t.name() != "tool_search");
+        }
     }
 
     /// Registers deferred tools behind `tool_search` and links them into `dynamic_tools`.
@@ -637,18 +667,23 @@ impl AgentSession {
             self.tools.retain(|t| t.name() != "tool_search");
             self.tools.push(Arc::new(ToolSearchTool::new(catalog)));
         }
+        if let (Some(ref mut custom), Some(tool_search)) = (
+            self.subagent_child_tools.as_mut(),
+            self.tools.iter().find(|t| t.name() == "tool_search"),
+        ) {
+            custom.retain(|t| t.name() != "tool_search");
+            custom.push(tool_search.clone());
+        }
         self.rebuild_system_prompt();
     }
 
-    fn refresh_subagent_tool(&mut self) {
-        let base_tools: Vec<Arc<dyn AgentTool>> = self
-            .tools
-            .iter()
+    fn build_subagent_tool(&self, child_tools: Vec<Arc<dyn AgentTool>>) -> Arc<dyn AgentTool> {
+        let filtered: Vec<Arc<dyn AgentTool>> = child_tools
+            .into_iter()
             .filter(|t| t.name() != "subagent" && t.name() != "codemode")
-            .cloned()
             .collect();
         let (subagent_model, subagent_provider, subagent_api_key) = {
-            let lw = self.lead_worker.lock().unwrap();
+            let lw = self.lead_worker.lock().unwrap_or_else(|e| e.into_inner());
             let wm = lw
                 .worker_model()
                 .cloned()
@@ -665,20 +700,44 @@ impl AgentSession {
             );
             (wm, wp, ak)
         };
-        let updated = Arc::new(
+        Arc::new(
             SubagentTool::new(
                 self.cwd.clone(),
                 subagent_model,
                 subagent_provider,
                 subagent_api_key,
-                base_tools,
+                filtered,
                 0,
             )
             .with_inspection_manager(self.inspection_manager.clone())
             .with_approval_handler(self.approval_handler.clone())
             .with_control(self.subagent_control.clone())
             .with_lead_worker(self.lead_worker.clone()),
-        );
+        )
+    }
+
+    /// Attaches or replaces the `subagent` tool on the parent session using an
+    /// explicit `child_tools` set, without altering the parent's other tools.
+    pub fn set_subagent_with_child_tools(&mut self, child_tools: Vec<Arc<dyn AgentTool>>) {
+        self.subagent_child_tools = Some(child_tools.clone());
+        let updated = self.build_subagent_tool(child_tools);
+        if let Some(slot) = self.tools.iter_mut().find(|t| t.name() == "subagent") {
+            *slot = updated;
+        } else {
+            self.tools.push(updated);
+        }
+        if let Some(ref codemode) = self.codemode_tool {
+            codemode.replace_tools(self.tools.clone());
+        }
+        self.rebuild_system_prompt();
+    }
+
+    fn refresh_subagent_tool(&mut self) {
+        let child_tools = self
+            .subagent_child_tools
+            .clone()
+            .unwrap_or_else(|| self.tools.clone());
+        let updated = self.build_subagent_tool(child_tools);
         if let Some(slot) = self.tools.iter_mut().find(|t| t.name() == "subagent") {
             *slot = updated;
         }
@@ -696,7 +755,7 @@ impl AgentSession {
     pub fn set_api_key(&mut self, api_key: Option<String>) {
         self.has_explicit_api_key = false;
         self.api_key = api_key.clone();
-        self.lead_worker.lock().unwrap().set_lead_api_key(api_key);
+        mehh_ai::lock_recover(&self.lead_worker).set_lead_api_key(api_key);
         self.refresh_subagent_tool();
     }
 
@@ -704,7 +763,7 @@ impl AgentSession {
     pub fn set_explicit_api_key(&mut self, api_key: Option<String>) {
         self.has_explicit_api_key = api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
         self.api_key = api_key.clone();
-        self.lead_worker.lock().unwrap().set_lead_api_key(api_key);
+        mehh_ai::lock_recover(&self.lead_worker).set_lead_api_key(api_key);
         self.refresh_subagent_tool();
     }
 
@@ -724,12 +783,12 @@ impl AgentSession {
         if !self.model.provider.eq_ignore_ascii_case(&model.provider) {
             self.api_key = None;
             self.has_explicit_api_key = false;
-            self.lead_worker.lock().unwrap().set_lead_api_key(None);
+            mehh_ai::lock_recover(&self.lead_worker).set_lead_api_key(None);
         }
         self.model = model;
         self.provider = provider;
         {
-            let mut mgr = self.lead_worker.lock().unwrap();
+            let mut mgr = mehh_ai::lock_recover(&self.lead_worker);
             mgr.lead_model = self.model.clone();
             mgr.lead_provider = self.provider.clone();
         }
@@ -754,6 +813,77 @@ impl AgentSession {
     /// Returns the active thinking/reasoning level.
     pub fn thinking_level(&self) -> Option<ThinkingLevel> {
         self.thinking_level
+    }
+
+    /// Sets the thinking level explicitly from user action, tracking explicit Off choices.
+    pub fn set_thinking_level_explicit(&mut self, level: ThinkingLevel) {
+        self.thinking_explicitly_off = level == ThinkingLevel::Off;
+        self.thinking_level = if level == ThinkingLevel::Off {
+            None
+        } else {
+            Some(level)
+        };
+    }
+
+    /// Synchronizes `thinking_level` with the active model's thinking capability profile.
+    pub fn sync_thinking_for_model(&mut self, preserve_existing: bool) {
+        let profile = mehh_ai::model_thinking_profile(&self.model);
+        if !profile.supported {
+            self.thinking_level = None;
+            return;
+        }
+
+        let apply_default = |this: &mut Self| {
+            this.thinking_level = if profile.default_level == ThinkingLevel::Off {
+                None
+            } else {
+                Some(profile.default_level)
+            };
+        };
+
+        if preserve_existing {
+            if let Some(cur) = self.thinking_level {
+                if cur != ThinkingLevel::Off {
+                    if self.model.provider.eq_ignore_ascii_case("faux")
+                        || profile.levels.contains(&cur)
+                    {
+                        return;
+                    }
+                    let mapped = match cur {
+                        ThinkingLevel::Max | ThinkingLevel::Xhigh => {
+                            if profile.levels.contains(&ThinkingLevel::High) {
+                                ThinkingLevel::High
+                            } else {
+                                profile.default_level
+                            }
+                        }
+                        ThinkingLevel::Minimal => {
+                            if profile.levels.contains(&ThinkingLevel::Low) {
+                                ThinkingLevel::Low
+                            } else {
+                                profile.default_level
+                            }
+                        }
+                        _ => profile.default_level,
+                    };
+                    self.thinking_level = if mapped == ThinkingLevel::Off {
+                        None
+                    } else {
+                        Some(mapped)
+                    };
+                    return;
+                }
+            }
+            if self.thinking_explicitly_off && profile.can_disable {
+                self.thinking_level = None;
+                return;
+            }
+            apply_default(self);
+        } else if self.thinking_level.is_none()
+            && !(self.thinking_explicitly_off && profile.can_disable)
+        {
+            apply_default(self);
+        }
     }
 
     /// Returns the slice of loaded skills.
@@ -813,7 +943,7 @@ impl AgentSession {
         content: UserContent,
     ) -> (Message, Vec<Message>, AgentLoopConfig) {
         // Routing decisions for the first turn must see a fresh prompt counter.
-        self.lead_worker.lock().unwrap().reset_for_new_prompt();
+        mehh_ai::lock_recover(&self.lead_worker).reset_for_new_prompt();
         let expanded_content = match content {
             UserContent::Text(text) => UserContent::Text(self.expand_input(&text)),
             UserContent::Blocks(blocks) => {
@@ -842,7 +972,7 @@ impl AgentSession {
 
         let cancel = CancellationToken::new();
         {
-            let mut slot = self.active_cancel.lock().unwrap();
+            let mut slot = mehh_ai::lock_recover(&self.active_cancel);
             // Idempotent handoff: a cancelled preparation token means Ctrl+C
             // fired before this loop token existed. Carry the cancellation
             // over instead of blindly replacing it and running the turn.
@@ -864,14 +994,33 @@ impl AgentSession {
         config.max_turns = Some(DEFAULT_MAX_AGENT_TURNS);
         config.stream_options.api_key = self.api_key.clone();
         {
-            let mgr = self.lead_worker.lock().unwrap();
+            let mgr = mehh_ai::lock_recover(&self.lead_worker);
             if mgr.should_use_worker() {
                 config.model = mgr.active_model();
                 config.provider = mgr.active_provider();
                 config.stream_options.api_key = mgr.worker_api_key.clone();
             }
         }
-        config.stream_options.reasoning = self.thinking_level;
+        config.stream_options.reasoning = if let Some(lvl) = self.thinking_level {
+            if lvl == ThinkingLevel::Off && !config.model.reasoning {
+                None
+            } else {
+                Some(lvl)
+            }
+        } else if config.model.reasoning {
+            if self.thinking_explicitly_off {
+                Some(ThinkingLevel::Off)
+            } else {
+                let profile = mehh_ai::model_thinking_profile(&config.model);
+                if profile.supported && profile.default_level != ThinkingLevel::Off {
+                    Some(profile.default_level)
+                } else {
+                    None
+                }
+            }
+        } else {
+            None
+        };
         if let Some(t) = self.settings.temperature {
             config.stream_options.temperature = Some(t);
         }
@@ -915,10 +1064,7 @@ impl AgentSession {
 
         let lead_worker_outcomes = self.lead_worker.clone();
         config.after_tool_call = Some(Arc::new(move |after_ctx, _cancel| {
-            lead_worker_outcomes
-                .lock()
-                .unwrap()
-                .record_tool_outcome(after_ctx.is_error);
+            mehh_ai::lock_recover(&lead_worker_outcomes).record_tool_outcome(after_ctx.is_error);
             Box::pin(async { mehh_agent::types::AfterToolCallResult::default() })
         }));
 
@@ -936,11 +1082,11 @@ impl AgentSession {
                     read.format_moim_block(&session_cwd, session_trusted)
                 };
 
-                let mut ctx = req_ctx.context.clone();
+                let mut ctx = req_ctx.context;
                 let mut changed = false;
                 if let Some(ref moim_block) = block_opt {
-                    if let Some(Message::User(ref mut u)) = ctx
-                        .messages
+                    let messages = Arc::make_mut(&mut ctx.messages);
+                    if let Some(Message::User(ref mut u)) = messages
                         .iter_mut()
                         .rev()
                         .find(|m| matches!(m, Message::User(_)))
@@ -973,7 +1119,7 @@ impl AgentSession {
                         }
                     } else {
                         // Fallback: If no User message exists in history, insert at the beginning.
-                        ctx.messages.insert(
+                        messages.insert(
                             0,
                             Message::User(UserMessage {
                                 content: UserContent::Text(moim_block.clone()),
@@ -983,22 +1129,41 @@ impl AgentSession {
                         changed = true;
                     }
                 } else {
-                    // Checklist cleared: remove the stale injected block as well.
-                    for msg in ctx.messages.iter_mut() {
-                        if let Message::User(u) = msg {
-                            match u.content {
-                                UserContent::Text(ref mut t) => {
-                                    changed |= strip_moim_text(t);
-                                }
-                                UserContent::Blocks(ref mut blocks) => {
-                                    let before = blocks.len();
-                                    blocks.retain(|b| match b {
-                                        mehh_ai::UserContentBlock::Text(t) => {
-                                            !t.text.contains(MOIM_START)
+                    // Checklist cleared: only clone-on-write when a stale MOIM block is present.
+                    let has_stale_moim = ctx.messages.iter().any(|msg| match msg {
+                        Message::User(u) => match &u.content {
+                            UserContent::Text(t) => t.contains(MOIM_START),
+                            UserContent::Blocks(blocks) => blocks.iter().any(|b| match b {
+                                mehh_ai::UserContentBlock::Text(t) => t.text.contains(MOIM_START),
+                                _ => false,
+                            }),
+                        },
+                        _ => false,
+                    });
+                    if has_stale_moim {
+                        for msg in Arc::make_mut(&mut ctx.messages).iter_mut() {
+                            if let Message::User(u) = msg {
+                                match u.content {
+                                    UserContent::Text(ref mut t) => {
+                                        changed |= strip_moim_text(t);
+                                    }
+                                    UserContent::Blocks(ref mut blocks) => {
+                                        let mut emptied_moim = vec![false; blocks.len()];
+                                        for (idx, b) in blocks.iter_mut().enumerate() {
+                                            if let mehh_ai::UserContentBlock::Text(t) = b {
+                                                if strip_moim_text(&mut t.text) {
+                                                    changed = true;
+                                                    if t.text.trim().is_empty() {
+                                                        emptied_moim[idx] = true;
+                                                    }
+                                                }
+                                            }
                                         }
-                                        _ => true,
-                                    });
-                                    changed |= blocks.len() != before;
+                                        if emptied_moim.iter().any(|&e| e) {
+                                            let mut iter = emptied_moim.into_iter();
+                                            blocks.retain(|_| !iter.next().unwrap_or(false));
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -1020,7 +1185,7 @@ impl AgentSession {
         config.prepare_next_turn = Some(Arc::new(move |turn_ctx, _cancel| {
             let lead_worker = lead_worker_turn.clone();
             Box::pin(async move {
-                let mut mgr = lead_worker.lock().unwrap();
+                let mut mgr = mehh_ai::lock_recover(&lead_worker);
                 let stop_reason = turn_ctx.assistant_message.stop_reason;
                 let is_empty_assistant = turn_ctx.assistant_message.content.is_empty();
                 let repetition_detected = turn_ctx.tool_results.iter().any(|tr| {
@@ -1112,10 +1277,7 @@ impl AgentSession {
         {
             if self.api_key.as_deref() != Some(key.as_str()) {
                 self.api_key = Some(key);
-                self.lead_worker
-                    .lock()
-                    .unwrap()
-                    .set_lead_api_key(self.api_key.clone());
+                mehh_ai::lock_recover(&self.lead_worker).set_lead_api_key(self.api_key.clone());
                 self.refresh_subagent_tool();
             }
         }
@@ -1230,52 +1392,88 @@ impl AgentSession {
         on_event: Option<Arc<dyn Fn(AgentEvent) + Send + Sync>>,
     ) -> Result<Vec<Message>> {
         let pre_cancel = CancellationToken::new();
-        *self.active_cancel.lock().unwrap() = Some(pre_cancel.clone());
+        *mehh_ai::lock_recover(&self.active_cancel) = Some(pre_cancel.clone());
 
         let auth_res = tokio::select! {
             _ = pre_cancel.cancelled() => {
-                *self.active_cancel.lock().unwrap() = None;
+                *mehh_ai::lock_recover(&self.active_cancel) = None;
                 anyhow::bail!("Operation aborted");
             }
             res = self.ensure_api_key(None) => res,
         };
         if let Err(e) = auth_res {
-            *self.active_cancel.lock().unwrap() = None;
+            *mehh_ai::lock_recover(&self.active_cancel) = None;
             return Err(e);
         }
         if pre_cancel.is_cancelled() {
-            *self.active_cancel.lock().unwrap() = None;
+            *mehh_ai::lock_recover(&self.active_cancel) = None;
             anyhow::bail!("Operation aborted");
         }
 
         self.run_proactive_compaction().await;
         if pre_cancel.is_cancelled() {
-            *self.active_cancel.lock().unwrap() = None;
+            *mehh_ai::lock_recover(&self.active_cancel) = None;
             anyhow::bail!("Operation aborted");
         }
 
         let (user_msg, history, config) = self.prepare_prompt_content(content.clone());
         let new_messages = run_agent_loop(vec![user_msg], history, config, on_event.clone()).await;
-        *self.active_cancel.lock().unwrap() = None;
+        *mehh_ai::lock_recover(&self.active_cancel) = None;
 
         if self.is_overflow_turn(&new_messages) {
-            match self.try_overflow_compaction().await {
-                Ok(true) => {
-                    let (retry_user, retry_history, retry_config) =
-                        self.prepare_prompt_content(content);
-                    let retry_messages =
-                        run_agent_loop(vec![retry_user], retry_history, retry_config, on_event)
-                            .await;
-                    *self.active_cancel.lock().unwrap() = None;
-                    self.finish_prompt(&retry_messages)?;
-                    return Ok(retry_messages);
+            let has_completed_tool = new_messages
+                .iter()
+                .any(|m| matches!(m, Message::ToolResult(_)));
+
+            if has_completed_tool {
+                if new_messages.len() >= 2
+                    && matches!(new_messages.last(), Some(Message::Assistant(_)))
+                {
+                    // Case B: Mid-turn overflow after side-effecting tools already ran.
+                    // Persist completed prefix (everything before the trailing overflow AssistantMessage),
+                    // compact the session, and resume with empty prompts so tools are never re-executed.
+                    let prefix = &new_messages[..new_messages.len() - 1];
+                    self.finish_prompt(prefix)?;
+                    match self.try_overflow_compaction().await {
+                        Ok(true) => {
+                            let (_, retry_history, retry_config) =
+                                self.prepare_prompt_content(UserContent::Text(String::new()));
+                            let continuation =
+                                run_agent_loop(Vec::new(), retry_history, retry_config, on_event)
+                                    .await;
+                            *mehh_ai::lock_recover(&self.active_cancel) = None;
+                            self.finish_prompt(&continuation)?;
+                            let mut combined = prefix.to_vec();
+                            combined.extend(continuation);
+                            return Ok(combined);
+                        }
+                        Ok(false) => {
+                            self.finish_prompt(&new_messages[new_messages.len() - 1..])?;
+                            return Ok(new_messages);
+                        }
+                        Err(e) => return Err(e).context("Overflow auto-compaction failed"),
+                    }
                 }
-                Ok(false) => {}
-                Err(e) => {
-                    // The overflow turn must not be persisted: it is only a
-                    // trigger for compaction, and retry deliberately avoids
-                    // saving it. Surface the failure instead of swallowing it.
-                    return Err(e).context("Overflow auto-compaction failed");
+            } else {
+                // Case A: Turn-0 overflow (no tools executed yet) -> safe to compact & retry prompt.
+                match self.try_overflow_compaction().await {
+                    Ok(true) => {
+                        let (retry_user, retry_history, retry_config) =
+                            self.prepare_prompt_content(content);
+                        let retry_messages =
+                            run_agent_loop(vec![retry_user], retry_history, retry_config, on_event)
+                                .await;
+                        *mehh_ai::lock_recover(&self.active_cancel) = None;
+                        self.finish_prompt(&retry_messages)?;
+                        return Ok(retry_messages);
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        // The overflow turn must not be persisted: it is only a
+                        // trigger for compaction, and retry deliberately avoids
+                        // saving it. Surface the failure instead of swallowing it.
+                        return Err(e).context("Overflow auto-compaction failed");
+                    }
                 }
             }
         }
@@ -1334,11 +1532,11 @@ impl AgentSession {
         prep: crate::compaction::CompactionPreparation,
         custom_instructions: Option<&str>,
     ) -> Result<String> {
-        let existing = self.active_cancel.lock().unwrap().clone();
+        let existing = mehh_ai::lock_recover(&self.active_cancel).clone();
         let owned_slot = existing.is_none();
         let cancel = existing.unwrap_or_else(|| {
             let c = CancellationToken::new();
-            *self.active_cancel.lock().unwrap() = Some(c.clone());
+            *mehh_ai::lock_recover(&self.active_cancel) = Some(c.clone());
             c
         });
         let res = crate::compaction::compact_with_provider(
@@ -1351,7 +1549,7 @@ impl AgentSession {
         )
         .await;
         if owned_slot {
-            *self.active_cancel.lock().unwrap() = None;
+            *mehh_ai::lock_recover(&self.active_cancel) = None;
         }
         let summary = res?;
         self.apply_prepared_compaction(
@@ -1945,14 +2143,14 @@ mod tests {
         for _ in 0..3 {
             let ctx = mehh_agent::types::PrepareRequestContext {
                 context: mehh_agent::types::AgentContext {
-                    messages: messages.clone(),
+                    messages: Arc::new(messages.clone()),
                     tools: None,
                 },
                 model: faux_model(),
                 thinking_level: None,
             };
             let update = hook(ctx, CancellationToken::new()).await.expect("update");
-            messages = update.context.expect("context").messages;
+            messages = Arc::unwrap_or_clone(update.context.expect("context").messages);
         }
         let text = match messages.last().expect("user message") {
             Message::User(u) => match &u.content {
@@ -2002,6 +2200,51 @@ mod tests {
             "worker tool must never receive the lead key"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sync_thinking_for_model_handles_reasoning_non_reasoning_and_explicit_off() {
+        let dir = crate::TempTestDir::new("sync_thinking_for_model");
+        let reg = crate::models_config::ModelRegistry::builtin_only();
+        let claude = reg.resolve("anthropic", Some("claude-sonnet-4-5")).unwrap();
+        let o3 = reg.resolve("openai", Some("o3")).unwrap();
+        let mut gpt41 = o3.clone();
+        gpt41.id = "gpt-4.1".to_string();
+        gpt41.reasoning = false;
+
+        let mut session = AgentSession::new_with_trust(
+            dir.path().to_path_buf(),
+            claude.clone(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(dir.path()),
+            Settings::default(),
+            false,
+        );
+        assert_eq!(session.thinking_level(), None);
+
+        // Switching to reasoning model without explicit Off activates Medium default
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
+
+        // Switching to non-reasoning model clears active level
+        session.set_model(gpt41, Arc::new(FauxProvider::new()));
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), None);
+
+        // Switching back restores Medium when user did not explicitly turn thinking off
+        session.set_model(claude.clone(), Arc::new(FauxProvider::new()));
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
+
+        // Explicit Off persists across disable-capable models (Claude), clamps to Medium on o3
+        session.set_thinking_level_explicit(ThinkingLevel::Off);
+        assert_eq!(session.thinking_level(), None);
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), None);
+
+        session.set_model(o3, Arc::new(FauxProvider::new()));
+        session.sync_thinking_for_model(true);
+        assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
     }
 
     #[test]
@@ -2057,7 +2300,7 @@ mod tests {
             result: mehh_agent::AgentToolResult::text("failed"),
             is_error: true,
             context: mehh_agent::types::AgentContext {
-                messages: Vec::new(),
+                messages: Arc::new(Vec::new()),
                 tools: None,
             },
         };
@@ -2097,6 +2340,74 @@ mod tests {
             config.stream_options.api_key.as_deref(),
             Some("worker-value")
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn subagent_child_tools_survive_approval_and_api_key_refresh() {
+        let dir = std::env::temp_dir()
+            .join(format!("agent_session_subagent_refresh_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut session = AgentSession::new_with_trust(
+            dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&dir),
+            Settings::default(),
+            false,
+        );
+        session.set_tools(Vec::new());
+        session.set_subagent_with_child_tools(vec![Arc::new(MockTool {
+            name: "read".to_string(),
+        })]);
+
+        session.set_approval_handler(None);
+        session.set_api_key(Some("updated-key".to_string()));
+
+        let parent_names: Vec<&str> = session.tools().iter().map(|t| t.name()).collect();
+        assert_eq!(parent_names, vec!["subagent"]);
+        let child_names: Option<Vec<&str>> = session
+            .subagent_child_tools
+            .as_ref()
+            .map(|tools| tools.iter().map(|t| t.name()).collect());
+        assert_eq!(child_names, Some(vec!["read"]));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_agent_session_applies_web_settings() {
+        let dir = std::env::temp_dir()
+            .join(format!("agent_session_web_cfg_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let default_session = AgentSession::new_with_trust(
+            dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&dir),
+            Settings::default(),
+            false,
+        );
+        assert!(default_session.tools().iter().any(|t| t.name() == "web_search"));
+        assert!(default_session.tools().iter().any(|t| t.name() == "web_fetch"));
+
+        let disabled_web = AgentSession::new_with_trust(
+            dir.clone(),
+            faux_model(),
+            Arc::new(FauxProvider::new()),
+            SessionManager::in_memory(&dir),
+            Settings {
+                web: Some(crate::settings::WebSettings {
+                    enabled: Some(false),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+            false,
+        );
+        assert!(!disabled_web.tools().iter().any(|t| t.name() == "web_search"));
+        assert!(!disabled_web.tools().iter().any(|t| t.name() == "web_fetch"));
+
         let _ = std::fs::remove_dir_all(dir);
     }
 }

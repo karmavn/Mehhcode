@@ -53,8 +53,24 @@ fn cleanup_old_mcp_outputs(dir: &Path) {
     }
 }
 
+fn mcp_output_base_dir() -> PathBuf {
+    #[cfg(windows)]
+    let home = std::env::var_os("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()));
+    #[cfg(not(windows))]
+    let home = std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()));
+    if let Some(h) = home {
+        PathBuf::from(h).join(".mehh").join("tmp").join("mcp")
+    } else {
+        std::env::temp_dir().join(format!("mehh-mcp-{}", std::process::id()))
+    }
+}
+
 pub fn save_mcp_output_file(data: &[u8], ext: &str) -> anyhow::Result<PathBuf> {
-    let base_dir = std::env::temp_dir().join("mehh-mcp");
+    let base_dir = mcp_output_base_dir();
     std::fs::create_dir_all(&base_dir)?;
     #[cfg(unix)]
     {
@@ -106,7 +122,7 @@ pub const MCP_RESOURCE_MAX_BYTES: usize = 100 * 1024; // 100KB cap for resources
 /// Async wrapper so filesystem work never blocks a Tokio worker thread.
 pub async fn save_mcp_output_file_async(data: Vec<u8>, ext: String) -> anyhow::Result<PathBuf> {
     tokio::task::spawn_blocking(move || {
-        cleanup_old_mcp_outputs(&std::env::temp_dir().join("mehh-mcp"));
+        cleanup_old_mcp_outputs(&mcp_output_base_dir());
         save_mcp_output_file(&data, &ext)
     })
     .await
@@ -327,8 +343,8 @@ pub fn truncate_middle(text: &str, max_bytes: usize) -> Option<String> {
     ))
 }
 
-/// Caps oversized strings inside a `details` payload before it reaches the model.
-fn truncate_details(value: &mut serde_json::Value) {
+/// Caps oversized strings and total serialized size inside a `details` payload before it reaches the model.
+fn truncate_details_inner(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::String(s) => {
             if let Some(truncated) = truncate_middle(s, MCP_OUTPUT_MAX_BYTES) {
@@ -337,15 +353,27 @@ fn truncate_details(value: &mut serde_json::Value) {
         }
         serde_json::Value::Array(arr) => {
             for item in arr {
-                truncate_details(item);
+                truncate_details_inner(item);
             }
         }
         serde_json::Value::Object(map) => {
             for item in map.values_mut() {
-                truncate_details(item);
+                truncate_details_inner(item);
             }
         }
         _ => {}
+    }
+}
+
+fn truncate_details(value: &mut serde_json::Value) {
+    truncate_details_inner(value);
+    if let Ok(bytes) = serde_json::to_vec(value) {
+        if bytes.len() > MCP_OUTPUT_MAX_BYTES * 2 {
+            *value = serde_json::json!({
+                "truncated": true,
+                "originalBytes": bytes.len()
+            });
+        }
     }
 }
 

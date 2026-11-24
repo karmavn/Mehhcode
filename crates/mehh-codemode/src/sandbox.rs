@@ -212,9 +212,13 @@ const PRELUDE_JS: &str = r#"function(__TOOLS_META__) {
     const toolMap = new Map();
     const allTools = [];
     for (const t of __TOOLS_META__) {
-        mapSet(toolMap, t.name, t.name);
         mapSet(toolMap, t.js_name, t.name);
         allTools.push(objectFreeze({ name: t.js_name, description: t.description }));
+    }
+    for (const t of __TOOLS_META__) {
+        if (!mapHas(toolMap, t.name)) {
+            mapSet(toolMap, t.name, t.name);
+        }
     }
     const toolsProxy = new Proxy({}, {
         get(target, prop) {
@@ -1056,7 +1060,8 @@ fn run_codemode_blocking(
             move |name: String| -> String {
                 let found = resolved_desc
                     .iter()
-                    .position(|m| m.name == name || m.js_name == name);
+                    .position(|m| m.js_name == name)
+                    .or_else(|| resolved_desc.iter().position(|m| m.name == name));
                 match found {
                     Some(idx) => {
                         let t = &tool_defs_desc[idx];
