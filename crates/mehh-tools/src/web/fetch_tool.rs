@@ -7,7 +7,7 @@ use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use mehh_ai::http_safety::{
     check_url_host_policy, is_eligible_for_remote_extract, normalize_and_validate_http_url,
-    url_contains_potential_secret, DnsPolicy,
+    DnsPolicy,
 };
 use reqwest::Url;
 use serde_json::{json, Map, Value};
@@ -273,7 +273,7 @@ fn can_use_remote_fallback(runtime: &WebRuntime, url: &Url, format: FetchFormat)
     }
     #[cfg(test)]
     if runtime.config.allow_remote_extract_for_loopback_tests {
-        return !url_contains_potential_secret(url);
+        return !mehh_ai::http_safety::url_contains_potential_secret(url);
     }
     is_eligible_for_remote_extract(url).is_ok()
 }
@@ -577,7 +577,7 @@ fn looks_like_html_document(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::web::{ProviderId, UrlPolicyChecker, WebConfig, WebEndpoints};
+    use crate::web::{ProviderId, UrlPolicyChecker, WebConfig};
     use mehh_ai::ToolResultContentBlock;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;

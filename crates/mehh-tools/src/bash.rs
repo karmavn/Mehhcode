@@ -156,14 +156,18 @@ mod tests {
             }
         });
 
-        let cmd = if cfg!(windows) {
-            "Write-Output 'partial_marker'; Start-Sleep -Seconds 10"
+        let (cmd, timeout_ms) = if cfg!(windows) {
+            // Cold PowerShell startup on Windows can exceed 2s under parallel test load.
+            (
+                "Write-Output 'partial_marker'; [Console]::Out.Flush(); Start-Sleep -Seconds 20",
+                8000,
+            )
         } else {
-            "echo partial_marker; sleep 10"
+            ("echo partial_marker; sleep 10", 2000)
         };
         let params = json!({
             "command": cmd,
-            "timeout": 2000
+            "timeout": timeout_ms
         })
         .as_object()
         .unwrap()

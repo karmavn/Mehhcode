@@ -1298,8 +1298,8 @@ mod client_tests {
                         .cloned()
                         .expect("progressToken present");
 
-                    // Progress 1 at 50ms
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    // Progress 1 at 100ms
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     let p1 = JsonRpcNotification::new(
                         "notifications/progress",
                         Some(serde_json::json!({
@@ -1311,8 +1311,8 @@ mod client_tests {
                     );
                     server_transport.send(JsonRpcMessage::Notification(p1)).await.unwrap();
 
-                    // Progress 2 at 100ms (50ms later)
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    // Progress 2 at 200ms (100ms later)
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     let p2 = JsonRpcNotification::new(
                         "notifications/progress",
                         Some(serde_json::json!({
@@ -1324,8 +1324,8 @@ mod client_tests {
                     );
                     server_transport.send(JsonRpcMessage::Notification(p2)).await.unwrap();
 
-                    // Complete at 140ms (40ms later)
-                    tokio::time::sleep(Duration::from_millis(40)).await;
+                    // Complete at 300ms (100ms later)
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                     let resp = JsonRpcResponse::success(
                         req.id,
                         serde_json::json!({
@@ -1346,20 +1346,20 @@ mod client_tests {
             assert_eq!(p.total, Some(2.0));
         });
 
-        // Timeout is 80ms, but total duration is 140ms. Without renewal it would fail!
+        // Timeout is 250ms, but total duration is 300ms. Without renewal it would fail!
         let start = std::time::Instant::now();
         let res = client
             .call_tool_with_options(
                 "long_tool",
                 serde_json::json!({}),
                 McpRequestOptions::new()
-                    .with_timeout(Duration::from_millis(80))
+                    .with_timeout(Duration::from_millis(250))
                     .with_progress(progress_cb),
             )
             .await
             .expect("should succeed because timeout is renewed");
 
-        assert!(start.elapsed() >= Duration::from_millis(130));
+        assert!(start.elapsed() >= Duration::from_millis(280));
         assert_eq!(progress_count.load(Ordering::SeqCst), 2);
         assert_eq!(res.content.len(), 1);
         let _ = client.close().await;
