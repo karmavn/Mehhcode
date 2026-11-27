@@ -117,7 +117,13 @@ impl LeadWorkerManager {
 
     pub fn active_api_key(&self) -> Option<String> {
         if self.should_use_worker() {
-            self.worker_api_key.clone()
+            self.worker_api_key.clone().or_else(|| {
+                self.worker_model
+                    .as_ref()
+                    .filter(|w| w.provider.eq_ignore_ascii_case(&self.lead_model.provider))
+                    .and(self.lead_api_key.as_ref())
+                    .cloned()
+            })
         } else {
             self.lead_api_key.clone()
         }
@@ -153,10 +159,15 @@ impl LeadWorkerManager {
             } else {
                 self.lead_rescue_remaining = self.rescue_turns;
             }
-        } else if self.lead_rescue_remaining > 0 {
-            self.lead_rescue_remaining -= 1;
+            self.consecutive_tool_errors = 0;
+        } else {
+            if self.lead_rescue_remaining > 0 {
+                self.lead_rescue_remaining -= 1;
+            }
+            if !was_worker_turn {
+                self.consecutive_tool_errors = 0;
+            }
         }
-        self.consecutive_tool_errors = 0;
         self.current_turn_in_prompt += 1;
     }
 
@@ -166,5 +177,57 @@ impl LeadWorkerManager {
         self.escalation_count = 0;
         self.locked_to_lead = false;
         self.consecutive_tool_errors = 0;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_provider_worker_falls_back_to_lead_api_key_only_when_provider_matches() {
+        let mut mgr = LeadWorkerManager::new_for_test("lead-model", "worker-model", 0);
+        mgr.lead_model.provider = "anthropic".to_string();
+        mgr.worker_model.as_mut().unwrap().provider = "anthropic".to_string();
+        mgr.set_lead_api_key(Some("sk-ant-lead".to_string()));
+        mgr.set_worker_api_key(None);
+
+        assert!(mgr.should_use_worker());
+        assert_eq!(mgr.active_api_key().as_deref(), Some("sk-ant-lead"));
+
+        // Different provider must never fall back to the lead key.
+        mgr.worker_model.as_mut().unwrap().provider = "openai".to_string();
+        assert_eq!(mgr.active_api_key(), None);
+    }
+
+    #[test]
+    fn consecutive_tool_errors_persists_across_worker_turns_and_resets_on_lead_or_escalation() {
+        let mut mgr = LeadWorkerManager::new_for_test("lead-model", "worker-model", 0);
+        assert!(mgr.should_use_worker());
+
+        // Worker turn 0 has 1 tool error -> does not escalate yet, must retain count = 1.
+        mgr.record_tool_outcome(true);
+        mgr.record_turn_outcome(StopReason::ToolUse, false);
+        assert!(mgr.should_use_worker(), "should stay on worker after 1 error");
+        assert_eq!(mgr.consecutive_tool_errors, 1);
+
+        // Worker turn 1 has a 2nd consecutive tool error -> reaches 2 -> escalates and resets.
+        mgr.record_tool_outcome(true);
+        mgr.record_turn_outcome(StopReason::ToolUse, false);
+        assert!(!mgr.should_use_worker(), "should escalate to lead on 2nd error");
+        assert_eq!(mgr.consecutive_tool_errors, 0);
+
+        // Lead rescue turn with a tool error resets consecutive_tool_errors at end of Lead turn.
+        mgr.record_tool_outcome(true);
+        mgr.record_turn_outcome(StopReason::Stop, false);
+        assert_eq!(mgr.consecutive_tool_errors, 0);
+
+        // Successful tool outcome also resets.
+        mgr.record_turn_outcome(StopReason::Stop, false); // finish rescue turn 2 -> back to worker
+        assert!(mgr.should_use_worker());
+        mgr.record_tool_outcome(true);
+        assert_eq!(mgr.consecutive_tool_errors, 1);
+        mgr.record_tool_outcome(false);
+        assert_eq!(mgr.consecutive_tool_errors, 0);
     }
 }

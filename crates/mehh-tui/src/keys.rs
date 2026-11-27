@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -35,9 +36,22 @@ pub fn normalize_crossterm_key(event: KeyEvent) -> Option<String> {
 
     match event.code {
         KeyCode::Char(c) => {
-            if has_ctrl || has_alt || has_super {
-                let lower = c.to_ascii_lowercase().to_string();
-                Some(make_mod_str(&lower, has_shift || c.is_ascii_uppercase()))
+            if cfg!(windows)
+                && has_ctrl
+                && has_alt
+                && !has_super
+                && !c.is_control()
+                && !c.is_ascii_alphabetic()
+                && c != ' '
+            {
+                Some(c.to_string())
+            } else if has_ctrl || has_alt || has_super {
+                if c == ' ' {
+                    Some(make_mod_str("space", has_shift))
+                } else {
+                    let lower = c.to_ascii_lowercase().to_string();
+                    Some(make_mod_str(&lower, has_shift || c.is_ascii_uppercase()))
+                }
             } else {
                 Some(c.to_string())
             }
@@ -70,64 +84,87 @@ pub fn normalize_crossterm_key(event: KeyEvent) -> Option<String> {
     }
 }
 
-fn canonicalize_key_spec(spec: &str) -> (BTreeSet<String>, String) {
+const MOD_CTRL: u8 = 1 << 0;
+const MOD_ALT: u8 = 1 << 1;
+const MOD_SHIFT: u8 = 1 << 2;
+const MOD_SUPER: u8 = 1 << 3;
+
+fn canonicalize_key_spec(spec: &str) -> (u8, Option<BTreeSet<String>>, Cow<'_, str>) {
     if spec == " " {
-        return (BTreeSet::new(), " ".to_string());
+        return (0, None, Cow::Borrowed(" "));
     }
     let trimmed = spec.trim();
     if trimmed.is_empty() {
-        return (BTreeSet::new(), String::new());
+        return (0, None, Cow::Borrowed(""));
     }
 
-    let (raw_mods, raw_base): (Vec<&str>, &str) = if trimmed == "+" {
-        (Vec::new(), "+")
+    let (mod_prefix, raw_base) = if trimmed == "+" {
+        ("", "+")
     } else if let Some(prefix) = trimmed.strip_suffix("++") {
-        (prefix.split('+').filter(|s| !s.is_empty()).collect(), "+")
+        (prefix, "+")
     } else if let Some(idx) = trimmed.rfind('+') {
-        let prefix = &trimmed[..idx];
-        let base = &trimmed[idx + 1..];
-        (prefix.split('+').filter(|s| !s.is_empty()).collect(), base)
+        (&trimmed[..idx], &trimmed[idx + 1..])
     } else {
-        (Vec::new(), trimmed)
+        ("", trimmed)
     };
 
-    let mut modifiers = BTreeSet::new();
-    for m in raw_mods {
-        match m.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => {
-                modifiers.insert("ctrl".to_string());
+    let mut mod_mask = 0u8;
+    let mut extra_mods: Option<BTreeSet<String>> = None;
+    if !mod_prefix.is_empty() {
+        for m in mod_prefix.split('+') {
+            if m.is_empty() {
+                continue;
             }
-            "alt" | "opt" | "option" => {
-                modifiers.insert("alt".to_string());
-            }
-            "shift" => {
-                modifiers.insert("shift".to_string());
-            }
-            "super" | "cmd" | "command" | "win" | "meta" => {
-                modifiers.insert("super".to_string());
-            }
-            other => {
-                modifiers.insert(other.to_string());
+            if m.eq_ignore_ascii_case("ctrl") || m.eq_ignore_ascii_case("control") {
+                mod_mask |= MOD_CTRL;
+            } else if m.eq_ignore_ascii_case("alt")
+                || m.eq_ignore_ascii_case("opt")
+                || m.eq_ignore_ascii_case("option")
+            {
+                mod_mask |= MOD_ALT;
+            } else if m.eq_ignore_ascii_case("shift") {
+                mod_mask |= MOD_SHIFT;
+            } else if m.eq_ignore_ascii_case("super")
+                || m.eq_ignore_ascii_case("cmd")
+                || m.eq_ignore_ascii_case("command")
+                || m.eq_ignore_ascii_case("win")
+                || m.eq_ignore_ascii_case("meta")
+            {
+                mod_mask |= MOD_SUPER;
+            } else {
+                extra_mods
+                    .get_or_insert_with(BTreeSet::new)
+                    .insert(m.to_ascii_lowercase());
             }
         }
     }
 
-    let lower_base = raw_base.to_ascii_lowercase();
-    let base = match lower_base.as_str() {
-        "esc" => "escape",
-        "return" => "enter",
-        "space" => " ",
-        "plus" => "+",
-        "backtab" => {
-            modifiers.insert("shift".to_string());
-            "tab"
+    let base = if raw_base.eq_ignore_ascii_case("esc") {
+        Cow::Borrowed("escape")
+    } else if raw_base.eq_ignore_ascii_case("return") {
+        Cow::Borrowed("enter")
+    } else if raw_base.eq_ignore_ascii_case("space") {
+        Cow::Borrowed(" ")
+    } else if raw_base.eq_ignore_ascii_case("plus") {
+        Cow::Borrowed("+")
+    } else if raw_base.eq_ignore_ascii_case("backtab") {
+        mod_mask |= MOD_SHIFT;
+        Cow::Borrowed("tab")
+    } else if raw_base.eq_ignore_ascii_case("page_up") {
+        Cow::Borrowed("pageup")
+    } else if raw_base.eq_ignore_ascii_case("page_down") {
+        Cow::Borrowed("pagedown")
+    } else if mod_mask != 0 || extra_mods.is_some() {
+        if raw_base.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(raw_base.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(raw_base)
         }
-        "page_up" => "pageup",
-        "page_down" => "pagedown",
-        _ => raw_base,
+    } else {
+        Cow::Borrowed(raw_base)
     };
 
-    (modifiers, base.to_string())
+    (mod_mask, extra_mods, base)
 }
 
 /// Check if a key string matches a binding pattern, accounting for aliases
@@ -137,10 +174,10 @@ pub fn matches_key(key: &str, pattern: &str) -> bool {
         return true;
     }
 
-    let (k_mods, k_base) = canonicalize_key_spec(key);
-    let (p_mods, p_base) = canonicalize_key_spec(pattern);
+    let (k_mask, k_extra, k_base) = canonicalize_key_spec(key);
+    let (p_mask, p_extra, p_base) = canonicalize_key_spec(pattern);
 
-    k_mods == p_mods && k_base == p_base
+    k_mask == p_mask && k_extra == p_extra && k_base == p_base
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -175,8 +212,30 @@ pub enum TuiAction {
 }
 
 #[derive(Debug, Clone)]
+struct CompiledBinding {
+    raw: String,
+    mod_mask: u8,
+    extra_mods: Option<BTreeSet<String>>,
+    base: String,
+}
+
+impl CompiledBinding {
+    fn from_raw(raw: String) -> Self {
+        let (mod_mask, extra_mods, base) = canonicalize_key_spec(&raw);
+        let base = base.into_owned();
+        Self {
+            raw,
+            mod_mask,
+            extra_mods,
+            base,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Keybindings {
     bindings: HashMap<TuiAction, Vec<String>>,
+    compiled: HashMap<TuiAction, Vec<CompiledBinding>>,
 }
 
 impl Default for Keybindings {
@@ -187,7 +246,7 @@ impl Default for Keybindings {
 
 impl Keybindings {
     pub fn default_bindings() -> Self {
-        let mut map = HashMap::new();
+        let mut map: HashMap<TuiAction, Vec<String>> = HashMap::new();
         map.insert(
             TuiAction::CursorLeft,
             vec!["left".into(), "ctrl+b".into()],
@@ -270,22 +329,53 @@ impl Keybindings {
             vec!["ctrl+end".into(), "shift+end".into()],
         );
 
-        Self { bindings: map }
-    }
+        let compiled = map
+            .iter()
+            .map(|(&action, patterns)| {
+                (
+                    action,
+                    patterns
+                        .iter()
+                        .map(|p| CompiledBinding::from_raw(p.clone()))
+                        .collect(),
+                )
+            })
+            .collect();
 
-    pub fn matches(&self, key: &str, action: TuiAction) -> bool {
-        if let Some(keys) = self.bindings.get(&action) {
-            keys.iter().any(|pattern| matches_key(key, pattern))
-        } else {
-            false
+        Self {
+            bindings: map,
+            compiled,
         }
     }
 
+    pub fn matches(&self, key: &str, action: TuiAction) -> bool {
+        let Some(entries) = self.compiled.get(&action) else {
+            return false;
+        };
+        if entries.iter().any(|b| key.eq_ignore_ascii_case(&b.raw)) {
+            return true;
+        }
+        let (k_mask, k_extra, k_base) = canonicalize_key_spec(key);
+        entries
+            .iter()
+            .any(|b| k_mask == b.mod_mask && k_extra == b.extra_mods && k_base == b.base)
+    }
+
     pub fn bind(&mut self, action: TuiAction, pattern: impl Into<String>) {
-        self.bindings.entry(action).or_default().push(pattern.into());
+        let p = pattern.into();
+        self.compiled
+            .entry(action)
+            .or_default()
+            .push(CompiledBinding::from_raw(p.clone()));
+        self.bindings.entry(action).or_default().push(p);
     }
 
     pub fn set_bindings(&mut self, action: TuiAction, patterns: Vec<String>) {
+        let compiled = patterns
+            .iter()
+            .map(|p| CompiledBinding::from_raw(p.clone()))
+            .collect();
+        self.compiled.insert(action, compiled);
         self.bindings.insert(action, patterns);
     }
 
@@ -322,6 +412,85 @@ mod tests {
     fn test_matches_key_space_alias() {
         assert!(matches_key(" ", "space"));
         assert!(matches_key("space", " "));
+    }
+
+    #[test]
+    fn test_matches_key_case_insensitive_base_with_modifiers() {
+        assert!(matches_key("shift+ctrl+P", "ctrl+shift+p"));
+        assert!(matches_key("ctrl+shift+p", "shift+ctrl+P"));
+    }
+
+    #[test]
+    fn test_normalize_crossterm_key_windows_altgr() {
+        let ev_at = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let ev_euro = KeyEvent::new(
+            KeyCode::Char('\u{20AC}'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let ev_alpha = KeyEvent::new(
+            KeyCode::Char('a'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+        );
+        let ev_super = KeyEvent::new(
+            KeyCode::Char('@'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+        );
+        if cfg!(windows) {
+            assert_eq!(normalize_crossterm_key(ev_at), Some("@".to_string()));
+            assert_eq!(
+                normalize_crossterm_key(ev_euro),
+                Some("\u{20AC}".to_string())
+            );
+        } else {
+            assert_eq!(
+                normalize_crossterm_key(ev_at),
+                Some("ctrl+alt+@".to_string())
+            );
+        }
+        assert_eq!(
+            normalize_crossterm_key(ev_alpha),
+            Some("ctrl+alt+a".to_string())
+        );
+        assert_eq!(
+            normalize_crossterm_key(ev_super),
+            Some("ctrl+alt+super+@".to_string())
+        );
+    }
+
+    #[test]
+    fn test_normalize_crossterm_key_modified_space() {
+        let ev_ctrl = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL);
+        assert_eq!(
+            normalize_crossterm_key(ev_ctrl),
+            Some("ctrl+space".to_string())
+        );
+        assert!(matches_key(
+            &normalize_crossterm_key(ev_ctrl).unwrap(),
+            "ctrl+space"
+        ));
+
+        let ev_alt = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::ALT);
+        assert_eq!(
+            normalize_crossterm_key(ev_alt),
+            Some("alt+space".to_string())
+        );
+        assert!(matches_key(
+            &normalize_crossterm_key(ev_alt).unwrap(),
+            "alt+space"
+        ));
+
+        let ev_ctrl_alt =
+            KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL | KeyModifiers::ALT);
+        assert_eq!(
+            normalize_crossterm_key(ev_ctrl_alt),
+            Some("ctrl+alt+space".to_string())
+        );
+
+        let ev_plain = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
+        assert_eq!(normalize_crossterm_key(ev_plain), Some(" ".to_string()));
     }
 }
 

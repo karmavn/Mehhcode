@@ -2,6 +2,7 @@ use super::*;
 use crate::session::SessionManager;
 use crate::settings::Settings;
 use mehh_ai::{Model, ModelCost, Usage, UsageCost};
+use mehh_tui::MarkdownView;
 
 #[test]
 fn interrupt_key_denies_pending_tool_approval() {
@@ -75,13 +76,13 @@ async fn overflow_retry_resends_expanded_file_blocks() {
     state.overflow_retried = true;
 
     let outcome = handle_agent_signal_async(
-        AgentSignal::OverflowCompacted {
+        AgentSignal::OverflowCompacted(Box::new(super::events::OverflowCompactedPayload {
             original_messages: Vec::new(),
             prep: Some(("entry-1".to_string(), 100)),
             result: Ok("summary".to_string()),
             cancelled: false,
             prefix_persisted: false,
-        },
+        })),
         &mut session,
         &mut state,
         &agent_tx,
@@ -1483,8 +1484,13 @@ fn slice_transcript_segments_returns_exact_viewport_window() {
 
 #[test]
 fn scrollbar_char_marks_thumb_and_track() {
-    assert_eq!(super::scrollbar_char(1, 10, 100, 0), '┃');
+    // offset == 0 is at the bottom of the transcript, so the thumb sits at the bottom row.
+    assert_eq!(super::scrollbar_char(9, 10, 100, 0), '┃');
+    assert_eq!(super::scrollbar_char(1, 10, 100, 0), '│');
     assert_eq!(super::scrollbar_char(5, 10, 100, 0), '│');
+    // offset == max_scroll (90) is at the top, so the thumb sits at row 0.
+    assert_eq!(super::scrollbar_char(0, 10, 100, 90), '┃');
+    assert_eq!(super::scrollbar_char(9, 10, 100, 90), '│');
 }
 
 #[test]
@@ -2672,13 +2678,13 @@ async fn mid_turn_overflow_failure_persists_only_trailing_error_without_duplicat
 
     let full_messages = vec![user, assistant_call, tool_res, overflow_err];
     let outcome = handle_agent_signal_async(
-        AgentSignal::OverflowCompacted {
+        AgentSignal::OverflowCompacted(Box::new(super::events::OverflowCompactedPayload {
             original_messages: full_messages,
             prep: Some(("e1".to_string(), 1000)),
             result: Err("compaction failed".to_string()),
             cancelled: false,
             prefix_persisted: true,
-        },
+        })),
         &mut session,
         &mut state,
         &agent_tx,
@@ -3418,8 +3424,43 @@ fn find_click_pos(
     (region.row, region.col_start)
 }
 
+struct ProviderEnvClearGuard(Vec<(&'static str, Option<std::ffi::OsString>)>);
+impl ProviderEnvClearGuard {
+    fn clear_all() -> Self {
+        let mut saved = Vec::new();
+        for spec in mehh_ai::KNOWN_PROVIDERS {
+            saved.push((spec.env_var, std::env::var_os(spec.env_var)));
+            unsafe {
+                std::env::remove_var(spec.env_var);
+            }
+        }
+        for extra in ["GOOGLE_API_KEY", "AWS_BEARER_TOKEN_BEDROCK", "API_KEY"] {
+            saved.push((extra, std::env::var_os(extra)));
+            unsafe {
+                std::env::remove_var(extra);
+            }
+        }
+        Self(saved)
+    }
+}
+impl Drop for ProviderEnvClearGuard {
+    fn drop(&mut self) {
+        for (k, v) in self.0.drain(..) {
+            unsafe {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_model_hides_unconnected_providers_and_opens_connect_when_empty() {
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    let _env_clear = ProviderEnvClearGuard::clear_all();
+
     let dir = crate::TempTestDir::new("tui_connected_models");
     let auth_file = dir.path().join("auth.json");
     let models_file = dir.path().join("models.json");
@@ -3443,14 +3484,16 @@ async fn test_model_hides_unconnected_providers_and_opens_connect_when_empty() {
     state.settings_file = Some(settings_file);
 
     let base_connected = crate::auth::list_connected_providers(Some(&auth_file), &reg).unwrap();
-    if base_connected.is_empty() {
-        handle_slash_command("/model", &mut session, &mut state, None, false).await;
-        assert_eq!(
-            state.selector.as_ref().map(|s| s.kind),
-            Some(SelectorKind::Login),
-            "/model with 0 connected providers should open Connect Provider modal"
-        );
-    }
+    assert!(
+        base_connected.is_empty(),
+        "expected clean isolated environment with 0 connected providers, got: {base_connected:?}"
+    );
+    handle_slash_command("/model", &mut session, &mut state, None, false).await;
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::Login),
+        "/model with 0 connected providers should open Connect Provider modal"
+    );
 
     handle_slash_command(
         "/login openrouter sk-or-test-key",
@@ -3499,16 +3542,17 @@ async fn test_model_hides_unconnected_providers_and_opens_connect_when_empty() {
     assert!(ids.contains(&"openrouter/meta-llama/llama-3.3-70b"));
     assert!(ids.contains(&"__action:refresh_models"));
     assert!(ids.contains(&"__action:connect_provider"));
-    if base_connected.is_empty() {
-        assert!(
-            !ids.contains(&"groq/llama-3.3-70b-versatile"),
-            "unconnected providers must be excluded from /model: {ids:?}"
-        );
-    }
+    assert!(
+        !ids.contains(&"groq/llama-3.3-70b-versatile"),
+        "unconnected providers must be excluded from /model: {ids:?}"
+    );
 }
 
 #[tokio::test]
 async fn test_connect_masked_input_paste_isolation_and_custom_provider() {
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    let _env_clear = ProviderEnvClearGuard::clear_all();
+
     let dir = crate::TempTestDir::new("tui_connect_input");
     let auth_file = dir.path().join("auth.json");
     let models_file = dir.path().join("models.json");
@@ -3722,6 +3766,9 @@ async fn test_session_switcher_lists_new_session_and_switches_saved_sessions() {
 async fn test_mouse_clicks_across_header_footer_scroll_modal_settings_approval_and_autocomplete() {
     use crossterm::event::{MouseButton, MouseEventKind};
 
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    let _env_clear = ProviderEnvClearGuard::clear_all();
+
     let dir = crate::TempTestDir::new("tui_mouse_clicks");
     let mut session = make_test_session();
     session.cwd = dir.path().to_path_buf();
@@ -3736,7 +3783,15 @@ async fn test_mouse_clicks_across_header_footer_scroll_modal_settings_approval_a
     let kb = Keybindings::default_bindings();
     let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
 
-    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let frame = render_interactive_frame(&state, &editor, &session, 100, 28);
+    assert!(
+        frame.iter().any(|l| l.to_ascii_lowercase().contains("connect")),
+        "header should render connect pill when no provider is connected"
+    );
+    assert!(
+        frame.iter().any(|l| l.to_ascii_lowercase().contains("settings")),
+        "footer should render settings pill"
+    );
     let (r, c) = find_click_pos(&state, |a| matches!(a, ClickAction::OpenConnectProvider));
     assert!(
         handle_mouse_event(
@@ -3940,17 +3995,20 @@ async fn test_mouse_clicks_across_header_footer_scroll_modal_settings_approval_a
 
     let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
     apply_agent_signal(
-        AgentSignal::ToolApprovalRequest(PendingApproval {
+        AgentSignal::ToolApprovalRequest(Box::new(PendingApproval {
             tool_name: "bash".to_string(),
             args: serde_json::Map::new(),
             reason: "Check".to_string(),
             preview: Some("echo hi".to_string()),
             reply_tx,
-        }),
+        })),
         &mut session,
         &mut state,
     );
     render_interactive_frame(&state, &editor, &session, 100, 28);
+    state.approval_first_rendered_at = std::time::Instant::now().checked_sub(
+        std::time::Duration::from_millis(super::events::APPROVAL_MIN_DISPLAY_MS + 10),
+    );
     let (ar, ac) = find_click_pos(&state, |a| {
         matches!(a, ClickAction::ApproveToolChoice(id) if id == "allow_once")
     });
@@ -3982,4 +4040,2435 @@ async fn test_mouse_clicks_across_header_footer_scroll_modal_settings_approval_a
     )
     .await;
     assert!(editor.text().starts_with("/connect"));
+}
+
+#[tokio::test]
+async fn test_thinking_command_rejects_unsupported_level_and_settings_off_clamps_always_on_model() {
+    let dir = crate::TempTestDir::new("tui_thinking_norm");
+    let reg = crate::models_config::ModelRegistry::builtin_only();
+    let o3 = reg.resolve("openai", Some("o3")).unwrap();
+    let gemini_pro = reg.resolve("google", Some("gemini-2.5-pro")).unwrap();
+
+    let mut session = make_test_session();
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.settings_file = Some(dir.path().join("settings.json"));
+
+    let prov_o3 = AgentSession::default_provider_for_model(&o3);
+    session.set_model(o3, prov_o3);
+    session.sync_thinking_for_model(true);
+    assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
+
+    handle_slash_command("/thinking max", &mut session, &mut state, None, false).await;
+    assert_eq!(
+        session.thinking_level(),
+        Some(ThinkingLevel::Medium),
+        "o3 does not support max and should keep Medium"
+    );
+    assert!(
+        state.items.iter().any(|it| {
+            matches!(it, TranscriptItem::System(s) if s.contains("does not support") && s.contains("low"))
+        }),
+        "expected unsupported level error naming supported levels, got: {:?}",
+        state.items
+    );
+
+    let prov_gem = AgentSession::default_provider_for_model(&gemini_pro);
+    session.set_model(gemini_pro, prov_gem);
+    session.sync_thinking_for_model(true);
+    handle_slash_command(
+        "/settings thinking off",
+        &mut session,
+        &mut state,
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(session.thinking_level(), Some(ThinkingLevel::Medium));
+    let (_u, _h, cfg) = session.prepare_prompt("hi");
+    assert_eq!(cfg.stream_options.reasoning, Some(ThinkingLevel::Medium));
+}
+
+#[tokio::test]
+async fn test_modal_click_and_paste_isolation_blocks_bleed_through() {
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    let _env_clear = ProviderEnvClearGuard::clear_all();
+
+    let mut session = make_test_session();
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    let mut editor = Editor::new();
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut wheel = WheelScrollAccelerator::default();
+
+    // Baseline: find where footer OpenSettings and header OpenModelPicker sit when no modal is open.
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    let (hdr_r, hdr_c) = find_click_pos(&state, |a| matches!(a, ClickAction::OpenConnectProvider | ClickAction::OpenModelPicker));
+    let (ftr_r, ftr_c) = find_click_pos(&state, |a| matches!(a, ClickAction::OpenSettings));
+    let (thk_r, thk_c) = find_click_pos(&state, |a| matches!(a, ClickAction::CycleThinking));
+
+    // Open ToolApproval modal: clicks on header/footer must be blocked completely.
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    apply_agent_signal(
+        AgentSignal::ToolApprovalRequest(Box::new(PendingApproval {
+            tool_name: "bash".to_string(),
+            args: serde_json::Map::new(),
+            reason: "Verify".to_string(),
+            preview: Some("echo hi".to_string()),
+            reply_tx,
+        })),
+        &mut session,
+        &mut state,
+    );
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    assert!(
+        state
+            .click_regions
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| matches!(r.action, ClickAction::ApproveToolChoice(_))),
+        "during ToolApproval, only ApproveToolChoice regions may be registered"
+    );
+    let handled_hdr = handle_mouse_event(
+        mouse_event(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            hdr_r,
+            hdr_c,
+        ),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert!(!handled_hdr, "header click during ToolApproval must be ignored");
+    assert!(!handle_interactive_paste("secret", &session, &mut state, &mut editor));
+    assert_eq!(editor.text(), "");
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::ToolApproval)
+    );
+    assert!(reply_rx.try_recv().is_err(), "approval must remain pending");
+
+    // Dismiss approval so test cleans up cleanly.
+    state.pending_approval = None;
+    state.selector = None;
+
+    // Open a dismissable modal (/settings) and verify header/footer clicks close it rather than bleeding through.
+    let reg = crate::models_config::ModelRegistry::builtin_only();
+    let claude = reg.resolve("anthropic", Some("claude-sonnet-4-5")).unwrap();
+    let prov = AgentSession::default_provider_for_model(&claude);
+    session.set_model(claude, prov);
+    handle_slash_command("/settings", &mut session, &mut state, None, false).await;
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::Settings)
+    );
+    assert!(!handle_interactive_paste("secret", &session, &mut state, &mut editor));
+    assert_eq!(editor.text(), "");
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+
+    // Right-clicking thinking pill position while Settings modal is open must NOT switch to Thinking modal.
+    handle_mouse_event(
+        mouse_event(
+            MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            thk_r,
+            thk_c,
+        ),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::Settings),
+        "right click during modal must not open Thinking picker"
+    );
+
+    // Left-clicking footer settings position while Settings modal is open should close modal (backdrop), not reopen or open Help.
+    handle_mouse_event(
+        mouse_event(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            ftr_r,
+            ftr_c,
+        ),
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert!(
+        state.selector.is_none(),
+        "outside click during dismissable modal must close it without triggering underlying footer action"
+    );
+    assert!(handle_interactive_paste("hello", &session, &mut state, &mut editor));
+    assert_eq!(editor.text(), "hello");
+}
+
+#[tokio::test]
+async fn test_discovery_preserves_keyless_ollama_and_ignores_stale_batches() {
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    let _env_clear = ProviderEnvClearGuard::clear_all();
+
+    let dir = crate::TempTestDir::new("tui_disc_ollama");
+    let auth_file = dir.path().join("auth.json");
+    let models_file = dir.path().join("models.json");
+    let disc_file = dir.path().join("discovered-models.json");
+    let settings_file = dir.path().join("settings.json");
+
+    crate::models_config::upsert_custom_provider(
+        "ollama",
+        "http://127.0.0.1:11434/v1",
+        None,
+        Some(&models_file),
+    )
+    .unwrap();
+    let ollama_model = mehh_ai::Model {
+        id: "llama3".to_string(),
+        name: "Llama 3".to_string(),
+        api: "openai-completions".to_string(),
+        provider: "ollama".to_string(),
+        base_url: "http://127.0.0.1:11434/v1".to_string(),
+        ..Default::default()
+    };
+    crate::models_config::save_discovered_provider_models(
+        "ollama",
+        std::slice::from_ref(&ollama_model),
+        Some(&disc_file),
+    )
+    .unwrap();
+
+    let mut session = make_test_session();
+    let prov = AgentSession::default_provider_for_model(&ollama_model);
+    session.set_model(ollama_model, prov);
+    assert!(session.api_key.is_none());
+
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.auth_file = Some(auth_file.clone());
+    state.models_file = Some(models_file);
+    state.discovered_models_file = Some(disc_file);
+    state.settings_file = Some(settings_file);
+
+    // Connect OpenAI as well; render idle discovery status and ensure stale batch_ids are dropped
+    // and matching batch completion does NOT hijack active keyless Ollama.
+    crate::auth::save_credential(
+        "openai",
+        &mehh_ai::StoredCredential::ApiKey {
+            key: Some("sk-openai-test".to_string()),
+            env: None,
+        },
+        Some(&auth_file),
+    )
+    .unwrap();
+    state.discovery_batch_id = 2;
+    state.discovery_pending = 1;
+    state.discovery_status = Some("Fetching models for openai...".to_string());
+    assert!(!state.is_busy);
+    assert!(state.status.is_none());
+
+    let editor = Editor::new();
+    let frame = render_interactive_frame(&state, &editor, &session, 100, 28);
+    assert!(
+        frame.iter().any(|l| l.contains("Fetching models for openai...")),
+        "discovery banner must render while session is idle"
+    );
+
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+    let gpt4o = crate::models_config::ModelRegistry::builtin_only()
+        .resolve("openai", Some("gpt-4o"))
+        .unwrap();
+
+    let items_before = state.items.len();
+    let _ = handle_agent_signal_async(
+        AgentSignal::ModelsDiscovered(Box::new(super::events::ModelsDiscoveredPayload {
+            batch_id: 1,
+            provider: "openai".to_string(),
+            result: Ok((vec![gpt4o.clone()], None)),
+        })),
+        &mut session,
+        &mut state,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(state.items.len(), items_before, "stale batch must be ignored");
+    assert_eq!(state.discovery_pending, 1);
+
+    let _ = handle_agent_signal_async(
+        AgentSignal::ModelsDiscovered(Box::new(super::events::ModelsDiscoveredPayload {
+            batch_id: 2,
+            provider: "openai".to_string(),
+            result: Ok((vec![gpt4o], None)),
+        })),
+        &mut session,
+        &mut state,
+        &agent_tx,
+    )
+    .await;
+
+    assert_eq!(state.discovery_pending, 0);
+    assert!(state.discovery_status.is_none());
+    assert_eq!(
+        session.model.provider, "ollama",
+        "keyless active custom provider must not be overwritten when another provider discovers models"
+    );
+    assert_eq!(session.model.id, "llama3");
+}
+
+#[tokio::test]
+async fn test_logout_and_disconnect_clear_active_key_and_remove_custom_provider() {
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    let _env_clear = ProviderEnvClearGuard::clear_all();
+
+    let dir = crate::TempTestDir::new("tui_logout_disc");
+    let auth_file = dir.path().join("auth.json");
+    let models_file = dir.path().join("models.json");
+    let disc_file = dir.path().join("discovered-models.json");
+    let settings_file = dir.path().join("settings.json");
+
+    crate::auth::save_credential(
+        "anthropic",
+        &mehh_ai::StoredCredential::ApiKey {
+            key: Some("sk-ant-active".to_string()),
+            env: None,
+        },
+        Some(&auth_file),
+    )
+    .unwrap();
+    crate::models_config::upsert_custom_provider(
+        "ollama",
+        "http://127.0.0.1:11434/v1",
+        None,
+        Some(&models_file),
+    )
+    .unwrap();
+
+    let reg = crate::models_config::ModelRegistry::builtin_only();
+    let claude = reg.resolve("anthropic", Some("claude-sonnet-4-5")).unwrap();
+    let mut session = make_test_session();
+    let prov = AgentSession::default_provider_for_model(&claude);
+    session.set_model(claude, prov);
+    session.set_api_key(Some("sk-ant-active".to_string()));
+
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.auth_file = Some(auth_file);
+    state.models_file = Some(models_file.clone());
+    state.discovered_models_file = Some(disc_file);
+    state.settings_file = Some(settings_file);
+
+    handle_slash_command("/logout anthropic", &mut session, &mut state, None, false).await;
+    assert!(
+        session.api_key.is_none(),
+        "/logout of active provider must clear session.api_key"
+    );
+
+    handle_slash_command("/logout ollama", &mut session, &mut state, None, false).await;
+    let reloaded = crate::models_config::ModelRegistry::load_with_path(&models_file).unwrap();
+    assert!(
+        !reloaded.provider_has_explicit_endpoint("ollama"),
+        "/logout of custom provider must remove it from models.json"
+    );
+}
+
+#[tokio::test]
+async fn test_connect_with_provider_arg_and_scoped_models_uses_discovered_registry() {
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    let _env_clear = ProviderEnvClearGuard::clear_all();
+
+    let dir = crate::TempTestDir::new("tui_connect_arg_scoped");
+    let auth_file = dir.path().join("auth.json");
+    let models_file = dir.path().join("models.json");
+    let disc_file = dir.path().join("discovered-models.json");
+
+    let mut session = make_test_session();
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.auth_file = Some(auth_file);
+    state.models_file = Some(models_file);
+    state.discovered_models_file = Some(disc_file.clone());
+
+    handle_slash_command("/connect openrouter", &mut session, &mut state, None, false).await;
+    assert_eq!(
+        state.selector.as_ref().map(|s| s.kind),
+        Some(SelectorKind::ConnectInput),
+        "/connect <provider> must jump directly into that provider's flow"
+    );
+    assert!(matches!(
+        state.connect_input.as_ref().map(|i| &i.kind),
+        Some(ConnectInputKind::ApiKey { provider, .. }) if provider == "openrouter"
+    ));
+
+    let disc_model = mehh_ai::Model {
+        id: "custom-disc-1".to_string(),
+        name: "Custom Discovered".to_string(),
+        api: "openai-completions".to_string(),
+        provider: "openrouter".to_string(),
+        base_url: "https://openrouter.ai/api/v1".to_string(),
+        ..Default::default()
+    };
+    crate::models_config::save_discovered_provider_models(
+        "openrouter",
+        &[disc_model],
+        Some(&disc_file),
+    )
+    .unwrap();
+
+    handle_slash_command(
+        "/scoped-models openrouter/custom-disc-1",
+        &mut session,
+        &mut state,
+        None,
+        false,
+    )
+    .await;
+    assert!(
+        session
+            .scoped_models()
+            .iter()
+            .any(|m| m.provider == "openrouter" && m.id == "custom-disc-1"),
+        "/scoped-models must resolve against discovered-models cache and custom models.json"
+    );
+}
+
+#[tokio::test]
+async fn test_disconnect_preserves_builtin_models_json_and_clears_key_on_corrupt_models_json() {
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    let _env_clear = ProviderEnvClearGuard::clear_all();
+
+    let dir = crate::TempTestDir::new("tui_disc_preserve_corrupt");
+    let auth_file = dir.path().join("auth.json");
+    let models_file = dir.path().join("models.json");
+    let disc_file = dir.path().join("discovered-models.json");
+
+    crate::auth::save_credential(
+        "anthropic",
+        &mehh_ai::StoredCredential::ApiKey {
+            key: Some("sk-ant-1".to_string()),
+            env: None,
+        },
+        Some(&auth_file),
+    )
+    .unwrap();
+    std::fs::write(
+        &models_file,
+        r#"{
+  "providers": {
+    "anthropic": {
+      "baseUrl": "https://proxy.example.com/anthropic",
+      "headers": { "X-Team": "core" },
+      "models": [{ "id": "custom-claude" }]
+    }
+  }
+}"#,
+    )
+    .unwrap();
+
+    let reg = crate::models_config::ModelRegistry::builtin_only();
+    let claude = reg.resolve("anthropic", Some("claude-sonnet-4-5")).unwrap();
+    let mut session = make_test_session();
+    let prov = AgentSession::default_provider_for_model(&claude);
+    session.set_model(claude.clone(), prov);
+    session.set_api_key(Some("sk-ant-1".to_string()));
+    {
+        let mut mgr = session.lead_worker.lock().unwrap();
+        mgr.worker_model = Some(claude);
+        mgr.worker_provider = Some(Arc::new(mehh_ai::FauxProvider::new()));
+        mgr.set_worker_api_key(Some("sk-ant-worker".to_string()));
+    }
+
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.auth_file = Some(auth_file.clone());
+    state.models_file = Some(models_file.clone());
+    state.discovered_models_file = Some(disc_file);
+
+    handle_slash_command("/logout anthropic", &mut session, &mut state, None, false).await;
+    assert!(session.api_key.is_none());
+    assert!(session.lead_worker.lock().unwrap().worker_api_key.is_none());
+
+    let loaded = crate::models_config::ModelRegistry::load_with_path(&models_file).unwrap();
+    let ant_cfg = loaded
+        .provider_config("anthropic")
+        .expect("built-in custom headers/models in models.json must be preserved on /logout");
+    assert_eq!(ant_cfg.models.len(), 1);
+
+    // Even when models.json is corrupt, /logout must still clear active session.api_key after removing auth.json key.
+    crate::auth::save_credential(
+        "openai",
+        &mehh_ai::StoredCredential::ApiKey {
+            key: Some("sk-openai-1".to_string()),
+            env: None,
+        },
+        Some(&auth_file),
+    )
+    .unwrap();
+    std::fs::write(&models_file, "{corrupt json").unwrap();
+    let gpt4o = reg.resolve("openai", Some("gpt-4o")).unwrap();
+    let prov_o = AgentSession::default_provider_for_model(&gpt4o);
+    session.set_model(gpt4o, prov_o);
+    session.set_api_key(Some("sk-openai-1".to_string()));
+
+    handle_slash_command("/logout openai", &mut session, &mut state, None, false).await;
+    assert!(
+        session.api_key.is_none(),
+        "corrupt models.json must not prevent clearing active session.api_key after auth.json removal"
+    );
+}
+
+#[tokio::test]
+async fn test_settings_thinking_cycle_reaches_all_levels_on_non_reasoning_and_always_on_models() {
+    let dir = crate::TempTestDir::new("tui_settings_think_cycle");
+    let settings_file = dir.path().join("settings.json");
+    let reg = crate::models_config::ModelRegistry::builtin_only();
+    let gpt4o = reg.resolve("openai", Some("gpt-4o")).unwrap();
+    let gemini_pro = reg.resolve("google", Some("gemini-2.5-pro")).unwrap();
+
+    let mut session = make_test_session();
+    let prov4o = AgentSession::default_provider_for_model(&gpt4o);
+    session.set_model(gpt4o, prov4o);
+    session.sync_thinking_for_model(true);
+
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    state.settings_file = Some(settings_file.clone());
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel();
+
+    handle_slash_command("/settings", &mut session, &mut state, None, false).await;
+    let think_idx = state
+        .selector
+        .as_ref()
+        .unwrap()
+        .settings_list
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .position(|i| i.id == "default_thinking_level")
+        .unwrap();
+    state
+        .selector
+        .as_mut()
+        .unwrap()
+        .settings_list
+        .as_mut()
+        .unwrap()
+        .selected = think_idx;
+
+    let mut seen_4o = Vec::new();
+    for _ in 0..4 {
+        handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+        seen_4o.push(session.settings.default_thinking_level.unwrap());
+    }
+    assert_eq!(
+        seen_4o,
+        vec![
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+            ThinkingLevel::High,
+            ThinkingLevel::Off,
+        ],
+        "non-reasoning model must still cycle all persisted default thinking levels"
+    );
+
+    // Switch to always-on reasoning model (gemini-2.5-pro): must cycle High -> Off -> Low -> Medium.
+    state.selector = None;
+    session.settings.default_thinking_level = None;
+    let prov_gem = AgentSession::default_provider_for_model(&gemini_pro);
+    session.set_model(gemini_pro, prov_gem);
+    session.sync_thinking_for_model(true);
+
+    handle_slash_command("/settings", &mut session, &mut state, None, false).await;
+    state
+        .selector
+        .as_mut()
+        .unwrap()
+        .settings_list
+        .as_mut()
+        .unwrap()
+        .selected = think_idx;
+
+    let mut seen_gem = Vec::new();
+    for _ in 0..4 {
+        handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+        seen_gem.push(session.settings.default_thinking_level.unwrap());
+    }
+    assert_eq!(
+        seen_gem,
+        vec![
+            ThinkingLevel::High,
+            ThinkingLevel::Off,
+            ThinkingLevel::Low,
+            ThinkingLevel::Medium,
+        ],
+        "always-on model must still reach every persisted default level"
+    );
+}
+
+#[tokio::test]
+async fn test_scroll_to_bottom_click_isolated_during_modals_and_tool_approval_restores_theme_preview() {
+    let mut session = make_test_session();
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    let editor = Editor::new();
+
+    for i in 0..40 {
+        state.items.push(TranscriptItem::System(format!("line {i}")));
+    }
+    state.scroll_offset = 3;
+
+    // Open /theme and set a simulated live preview theme different from orig.
+    handle_slash_command("/theme", &mut session, &mut state, None, false).await;
+    let orig_name = state.theme.name.clone();
+    state.theme_preview_restore = Some(state.theme.clone());
+    state.theme = Theme::light();
+    assert_ne!(state.theme.name, orig_name);
+
+    // Incoming ToolApprovalRequest must restore unconfirmed theme preview cleanly.
+    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+    apply_agent_signal(
+        AgentSignal::ToolApprovalRequest(Box::new(PendingApproval {
+            tool_name: "bash".to_string(),
+            args: serde_json::Map::new(),
+            reason: "Approve".to_string(),
+            preview: Some("echo 1".to_string()),
+            reply_tx,
+        })),
+        &mut session,
+        &mut state,
+    );
+    assert_eq!(
+        state.theme.name, orig_name,
+        "ToolApprovalRequest arriving during /theme preview must restore original theme"
+    );
+    assert!(state.theme_preview_restore.is_none());
+
+    // Scrolled up during ToolApproval must NOT emit ScrollToBottom click region.
+    render_interactive_frame(&state, &editor, &session, 100, 28);
+    assert!(
+        state
+            .click_regions
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|r| matches!(r.action, ClickAction::ApproveToolChoice(_))),
+        "ScrollToBottom region leaked during ToolApproval while scrolled up"
+    );
+}
+
+#[tokio::test]
+async fn zero_frame_and_250ms_guard_rejects_blind_approval_keypress() {
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    let kb = Keybindings::default_bindings();
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+
+    apply_agent_signal(
+        AgentSignal::ToolApprovalRequest(Box::new(PendingApproval {
+            tool_name: "bash".to_string(),
+            args: serde_json::Map::new(),
+            reason: "Run test".to_string(),
+            preview: Some("echo hi".to_string()),
+            reply_tx,
+        })),
+        &mut session,
+        &mut state,
+    );
+    assert!(
+        state.approval_first_rendered_at.is_none(),
+        "new approval request must start unrendered"
+    );
+
+    // Zero-frame rejection: key press before first render must not approve or deny.
+    assert!(!super::events::handle_tool_approval_key("y", &kb, &mut session, &mut state).await);
+    assert!(state.has_tool_approval());
+    assert!(reply_rx.try_recv().is_err());
+
+    // < 250ms rejection: instant blind keypress right after render must be ignored.
+    state.approval_first_rendered_at = Some(std::time::Instant::now());
+    assert!(!super::events::handle_tool_approval_key("y", &kb, &mut session, &mut state).await);
+    assert!(state.has_tool_approval());
+    assert!(reply_rx.try_recv().is_err());
+
+    // >= 250ms confirmation: accepted cleanly and clears approval_first_rendered_at.
+    state.approval_first_rendered_at =
+        Some(std::time::Instant::now() - Duration::from_millis(300));
+    assert!(super::events::handle_tool_approval_key("y", &kb, &mut session, &mut state).await);
+    assert_eq!(reply_rx.try_recv().ok(), Some(true));
+    assert!(!state.has_tool_approval());
+    assert!(state.approval_first_rendered_at.is_none());
+}
+
+#[test]
+fn render_sanitizes_untrusted_csi_osc_and_bidi_from_transcript_and_modals() {
+    let session = make_test_session();
+    let mut state = make_test_state();
+    state.status = Some("status \x1b[2J\u{202E}evil".to_string());
+    state.items.push(TranscriptItem::User(
+        "user \x1b[31mred\x1b[0m \u{2066}bidi".to_string(),
+    ));
+    state.items.push(TranscriptItem::Assistant {
+        thinking: "think \x1b]52;c;AAAA\x07 \u{202E}hidden".to_string(),
+        text: "answer \x1b[2J\x1bc \u{202D}visible".to_string(),
+    });
+    state.items.push(TranscriptItem::ToolCall {
+        id: "tc_1".to_string(),
+        name: "bash\x1b[2J".to_string(),
+        status: "running".to_string(),
+        is_error: false,
+        args_summary: "echo \x1b]0;pwn\x07ok".to_string(),
+        output_preview: vec!["out \x1b[31m\u{202E}line".to_string()],
+        diff: Some("+add \x1b[2J\u{202E}row".to_string()),
+        duration_ms: None,
+    });
+    state.items.push(TranscriptItem::Subagent {
+        id: "sub_1".to_string(),
+        mode: "coding\u{202E}".to_string(),
+        status: "running".to_string(),
+        is_error: false,
+        children: vec![SubagentChildRow {
+            child_id: "c1".to_string(),
+            label: "tool\x1b[2J".to_string(),
+            status: "running".to_string(),
+            detail: "read \x1b]0;title\x07\u{2066}x".to_string(),
+        }],
+    });
+    state.items.push(TranscriptItem::System(
+        "sys \x1b[2J\x1b]52;c;QQ==\x07\u{202E}notice".to_string(),
+    ));
+
+    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+    state.pending_approval = Some(PendingApproval {
+        tool_name: "bash\x1b[2J".to_string(),
+        args: serde_json::Map::new(),
+        reason: "reason \u{202E}spoof".to_string(),
+        preview: Some("echo \x1b]0;owned\x07safe".to_string()),
+        reply_tx,
+    });
+    state.selector = Some(Selector {
+        kind: SelectorKind::ToolApproval,
+        list: SelectList::new(vec![SelectItem::new("allow_once", "Allow once")], 4),
+        settings_list: None,
+    });
+
+    let frame = render_interactive_frame(&state, &Editor::new(), &session, 100, 32).join("\n");
+    assert!(!frame.contains("\x1b[2J"));
+    assert!(!frame.contains("\x1b]52;"));
+    assert!(!frame.contains("\x1b]0;"));
+    assert!(!frame.contains("\x1bc"));
+    assert!(!frame.contains('\u{202E}'));
+    assert!(!frame.contains('\u{202D}'));
+    assert!(!frame.contains('\u{2066}'));
+    let plain = mehh_tui::strip_ansi(&frame);
+    assert!(plain.contains("visible"));
+    assert!(plain.contains("notice"));
+    assert!(plain.contains("safe"));
+}
+
+#[test]
+fn theme_generation_effective_elapsed_and_subagent_child_invalidate_transcript_cache() {
+    let session = make_test_session();
+    let mut state = make_test_state();
+    let editor = Editor::new();
+
+    let now = std::time::Instant::now();
+    *state.turn_started_at.lock().unwrap() = Some(now - Duration::from_millis(500));
+    *state.turn_completed_at.lock().unwrap() = Some(now);
+    state.items.push(TranscriptItem::Assistant {
+        thinking: "step 1".to_string(),
+        text: "hello".to_string(),
+    });
+    state.items.push(TranscriptItem::Subagent {
+        id: "sub_1".to_string(),
+        mode: "coding".to_string(),
+        status: "completed".to_string(),
+        is_error: false,
+        children: vec![SubagentChildRow {
+            child_id: "c1".to_string(),
+            label: "tool".to_string(),
+            status: "running".to_string(),
+            detail: "read".to_string(),
+        }],
+    });
+
+    let f1 = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
+    assert!(mehh_tui::strip_ansi(&f1).contains("0.5s"));
+
+    // 1. Changing effective_elapsed_ms via turn_completed_at must invalidate cached Assistant item.
+    *state.turn_completed_at.lock().unwrap() = Some(now + Duration::from_millis(2000));
+    let f2 = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
+    assert!(
+        mehh_tui::strip_ansi(&f2).contains("2.5s"),
+        "updated live elapsed must invalidate TranscriptCache: {f2}"
+    );
+
+    // 2. Bumping theme_generation with identical theme.name must invalidate cached items.
+    let mut custom_dark = Theme::dark();
+    custom_dark.dim = "\x1b[38;2;99;88;77m".to_string();
+    state.set_theme(custom_dark);
+    let f3 = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
+    assert!(
+        f3.contains("\x1b[38;2;99;88;77m"),
+        "theme_generation bump must invalidate TranscriptCache even with same theme name"
+    );
+
+    // 3. Running child inside a Subagent item must invalidate on loader.tick().
+    state.loader.tick();
+    let f4 = render_interactive_frame(&state, &editor, &session, 80, 24).join("\n");
+    assert_ne!(
+        mehh_tui::strip_ansi(&f3),
+        mehh_tui::strip_ansi(&f4),
+        "running child spinner must advance across frames"
+    );
+}
+
+#[test]
+fn login_key_submission_is_scrubbed_from_editor_history() {
+    let mut editor = Editor::new();
+    let kb = Keybindings::default_bindings();
+
+    editor.set_text("explain ownership");
+    let _ = editor.handle_editor_key("enter", &kb);
+    super::events::scrub_sensitive_submission(&mut editor);
+
+    editor.set_text("/login openai sk-secret-token-999");
+    let _ = editor.handle_editor_key("enter", &kb);
+    super::events::scrub_sensitive_submission(&mut editor);
+
+    editor.set_text("/login");
+    let _ = editor.handle_editor_key("enter", &kb);
+    super::events::scrub_sensitive_submission(&mut editor);
+
+    editor.set_text("/LOGIN openai sk-secret-upper");
+    let _ = editor.handle_editor_key("enter", &kb);
+    super::events::scrub_sensitive_submission(&mut editor);
+
+    editor.set_text("/follow-up /login openai sk-secret-followup");
+    let _ = editor.handle_editor_key("enter", &kb);
+    super::events::scrub_sensitive_submission(&mut editor);
+
+    assert_eq!(
+        editor.history,
+        vec!["explain ownership".to_string(), "/login".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn mouse_approval_click_respects_zero_frame_and_min_display_guard() {
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    let mut editor = Editor::new();
+    let mut wheel = WheelScrollAccelerator::new(mehh_tui::WheelScrollLines::Auto, false);
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    state.pending_approval = Some(PendingApproval {
+        tool_name: "bash".to_string(),
+        args: serde_json::Map::new(),
+        reason: "Confirm shell command".to_string(),
+        preview: Some("echo hi".to_string()),
+        reply_tx,
+    });
+    state.selector = Some(Selector {
+        kind: SelectorKind::ToolApproval,
+        list: SelectList::new(
+            vec![SelectItem::new("allow_once", "Allow once (y/Enter)")],
+            6,
+        ),
+        settings_list: None,
+    });
+    state.click_regions.lock().unwrap().push(ClickRegion {
+        row: 5,
+        col_start: 0,
+        col_end: 20,
+        action: ClickAction::ApproveToolChoice("allow_once".to_string()),
+    });
+
+    let click = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 4,
+        row: 5,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    };
+
+    // Zero-frame guard: approval has never been rendered yet.
+    assert!(state.approval_first_rendered_at.is_none());
+    assert!(!super::events::handle_mouse_event(
+        click,
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await);
+    assert!(
+        state.pending_approval.is_some(),
+        "click before first render must not approve"
+    );
+
+    // Minimum display duration guard: rendered just now (< APPROVAL_MIN_DISPLAY_MS).
+    state.approval_first_rendered_at = Some(std::time::Instant::now());
+    assert!(!super::events::handle_mouse_event(
+        click,
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await);
+    assert!(
+        state.pending_approval.is_some(),
+        "click before APPROVAL_MIN_DISPLAY_MS must not approve"
+    );
+
+    // After the guard window elapses, clicking resolves the approval.
+    state.approval_first_rendered_at = std::time::Instant::now().checked_sub(
+        std::time::Duration::from_millis(super::events::APPROVAL_MIN_DISPLAY_MS + 50),
+    );
+    assert!(super::events::handle_mouse_event(
+        click,
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await);
+    assert!(state.pending_approval.is_none());
+    assert_eq!(reply_rx.try_recv(), Ok(true));
+}
+
+#[test]
+fn busy_submission_rejects_login_without_echoing_or_queueing() {
+    let session = make_test_session();
+    let mut state = make_test_state();
+
+    for (input, force_follow_up) in [
+        ("/login openai sk-secret-steer-111", false),
+        ("/login openai sk-secret-alt-222", true),
+        ("/LOGIN anthropic sk-secret-upper-333", false),
+        ("/follow-up /login openai sk-secret-follow-444", false),
+        ("/FOLLOW-UP /LOGIN openai sk-secret-follow-555", true),
+    ] {
+        super::events::queue_busy_submission(input, force_follow_up, &session, &mut state);
+    }
+
+    assert!(
+        session.steering_queue.lock().unwrap().is_empty(),
+        "login commands must never be queued to steering_queue"
+    );
+    assert!(
+        session.follow_up_queue.lock().unwrap().is_empty(),
+        "login commands must never be queued to follow_up_queue"
+    );
+    assert_eq!(state.items.len(), 5);
+    for item in &state.items {
+        let TranscriptItem::System(msg) = item else {
+            panic!("expected system notice, got {item:?}");
+        };
+        assert!(msg.contains("Cannot run /login while a turn is running"));
+        assert!(!msg.contains("sk-secret"), "secret leaked into transcript: {msg}");
+    }
+}
+
+#[test]
+fn frame_truncates_to_height_and_aligns_scrollbar_without_chopping_user_turn() {
+    let session = make_test_session();
+    let mut state = make_test_state();
+    for i in 0..30 {
+        state.items.push(TranscriptItem::User(format!("turn {i}")));
+    }
+    let editor = Editor::new();
+    let tall = render_interactive_frame(&state, &editor, &session, 60, 16);
+    assert_eq!(tall.len(), 16);
+    for line in &tall {
+        assert!(mehh_tui::visible_width(line) <= 60);
+    }
+    assert!(
+        !tall.iter().any(|l| l.contains("...│") || l.contains("...┃")),
+        "scrollbar must not overwrite user turn padding with ellipsis: {tall:?}"
+    );
+
+    // Tiny height with open selector must clamp cleanly.
+    state.open_modal(Selector {
+        kind: SelectorKind::Model,
+        list: SelectList::new(vec![SelectItem::new("m1", "Model 1")], 6),
+        settings_list: None,
+    });
+    let tiny = render_interactive_frame(&state, &editor, &session, 40, 5);
+    assert!(tiny.len() <= 5, "frame overflowed height 5: {}", tiny.len());
+}
+
+#[tokio::test]
+async fn non_builtin_slash_commands_return_not_a_command_and_reset_metadata_clears_state() {
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+
+    assert_eq!(
+        handle_slash_command("/skill:refactor target=lib.rs", &mut session, &mut state, None, false)
+            .await,
+        SlashCommandOutcome::NotACommand
+    );
+    assert_eq!(
+        handle_slash_command("/custom-template arg1", &mut session, &mut state, None, false).await,
+        SlashCommandOutcome::NotACommand
+    );
+
+    state.scroll_offset = 4;
+    state.scroll_anchor.store(12, Ordering::Relaxed);
+    state.prev_transcript_len.store(42, Ordering::Relaxed);
+    state.approval_first_rendered_at = Some(std::time::Instant::now());
+    *state.turn_started_at.lock().unwrap() = Some(std::time::Instant::now());
+    state.thinking_elapsed.lock().unwrap().insert(0, 1234);
+
+    handle_slash_command("/new", &mut session, &mut state, None, false).await;
+    assert_eq!(state.scroll_offset, 0);
+    assert_eq!(state.scroll_anchor.load(Ordering::Relaxed), 0);
+    assert_eq!(state.prev_transcript_len.load(Ordering::Relaxed), 0);
+    assert!(state.approval_first_rendered_at.is_none());
+    assert!(state.turn_started_at.lock().unwrap().is_none());
+    assert!(state.thinking_elapsed.lock().unwrap().is_empty());
+}
+
+#[test]
+fn scoped_panic_hook_skips_restore_when_panicking_and_restores_normally() {
+    use std::sync::atomic::AtomicBool;
+
+    let restored_normal = Arc::new(AtomicBool::new(false));
+    {
+        let flag = Arc::clone(&restored_normal);
+        let _hook = super::events::ScopedPanicHook::with_restore(move || {
+            flag.store(true, Ordering::SeqCst);
+        });
+    }
+    assert!(
+        restored_normal.load(Ordering::SeqCst),
+        "normal drop must invoke restore closure"
+    );
+
+    let restored_unwind = Arc::new(AtomicBool::new(false));
+    let flag_unwind = Arc::clone(&restored_unwind);
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _hook = super::events::ScopedPanicHook::with_restore(move || {
+            flag_unwind.store(true, Ordering::SeqCst);
+        });
+        panic!("simulated panic during unwind");
+    }));
+    assert!(res.is_err());
+    assert!(
+        !restored_unwind.load(Ordering::SeqCst),
+        "drop while unwinding must skip restore closure to avoid double-panic abort"
+    );
+}
+
+#[tokio::test]
+async fn idle_case_insensitive_login_and_nested_follow_up_login_are_handled_and_scrubbed() {
+    let dir = crate::TempTestDir::new("idle_login_case");
+    let auth_file = dir.path().join("auth.json");
+    let mut session = make_test_session();
+    session.model.provider = "openai".to_string();
+    let mut state = make_test_state();
+    state.auth_file = Some(auth_file.clone());
+
+    assert_eq!(
+        handle_slash_command(
+            "/LOGIN openai sk-secret-123",
+            &mut session,
+            &mut state,
+            None,
+            false
+        )
+        .await,
+        SlashCommandOutcome::Handled
+    );
+    let entries = crate::auth::load_auth_entries(Some(&auth_file)).unwrap();
+    assert!(entries.contains_key("openai"));
+    assert_eq!(session.api_key.as_deref(), Some("sk-secret-123"));
+    for item in &state.items {
+        let TranscriptItem::System(msg) = item else {
+            continue;
+        };
+        assert!(!msg.contains("sk-secret-123"), "secret leaked: {msg}");
+    }
+
+    for nested in [
+        "/follow-up /login openai sk-secret-456",
+        "/FOLLOW-UP /follow-up /LOGIN openai sk-secret-789",
+    ] {
+        assert_eq!(
+            handle_slash_command(nested, &mut session, &mut state, None, false).await,
+            SlashCommandOutcome::Handled
+        );
+        assert!(
+            session.follow_up_queue.lock().unwrap().is_empty(),
+            "nested /login must not be queued as follow-up: {nested}"
+        );
+        let Some(TranscriptItem::System(last)) = state.items.last() else {
+            panic!("expected system notice");
+        };
+        assert_eq!(
+            last,
+            "Cannot queue /login as a follow-up; run /login directly."
+        );
+        assert!(!last.contains("sk-secret"), "secret leaked: {last}");
+    }
+
+    let mut editor = Editor::new();
+    let kb = Keybindings::default_bindings();
+    editor.set_text("normal prompt");
+    let _ = editor.handle_editor_key("enter", &kb);
+    super::events::scrub_sensitive_submission(&mut editor);
+
+    editor.set_text("/FOLLOW-UP /follow-up /LOGIN openai sk-secret-789");
+    let _ = editor.handle_editor_key("enter", &kb);
+    super::events::scrub_sensitive_submission(&mut editor);
+    assert_eq!(editor.history, vec!["normal prompt".to_string()]);
+}
+
+#[test]
+fn busy_case_insensitive_follow_up_and_nested_login_rejection() {
+    assert_eq!(
+        route_busy_input("/FOLLOW-UP do work"),
+        BusyInput::FollowUp("do work".to_string())
+    );
+
+    let session = make_test_session();
+    let mut state = make_test_state();
+    super::events::queue_busy_submission(
+        "/FOLLOW-UP /follow-up /LOGIN openai sk-secret-999",
+        false,
+        &session,
+        &mut state,
+    );
+    assert!(session.steering_queue.lock().unwrap().is_empty());
+    assert!(session.follow_up_queue.lock().unwrap().is_empty());
+    let Some(TranscriptItem::System(msg)) = state.items.last() else {
+        panic!("expected system notice");
+    };
+    assert!(msg.contains("Cannot run /login while a turn is running"));
+    assert!(!msg.contains("sk-secret-999"));
+}
+
+#[tokio::test]
+async fn import_and_resume_clear_stale_queues() {
+    let dir = crate::TempTestDir::new("import_resume_clear_queues");
+    let import_path = dir.path().join("imported.jsonl");
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+
+    let _created = SessionManager::open_file(&import_path, &session.cwd).unwrap();
+
+    session.steer("stale steer".to_string());
+    session.follow_up("stale follow".to_string());
+    assert!(!session.steering_queue.lock().unwrap().is_empty());
+    assert!(!session.follow_up_queue.lock().unwrap().is_empty());
+
+    assert_eq!(
+        handle_slash_command(
+            &format!("/import {}", import_path.display()),
+            &mut session,
+            &mut state,
+            None,
+            false
+        )
+        .await,
+        SlashCommandOutcome::Handled
+    );
+    assert!(
+        session.steering_queue.lock().unwrap().is_empty(),
+        "/import must clear steering_queue"
+    );
+    assert!(
+        session.follow_up_queue.lock().unwrap().is_empty(),
+        "/import must clear follow_up_queue"
+    );
+
+    session.steer("stale steer 2".to_string());
+    session.follow_up("stale follow 2".to_string());
+    state.open_modal(Selector {
+        kind: SelectorKind::Resume,
+        list: SelectList::new(
+            vec![SelectItem::new(
+                import_path.display().to_string(),
+                "Imported Session",
+            )],
+            5,
+        ),
+        settings_list: None,
+    });
+    let _ = handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx)
+        .await;
+    assert!(
+        session.steering_queue.lock().unwrap().is_empty(),
+        "SelectorKind::Resume must clear steering_queue"
+    );
+    assert!(
+        session.follow_up_queue.lock().unwrap().is_empty(),
+        "SelectorKind::Resume must clear follow_up_queue"
+    );
+}
+
+#[tokio::test]
+async fn corrupt_theme_fails_closed_without_mutating_state_or_settings_file() {
+    let dir = crate::TempTestDir::new("corrupt_theme");
+    let bad_theme_path = dir.path().join("corrupt.json");
+    let settings_file = dir.path().join("settings.json");
+    std::fs::write(&bad_theme_path, "{not valid json").unwrap();
+
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    state.settings_file = Some(settings_file.clone());
+    let orig_theme = state.theme.clone();
+
+    assert_eq!(
+        handle_slash_command(
+            &format!("/theme {}", bad_theme_path.display()),
+            &mut session,
+            &mut state,
+            None,
+            false
+        )
+        .await,
+        SlashCommandOutcome::Handled
+    );
+    assert_eq!(state.theme, orig_theme);
+    assert!(session.settings.theme.is_none());
+    assert!(!settings_file.exists());
+    let Some(TranscriptItem::System(msg)) = state.items.last() else {
+        panic!("expected system notice");
+    };
+    assert!(msg.contains("Failed to load theme"), "{msg}");
+
+    assert_eq!(
+        handle_slash_command(
+            &format!("/settings theme {}", bad_theme_path.display()),
+            &mut session,
+            &mut state,
+            None,
+            false
+        )
+        .await,
+        SlashCommandOutcome::Handled
+    );
+    assert_eq!(state.theme, orig_theme);
+    assert!(session.settings.theme.is_none());
+    assert!(!settings_file.exists());
+    let Some(TranscriptItem::System(msg2)) = state.items.last() else {
+        panic!("expected system notice");
+    };
+    assert!(msg2.contains("Failed to parse theme"), "{msg2}");
+}
+
+#[tokio::test]
+async fn mouse_select_modal_row_returns_spawned_abort_handle() {
+    let dir = crate::TempTestDir::new("mouse_modal_abort");
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    state.auth_file = Some(dir.path().join("auth.json"));
+    let mut editor = Editor::new();
+    let mut wheel = WheelScrollAccelerator::new(mehh_tui::WheelScrollLines::Auto, false);
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+
+    state.connect_provider_target = Some("mistral".to_string());
+    state.selector = Some(Selector {
+        kind: SelectorKind::ConnectMethod,
+        list: SelectList::new(vec![SelectItem::new("oauth", "OAuth")], 4),
+        settings_list: None,
+    });
+    state.click_regions.lock().unwrap().push(ClickRegion {
+        row: 3,
+        col_start: 0,
+        col_end: 20,
+        action: ClickAction::SelectModalRow(0),
+    });
+
+    let click = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: 2,
+        row: 3,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    };
+
+    let (handled, handle) = super::events::handle_mouse_event_inner(
+        click,
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert!(handled);
+    let abort_handle = handle.expect("mouse SelectModalRow for oauth must return AbortHandle");
+    abort_handle.abort();
+}
+
+#[test]
+#[ignore]
+fn perf_baseline_and_fingerprints_tui_and_web() {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+    use std::time::Instant;
+
+    fn finish_sha(hasher: Sha256) -> String {
+        let digest = hasher.finalize();
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            let _ = write!(hex, "{b:02x}");
+        }
+        hex
+    }
+
+    fn make_deterministic_session() -> AgentSession {
+        let cwd = PathBuf::from("perf-bench-cwd");
+        let mut session_mgr = SessionManager::in_memory(&cwd);
+        let _ = session_mgr.set_session_name(Some("perf-bench".to_string()));
+        let faux = mehh_ai::FauxProvider::new();
+        let model = Model {
+            id: "claude-sonnet-4-5".to_string(),
+            name: "Claude Sonnet 4.5".to_string(),
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            base_url: "http://localhost".to_string(),
+            reasoning: true,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            headers: None,
+            ..Default::default()
+        };
+        AgentSession::new(cwd, model, Arc::new(faux), session_mgr, Settings::default())
+    }
+
+    // 1. tui_render_scrolling_and_spinner
+    {
+        let session = make_deterministic_session();
+        let mut state = InteractiveState::new(Vec::new(), &session.settings);
+        state.connected_provider_count = 1;
+        state.scroll_offset = 12;
+        for i in 0..80usize {
+            match i % 5 {
+                0 => state.items.push(TranscriptItem::User(format!(
+                    "Prompt #{i}: inspect module rendering and table formatting for perf workload"
+                ))),
+                1 => state.items.push(TranscriptItem::Assistant {
+                    thinking: "Line one reasoning\nLine two reasoning\nLine three reasoning"
+                        .to_string(),
+                    text: format!(
+                        "## Section {i}\n\nSummary with **bold**, `inline_code`, and a [link](https://docs.rs).\n\n\
+                         | Crate | Role | Status |\n| --- | --- | --- |\n| mehh-tui | renderer | active |\n| mehh-tools | web | active |\n\n\
+                         ```rust\nfn step_{i}(v: usize) -> usize {{ v + 1 }}\n```"
+                    ),
+                }),
+                2 => state.items.push(TranscriptItem::ToolCall {
+                    id: format!("tc_{i}"),
+                    name: "read".to_string(),
+                    status: if i >= 75 {
+                        "running".to_string()
+                    } else {
+                        "completed".to_string()
+                    },
+                    is_error: false,
+                    args_summary: format!("crates/mehh-tui/src/file_{i}.rs"),
+                    output_preview: vec![format!("ok line {i}")],
+                    diff: Some("--- a/x.rs\n+++ b/x.rs\n@@ -1 +1 @@\n-old\n+new".to_string()),
+                    duration_ms: Some(12),
+                }),
+                3 => state.items.push(TranscriptItem::Subagent {
+                    id: format!("sub_{i}"),
+                    mode: "research".to_string(),
+                    status: if i >= 78 {
+                        "running".to_string()
+                    } else {
+                        "completed".to_string()
+                    },
+                    is_error: false,
+                    children: vec![SubagentChildRow {
+                        child_id: format!("c_{i}"),
+                        label: "tool".to_string(),
+                        status: "completed".to_string(),
+                        detail: "completed".to_string(),
+                    }],
+                }),
+                _ => state
+                    .items
+                    .push(TranscriptItem::System(format!("System notice #{i}"))),
+            }
+        }
+        let mut editor = Editor::new()
+            .with_prefix("> ")
+            .with_placeholder("Type a message...");
+        for h in 0..50usize {
+            editor.history.push(format!("previous prompt {h}"));
+        }
+        for u in 0..40usize {
+            editor.set_text(&format!("draft revision {u}"));
+        }
+        let large_paste = "pasted line payload\n".repeat(1_500);
+        editor.insert_text(&large_paste);
+
+        let mut term = mehh_tui::MockTerminal::new(100, 32);
+        let mut renderer = TuiRenderer::new();
+        let mut hasher = Sha256::new();
+
+        let t0 = Instant::now();
+        for _ in 0..40 {
+            state.loader.tick();
+            let frame = render_interactive_frame(&state, &editor, &session, 100, 32);
+            for line in &frame {
+                hasher.update(line.as_bytes());
+                hasher.update(b"\n");
+            }
+            renderer.render_frame(&mut term, frame, false).unwrap();
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("METRIC tui_render_scrolling_and_spinner {ms:.3}");
+        println!(
+            "FINGERPRINT tui_render_scrolling_and_spinner {}",
+            finish_sha(hasher)
+        );
+    }
+
+    // 2. tui_model_picker_fuzzy_filter
+    {
+        let session = make_deterministic_session();
+        let mut state = InteractiveState::new(Vec::new(), &session.settings);
+        let items: Vec<SelectItem> = (0..500usize)
+            .map(|i| {
+                let prov = match i % 3 {
+                    0 => "openrouter",
+                    1 => "anthropic",
+                    _ => "openai",
+                };
+                let family = if i % 7 == 0 {
+                    "claude-sonnet-4-5"
+                } else if i % 5 == 0 {
+                    "gpt-4.1"
+                } else {
+                    "model-variant"
+                };
+                SelectItem::new(
+                    format!("{prov}/{family}-{i}"),
+                    format!("{family} #{i} ({prov})"),
+                )
+                .with_description(format!("{family}-{i} · 200k ctx"))
+            })
+            .collect();
+        let mut list = SelectList::new(items, 10);
+        list.set_filter("claude sonnet");
+        state.open_modal(Selector {
+            kind: SelectorKind::Model,
+            list,
+            settings_list: None,
+        });
+        let editor = Editor::new();
+        let mut hasher = Sha256::new();
+
+        let t0 = Instant::now();
+        for _ in 0..30 {
+            let filtered = state.selector.as_ref().unwrap().list.filtered_indices();
+            for idx in filtered {
+                hasher.update(idx.to_le_bytes());
+            }
+            let frame = render_interactive_frame(&state, &editor, &session, 100, 32);
+            for line in &frame {
+                hasher.update(line.as_bytes());
+                hasher.update(b"\n");
+            }
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("METRIC tui_model_picker_fuzzy_filter {ms:.3}");
+        println!(
+            "FINGERPRINT tui_model_picker_fuzzy_filter {}",
+            finish_sha(hasher)
+        );
+    }
+
+    // 3. tui_settings_narrow_modal
+    {
+        let mut sl = build_settings_list(&Settings::default());
+        sl.max_height = Some(10);
+        sl.set_filter("mode");
+        let mut hasher = Sha256::new();
+
+        let t0 = Instant::now();
+        for _ in 0..100 {
+            let (lines, row_map) = sl.render_with_row_map(64);
+            for line in &lines {
+                hasher.update(line.as_bytes());
+                hasher.update(b"\n");
+            }
+            for entry in &row_map {
+                match entry {
+                    Some((idx, id)) => {
+                        hasher.update([1u8]);
+                        hasher.update(idx.to_le_bytes());
+                        hasher.update(id.as_bytes());
+                    }
+                    None => hasher.update([0u8]),
+                }
+            }
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("METRIC tui_settings_narrow_modal {ms:.3}");
+        println!(
+            "FINGERPRINT tui_settings_narrow_modal {}",
+            finish_sha(hasher)
+        );
+    }
+
+    // 4. tui_ansi_and_markdown_wrap
+    {
+        let mut md = String::new();
+        for i in 0..30usize {
+            let _ = write!(
+                md,
+                "# Heading {i}\n\nParagraph {i} with **bold**, *italic*, [Docs](https://docs.rs/{i}), and CJK text 日本語テスト.\n\n\
+                 | Key | Value | Notes |\n| --- | --- | --- |\n| item_{i} | {i}00 | row description |\n\n\
+                 ```rust\nlet val_{i} = \"sample string {i}\";\n```\n\n"
+            );
+        }
+        let styled_sample = "\x1b[38;2;120;200;255m\x1b[1mStatus: active build running with \t tab and styled spans across segments\x1b[0m \x1b]8;;https://docs.rs\x07LinkTarget\x1b]8;;\x07";
+        let theme = Theme::dark();
+        let mut hasher = Sha256::new();
+
+        let t0 = Instant::now();
+        for _ in 0..20 {
+            let lines = MarkdownView::new(&md).with_theme(theme.clone()).render(80);
+            for l in &lines {
+                let w = mehh_tui::visible_width(l);
+                let tr = mehh_tui::truncate_to_width(l, 60, "...", false);
+                hasher.update(w.to_le_bytes());
+                hasher.update(tr.as_bytes());
+                hasher.update(b"\n");
+            }
+            for wrapped in mehh_tui::wrap_text_with_ansi(styled_sample, 36) {
+                hasher.update(mehh_tui::visible_width(&wrapped).to_le_bytes());
+                hasher.update(wrapped.as_bytes());
+            }
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("METRIC tui_ansi_and_markdown_wrap {ms:.3}");
+        println!(
+            "FINGERPRINT tui_ansi_and_markdown_wrap {}",
+            finish_sha(hasher)
+        );
+    }
+
+    // 5. web_html_to_markdown_and_spa
+    {
+        let mut html = String::with_capacity(420_000);
+        html.push_str("<!DOCTYPE html><html><head><style>.a{color:red}</style><script>window.__INIT=1;</script></head><body><main>");
+        html.push_str("<h1>Benchmark Page &amp; Docs</h1>");
+        for i in 0..1_200usize {
+            let _ = write!(
+                html,
+                "<div class=\"flex items-center justify-between px-4 py-2 text-sm border-b\" data-row=\"{i}\" style=\"margin:0;padding:4px\">\
+                 <span class=\"badge text-gray-500\">#{i}</span>\
+                 <a class=\"underline\" href=\"/docs/page-{i}\">Article &amp; Guide {i}</a>\
+                 <p>Content paragraph {i} with <strong>emphasis</strong> and <code>snippet_{i}()</code>.</p>\
+                 </div>"
+            );
+        }
+        html.push_str("<table><tr><th>Col1</th><th>Col2</th></tr><tr><td>A &lt; B</td><td>Ok</td></tr></table>");
+        html.push_str(&format!(
+            "<img alt=\"diagram\" src=\"data:image/png;base64,{}\">",
+            "QUJDRA==".repeat(4_000)
+        ));
+        html.push_str("</main></body></html>");
+        let base_url = reqwest::Url::parse("https://example.com/start").unwrap();
+        let mut hasher = Sha256::new();
+
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            let md = mehh_tools::web::html_markdown::html_to_markdown(&html, Some(&base_url));
+            let txt = mehh_tools::web::html_markdown::html_to_text(&html);
+            let spa = mehh_tools::web::html_markdown::looks_like_empty_spa_shell(&html, &md);
+            hasher.update(md.as_bytes());
+            hasher.update([u8::from(spa)]);
+            hasher.update(txt.as_bytes());
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("METRIC web_html_to_markdown_and_spa {ms:.3}");
+        println!(
+            "FINGERPRINT web_html_to_markdown_and_spa {}",
+            finish_sha(hasher)
+        );
+    }
+
+    // 6. web_output_format_and_secret_check
+    {
+        let hits: Vec<mehh_tools::web::types::SearchHit> = (0..8)
+            .map(|i| mehh_tools::web::types::SearchHit {
+                url: format!("https://docs.rs/crate-{i}"),
+                title: Some(format!("Crate {i} Documentation")),
+                published: Some("2026-06-01".to_string()),
+                content: Some("Detailed search excerpt about async Rust and networking. ".repeat(12)),
+            })
+            .collect();
+        let inline_body = "Header line\nParagraph content for inline fetch output.\n".repeat(250);
+        let urls: Vec<reqwest::Url> = (0..50)
+            .map(|i| {
+                if i % 5 == 0 {
+                    reqwest::Url::parse(&format!("https://example.com/hook?api_key=tok_{i}&x=1"))
+                        .unwrap()
+                } else {
+                    reqwest::Url::parse(&format!(
+                        "https://docs.rs/crate/{i}?page=2&sort=recent&filter=rust"
+                    ))
+                    .unwrap()
+                }
+            })
+            .collect();
+        let mut hasher = Sha256::new();
+
+        let t0 = Instant::now();
+        for _ in 0..50 {
+            let s_out = mehh_tools::web::output::format_search_results(&hits);
+            let f_out = mehh_tools::web::output::format_fetch_content(&inline_body, "md").unwrap();
+            hasher.update(s_out.text.as_bytes());
+            hasher.update(f_out.text.as_bytes());
+            for _ in 0..2 {
+                for u in &urls {
+                    hasher.update([u8::from(mehh_ai::http_safety::url_contains_potential_secret(u))]);
+                }
+            }
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        println!("METRIC web_output_format_and_secret_check {ms:.3}");
+        println!(
+            "FINGERPRINT web_output_format_and_secret_check {}",
+            finish_sha(hasher)
+        );
+    }
+
+    // 7. model_registry_load_and_file_complete
+    {
+        let dir = std::env::temp_dir().join("mehh_perf_bench_reg_v1");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src/web")).unwrap();
+        std::fs::create_dir_all(dir.join("crates/core/tests")).unwrap();
+        for i in 0..400usize {
+            let sub = match i % 4 {
+                0 => "src/web",
+                1 => "src",
+                2 => "crates/core/tests",
+                _ => "crates/core",
+            };
+            let p = dir.join(sub).join(format!("mod_file_{i:03}.rs"));
+            let _ = std::fs::write(p, "// fixture");
+        }
+        let models_path = dir.join("models.json");
+        let disc_path = dir.join("discovered-models.json");
+        std::fs::write(
+            &models_path,
+            serde_json::json!({
+                "providers": {
+                    "openrouter": { "baseUrl": "https://openrouter.ai/api/v1" },
+                    "anthropic": { "baseUrl": "https://api.anthropic.com/v1" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut disc_provs = serde_json::Map::new();
+        for (prov, count) in [("openrouter", 150usize), ("openai", 100), ("anthropic", 50)] {
+            let list: Vec<Model> = (0..count)
+                .map(|i| Model {
+                    id: format!("{prov}-model-{i}"),
+                    name: format!("{prov} Model {i}"),
+                    api: "openai-completions".to_string(),
+                    provider: prov.to_string(),
+                    base_url: "https://example.com/v1".to_string(),
+                    ..Default::default()
+                })
+                .collect();
+            disc_provs.insert(
+                prov.to_string(),
+                serde_json::json!({
+                    "fetchedAtMs": 1700000000000i64,
+                    "models": list
+                }),
+            );
+        }
+        std::fs::write(
+            &disc_path,
+            serde_json::json!({ "providers": disc_provs }).to_string(),
+        )
+        .unwrap();
+
+        let queries = [
+            "src/", "mod", "web", "test", "file_0", "core", "crates/", "01", "12", "23",
+            "34", "mod_file_1", "mod_file_2", "src/web", "tests/", "rs", "_05", "_19", "99", "a",
+        ];
+        let mut hasher = Sha256::new();
+
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            let reg = crate::models_config::ModelRegistry::load_with_discovered(
+                Some(&models_path),
+                Some(&disc_path),
+            )
+            .unwrap();
+            let mut model_keys: Vec<String> = reg
+                .models()
+                .iter()
+                .map(|m| format!("{}/{}/{}", m.provider, m.id, m.base_url))
+                .collect();
+            model_keys.sort();
+            for key in model_keys {
+                hasher.update(key.as_bytes());
+                hasher.update(b"\n");
+            }
+            for q in queries {
+                let res = crate::file_complete::complete_file_paths(&dir, q, 15);
+                for r in res {
+                    hasher.update(r.as_bytes());
+                    hasher.update(b"\n");
+                }
+            }
+        }
+        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+        let _ = std::fs::remove_dir_all(&dir);
+        println!("METRIC model_registry_load_and_file_complete {ms:.3}");
+        println!(
+            "FINGERPRINT model_registry_load_and_file_complete {}",
+            finish_sha(hasher)
+        );
+    }
+}
+
+#[tokio::test]
+async fn c11_overflow_after_drained_steering_uses_case_b_and_does_not_retry_from_scratch() {
+    let dir = temp_dir("mehh_c11_steering_overflow");
+    let session_mgr = SessionManager::in_memory(&dir);
+    let faux = mehh_ai::FauxProvider::with_responses(vec![
+        mehh_ai::faux_assistant_message("summary of prefix"),
+        mehh_ai::faux_assistant_message("continued after compaction"),
+    ]);
+    let mut session = AgentSession::new(
+        dir.clone(),
+        mehh_ai::faux_model(),
+        Arc::new(faux),
+        session_mgr,
+        Settings::default(),
+    );
+    // Seed existing history so prepare_overflow_compaction has entries to compact.
+    for i in 0..10 {
+        session
+            .session_mut()
+            .append_message(Message::User(mehh_ai::UserMessage {
+                content: UserContent::Text(format!("prior prompt {i} {}", "x".repeat(200))),
+                timestamp: mehh_ai::now_ms(),
+            }))
+            .unwrap();
+        session
+            .session_mut()
+            .append_message(Message::Assistant(mehh_ai::faux_assistant_message(format!(
+                "prior answer {i} {}",
+                "y".repeat(200)
+            ))))
+            .unwrap();
+    }
+    session.model.context_window = 200;
+
+    let mut state = make_test_state();
+    state.last_prompt_text = Some("initial".to_string());
+    state.last_prompt_content = Some(("initial".to_string(), Vec::new()));
+
+    // Overflow after a drained steering UserMessage (no ToolResult in turn messages!)
+    let mut overflow_ast = mehh_ai::faux_assistant_message("");
+    overflow_ast.stop_reason = StopReason::Error;
+    overflow_ast.error_message = Some("prompt is too long: context_length_exceeded".to_string());
+    let messages = vec![
+        Message::User(mehh_ai::UserMessage {
+            content: UserContent::Text("initial".to_string()),
+            timestamp: mehh_ai::now_ms(),
+        }),
+        Message::Assistant(mehh_ai::faux_assistant_message("first step")),
+        Message::User(mehh_ai::UserMessage {
+            content: UserContent::Text("steering message".to_string()),
+            timestamp: mehh_ai::now_ms(),
+        }),
+        Message::Assistant(overflow_ast),
+    ];
+
+    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+    let outcome = handle_agent_signal_async(
+        AgentSignal::Finished(messages),
+        &mut session,
+        &mut state,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(outcome, SignalOutcome::RetryStarted);
+
+    // The completed prefix (3 messages before trailing overflow) must have been persisted.
+    let ctx = session.session().build_context_messages();
+    assert!(
+        ctx.iter()
+            .any(|m| matches!(m, Message::User(u) if u.content.text() == "steering message")),
+        "Case B must persist completed prefix before compaction"
+    );
+
+    let sig = agent_rx.recv().await.expect("OverflowCompacted signal");
+    match sig {
+        AgentSignal::OverflowCompacted(payload) => {
+            let super::events::OverflowCompactedPayload {
+                prefix_persisted, ..
+            } = *payload;
+            assert!(
+                prefix_persisted,
+                "C11: non-turn-0 overflow without ToolResult must use Case B (prefix_persisted = true)"
+            );
+        }
+        other => panic!("unexpected signal: {:?}", std::mem::discriminant(&other)),
+    }
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn c12_at_file_autocomplete_closes_on_exact_match_and_quotes_spaces() {
+    let dir = temp_dir("mehh_c12_at_spaces");
+    std::fs::create_dir_all(dir.join("src")).unwrap();
+    std::fs::write(dir.join("src").join("alpha.rs"), "fn a() {}").unwrap();
+    std::fs::write(dir.join("notes with spaces.txt"), "hello").unwrap();
+
+    let mut editor = Editor::new();
+    let kb = Keybindings::default_bindings();
+
+    // 1. Selecting a file with spaces produces @"..." value
+    editor.set_text("check @notes");
+    let t1 = editor.text();
+    update_autocomplete_with_cwd(&mut editor, &t1, &dir);
+    let ac = editor.autocomplete.as_ref().expect("popup for @notes");
+    let space_item = ac
+        .items
+        .iter()
+        .find(|i| i.label == "notes with spaces.txt")
+        .expect("space file candidate");
+    assert_eq!(space_item.id, "@\"notes with spaces.txt\"");
+
+    // 2. Accepting @src/alpha.rs and re-running autocomplete must NOT re-open popup
+    editor.set_text("check @src/alpha.rs");
+    let t2 = editor.text();
+    update_autocomplete_with_cwd(&mut editor, &t2, &dir);
+    assert!(
+        editor.autocomplete.is_none(),
+        "C12: exact @file match must keep autocomplete closed"
+    );
+
+    // 3. Quoted exact match with backslashes also stays closed
+    editor.set_text("check @\"src\\alpha.rs\"");
+    let t3 = editor.text();
+    update_autocomplete_with_cwd(&mut editor, &t3, &dir);
+    assert!(
+        editor.autocomplete.is_none(),
+        "C12: quoted/backslash exact @file match must stay closed"
+    );
+    let _ = kb;
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn c13_expand_prompt_with_files_preserves_quotes_contractions_indentation_and_emails() {
+    let dir = temp_dir("mehh_c13_expand");
+    std::fs::write(dir.join("notes.txt"), "file body").unwrap();
+    std::fs::write(dir.join("my doc.txt"), "spaced body").unwrap();
+
+    // Prompt with no @file tokens at boundary preserves everything verbatim
+    let raw_no_file = "I don't know what's \"wrong\" with {\"a\": 1}\n  indented line\nemail user@example.com";
+    let (out_no_file, blocks_no_file) = expand_prompt_with_files(&dir, raw_no_file).unwrap();
+    assert_eq!(out_no_file, raw_no_file);
+    assert!(blocks_no_file.is_empty());
+
+    // Prompt mixing contractions, quotes, indentation, email, and real @file tokens
+    let mixed = "don't touch \"it's\" or user@example.com:\n  @notes.txt\nand @\"my doc.txt\"";
+    let (out_mixed, blocks_mixed) = expand_prompt_with_files(&dir, mixed).unwrap();
+    assert!(out_mixed.starts_with("don't touch \"it's\" or user@example.com:\n  <file name=\"notes.txt\">"));
+    assert!(out_mixed.contains("file body"));
+    assert!(out_mixed.contains("\nand <file name=\"my doc.txt\">"));
+    assert!(out_mixed.contains("spaced body"));
+    assert!(blocks_mixed
+        .iter()
+        .any(|b| matches!(b, UserContentBlock::Text(t) if t.text == out_mixed)));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn i26_new_resume_import_tree_clear_todo_and_sync_usage() {
+    let dir = temp_dir("mehh_i26_sync");
+    let file_a = dir.join("sess_a.jsonl");
+    let mut sm_a = SessionManager::create_file_with_id(&file_a, &dir, "sess-a").unwrap();
+    sm_a.append_message(Message::User(mehh_ai::UserMessage {
+        content: UserContent::Text("hello a".to_string()),
+        timestamp: mehh_ai::now_ms(),
+    }))
+    .unwrap();
+    let mut ast_a = mehh_ai::faux_assistant_message("reply a");
+    ast_a.usage = Usage {
+        input: 150,
+        output: 40,
+        total_tokens: 190,
+        cost: UsageCost {
+            total: 0.0125,
+            ..UsageCost::default()
+        },
+        ..Usage::default()
+    };
+    sm_a.append_message(Message::Assistant(ast_a)).unwrap();
+
+    let mut session = AgentSession::new(
+        dir.clone(),
+        mehh_ai::faux_model(),
+        Arc::new(mehh_ai::FauxProvider::new()),
+        SessionManager::in_memory(&dir),
+        Settings::default(),
+    );
+    let mut state = make_test_state();
+    state.total_input_tokens = 999;
+    state.total_output_tokens = 888;
+    state.total_cost = 9.99;
+    session.todo_state.write().await.add("stale todo".into());
+
+    // /import must clear todo_state and recompute transcript + usage from imported session
+    handle_slash_command(
+        &format!("/import {}", file_a.display()),
+        &mut session,
+        &mut state,
+        None,
+        false,
+    )
+    .await;
+    assert!(session.todo_state.read().await.items.is_empty());
+    assert_eq!(state.total_input_tokens, 150);
+    assert_eq!(state.total_output_tokens, 40);
+    assert!((state.total_cost - 0.0125).abs() < 1e-9);
+    assert!(state
+        .items
+        .iter()
+        .any(|it| matches!(it, TranscriptItem::User(s) if s == "hello a")));
+
+    // /new must clear todo_state and reset usage totals
+    session.todo_state.write().await.add("todo before new".into());
+    handle_slash_command("/new", &mut session, &mut state, None, false).await;
+    assert!(session.todo_state.read().await.items.is_empty());
+    assert_eq!(state.total_input_tokens, 0);
+    assert_eq!(state.total_output_tokens, 0);
+    assert_eq!(state.total_cost, 0.0);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn i27_open_model_picker_click_is_ignored_while_busy() {
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    state.is_busy = true;
+    state.items.push(TranscriptItem::User("working".to_string()));
+    let mut editor = Editor::new();
+    let mut wheel = WheelScrollAccelerator::default();
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+
+    render_interactive_frame(&state, &editor, &session, 100, 24);
+    let (row, col) = state
+        .click_regions
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| matches!(r.action, ClickAction::OpenModelPicker))
+        .map(|r| (r.row as u16, r.col_start as u16))
+        .expect("OpenModelPicker click region");
+
+    let mouse = crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        column: col,
+        row,
+        modifiers: crossterm::event::KeyModifiers::NONE,
+    };
+    handle_mouse_event(
+        mouse,
+        &mut session,
+        &mut state,
+        &mut editor,
+        &mut wheel,
+        &kb,
+        &agent_tx,
+    )
+    .await;
+    assert!(
+        state.selector.is_none(),
+        "I27: clicking OpenModelPicker while busy must not open model selector"
+    );
+}
+
+#[test]
+fn i28_approval_preview_preserved_on_short_12_to_15_row_terminals() {
+    let session = make_test_session();
+    session.steer("queued steer");
+    let mut state = make_test_state();
+    state.is_busy = true;
+    state.status = Some("Executing bash...".to_string());
+    let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+    state.pending_approval = Some(PendingApproval {
+        tool_name: "bash".to_string(),
+        args: serde_json::Map::new(),
+        reason: "Run shell command".to_string(),
+        preview: Some("rm -rf ./tmp-build".to_string()),
+        reply_tx,
+    });
+    state.selector = Some(Selector {
+        kind: SelectorKind::ToolApproval,
+        list: SelectList::new(
+            vec![
+                SelectItem::new("allow_once", "Allow once (y/Enter)"),
+                SelectItem::new("allow_session", "Allow for session (a)"),
+                SelectItem::new("always_allow", "Always allow (A)"),
+                SelectItem::new("deny", "Deny (n/Esc)"),
+            ],
+            6,
+        ),
+        settings_list: None,
+    });
+
+    let editor = Editor::new();
+    for height in [12usize, 15] {
+        let frame = render_interactive_frame(&state, &editor, &session, 80, height);
+        assert!(frame.len() <= height);
+        let plain = mehh_tui::strip_ansi(&frame.join("\n"));
+        assert!(
+            plain.contains("Command preview") && plain.contains("bash") && plain.contains("rm -rf ./tmp-build"),
+            "I28 height={height}: approval header/tool/command must stay visible: {plain}"
+        );
+    }
+}
+
+#[test]
+fn i29_historical_assistant_does_not_inherit_live_elapsed_ms() {
+    let session = make_test_session();
+    let mut state = make_test_state();
+    let now = std::time::Instant::now();
+    *state.turn_started_at.lock().unwrap() = Some(now - Duration::from_millis(4200));
+    *state.turn_completed_at.lock().unwrap() = Some(now);
+    state.items.push(TranscriptItem::User("turn 1".to_string()));
+    state.items.push(TranscriptItem::Assistant {
+        thinking: "old reasoning".to_string(),
+        text: "old answer".to_string(),
+    });
+    state.items.push(TranscriptItem::User("turn 2".to_string()));
+    state.items.push(TranscriptItem::Assistant {
+        thinking: "new reasoning".to_string(),
+        text: "new answer".to_string(),
+    });
+
+    let frame = render_interactive_frame(&state, &Editor::new(), &session, 80, 24);
+    let plain = mehh_tui::strip_ansi(&frame.join("\n"));
+    assert_eq!(
+        plain.matches("4.2s").count(),
+        1,
+        "I29: only the latest turn's assistant item may inherit live_elapsed_ms: {plain}"
+    );
+    assert!(
+        plain.contains("0.0s"),
+        "I29: earlier historical assistant without recorded elapsed must show 0.0s: {plain}"
+    );
+}
+
+#[test]
+fn minor_fixes_scroll_pill_label_and_hidden_when_fits() {
+    let pill = super::scroll_pill_text(5, 10, 2);
+    assert!(
+        pill.contains("Ctrl+End to jump"),
+        "scroll pill must say Ctrl+End to jump: {pill}"
+    );
+
+    let session = make_test_session();
+    let mut state = make_test_state();
+    state.items.push(TranscriptItem::System("short".to_string()));
+    state.scroll_offset = 3;
+    let frame = render_interactive_frame(&state, &Editor::new(), &session, 80, 24);
+    let plain = mehh_tui::strip_ansi(&frame.join("\n"));
+    assert!(
+        !plain.contains("Paused at"),
+        "scroll pill must stay hidden when max_scroll == 0: {plain}"
+    );
+}
+
+#[tokio::test]
+async fn minor_fixes_tree_summarize_without_id_and_name_uses_active_branch() {
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+
+    handle_slash_command("/tree --summarize", &mut session, &mut state, None, false).await;
+    assert!(
+        state.items.iter().any(|it| matches!(it, TranscriptItem::System(s) if s.contains("Usage: /tree"))),
+        "missing usage message for /tree --summarize without entry id"
+    );
+
+    // /name with no argument after setting an empty name should report no name set
+    session.session_mut().set_session_name(Some("alpha".to_string())).unwrap();
+    session.session_mut().set_session_name(Some("   ".to_string())).unwrap();
+    handle_slash_command("/name", &mut session, &mut state, None, false).await;
+    assert!(
+        matches!(state.items.last(), Some(TranscriptItem::System(s)) if s.contains("no name")),
+        "cleared/blank session name must report no name set: {:?}",
+        state.items.last()
+    );
+}
+
+#[tokio::test]
+async fn minor_fix_start_turn_image_only_has_no_empty_text_block() {
+    let session = make_test_session();
+    let mut state = make_test_state();
+    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+    let img = mehh_ai::UserContentBlock::Image(mehh_ai::ImageContent {
+        data: "AAAA".to_string(),
+        mime_type: "image/png".to_string(),
+    });
+    start_turn(&session, &mut state, "", vec![img], &agent_tx);
+    while let Some(sig) = agent_rx.recv().await {
+        if let AgentSignal::Finished(messages) = sig {
+            let Some(Message::User(u)) = messages.first() else {
+                panic!("expected UserMessage");
+            };
+            let UserContent::Blocks(blocks) = &u.content else {
+                panic!("expected Blocks");
+            };
+            assert!(
+                !blocks
+                    .iter()
+                    .any(|b| matches!(b, UserContentBlock::Text(t) if t.text.is_empty())),
+                "must not insert empty Text(\"\") block on image-only prompt: {blocks:?}"
+            );
+            assert_eq!(blocks.len(), 1);
+            break;
+        }
+    }
+}
+
+#[tokio::test]
+async fn minor_fix_theme_restore_when_selector_theme_fails() {
+    let dir = temp_dir("mehh_theme_fail_restore");
+    let bad_theme = dir.join("broken.json");
+    std::fs::write(&bad_theme, "{not json").unwrap();
+
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    let orig_theme = state.theme.clone();
+    state.theme_preview_restore = Some(orig_theme.clone());
+    state.set_theme(Theme::light());
+    state.selector = Some(Selector {
+        kind: SelectorKind::Theme,
+        list: SelectList::new(
+            vec![SelectItem::new(
+                bad_theme.to_string_lossy().to_string(),
+                "broken",
+            )],
+            4,
+        ),
+        settings_list: None,
+    });
+    let kb = Keybindings::default_bindings();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+    handle_non_approval_selector_key("enter", &kb, &mut session, &mut state, &agent_tx).await;
+    assert_eq!(
+        state.theme, orig_theme,
+        "failed /theme selection from picker must restore theme_preview_restore"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn c14_sync_state_from_session_populates_transcript_and_totals() {
+    let dir = temp_dir("mehh_c14_sync_startup");
+    let mut session = AgentSession::new(
+        dir.clone(),
+        mehh_ai::faux_model(),
+        Arc::new(mehh_ai::FauxProvider::new()),
+        SessionManager::in_memory(&dir),
+        Settings::default(),
+    );
+    session
+        .session_mut()
+        .append_message(Message::User(mehh_ai::UserMessage {
+            content: UserContent::Text("resumed question".to_string()),
+            timestamp: mehh_ai::now_ms(),
+        }))
+        .unwrap();
+    let mut ast = mehh_ai::faux_assistant_message("resumed answer");
+    ast.usage = Usage {
+        input: 210,
+        output: 65,
+        total_tokens: 275,
+        cost: UsageCost {
+            total: 0.042,
+            ..UsageCost::default()
+        },
+        ..Usage::default()
+    };
+    session.session_mut().append_message(Message::Assistant(ast)).unwrap();
+
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    super::state::sync_state_from_session(&mut state, &session);
+    assert_eq!(state.items.len(), 2);
+    assert_eq!(state.items[0], TranscriptItem::User("resumed question".to_string()));
+    assert_eq!(state.total_input_tokens, 210);
+    assert_eq!(state.total_output_tokens, 65);
+    assert!((state.total_cost - 0.042).abs() < 1e-9);
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn i22_apply_mcp_refresh_report_surfaces_errors_and_syncs_changes() {
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    let report = crate::mcp_manager::McpRefreshReport {
+        changed: true,
+        errors: vec!["broken-srv: timeout".to_string()],
+    };
+    super::events::apply_mcp_refresh_report(report, Vec::new(), &mut session, &mut state, false);
+    assert!(state.items.iter().any(|it| matches!(
+        it,
+        TranscriptItem::System(s) if s == "MCP tools updated via tools/list_changed."
+    )));
+    assert!(state.items.iter().any(|it| matches!(
+        it,
+        TranscriptItem::System(s) if s == "Warning: MCP tool refresh failed: broken-srv: timeout"
+    )));
+}
+
+#[tokio::test]
+async fn i27_ready_for_turn_ignores_stale_provider_api_key() {
+    let mut session = make_test_session();
+    session.model.provider = "anthropic".to_string();
+    session.set_api_key(Some("anthropic-key".to_string()));
+    let mut state = make_test_state();
+    let (agent_tx, _agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+    let cancel = CancellationToken::new();
+
+    // Cancelled signal does not even run; here we test mismatched provider_name ("openai")
+    let outcome = handle_agent_signal_async(
+        AgentSignal::ReadyForTurn(Box::new(super::events::ReadyForTurnPayload {
+            prompt_text: "hello".to_string(),
+            blocks: Vec::new(),
+            provider_name: "openai".to_string(),
+            new_api_key: Some("stale-openai-key".to_string()),
+            compaction: None,
+            warning: None,
+            cancel,
+        })),
+        &mut session,
+        &mut state,
+        &agent_tx,
+    )
+    .await;
+    assert_eq!(outcome, SignalOutcome::RetryStarted);
+    assert_eq!(
+        session.api_key.as_deref(),
+        Some("anthropic-key"),
+        "I27: stale ReadyForTurn for another provider must not overwrite current provider api_key"
+    );
+}
+
+#[tokio::test]
+async fn i29_drain_agent_signals_async_updates_turn_timestamps_and_thinking_elapsed() {
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    let started = std::time::Instant::now() - Duration::from_millis(500);
+    *state.turn_started_at.lock().unwrap() = Some(started);
+    state.items.push(TranscriptItem::Assistant {
+        thinking: "thought".to_string(),
+        text: "answer".to_string(),
+    });
+    let (agent_tx, mut agent_rx) = tokio::sync::mpsc::unbounded_channel::<AgentSignal>();
+    agent_tx
+        .send(AgentSignal::Finished(vec![Message::Assistant(
+            mehh_ai::faux_assistant_message("answer"),
+        )]))
+        .unwrap();
+
+    let running = super::events::drain_agent_signals_async(
+        &mut agent_rx,
+        &mut session,
+        &mut state,
+        &agent_tx,
+        None,
+        false,
+    )
+    .await;
+    assert_eq!(running, Some(false));
+    assert!(state.turn_completed_at.lock().unwrap().is_some());
+    assert!(
+        state.thinking_elapsed.lock().unwrap().contains_key(&0),
+        "I29: drain_agent_signals_async must record thinking_elapsed on TurnEnded"
+    );
+}
+
+#[test]
+fn i30_and_minor_autocomplete_cursor_sync_and_pageup_scroll_guard() {
+    let dir = temp_dir("mehh_i30_ac_sync");
+    std::fs::write(dir.join("alpha.txt"), "a").unwrap();
+    let mut session = make_test_session();
+    session.cwd = dir.clone();
+    let state = make_test_state();
+    let mut editor = Editor::new();
+    let kb = Keybindings::default_bindings();
+
+    editor.set_text("open @al");
+    let t = editor.text();
+    update_autocomplete_with_cwd(&mut editor, &t, &dir);
+    assert!(editor.autocomplete.is_some());
+
+    // PageUp/PageDown must NOT be hijacked for transcript scrolling while autocomplete is open
+    assert!(!super::events::should_handle_transcript_scroll(&editor, "pageup"));
+    assert!(!super::events::should_handle_transcript_scroll(&editor, "pagedown"));
+
+    // Arrow keys stay in popup; cursor movement ("home") returning EditorOutput::None syncs/closes popup
+    assert_eq!(editor.handle_editor_key("home", &kb), EditorOutput::None);
+    super::events::sync_autocomplete_on_editor_none(&mut editor, "home", &session, &state);
+    assert!(
+        editor.autocomplete.is_none(),
+        "I30: moving cursor away from @token must close stale autocomplete popup"
+    );
+    assert!(super::events::should_handle_transcript_scroll(&editor, "pageup"));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn agent_signal_enum_size_is_bounded() {
+    assert!(
+        std::mem::size_of::<AgentSignal>() <= 64,
+        "AgentSignal size grew to {} bytes",
+        std::mem::size_of::<AgentSignal>()
+    );
+}
+
+#[test]
+fn completed_transcript_items_reuse_arc_lines_across_busy_ticks() {
+    let session = make_test_session();
+    let mut state = make_test_state();
+    let editor = Editor::new();
+
+    state.items.push(TranscriptItem::Assistant {
+        thinking: "prior thinking".to_string(),
+        text: "prior answer".to_string(),
+    });
+    state.thinking_elapsed.lock().unwrap().insert(0, 1200);
+    state.items.push(TranscriptItem::User("next".to_string()));
+    state.items.push(TranscriptItem::Assistant {
+        thinking: "active thinking".to_string(),
+        text: String::new(),
+    });
+    state.is_busy = true;
+    *state.turn_started_at.lock().unwrap() = Some(std::time::Instant::now());
+
+    let _ = render_interactive_frame(&state, &editor, &session, 80, 24);
+    let ptr_first = {
+        let cache = state.transcript_cache.lock().unwrap();
+        Arc::as_ptr(&cache[0].as_ref().unwrap().lines)
+    };
+
+    std::thread::sleep(Duration::from_millis(85));
+    state.loader.tick();
+    let _ = render_interactive_frame(&state, &editor, &session, 80, 24);
+    let ptr_second = {
+        let cache = state.transcript_cache.lock().unwrap();
+        Arc::as_ptr(&cache[0].as_ref().unwrap().lines)
+    };
+
+    assert_eq!(
+        ptr_first, ptr_second,
+        "completed Assistant transcript entry must reuse Arc<[String]> across 80ms busy ticks"
+    );
+}
+
+#[test]
+fn incremental_streaming_markdown_matches_full_document_render() {
+    let dark = Theme::load(Some("dark"));
+    let light = Theme::load(Some("light"));
+    let doc = concat!(
+        "# Title Heading\n\n",
+        "First paragraph with **bold**, *italic*, and `inline_code` that spans multiple words across the terminal width.\n\n",
+        "```rust\n",
+        "fn alpha() {\n\n",
+        "    println!(\"inside code fence with blank line\");\n",
+        "}\n",
+        "```\n\n",
+        "## Section Two\n\n",
+        "Paragraph before a list and table section with enough text to cross the split threshold cleanly.\n\n",
+        "### Details Table\n\n",
+        "| Col A | Col B |\n",
+        "| ----- | ----- |\n",
+        "| one   | two   |\n\n",
+        "- item one\n",
+        "- item two\n\n",
+        "> Quoted remark after list.\n\n",
+        "Final concluding paragraph with plenty of characters to verify incremental tail appending.\n"
+    );
+
+    let mut cache: Option<super::state::StreamingMarkdownPrefix> = None;
+    let mut step = 12usize;
+    while step <= doc.len() {
+        while step < doc.len() && !doc.is_char_boundary(step) {
+            step += 1;
+        }
+        let prefix = &doc[..step];
+        let (inc_lines, next_cache) =
+            super::render::render_markdown_incremental(prefix, &dark, 72, cache.as_ref(), 1);
+        let full_lines = mehh_tui::render_markdown(prefix, &dark, 72);
+        assert_eq!(
+            inc_lines, full_lines,
+            "mismatch at streaming prefix byte {step}"
+        );
+        cache = next_cache;
+        if step == doc.len() {
+            break;
+        }
+        step = (step + 37).min(doc.len());
+    }
+    assert!(
+        cache.is_some(),
+        "multi-block document above threshold should populate incremental prefix cache"
+    );
+
+    // Width change, theme generation change, and text shrink must match full render.
+    let (narrow_lines, _) =
+        super::render::render_markdown_incremental(doc, &dark, 40, cache.as_ref(), 1);
+    assert_eq!(narrow_lines, mehh_tui::render_markdown(doc, &dark, 40));
+
+    let (light_lines, _) =
+        super::render::render_markdown_incremental(doc, &light, 72, cache.as_ref(), 2);
+    assert_eq!(light_lines, mehh_tui::render_markdown(doc, &light, 72));
+
+    let shrunk = &doc[..300];
+    let (shrunk_lines, _) =
+        super::render::render_markdown_incremental(shrunk, &dark, 72, cache.as_ref(), 1);
+    assert_eq!(shrunk_lines, mehh_tui::render_markdown(shrunk, &dark, 72));
+
+    // Reference link definitions must fall back safely and remain identical to full render.
+    let with_ref = format!("{doc}\nSee [ref][k] here.\n\n[k]: https://example.com\n");
+    let (ref_lines, ref_cache) =
+        super::render::render_markdown_incremental(&with_ref, &dark, 72, cache.as_ref(), 1);
+    assert!(ref_cache.is_none(), "reference-link document must bypass split cache");
+    assert_eq!(ref_lines, mehh_tui::render_markdown(&with_ref, &dark, 72));
 }

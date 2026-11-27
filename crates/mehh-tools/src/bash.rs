@@ -6,7 +6,7 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::context::PathPolicy;
-use mehh_sandbox::{SandboxPlan, SandboxPolicy};
+use mehh_sandbox::SandboxPolicy;
 use crate::core::shell::{parse_timeout_ms, run_shell, ShellKind};
 
 #[derive(Debug, Clone)]
@@ -85,6 +85,7 @@ impl AgentTool for BashTool {
         if cancel.is_cancelled() {
             return Err("Command aborted".to_string());
         }
+        self.path_policy.validate(&self.cwd)?;
 
         let command = params
             .get("command")
@@ -97,7 +98,6 @@ impl AgentTool for BashTool {
             ShellKind::PosixSh
         };
 
-        let plan = SandboxPlan::new(self.sandbox_policy, self.cwd.clone());
         let outcome = run_shell(
             kind,
             &self.cwd,
@@ -105,7 +105,7 @@ impl AgentTool for BashTool {
             timeout_ms,
             cancel,
             on_update,
-            Some(&plan),
+            Some(self.sandbox_policy),
         )
         .await?;
 
@@ -180,5 +180,25 @@ mod tests {
         assert!(err.contains("timed out"), "unexpected err: {err}");
         assert!(err.contains("partial_marker"), "missing partial output in: {err}");
         assert!(!updates.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_bash_rejects_cwd_outside_workspace_policy() {
+        let ws = crate::TempTestDir::new("bash_policy_ws");
+        let outside = crate::TempTestDir::new("bash_policy_outside");
+        let tool = BashTool::new(outside.path().to_path_buf())
+            .with_path_policy(PathPolicy::WorkspaceOnly(vec![ws.path().to_path_buf()]));
+        let params = json!({ "command": "echo hi" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let err = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("outside the allowed workspace"),
+            "unexpected err: {err}"
+        );
     }
 }

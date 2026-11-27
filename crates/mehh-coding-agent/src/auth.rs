@@ -12,21 +12,17 @@ use std::path::{Path, PathBuf};
 
 /// Returns default auth path `~/.mehh/agent/auth.json`.
 pub fn default_auth_path() -> anyhow::Result<PathBuf> {
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Cannot determine default auth path: neither USERPROFILE nor HOME is set"
-            )
-        })?;
+    let home = crate::user_home_dir().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Cannot determine default auth path: neither USERPROFILE nor HOME is set"
+        )
+    })?;
     Ok(home.join(".mehh").join("agent").join("auth.json"))
 }
 
 /// Maps a provider identifier to an OAuthProviderKind, if supported.
 pub fn oauth_kind_for_provider(provider: &str) -> Option<OAuthProviderKind> {
-    match provider.to_lowercase().as_str() {
+    match provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" => Some(OAuthProviderKind::Anthropic),
         "openai" | "openai-codex" | "openai-chatgpt" | "openai-responses" => {
             Some(OAuthProviderKind::OpenAiChatGpt)
@@ -38,7 +34,11 @@ pub fn oauth_kind_for_provider(provider: &str) -> Option<OAuthProviderKind> {
 
 /// Helper to resolve environment variable for a provider.
 pub fn resolve_provider_env_var(provider: &str) -> Option<String> {
-    let p = provider.to_lowercase();
+    let trimmed_provider = provider.trim();
+    if trimmed_provider.is_empty() {
+        return None;
+    }
+    let p = trimmed_provider.to_ascii_lowercase();
     let primary_var = env_api_key_name(&p);
     if let Ok(val) = std::env::var(primary_var) {
         let trimmed = val.trim().to_string();
@@ -66,7 +66,10 @@ pub fn resolve_provider_env_var(provider: &str) -> Option<String> {
 
     // Dynamic fallback e.g. FOO_API_KEY if primary_var was default "API_KEY"
     if primary_var == "API_KEY" {
-        let var_name = format!("{}_API_KEY", provider.to_uppercase().replace('-', "_"));
+        let var_name = format!(
+            "{}_API_KEY",
+            trimmed_provider.to_ascii_uppercase().replace('-', "_")
+        );
         if let Ok(val) = std::env::var(var_name) {
             let trimmed = val.trim().to_string();
             if !trimmed.is_empty() {
@@ -143,16 +146,74 @@ pub fn load_auth_entries(
 
     let mut entries = HashMap::new();
     for (k, val) in raw_map {
+        let normalized_key = k.trim().to_ascii_lowercase();
+        if normalized_key.is_empty() {
+            anyhow::bail!(
+                "Credential entry for empty provider key in '{}'",
+                path.display()
+            );
+        }
+        if entries.contains_key(&normalized_key) {
+            anyhow::bail!(
+                "Duplicate credential entry for provider '{normalized_key}' in '{}'",
+                path.display()
+            );
+        }
         let cred = parse_stored_credential_value(val).ok_or_else(|| {
             anyhow::anyhow!(
                 "Invalid credential entry for provider '{k}' in '{}'",
                 path.display()
             )
         })?;
-        entries.insert(k, cred);
+        entries.insert(normalized_key, cred);
     }
 
     Ok(entries)
+}
+
+fn lock_path_for(path: &Path) -> PathBuf {
+    let mut lock_os = path.as_os_str().to_os_string();
+    lock_os.push(".lock");
+    PathBuf::from(lock_os)
+}
+
+fn non_empty_trimmed_key(key: Option<&str>) -> Option<String> {
+    key.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn resolve_stored_api_key(
+    provider: &str,
+    key: Option<&str>,
+    env: Option<&HashMap<String, String>>,
+) -> Option<String> {
+    if let Some(k) = non_empty_trimmed_key(key) {
+        return Some(k);
+    }
+    let env_map = env?;
+    let primary_var = env_api_key_name(&provider.trim().to_ascii_lowercase());
+    if let Some(v) = env_map
+        .iter()
+        .find(|(k, _)| k.trim().eq_ignore_ascii_case(primary_var))
+        .and_then(|(_, v)| non_empty_trimmed_key(Some(v.as_str())))
+    {
+        return Some(v);
+    }
+    let mut candidates: Vec<(&str, &str)> = env_map
+        .iter()
+        .filter_map(|(k, v)| {
+            let k_trim = k.trim();
+            let v_trim = v.trim();
+            if k_trim.is_empty() || v_trim.is_empty() {
+                None
+            } else {
+                Some((k_trim, v_trim))
+            }
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.0.cmp(b.0));
+    candidates.first().map(|(_, v)| (*v).to_string())
 }
 
 /// File-backed credential store for auth.json with process-safe advisory file locking.
@@ -172,7 +233,7 @@ impl FileCredentialStore {
     /// Creates a store for a specific auth file path.
     pub fn for_path(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+        let lock_path = lock_path_for(&path);
         let process_lock = get_path_lock_mutex(&lock_path);
         Self {
             path,
@@ -201,24 +262,38 @@ impl FileCredentialStore {
 #[async_trait::async_trait]
 impl CredentialStore for FileCredentialStore {
     async fn read(&self, provider_id: &str) -> anyhow::Result<Option<StoredCredential>> {
-        let entries = load_auth_entries(Some(&self.path))?;
-        let cred = entries.get(provider_id).or_else(|| {
-            entries
-                .iter()
-                .find(|(k, _)| k.eq_ignore_ascii_case(provider_id))
-                .map(|(_, v)| v)
-        });
-        Ok(cred.cloned())
+        let key = provider_id.trim().to_ascii_lowercase();
+        if key.is_empty() {
+            return Ok(None);
+        }
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Option<StoredCredential>> {
+            let entries = load_auth_entries(Some(&path))?;
+            let cred = entries.get(&key).or_else(|| {
+                entries
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(&key))
+                    .map(|(_, v)| v)
+            });
+            Ok(cred.cloned())
+        })
+        .await
+        .context("Credential read task panicked")?
     }
 
     async fn list(&self) -> anyhow::Result<Vec<CredentialInfo>> {
-        let entries = load_auth_entries(Some(&self.path))?;
-        let mut list: Vec<CredentialInfo> = entries
-            .into_iter()
-            .map(|(k, v)| CredentialInfo::new(k, v.credential_type()))
-            .collect();
-        list.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
-        Ok(list)
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<CredentialInfo>> {
+            let entries = load_auth_entries(Some(&path))?;
+            let mut list: Vec<CredentialInfo> = entries
+                .into_iter()
+                .map(|(k, v)| CredentialInfo::new(k, v.credential_type()))
+                .collect();
+            list.sort_by(|a, b| a.provider_id.cmp(&b.provider_id));
+            Ok(list)
+        })
+        .await
+        .context("Credential list task panicked")?
     }
 
     async fn modify(
@@ -228,46 +303,76 @@ impl CredentialStore for FileCredentialStore {
     ) -> anyhow::Result<Option<StoredCredential>> {
         let _lock = self.lock().await?;
 
-        let mut entries = load_auth_entries(Some(&self.path))?;
-        let existing_key = entries
-            .keys()
-            .find(|k| k.eq_ignore_ascii_case(provider_id))
-            .cloned();
-        let current = existing_key.as_ref().and_then(|k| entries.get(k)).cloned();
+        let normalized_key = provider_id.trim().to_ascii_lowercase();
+        if normalized_key.is_empty() {
+            anyhow::bail!("Provider ID must not be empty");
+        }
+        let path = self.path.clone();
+        let key_for_read = normalized_key.clone();
+        let (mut entries, current) = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let entries = load_auth_entries(Some(&path))?;
+            let existing_key = entries
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(&key_for_read))
+                .cloned();
+            let current = existing_key.as_ref().and_then(|k| entries.get(k)).cloned();
+            Ok((entries, current))
+        })
+        .await
+        .context("Credential load task panicked")??;
 
         let next = modify_fn(current.clone()).await?;
 
-        if let Some(ref new_cred) = next {
-            let key = existing_key.unwrap_or_else(|| provider_id.to_string());
-            entries.insert(key, new_cred.clone());
-            let json_str = serde_json::to_string_pretty(&entries)
-                .context("Failed to serialize auth credentials to JSON")?;
-            crate::settings::write_file_atomic(&self.path, json_str.as_bytes(), true)?;
-            Ok(Some(new_cred.clone()))
+        if let Some(new_cred) = next {
+            let path = self.path.clone();
+            let ret_cred = new_cred.clone();
+            tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                entries.retain(|k, _| !k.eq_ignore_ascii_case(&normalized_key));
+                entries.insert(normalized_key, new_cred);
+                let json_str = serde_json::to_string_pretty(&entries)
+                    .context("Failed to serialize auth credentials to JSON")?;
+                crate::settings::write_file_atomic(&path, json_str.as_bytes(), true)
+            })
+            .await
+            .context("Credential write task panicked")??;
+            Ok(Some(ret_cred))
         } else {
             Ok(current)
         }
     }
 
     async fn delete(&self, provider_id: &str) -> anyhow::Result<()> {
-        let _lock = self.lock().await?;
-        if !self.path.exists() {
+        let key = provider_id.trim().to_ascii_lowercase();
+        if key.is_empty() {
             return Ok(());
         }
+        let _lock = self.lock().await?;
+        let path = self.path.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            match std::fs::metadata(&path) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    return Err(e)
+                        .with_context(|| format!("Failed to stat auth file: {}", path.display()));
+                }
+            }
+            let mut entries = load_auth_entries(Some(&path))?;
+            let existing_key = entries
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(&key))
+                .cloned();
 
-        let mut entries = load_auth_entries(Some(&self.path))?;
-        let existing_key = entries
-            .keys()
-            .find(|k| k.eq_ignore_ascii_case(provider_id))
-            .cloned();
-
-        if let Some(k) = existing_key {
-            entries.remove(&k);
-            let json_str = serde_json::to_string_pretty(&entries)
-                .context("Failed to serialize auth credentials to JSON")?;
-            crate::settings::write_file_atomic(&self.path, json_str.as_bytes(), true)?;
-        }
-        Ok(())
+            if let Some(k) = existing_key {
+                entries.remove(&k);
+                let json_str = serde_json::to_string_pretty(&entries)
+                    .context("Failed to serialize auth credentials to JSON")?;
+                crate::settings::write_file_atomic(&path, json_str.as_bytes(), true)?;
+            }
+            Ok(())
+        })
+        .await
+        .context("Credential delete task panicked")?
     }
 }
 
@@ -278,7 +383,7 @@ fn acquire_auth_file_lock(path: &Path) -> anyhow::Result<std::fs::File> {
             .with_context(|| format!("Failed to create directories for: {}", path.display()))?;
     }
 
-    let lock_path = PathBuf::from(format!("{}.lock", path.display()));
+    let lock_path = lock_path_for(path);
     let mut opts = std::fs::OpenOptions::new();
     opts.create(true).read(true).write(true);
     #[cfg(unix)]
@@ -315,13 +420,11 @@ pub fn save_credential(
 
     let mut entries = load_auth_entries(Some(path))?;
 
-    // Find existing key matching provider case-insensitively
-    let existing_key = entries
-        .keys()
-        .find(|k| k.eq_ignore_ascii_case(provider))
-        .cloned();
-
-    let target_key = existing_key.unwrap_or_else(|| provider.to_string());
+    let target_key = provider.trim().to_ascii_lowercase();
+    if target_key.is_empty() {
+        anyhow::bail!("Provider ID must not be empty");
+    }
+    entries.retain(|k, _| !k.eq_ignore_ascii_case(&target_key));
     entries.insert(target_key, cred.clone());
 
     let json_str = serde_json::to_string_pretty(&entries)
@@ -344,8 +447,17 @@ pub fn remove_credential(provider: &str, auth_file: Option<&Path>) -> anyhow::Re
         }
     };
 
-    if !path.exists() {
+    let normalized_provider = provider.trim().to_ascii_lowercase();
+    if normalized_provider.is_empty() {
         return Ok(false);
+    }
+
+    match std::fs::metadata(path) {
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to stat auth file: {}", path.display()))
+        }
     }
 
     let lock_file = acquire_auth_file_lock(path)?;
@@ -353,7 +465,7 @@ pub fn remove_credential(provider: &str, auth_file: Option<&Path>) -> anyhow::Re
     let mut entries = load_auth_entries(Some(path))?;
     let existing_key = entries
         .keys()
-        .find(|k| k.eq_ignore_ascii_case(provider))
+        .find(|k| k.eq_ignore_ascii_case(&normalized_provider))
         .cloned();
 
     let removed = if let Some(k) = existing_key {
@@ -397,16 +509,24 @@ pub async fn remove_credential_async(
     provider: &str,
     auth_file: Option<&Path>,
 ) -> anyhow::Result<bool> {
+    let provider_owned = provider.trim().to_ascii_lowercase();
+    if provider_owned.is_empty() {
+        return Ok(false);
+    }
     let path = match auth_file {
         Some(p) => p.to_path_buf(),
         None => default_auth_path()?,
     };
     let store = FileCredentialStore::for_path(path.clone());
     let _lock = store.lock().await?;
-    let provider_owned = provider.to_string();
     tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
-        if !path.exists() {
-            return Ok(false);
+        match std::fs::metadata(&path) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(false),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("Failed to stat auth file: {}", path.display()));
+            }
         }
         let mut entries = load_auth_entries(Some(&path))?;
         let existing_key = entries
@@ -442,7 +562,12 @@ pub fn resolve_api_key(
         }
     }
 
-    if let Some(val) = resolve_provider_env_var(provider) {
+    let provider_trimmed = provider.trim();
+    if provider_trimmed.is_empty() {
+        return None;
+    }
+
+    if let Some(val) = resolve_provider_env_var(provider_trimmed) {
         return Some(val);
     }
 
@@ -453,16 +578,27 @@ pub fn resolve_api_key(
             return None;
         }
     };
-    let cred = entries.get(provider).or_else(|| {
+    let normalized = provider_trimmed.to_ascii_lowercase();
+    let cred = entries.get(&normalized).or_else(|| {
         entries
             .iter()
-            .find(|(k, _)| k.eq_ignore_ascii_case(provider))
+            .find(|(k, _)| k.eq_ignore_ascii_case(&normalized))
             .map(|(_, v)| v)
     })?;
 
     match cred {
-        StoredCredential::ApiKey { key, .. } => key.clone(),
-        StoredCredential::OAuth { access, .. } => Some(access.clone()),
+        StoredCredential::ApiKey { key, env } => {
+            resolve_stored_api_key(provider_trimmed, key.as_deref(), env.as_ref())
+        }
+        StoredCredential::OAuth {
+            access, expires, ..
+        } => {
+            if now_ms() >= *expires {
+                None
+            } else {
+                non_empty_trimmed_key(Some(access.as_str()))
+            }
+        }
     }
 }
 
@@ -479,6 +615,11 @@ pub async fn resolve_api_key_async(
         if !trimmed.is_empty() {
             return Ok(Some(trimmed.to_string()));
         }
+    }
+
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Ok(None);
     }
 
     if let Some(val) = resolve_provider_env_var(provider) {
@@ -498,14 +639,18 @@ pub async fn resolve_api_key_async(
     };
 
     match cred {
-        StoredCredential::ApiKey { key, .. } => Ok(key),
+        StoredCredential::ApiKey { key, env } => Ok(resolve_stored_api_key(
+            provider,
+            key.as_deref(),
+            env.as_ref(),
+        )),
         StoredCredential::OAuth {
             access, expires, ..
         } => {
             let now = now_ms();
-            if now + 60_000 >= expires {
+            if now.saturating_add(60_000) >= expires || access.trim().is_empty() {
                 let Some(kind) = oauth_kind_for_provider(provider) else {
-                    // No refresh support: an expired token is not usable.
+                    // No refresh support: an expired or empty token is not usable.
                     return Ok(None);
                 };
                 {
@@ -518,14 +663,19 @@ pub async fn resolve_api_key_async(
                                         Some(c) => c,
                                         None => return Ok(None),
                                     };
-                                    let current_expires = match &current {
-                                        StoredCredential::OAuth { expires, .. } => *expires,
-                                        _ => return Ok(Some(current)),
+                                    let (current_access_nonempty, current_expires) = match &current
+                                    {
+                                        StoredCredential::OAuth {
+                                            access, expires, ..
+                                        } => (!access.trim().is_empty(), *expires),
+                                        _ => return Ok(None),
                                     };
                                     // Double-check expiry under lock:
-                                    if now_ms() + 60_000 < current_expires {
+                                    if current_access_nonempty
+                                        && now_ms().saturating_add(60_000) < current_expires
+                                    {
                                         // Another task or process refreshed while we waited for lock
-                                        return Ok(Some(current));
+                                        return Ok(None);
                                     }
                                     let refreshed = refresh_oauth_credential(kind, &current).await?;
                                     Ok(Some(refreshed))
@@ -534,15 +684,27 @@ pub async fn resolve_api_key_async(
                         )
                         .await?;
 
-                    if let Some(StoredCredential::OAuth { access, .. }) = refreshed_cred {
-                        return Ok(Some(access));
+                    match refreshed_cred {
+                        Some(StoredCredential::OAuth {
+                            access, expires, ..
+                        }) => {
+                            if now_ms() >= expires {
+                                return Ok(None);
+                            }
+                            return Ok(non_empty_trimmed_key(Some(access.as_str())));
+                        }
+                        Some(StoredCredential::ApiKey { key, env }) => {
+                            return Ok(resolve_stored_api_key(
+                                provider,
+                                key.as_deref(),
+                                env.as_ref(),
+                            ));
+                        }
+                        None => return Ok(None),
                     }
                 }
-                // Refresh did not yield a usable token: never fall back to the
-                // expired one.
-                return Ok(None);
             }
-            Ok(Some(access))
+            Ok(non_empty_trimmed_key(Some(access.as_str())))
         }
     }
 }
@@ -563,16 +725,12 @@ pub struct ConnectedProvider {
     pub has_oauth: bool,
 }
 
-fn is_stored_credential_connected(cred: &StoredCredential) -> (bool, bool) {
+fn is_stored_credential_connected(provider: &str, cred: &StoredCredential) -> (bool, bool) {
     match cred {
-        StoredCredential::ApiKey { key, env } => {
-            let has_key = key.as_deref().is_some_and(|k| !k.trim().is_empty());
-            let has_env = env.as_ref().is_some_and(|m| {
-                m.values()
-                    .any(|var| std::env::var(var).is_ok_and(|v| !v.trim().is_empty()))
-            });
-            (has_key || has_env, false)
-        }
+        StoredCredential::ApiKey { key, env } => (
+            resolve_stored_api_key(provider, key.as_deref(), env.as_ref()).is_some(),
+            false,
+        ),
         StoredCredential::OAuth {
             access, refresh, ..
         } => {
@@ -613,7 +771,7 @@ pub fn list_connected_providers(
         }
 
         if let Some(cred) = entries.get(&id) {
-            let (ok, has_oauth) = is_stored_credential_connected(cred);
+            let (ok, has_oauth) = is_stored_credential_connected(&id, cred);
             if ok {
                 connected.push(ConnectedProvider {
                     provider_id: id,
@@ -634,10 +792,7 @@ pub fn list_connected_providers(
         }
 
         let has_cfg_key = registry.provider_api_key(&id).is_some();
-        let has_custom_base = registry
-            .provider_config(&id)
-            .and_then(|cfg| cfg.base_url.as_deref())
-            .is_some_and(|u| !u.trim().is_empty());
+        let has_custom_base = registry.provider_has_explicit_endpoint(&id);
         if has_cfg_key || has_custom_base {
             connected.push(ConnectedProvider {
                 provider_id: id,
@@ -936,8 +1091,9 @@ mod tests {
         let _ = server_task.await;
     }
 
-    #[test]
-    fn test_list_connected_providers_across_sources() {
+    #[tokio::test]
+    async fn test_list_connected_providers_across_sources() {
+        let _env_lock = crate::ENV_MUTEX.lock().await;
         let dir = crate::TempTestDir::new("connected_providers");
         let auth_file = dir.path().join("auth.json");
         let models_file = dir.path().join("models.json");
@@ -988,5 +1144,275 @@ mod tests {
         // Corrupt auth.json fails closed
         std::fs::write(&auth_file, b"{corrupt").unwrap();
         assert!(list_connected_providers(Some(&auth_file), &reg).is_err());
+    }
+
+    #[tokio::test]
+    async fn test_list_connected_providers_normalizes_mixed_case_keys_and_ignores_header_only_models_json() {
+        let _env_lock = crate::ENV_MUTEX.lock().await;
+        let prev_openai = std::env::var_os("OPENAI_API_KEY");
+        let prev_anth = std::env::var_os("ANTHROPIC_API_KEY");
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("ANTHROPIC_API_KEY");
+        }
+        struct EnvRestore(Option<std::ffi::OsString>, Option<std::ffi::OsString>);
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+                        None => std::env::remove_var("OPENAI_API_KEY"),
+                    }
+                    match &self.1 {
+                        Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
+                        None => std::env::remove_var("ANTHROPIC_API_KEY"),
+                    }
+                }
+            }
+        }
+        let _guard = EnvRestore(prev_openai, prev_anth);
+
+        let dir = crate::TempTestDir::new("connected_norm");
+        let auth_file = dir.path().join("auth.json");
+        let models_file = dir.path().join("models.json");
+
+        std::fs::write(
+            &auth_file,
+            r#"{"Anthropic":{"type":"api_key","key":"sk-mixed-1"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &models_file,
+            r#"{"providers":{"openai":{"headers":{"X-Org":"abc"}},"ollama":{"baseUrl":"http://localhost:11434/v1"}}}"#,
+        )
+        .unwrap();
+        let reg = crate::models_config::ModelRegistry::load_with_path(&models_file).unwrap();
+        let list = list_connected_providers(Some(&auth_file), &reg).unwrap();
+
+        assert!(
+            list.iter().any(|p| p.provider_id == "anthropic" && p.source == CredentialSource::AuthFile),
+            "mixed-case auth.json key must be recognized as connected: {list:?}"
+        );
+        assert!(
+            list.iter().any(|p| p.provider_id == "ollama" && p.source == CredentialSource::ModelsConfig),
+            "custom endpoint must be recognized: {list:?}"
+        );
+        assert!(
+            !list.iter().any(|p| p.provider_id == "openai"),
+            "header-only models.json override without baseUrl/apiKey must NOT appear connected: {list:?}"
+        );
+
+        save_credential(
+            "OpenRouter",
+            &StoredCredential::ApiKey {
+                key: Some("sk-or-1".to_string()),
+                env: None,
+            },
+            Some(&auth_file),
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(&auth_file).unwrap();
+        assert!(raw.contains("\"openrouter\""), "expected lowercase key in {raw}");
+    }
+
+    #[tokio::test]
+    async fn test_duplicate_case_variant_auth_keys_fail_closed_and_padded_provider_is_symmetric() {
+        let _env_lock = crate::ENV_MUTEX.lock().await;
+        let dir = crate::TempTestDir::new("dup_auth_keys");
+        let auth_file = dir.path().join("auth.json");
+
+        std::fs::write(
+            &auth_file,
+            r#"{
+  "Anthropic": { "type": "api_key", "key": "sk-1" },
+  "anthropic": { "type": "api_key", "key": "sk-2" }
+}"#,
+        )
+        .unwrap();
+        let err = load_auth_entries(Some(&auth_file)).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("duplicate"),
+            "duplicate case-variant keys must fail closed, got: {err}"
+        );
+
+        let clean_file = dir.path().join("clean_auth.json");
+        save_credential(
+            "anthropic",
+            &StoredCredential::ApiKey {
+                key: Some("sk-ant-trim".to_string()),
+                env: None,
+            },
+            Some(&clean_file),
+        )
+        .unwrap();
+        let store = FileCredentialStore::for_path(&clean_file);
+        assert!(store.read(" anthropic ").await.unwrap().is_some());
+        assert_eq!(
+            resolve_api_key(" anthropic ", None, Some(&clean_file)).as_deref(),
+            Some("sk-ant-trim")
+        );
+        assert!(remove_credential_async(" anthropic ", Some(&clean_file))
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn whitespace_keys_and_expired_oauth_rejected_and_padded_env_resolved() {
+        let _env_lock = crate::ENV_MUTEX.lock().await;
+        let dir = crate::TempTestDir::new("auth_hardening");
+        let auth_file = dir.path().join("auth.json");
+
+        std::fs::write(
+            &auth_file,
+            r#"{
+                "openai": { "type": "api_key", "key": "   \t  " },
+                "groq": { "type": "api_key", "key": "" }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(resolve_api_key("openai", None, Some(&auth_file)), None);
+        assert_eq!(resolve_api_key("groq", None, Some(&auth_file)), None);
+        assert_eq!(
+            resolve_api_key_async("openai", None, Some(&auth_file))
+                .await
+                .unwrap(),
+            None
+        );
+
+        let expired = StoredCredential::OAuth {
+            access: "stale-sync-token".to_string(),
+            refresh: "refresh-token".to_string(),
+            expires: now_ms().saturating_sub(10_000),
+            client_id: None,
+            scopes: None,
+            available_model_ids: None,
+        };
+        save_credential("anthropic", &expired, Some(&auth_file)).unwrap();
+        assert_eq!(
+            resolve_api_key("anthropic", None, Some(&auth_file)),
+            None,
+            "sync resolve_api_key must not return expired OAuth access tokens"
+        );
+
+        struct CustomEnvGuard(Option<std::ffi::OsString>);
+        impl Drop for CustomEnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.0 {
+                        Some(v) => std::env::set_var("CUSTOM_PADDED_API_KEY", v),
+                        None => std::env::remove_var("CUSTOM_PADDED_API_KEY"),
+                    }
+                }
+            }
+        }
+        let _g = CustomEnvGuard(std::env::var_os("CUSTOM_PADDED_API_KEY"));
+        unsafe {
+            std::env::set_var("CUSTOM_PADDED_API_KEY", "sk-padded-ok");
+        }
+        assert_eq!(
+            resolve_provider_env_var(" custom-padded ").as_deref(),
+            Some("sk-padded-ok")
+        );
+
+        assert_eq!(
+            lock_path_for(Path::new("/tmp/auth.json")),
+            PathBuf::from("/tmp/auth.json.lock")
+        );
+    }
+
+    #[tokio::test]
+    async fn stored_api_key_env_map_is_resolved_and_connected_consistently() {
+        let _env_lock = crate::ENV_MUTEX.lock().await;
+        let prev_openai = std::env::var_os("OPENAI_API_KEY");
+        let prev_bedrock = std::env::var_os("AWS_ACCESS_KEY_ID");
+        let prev_bedrock_bearer = std::env::var_os("AWS_BEARER_TOKEN_BEDROCK");
+        struct EnvRestore {
+            vars: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        }
+        impl Drop for EnvRestore {
+            fn drop(&mut self) {
+                unsafe {
+                    for (k, v) in &self.vars {
+                        match v {
+                            Some(val) => std::env::set_var(k, val),
+                            None => std::env::remove_var(k),
+                        }
+                    }
+                }
+            }
+        }
+        let _guard = EnvRestore {
+            vars: vec![
+                ("OPENAI_API_KEY", prev_openai),
+                ("AWS_ACCESS_KEY_ID", prev_bedrock),
+                ("AWS_BEARER_TOKEN_BEDROCK", prev_bedrock_bearer),
+            ],
+        };
+        unsafe {
+            std::env::remove_var("OPENAI_API_KEY");
+            std::env::remove_var("AWS_ACCESS_KEY_ID");
+            std::env::remove_var("AWS_BEARER_TOKEN_BEDROCK");
+        }
+
+        let dir = crate::TempTestDir::new("auth_env_map");
+        let auth_file = dir.path().join("auth.json");
+        let models_file = dir.path().join("models.json");
+        std::fs::write(&models_file, "{}").unwrap();
+        let reg = crate::models_config::ModelRegistry::load_with_path(&models_file).unwrap();
+
+        let mut openai_env = HashMap::new();
+        openai_env.insert("OPENAI_API_KEY".to_string(), "sk-from-auth-env".to_string());
+        save_credential(
+            "openai",
+            &StoredCredential::ApiKey {
+                key: None,
+                env: Some(openai_env),
+            },
+            Some(&auth_file),
+        )
+        .unwrap();
+
+        let mut blank_env = HashMap::new();
+        blank_env.insert("AWS_PROFILE".to_string(), "   ".to_string());
+        save_credential(
+            "amazon-bedrock",
+            &StoredCredential::ApiKey {
+                key: None,
+                env: Some(blank_env),
+            },
+            Some(&auth_file),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_api_key("openai", None, Some(&auth_file)).as_deref(),
+            Some("sk-from-auth-env")
+        );
+        assert_eq!(
+            resolve_api_key_async("openai", None, Some(&auth_file))
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("sk-from-auth-env")
+        );
+        assert_eq!(
+            resolve_api_key("amazon-bedrock", None, Some(&auth_file)),
+            None
+        );
+
+        let connected = list_connected_providers(Some(&auth_file), &reg).unwrap();
+        assert!(
+            connected
+                .iter()
+                .any(|p| p.provider_id == "openai" && p.source == CredentialSource::AuthFile),
+            "openai with env map in auth.json must be connected: {connected:?}"
+        );
+        assert!(
+            !connected
+                .iter()
+                .any(|p| p.provider_id == "amazon-bedrock" && p.source == CredentialSource::AuthFile),
+            "blank env map value must not be connected: {connected:?}"
+        );
     }
 }

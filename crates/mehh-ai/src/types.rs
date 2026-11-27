@@ -198,18 +198,38 @@ pub enum UserContent {
     Blocks(Vec<UserContentBlock>),
 }
 
+fn join_text_slices<'a>(iter: impl Iterator<Item = &'a str>) -> String {
+    let mut first: Option<&'a str> = None;
+    let mut out: Option<String> = None;
+    for part in iter {
+        match (&mut out, first) {
+            (Some(s), _) => {
+                s.push('\n');
+                s.push_str(part);
+            }
+            (None, Some(prev)) => {
+                let mut s = String::with_capacity(prev.len() + 1 + part.len());
+                s.push_str(prev);
+                s.push('\n');
+                s.push_str(part);
+                out = Some(s);
+            }
+            (None, None) => {
+                first = Some(part);
+            }
+        }
+    }
+    out.unwrap_or_else(|| first.map(str::to_string).unwrap_or_default())
+}
+
 impl UserContent {
     pub fn text(&self) -> String {
         match self {
             UserContent::Text(s) => s.clone(),
-            UserContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    UserContentBlock::Text(t) => Some(t.text.as_str()),
-                    UserContentBlock::Image(_) => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
+            UserContent::Blocks(blocks) => join_text_slices(blocks.iter().filter_map(|b| match b {
+                UserContentBlock::Text(t) => Some(t.text.as_str()),
+                UserContentBlock::Image(_) => None,
+            })),
         }
     }
 }
@@ -300,14 +320,10 @@ impl AssistantMessage {
     }
 
     pub fn text_content(&self) -> String {
-        self.content
-            .iter()
-            .filter_map(|b| match b {
-                AssistantContentBlock::Text(t) => Some(t.text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
+        join_text_slices(self.content.iter().filter_map(|b| match b {
+            AssistantContentBlock::Text(t) => Some(t.text.as_str()),
+            _ => None,
+        }))
     }
 
     pub fn tool_calls(&self) -> Vec<ToolCall> {
@@ -449,7 +465,7 @@ pub enum AnthropicThinkingDisplay {
     Omitted,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct Model {
     pub id: String,
@@ -470,7 +486,30 @@ pub struct Model {
     pub thinking_level_map: Option<ThinkingLevelMap>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+impl std::fmt::Debug for Model {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Model")
+            .field("id", &self.id)
+            .field("name", &self.name)
+            .field("api", &self.api)
+            .field("provider", &self.provider)
+            .field("base_url", &self.base_url)
+            .field("reasoning", &self.reasoning)
+            .field("input", &self.input)
+            .field("cost", &self.cost)
+            .field("context_window", &self.context_window)
+            .field("max_tokens", &self.max_tokens)
+            .field(
+                "headers",
+                &self.headers.as_ref().map(|h| format!("[{} headers]", h.len())),
+            )
+            .field("compat", &self.compat)
+            .field("thinking_level_map", &self.thinking_level_map)
+            .finish()
+    }
+}
+
+#[derive(Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct StreamOptions {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -497,6 +536,25 @@ pub struct StreamOptions {
     pub thinking_display: Option<AnthropicThinkingDisplay>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interleaved_thinking: Option<bool>,
+}
+
+impl std::fmt::Debug for StreamOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamOptions")
+            .field("api_key", &self.api_key.as_ref().map(|_| "[REDACTED]"))
+            .field("temperature", &self.temperature)
+            .field("max_tokens", &self.max_tokens)
+            .field("reasoning", &self.reasoning)
+            .field("session_id", &self.session_id)
+            .field("headers", &self.headers.as_ref().map(|h| format!("[{} headers]", h.len())))
+            .field("cache_retention", &self.cache_retention)
+            .field("thinking_budgets", &self.thinking_budgets)
+            .field("thinking_budget_tokens", &self.thinking_budget_tokens)
+            .field("effort", &self.effort)
+            .field("thinking_display", &self.thinking_display)
+            .field("interleaved_thinking", &self.interleaved_thinking)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -921,5 +979,22 @@ mod tests {
         };
         usage.calculate_cost(&ModelCost::default());
         assert_eq!(usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn model_debug_redacts_headers() {
+        let mut headers = HashMap::new();
+        headers.insert(
+            "Authorization".to_string(),
+            "Bearer secret-header-token".to_string(),
+        );
+        let model = Model {
+            id: "test".to_string(),
+            headers: Some(headers),
+            ..Default::default()
+        };
+        let dbg = format!("{model:?}");
+        assert!(!dbg.contains("secret-header-token"), "{dbg}");
+        assert!(dbg.contains("[1 headers]"), "{dbg}");
     }
 }

@@ -40,14 +40,30 @@ impl RollingBytes {
     }
 
     pub fn extend(&mut self, chunk: &[u8]) {
-        self.buf.extend(chunk.iter().copied());
-        while self.buf.len() > self.cap {
-            self.buf.pop_front();
+        if self.cap == 0 {
+            self.buf.clear();
+            return;
         }
-        // A trimmed head may be a UTF-8 continuation byte; drop leading
-        // continuation bytes so the buffer always decodes from a boundary.
-        while self.buf.front().is_some_and(|b| b & 0xC0 == 0x80) {
-            self.buf.pop_front();
+        if chunk.len() > self.cap {
+            self.buf.clear();
+            self.buf.extend(chunk[chunk.len() - self.cap..].iter().copied());
+            while self.buf.front().is_some_and(|b| b & 0xC0 == 0x80) {
+                self.buf.pop_front();
+            }
+            return;
+        }
+        let total = self.buf.len() + chunk.len();
+        if total > self.cap {
+            let excess = total - self.cap;
+            self.buf.drain(..excess);
+            self.buf.extend(chunk.iter().copied());
+            // A trimmed head may be a UTF-8 continuation byte; drop leading
+            // continuation bytes so the buffer always decodes from a boundary.
+            while self.buf.front().is_some_and(|b| b & 0xC0 == 0x80) {
+                self.buf.pop_front();
+            }
+        } else {
+            self.buf.extend(chunk.iter().copied());
         }
     }
 
@@ -60,10 +76,18 @@ impl RollingBytes {
     }
 
     pub fn to_vec(&self) -> Vec<u8> {
-        self.buf.iter().copied().collect()
+        let (a, b) = self.buf.as_slices();
+        let mut out = Vec::with_capacity(a.len() + b.len());
+        out.extend_from_slice(a);
+        out.extend_from_slice(b);
+        out
     }
 
     pub fn to_string_lossy(&self) -> String {
+        let (a, b) = self.buf.as_slices();
+        if b.is_empty() {
+            return String::from_utf8_lossy(a).into_owned();
+        }
         String::from_utf8_lossy(&self.to_vec()).into_owned()
     }
 }
@@ -91,6 +115,14 @@ mod tests {
         rolling.extend("é".as_bytes()); // -> 5 bytes, one byte trimmed
         let decoded = rolling.to_string_lossy();
         assert!(!decoded.contains('\u{fffd}'), "unexpected: {decoded:?}");
+    }
+
+    #[test]
+    fn rolling_bytes_does_not_strip_continuation_bytes_without_eviction() {
+        let mut rolling = RollingBytes::new(16);
+        // Leading continuation byte 0x80 with total length <= cap: no eviction occurred.
+        rolling.extend(&[0x80, b'o', b'k']);
+        assert_eq!(rolling.to_vec(), vec![0x80, b'o', b'k']);
     }
 
     #[test]

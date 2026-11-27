@@ -147,6 +147,7 @@ pub type RequestHandler = Arc<
 #[derive(Clone, Default)]
 pub struct McpRequestOptions {
     pub timeout: Option<Duration>,
+    pub max_total_timeout: Option<Duration>,
     pub cancel: Option<tokio_util::sync::CancellationToken>,
     pub on_progress: Option<ProgressCallback>,
 }
@@ -158,6 +159,11 @@ impl McpRequestOptions {
 
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = Some(timeout);
+        self
+    }
+
+    pub fn with_max_total_timeout(mut self, max_total_timeout: Duration) -> Self {
+        self.max_total_timeout = Some(max_total_timeout);
         self
     }
 
@@ -174,12 +180,33 @@ impl McpRequestOptions {
 
 type PendingResponseSender = oneshot::Sender<Result<serde_json::Value, String>>;
 type PendingRequestsMap = Arc<std::sync::Mutex<HashMap<String, PendingResponseSender>>>;
+type ProgressSendersMap =
+    Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::Sender<McpProgressNotification>>>>;
+type IncomingTasksMap =
+    Arc<std::sync::Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>;
+
+/// Removes an in-flight incoming server request from both tracking maps on task
+/// completion or panic, so cancelled/panicking handlers never leak request IDs.
+struct IncomingRequestGuard {
+    incoming_map: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    tasks_map: IncomingTasksMap,
+    key: String,
+}
+
+impl Drop for IncomingRequestGuard {
+    fn drop(&mut self) {
+        lock_std(&self.incoming_map).remove(&self.key);
+        lock_std(&self.tasks_map).remove(&self.key);
+    }
+}
 
 fn lock_std<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 const MAX_CONCURRENT_SERVER_REQUESTS: usize = 32;
+const PROGRESS_CHANNEL_CAPACITY: usize = 64;
+const DEFAULT_MAX_TOTAL_TIMEOUT: Duration = Duration::from_secs(600);
 
 fn enqueue_response(
     writer_tx: &tokio::sync::mpsc::Sender<JsonRpcMessage>,
@@ -195,7 +222,7 @@ fn enqueue_response(
 /// still removed and a best-effort `notifications/cancelled` is emitted.
 struct PendingRequestGuard {
     pending: PendingRequestsMap,
-    progress: Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<McpProgressNotification>>>>,
+    progress: ProgressSendersMap,
     transport: Arc<dyn McpTransport>,
     key: String,
     request_id: serde_json::Value,
@@ -233,8 +260,9 @@ impl Drop for PendingRequestGuard {
 pub struct McpClient {
     transport: Arc<dyn McpTransport>,
     pending_requests: PendingRequestsMap,
-    progress_senders: Arc<std::sync::Mutex<HashMap<String, tokio::sync::mpsc::UnboundedSender<McpProgressNotification>>>>,
+    progress_senders: ProgressSendersMap,
     incoming_requests: Arc<std::sync::Mutex<HashMap<String, tokio_util::sync::CancellationToken>>>,
+    incoming_tasks: IncomingTasksMap,
     request_handlers: Arc<std::sync::Mutex<HashMap<String, RequestHandler>>>,
     notification_listeners: Arc<std::sync::Mutex<HashMap<String, Vec<NotificationListener>>>>,
     error_listeners: Arc<std::sync::Mutex<Vec<ErrorListener>>>,
@@ -260,9 +288,19 @@ impl McpClient {
         transport: Arc<dyn McpTransport>,
         roots: Vec<McpRoot>,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_roots_and_timeout(transport, roots, Duration::from_secs(15)).await
+    }
+
+    /// Connects to an MCP server providing client workspace roots and an explicit handshake timeout.
+    pub async fn connect_with_roots_and_timeout(
+        transport: Arc<dyn McpTransport>,
+        roots: Vec<McpRoot>,
+        timeout: Duration,
+    ) -> anyhow::Result<Self> {
         let pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let progress_senders = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let incoming_requests = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let incoming_tasks = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let request_handlers = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let notification_listeners = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let error_listeners = Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -278,6 +316,7 @@ impl McpClient {
             pending_requests: pending.clone(),
             progress_senders: progress_senders.clone(),
             incoming_requests: incoming_requests.clone(),
+            incoming_tasks: incoming_tasks.clone(),
             request_handlers: request_handlers.clone(),
             notification_listeners: notification_listeners.clone(),
             error_listeners: error_listeners.clone(),
@@ -294,10 +333,14 @@ impl McpClient {
         // Dedicated writer task: the reader loop must never block on transport.send().
         let (writer_tx, mut writer_rx) = tokio::sync::mpsc::channel::<JsonRpcMessage>(256);
         let transport_writer = transport.clone();
+        let closed_writer = closed.clone();
         let writer_handle = tokio::spawn(async move {
             while let Some(msg) = writer_rx.recv().await {
-                if transport_writer.send(msg).await.is_err() {
-                    break;
+                if let Err(err) = transport_writer.send(msg).await {
+                    tracing::warn!("MCP writer task failed to send message: {err}");
+                    if closed_writer.load(Ordering::SeqCst) {
+                        break;
+                    }
                 }
             }
         });
@@ -308,6 +351,7 @@ impl McpClient {
         let pending_reader = pending.clone();
         let progress_reader = progress_senders.clone();
         let incoming_reader = incoming_requests.clone();
+        let incoming_tasks_reader = incoming_tasks.clone();
         let handlers_reader = request_handlers.clone();
         let notif_reader = notification_listeners.clone();
         let err_reader = error_listeners.clone();
@@ -342,6 +386,20 @@ impl McpClient {
                             map.get(&req.method).cloned()
                         };
                         if let Some(h) = handler {
+                            let key = id_to_key(&req.id);
+                            {
+                                let inc = lock_std(&incoming_reader);
+                                if inc.contains_key(&key) {
+                                    let resp = JsonRpcResponse::error(
+                                        req.id,
+                                        -32600,
+                                        format!("Duplicate in-flight request id: {key}"),
+                                        None,
+                                    );
+                                    enqueue_response(&writer_tx, resp);
+                                    continue;
+                                }
+                            }
                             let permit = match incoming_permits.clone().try_acquire_owned() {
                                 Ok(p) => p,
                                 Err(_) => {
@@ -356,7 +414,6 @@ impl McpClient {
                                 }
                             };
                             let cancel = tokio_util::sync::CancellationToken::new();
-                            let key = id_to_key(&req.id);
                             {
                                 let mut inc = lock_std(&incoming_reader);
                                 inc.insert(key.clone(), cancel.clone());
@@ -364,13 +421,19 @@ impl McpClient {
                             let writer_for_handler = writer_tx.clone();
                             let id_clone = req.id.clone();
                             let incoming_map = incoming_reader.clone();
-                            tokio::spawn(async move {
+                            let tasks_map = incoming_tasks_reader.clone();
+                            let task_key = key.clone();
+                            let mut tasks_guard = lock_std(&incoming_tasks_reader);
+                            tasks_guard.retain(|_, h| !h.is_finished());
+                            let handle = tokio::spawn(async move {
                                 let _permit = permit;
+                                let guard = IncomingRequestGuard {
+                                    incoming_map,
+                                    tasks_map,
+                                    key: task_key,
+                                };
                                 let res = h(req.params, cancel).await;
-                                {
-                                    let mut inc = lock_std(&incoming_map);
-                                    inc.remove(&key);
-                                }
+                                drop(guard);
                                 match res {
                                     Ok(val) => {
                                         let resp = JsonRpcResponse::success(id_clone, val);
@@ -382,6 +445,7 @@ impl McpClient {
                                     }
                                 }
                             });
+                            tasks_guard.insert(key, handle);
                         } else if req.method == "ping" {
                             let resp = JsonRpcResponse::success(req.id, serde_json::json!({}));
                             enqueue_response(&writer_tx, resp);
@@ -411,7 +475,7 @@ impl McpClient {
                                         map.get(&key).cloned()
                                     };
                                     if let Some(tx) = tx {
-                                        let _ = tx.send(prog);
+                                        let _ = tx.try_send(prog);
                                     }
                                 }
                             }
@@ -420,8 +484,8 @@ impl McpClient {
                                 if let Some(req_id) = params.get("requestId") {
                                     let key = id_to_key(req_id);
                                     let cancel_token = {
-                                        let mut inc = lock_std(&incoming_reader);
-                                        inc.remove(&key)
+                                        let inc = lock_std(&incoming_reader);
+                                        inc.get(&key).cloned()
                                     };
                                     if let Some(cancel) = cancel_token {
                                         cancel.cancel();
@@ -456,6 +520,9 @@ impl McpClient {
             let mut map = lock_std(&pending_reader);
             for (_, tx) in map.drain() {
                 let _ = tx.send(Err(final_reason.clone()));
+            }
+            for (_, token) in lock_std(&incoming_reader).drain() {
+                token.cancel();
             }
             if !was_closed {
                 let close_listeners = {
@@ -495,7 +562,7 @@ impl McpClient {
                     "initialize",
                     Some(init_params),
                     McpRequestOptions {
-                        timeout: Some(Duration::from_secs(15)),
+                        timeout: Some(timeout),
                         ..Default::default()
                     },
                 )
@@ -531,7 +598,7 @@ impl McpClient {
             // Send notifications/initialized
             let notif = JsonRpcNotification::new("notifications/initialized", None);
             tokio::time::timeout(
-                Duration::from_secs(15),
+                timeout,
                 transport.send(JsonRpcMessage::Notification(notif)),
             )
             .await
@@ -601,11 +668,12 @@ impl McpClient {
             map.insert(key.clone(), tx);
         }
 
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel();
-        if options.on_progress.is_some() {
+        let mut progress_rx = options.on_progress.as_ref().map(|_| {
+            let (progress_tx, rx) = tokio::sync::mpsc::channel(PROGRESS_CHANNEL_CAPACITY);
             let mut map = lock_std(&self.progress_senders);
             map.insert(key.clone(), progress_tx);
-        }
+            rx
+        });
 
         let mut request_params = params;
         if options.on_progress.is_some() {
@@ -629,10 +697,17 @@ impl McpClient {
         }
 
         let timeout_dur = options.timeout.unwrap_or(Duration::from_secs(30));
+        let max_total_dur = options
+            .max_total_timeout
+            .unwrap_or_else(|| DEFAULT_MAX_TOTAL_TIMEOUT.max(timeout_dur));
         let req = JsonRpcRequest::new(id.clone(), method, request_params);
 
         let cancel = options.cancel.clone().unwrap_or_default();
-        let mut deadline = tokio::time::Instant::now() + timeout_dur;
+        let start = tokio::time::Instant::now();
+        let total_deadline = start + max_total_dur;
+        let deadline = (start + timeout_dur).min(total_deadline);
+        let deadline_sleep = tokio::time::sleep_until(deadline);
+        tokio::pin!(deadline_sleep);
 
         let send_fut = self.transport.send(JsonRpcMessage::Request(req));
         tokio::pin!(send_fut);
@@ -654,7 +729,7 @@ impl McpClient {
                             }
                         }
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
+                    _ = &mut deadline_sleep => {
                         is_timeout = true;
                         break Err(anyhow::anyhow!("MCP request timed out after {}ms", timeout_dur.as_millis()));
                     }
@@ -666,22 +741,49 @@ impl McpClient {
             } else {
                 tokio::select! {
                     response = &mut rx => {
+                        if let (Some(cb), Some(ref mut prx)) = (&options.on_progress, progress_rx.as_mut()) {
+                            while let Ok(prog) = prx.try_recv() {
+                                cb(prog);
+                            }
+                        }
                         break match response {
                             Ok(Ok(val)) => Ok(val),
                             Ok(Err(err_msg)) => Err(anyhow::anyhow!("{err_msg}")),
                             Err(_) => Err(anyhow::anyhow!("MCP request sender dropped / connection closed")),
                         };
                     }
-                    _ = tokio::time::sleep_until(deadline) => {
+                    _ = &mut deadline_sleep => {
                         is_timeout = true;
-                        break Err(anyhow::anyhow!("MCP request timed out after {}ms", timeout_dur.as_millis()));
+                        let msg = if tokio::time::Instant::now() >= total_deadline {
+                            format!(
+                                "MCP request timed out after max total duration of {}ms",
+                                max_total_dur.as_millis()
+                            )
+                        } else {
+                            format!("MCP request timed out after {}ms", timeout_dur.as_millis())
+                        };
+                        break Err(anyhow::anyhow!("{msg}"));
                     }
                     _ = cancel.cancelled() => {
                         is_cancelled = true;
                         break Err(anyhow::anyhow!("MCP request cancelled"));
                     }
-                    Some(prog) = progress_rx.recv(), if options.on_progress.is_some() => {
-                        deadline = tokio::time::Instant::now() + timeout_dur;
+                    Some(prog) = async {
+                        match progress_rx.as_mut() {
+                            Some(prx) => prx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    }, if progress_rx.is_some() => {
+                        let now = tokio::time::Instant::now();
+                        if now >= total_deadline {
+                            is_timeout = true;
+                            break Err(anyhow::anyhow!(
+                                "MCP request timed out after max total duration of {}ms",
+                                max_total_dur.as_millis()
+                            ));
+                        }
+                        let next_deadline = (now + timeout_dur).min(total_deadline);
+                        deadline_sleep.as_mut().reset(next_deadline);
                         if let Some(cb) = &options.on_progress {
                             cb(prog);
                         }
@@ -692,7 +794,9 @@ impl McpClient {
 
         {
             lock_std(&self.pending_requests).remove(&key);
-            lock_std(&self.progress_senders).remove(&key);
+            if options.on_progress.is_some() {
+                lock_std(&self.progress_senders).remove(&key);
+            }
         }
         guard.active = false;
 
@@ -933,6 +1037,30 @@ impl McpClient {
         };
         if let Some(handle) = self.reader_task.lock().await.take() {
             handle.abort();
+            let _ = handle.await;
+        }
+        // Cancel and drain all active incoming server-to-client request handlers.
+        for (_, token) in lock_std(&self.incoming_requests).drain() {
+            token.cancel();
+        }
+        let mut handler_handles: Vec<tokio::task::JoinHandle<()>> = lock_std(&self.incoming_tasks)
+            .drain()
+            .map(|(_, h)| h)
+            .collect();
+        if !handler_handles.is_empty() {
+            let drain_fut = async {
+                for handle in &mut handler_handles {
+                    let _ = handle.await;
+                }
+            };
+            if tokio::time::timeout(Duration::from_millis(500), drain_fut)
+                .await
+                .is_err()
+            {
+                for handle in handler_handles {
+                    handle.abort();
+                }
+            }
         }
         if let Some(handle) = self.writer_task.lock().await.take() {
             handle.abort();
@@ -980,7 +1108,13 @@ impl Drop for McpClient {
     fn drop(&mut self) {
         // Stop background tasks even when callers forget close(). Aborting the
         // writer task drops its transport Arc, which terminates stdio children.
-        self.is_closed.store(true, Ordering::SeqCst);
+        let was_closed = self.is_closed.swap(true, Ordering::SeqCst);
+        for (_, token) in lock_std(&self.incoming_requests).drain() {
+            token.cancel();
+        }
+        for (_, handle) in lock_std(&self.incoming_tasks).drain() {
+            handle.abort();
+        }
         if let Ok(mut guard) = self.reader_task.try_lock() {
             if let Some(handle) = guard.take() {
                 handle.abort();
@@ -994,11 +1128,13 @@ impl Drop for McpClient {
         // Aborting the tasks alone leaves HTTP SSE tasks and the server-side
         // MCP session alive. Best-effort close on the runtime if one is still
         // available; skip it otherwise so Drop never panics at shutdown.
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            let transport = self.transport.clone();
-            runtime.spawn(async move {
-                let _ = transport.close().await;
-            });
+        if !was_closed {
+            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                let transport = self.transport.clone();
+                runtime.spawn(async move {
+                    let _ = transport.close().await;
+                });
+            }
         }
     }
 }
@@ -1040,6 +1176,7 @@ mod client_tests {
             pending_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             progress_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             incoming_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            incoming_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             notification_listeners: Arc::new(std::sync::Mutex::new(HashMap::new())),
             error_listeners: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1180,6 +1317,7 @@ mod client_tests {
             pending_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             progress_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             incoming_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            incoming_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             notification_listeners: Arc::new(std::sync::Mutex::new(HashMap::new())),
             error_listeners: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1679,6 +1817,7 @@ mod client_tests {
             pending_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             progress_senders: Arc::new(std::sync::Mutex::new(HashMap::new())),
             incoming_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            incoming_tasks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             request_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
             notification_listeners: Arc::new(std::sync::Mutex::new(HashMap::new())),
             error_listeners: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -1703,5 +1842,659 @@ mod client_tests {
         }
         assert!(lock_std(&pending).is_empty(), "pending entry must be removed on future drop");
         assert!(lock_std(&progress).is_empty(), "progress entry must be removed on future drop");
+    }
+
+    #[tokio::test]
+    async fn max_total_timeout_terminates_despite_continuous_progress() {
+        let (client_transport, server_transport) = crate::transport::InMemoryTransport::pair();
+        let client_transport = Arc::new(client_transport);
+        let server_transport = Arc::new(server_transport);
+
+        let srv = tokio::spawn(async move {
+            if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                    }),
+                );
+                server_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+            }
+            let _ = server_transport.recv().await; // notifications/initialized
+
+            if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                let token = req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("_meta"))
+                    .and_then(|m| m.get("progressToken"))
+                    .cloned()
+                    .expect("progressToken");
+
+                // Continuously emit progress every 20ms, never sending a final response.
+                for i in 1..=25 {
+                    let p = JsonRpcNotification::new(
+                        "notifications/progress",
+                        Some(serde_json::json!({
+                            "progressToken": token,
+                            "progress": i as f64,
+                            "total": 100.0
+                        })),
+                    );
+                    if server_transport.send(JsonRpcMessage::Notification(p)).await.is_err() {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        });
+
+        let client = McpClient::connect(client_transport).await.unwrap();
+        let start = std::time::Instant::now();
+        let err = client
+            .call_tool_with_options(
+                "endless_tool",
+                serde_json::json!({}),
+                McpRequestOptions::new()
+                    .with_timeout(Duration::from_millis(120))
+                    .with_max_total_timeout(Duration::from_millis(180))
+                    .with_progress(Arc::new(|_| {})),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "request must terminate near max_total_timeout"
+        );
+        assert!(
+            err.to_string().contains("max total duration"),
+            "expected max total duration timeout, got: {err}"
+        );
+        client.close().await.unwrap();
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn close_cancels_and_drains_incoming_handlers_and_drop_is_idempotent() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct CountCloseTransport {
+            inner: crate::transport::InMemoryTransport,
+            close_calls: Arc<AtomicUsize>,
+        }
+        #[async_trait]
+        impl McpTransport for CountCloseTransport {
+            async fn send(&self, msg: JsonRpcMessage) -> anyhow::Result<()> {
+                self.inner.send(msg).await
+            }
+            async fn recv(&self) -> Option<anyhow::Result<JsonRpcMessage>> {
+                self.inner.recv().await
+            }
+            async fn close(&self) -> anyhow::Result<()> {
+                self.close_calls.fetch_add(1, Ordering::SeqCst);
+                self.inner.close().await
+            }
+        }
+
+        let (client_inner, server_transport) = crate::transport::InMemoryTransport::pair();
+        let close_calls = Arc::new(AtomicUsize::new(0));
+        let client_transport = Arc::new(CountCloseTransport {
+            inner: client_inner,
+            close_calls: close_calls.clone(),
+        });
+
+        let srv = tokio::spawn(async move {
+            if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                    }),
+                );
+                server_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+            }
+            let _ = server_transport.recv().await; // notifications/initialized
+
+            server_transport
+                .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                    serde_json::json!(77),
+                    "custom/wait_shutdown",
+                    None,
+                )))
+                .await
+                .unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+
+        let client = McpClient::connect(client_transport).await.unwrap();
+        let handler_cancelled = Arc::new(AtomicBool::new(false));
+        let handler_finished = Arc::new(AtomicBool::new(false));
+        let hc = handler_cancelled.clone();
+        let hf = handler_finished.clone();
+        client.set_request_handler(
+            "custom/wait_shutdown",
+            Arc::new(move |_params, cancel| {
+                let hc = hc.clone();
+                let hf = hf.clone();
+                Box::pin(async move {
+                    cancel.cancelled().await;
+                    hc.store(true, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    hf.store(true, Ordering::SeqCst);
+                    Ok(serde_json::json!({}))
+                })
+            }),
+        );
+
+        // Wait for handler to start and register in incoming_requests.
+        for _ in 0..50 {
+            if !client.incoming_cancellation_tokens().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!client.incoming_cancellation_tokens().is_empty());
+
+        client.close().await.unwrap();
+        assert!(handler_cancelled.load(Ordering::SeqCst), "close() must cancel incoming handlers");
+        assert!(handler_finished.load(Ordering::SeqCst), "close() must drain incoming handlers");
+        assert_eq!(close_calls.load(Ordering::SeqCst), 1);
+
+        drop(client);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            close_calls.load(Ordering::SeqCst),
+            1,
+            "Drop after close() must be idempotent and not call transport.close() again"
+        );
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn duplicate_inflight_server_request_id_is_rejected_without_orphaning_first() {
+        let (client_transport, server_transport) = crate::transport::InMemoryTransport::pair();
+        let client_transport = Arc::new(client_transport);
+        let server_transport = Arc::new(server_transport);
+        let srv_transport = server_transport.clone();
+
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_started = Arc::new(Mutex::new(Some(first_started_tx)));
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_first = Arc::new(tokio::sync::Mutex::new(Some(release_first_rx)));
+
+        let srv = tokio::spawn(async move {
+            if let Some(Ok(JsonRpcMessage::Request(req))) = srv_transport.recv().await {
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                    }),
+                );
+                srv_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+            }
+            let _ = srv_transport.recv().await; // notifications/initialized
+        });
+
+        let client = McpClient::connect(client_transport).await.unwrap();
+        srv.await.unwrap();
+
+        let started_cb = first_started.clone();
+        let release_cb = release_first.clone();
+        client.set_request_handler(
+            "custom/slow",
+            Arc::new(move |_params, _cancel| {
+                let started_cb = started_cb.clone();
+                let release_cb = release_cb.clone();
+                Box::pin(async move {
+                    if let Some(tx) = started_cb.lock().await.take() {
+                        let _ = tx.send(());
+                    }
+                    if let Some(rx) = release_cb.lock().await.take() {
+                        let _ = rx.await;
+                    }
+                    Ok(serde_json::json!({ "from": "first" }))
+                })
+            }),
+        );
+
+        server_transport
+            .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                serde_json::json!(99),
+                "custom/slow",
+                None,
+            )))
+            .await
+            .unwrap();
+        first_started_rx.await.unwrap();
+
+        // Send a duplicate request with the exact same in-flight ID.
+        server_transport
+            .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                serde_json::json!(99),
+                "custom/slow",
+                None,
+            )))
+            .await
+            .unwrap();
+
+        let dup_reply = tokio::time::timeout(Duration::from_secs(2), server_transport.recv())
+            .await
+            .expect("expected immediate -32600 error for duplicate ID")
+            .unwrap()
+            .unwrap();
+        match dup_reply {
+            JsonRpcMessage::Response(r) => {
+                assert_eq!(r.id, serde_json::json!(99));
+                let err = r.error.expect("duplicate request must return error");
+                assert_eq!(err.code, -32600);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+
+        // First handler must still be alive and complete cleanly.
+        let _ = release_first_tx.send(());
+        let first_reply = tokio::time::timeout(Duration::from_secs(2), server_transport.recv())
+            .await
+            .expect("expected first handler response")
+            .unwrap()
+            .unwrap();
+        match first_reply {
+            JsonRpcMessage::Response(r) => {
+                assert_eq!(r.id, serde_json::json!(99));
+                assert_eq!(r.result, Some(serde_json::json!({ "from": "first" })));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_inflight_server_request_id_cannot_be_reused_until_handler_exits() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (client_transport, server_transport) = crate::transport::InMemoryTransport::pair();
+        let client_transport = Arc::new(client_transport);
+        let server_transport = Arc::new(server_transport);
+        let srv_transport = server_transport.clone();
+
+        let srv = tokio::spawn(async move {
+            if let Some(Ok(JsonRpcMessage::Request(req))) = srv_transport.recv().await {
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                    }),
+                );
+                srv_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+            }
+            let _ = srv_transport.recv().await; // notifications/initialized
+        });
+
+        let client = McpClient::connect(client_transport).await.unwrap();
+        srv.await.unwrap();
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let (first_started_tx, first_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_started = Arc::new(Mutex::new(Some(first_started_tx)));
+        let (first_cancelled_tx, first_cancelled_rx) = tokio::sync::oneshot::channel::<()>();
+        let first_cancelled = Arc::new(Mutex::new(Some(first_cancelled_tx)));
+        let (release_first_tx, release_first_rx) = tokio::sync::oneshot::channel::<()>();
+        let release_first = Arc::new(Mutex::new(Some(release_first_rx)));
+        let (second_started_tx, second_started_rx) = tokio::sync::oneshot::channel::<()>();
+        let second_started = Arc::new(Mutex::new(Some(second_started_tx)));
+        let second_cancelled = Arc::new(AtomicBool::new(false));
+        let second_cancelled_cb = second_cancelled.clone();
+
+        client.set_request_handler(
+            "custom/cancellable",
+            Arc::new(move |_params, cancel| {
+                let call_count = call_count.clone();
+                let first_started = first_started.clone();
+                let first_cancelled = first_cancelled.clone();
+                let release_first = release_first.clone();
+                let second_started = second_started.clone();
+                let second_cancelled_cb = second_cancelled_cb.clone();
+                Box::pin(async move {
+                    if call_count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        if let Some(tx) = first_started.lock().await.take() {
+                            let _ = tx.send(());
+                        }
+                        cancel.cancelled().await;
+                        if let Some(tx) = first_cancelled.lock().await.take() {
+                            let _ = tx.send(());
+                        }
+                        if let Some(rx) = release_first.lock().await.take() {
+                            let _ = rx.await;
+                        }
+                        Ok(serde_json::json!({ "call": 1 }))
+                    } else {
+                        if let Some(tx) = second_started.lock().await.take() {
+                            let _ = tx.send(());
+                        }
+                        cancel.cancelled().await;
+                        second_cancelled_cb.store(true, Ordering::SeqCst);
+                        Ok(serde_json::json!({ "call": 2 }))
+                    }
+                })
+            }),
+        );
+
+        server_transport
+            .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                serde_json::json!(55),
+                "custom/cancellable",
+                None,
+            )))
+            .await
+            .unwrap();
+        first_started_rx.await.unwrap();
+
+        // Cancel handler 1 while it is still running.
+        server_transport
+            .send(JsonRpcMessage::Notification(JsonRpcNotification::new(
+                "notifications/cancelled",
+                Some(serde_json::json!({ "requestId": 55 })),
+            )))
+            .await
+            .unwrap();
+        first_cancelled_rx.await.unwrap();
+
+        // Reusing request ID 55 while handler 1 has not exited yet must be rejected.
+        server_transport
+            .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                serde_json::json!(55),
+                "custom/cancellable",
+                None,
+            )))
+            .await
+            .unwrap();
+        let dup_reply = tokio::time::timeout(Duration::from_secs(2), server_transport.recv())
+            .await
+            .expect("expected immediate -32600 for cancelled-but-still-running ID")
+            .unwrap()
+            .unwrap();
+        match dup_reply {
+            JsonRpcMessage::Response(r) => {
+                assert_eq!(r.id, serde_json::json!(55));
+                assert_eq!(r.error.expect("duplicate error").code, -32600);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+
+        // Let handler 1 finish and clean up.
+        let _ = release_first_tx.send(());
+        let first_reply = tokio::time::timeout(Duration::from_secs(2), server_transport.recv())
+            .await
+            .expect("expected handler 1 response")
+            .unwrap()
+            .unwrap();
+        match first_reply {
+            JsonRpcMessage::Response(r) => {
+                assert_eq!(r.id, serde_json::json!(55));
+                assert_eq!(r.result, Some(serde_json::json!({ "call": 1 })));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+
+        for _ in 0..50 {
+            if client.incoming_cancellation_tokens().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(client.incoming_cancellation_tokens().is_empty());
+
+        // Now ID 55 can be reused for handler 2 with intact cancellation/cleanup.
+        server_transport
+            .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                serde_json::json!(55),
+                "custom/cancellable",
+                None,
+            )))
+            .await
+            .unwrap();
+        second_started_rx.await.unwrap();
+        assert!(!client.incoming_cancellation_tokens().is_empty());
+
+        server_transport
+            .send(JsonRpcMessage::Notification(JsonRpcNotification::new(
+                "notifications/cancelled",
+                Some(serde_json::json!({ "requestId": 55 })),
+            )))
+            .await
+            .unwrap();
+        let second_reply = tokio::time::timeout(Duration::from_secs(2), server_transport.recv())
+            .await
+            .expect("expected handler 2 response")
+            .unwrap()
+            .unwrap();
+        match second_reply {
+            JsonRpcMessage::Response(r) => {
+                assert_eq!(r.id, serde_json::json!(55));
+                assert_eq!(r.result, Some(serde_json::json!({ "call": 2 })));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+        assert!(second_cancelled.load(Ordering::SeqCst));
+        assert!(client.incoming_cancellation_tokens().is_empty());
+
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn panicking_server_request_handler_cleans_up_request_id() {
+        let (client_transport, server_transport) = crate::transport::InMemoryTransport::pair();
+        let client_transport = Arc::new(client_transport);
+        let server_transport = Arc::new(server_transport);
+        let srv_transport = server_transport.clone();
+
+        let srv = tokio::spawn(async move {
+            if let Some(Ok(JsonRpcMessage::Request(req))) = srv_transport.recv().await {
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                    }),
+                );
+                srv_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+            }
+            let _ = srv_transport.recv().await; // notifications/initialized
+        });
+
+        let client = McpClient::connect(client_transport).await.unwrap();
+        srv.await.unwrap();
+
+        let should_panic = Arc::new(AtomicBool::new(true));
+        let panic_entered = Arc::new(tokio::sync::Notify::new());
+        let panic_entered_cb = panic_entered.clone();
+        client.set_request_handler(
+            "custom/panic_once",
+            Arc::new(move |_params, _cancel| {
+                let should_panic = should_panic.clone();
+                let panic_entered_cb = panic_entered_cb.clone();
+                Box::pin(async move {
+                    if should_panic.swap(false, Ordering::SeqCst) {
+                        panic_entered_cb.notify_one();
+                        panic!("intentional handler panic");
+                    }
+                    Ok(serde_json::json!({ "recovered": true }))
+                })
+            }),
+        );
+
+        server_transport
+            .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                serde_json::json!(77),
+                "custom/panic_once",
+                None,
+            )))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), panic_entered.notified())
+            .await
+            .expect("first handler invocation must run and panic");
+
+        let mut cleaned_up = false;
+        for _ in 0..200 {
+            if client.incoming_cancellation_tokens().is_empty() {
+                cleaned_up = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            cleaned_up,
+            "panicking handler must clean up request ID via Drop guard"
+        );
+
+        server_transport
+            .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                serde_json::json!(77),
+                "custom/panic_once",
+                None,
+            )))
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(Duration::from_secs(2), server_transport.recv())
+            .await
+            .expect("expected subsequent request with same ID to run")
+            .unwrap()
+            .unwrap();
+        match reply {
+            JsonRpcMessage::Response(r) => {
+                assert_eq!(r.id, serde_json::json!(77));
+                assert_eq!(r.result, Some(serde_json::json!({ "recovered": true })));
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn i20_writer_task_survives_transient_send_error() {
+        use std::sync::atomic::AtomicUsize;
+
+        struct FlakyResponseTransport {
+            inner: crate::transport::InMemoryTransport,
+            response_send_attempts: Arc<AtomicUsize>,
+        }
+
+        #[async_trait]
+        impl McpTransport for FlakyResponseTransport {
+            async fn send(&self, msg: JsonRpcMessage) -> anyhow::Result<()> {
+                if matches!(msg, JsonRpcMessage::Response(_)) {
+                    let n = self.response_send_attempts.fetch_add(1, Ordering::SeqCst);
+                    if n == 0 {
+                        anyhow::bail!("transient send failure on first response");
+                    }
+                }
+                self.inner.send(msg).await
+            }
+
+            async fn recv(&self) -> Option<anyhow::Result<JsonRpcMessage>> {
+                self.inner.recv().await
+            }
+
+            async fn close(&self) -> anyhow::Result<()> {
+                self.inner.close().await
+            }
+        }
+
+        let (client_inner, server_transport) = crate::transport::InMemoryTransport::pair();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let client_transport = Arc::new(FlakyResponseTransport {
+            inner: client_inner,
+            response_send_attempts: attempts.clone(),
+        });
+
+        let srv = tokio::spawn({
+            let server_transport = server_transport;
+            async move {
+                if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                    let resp = JsonRpcResponse::success(
+                        req.id,
+                        serde_json::json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": {},
+                            "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                        }),
+                    );
+                    server_transport
+                        .send(JsonRpcMessage::Response(resp))
+                        .await
+                        .unwrap();
+                }
+                let _ = server_transport.recv().await; // notifications/initialized
+
+                // Ping 1: client writer will fail transiently.
+                server_transport
+                    .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                        serde_json::json!(101),
+                        "ping",
+                        None,
+                    )))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(40)).await;
+
+                // Ping 2: writer task must still be alive and deliver this response!
+                server_transport
+                    .send(JsonRpcMessage::Request(JsonRpcRequest::new(
+                        serde_json::json!(102),
+                        "ping",
+                        None,
+                    )))
+                    .await
+                    .unwrap();
+
+                let reply = tokio::time::timeout(Duration::from_secs(2), server_transport.recv())
+                    .await
+                    .expect("writer task must stay alive after transient error")
+                    .unwrap()
+                    .unwrap();
+                match reply {
+                    JsonRpcMessage::Response(r) => assert_eq!(r.id, serde_json::json!(102)),
+                    other => panic!("expected Response for 102, got {other:?}"),
+                }
+            }
+        });
+
+        let client = McpClient::connect(client_transport).await.unwrap();
+        srv.await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        client.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn c9_connect_with_roots_and_timeout_enforces_custom_timeout() {
+        let closed = Arc::new(AtomicBool::new(false));
+        let transport = Arc::new(SlowSendTransport {
+            closed: closed.clone(),
+        });
+        let start = std::time::Instant::now();
+        let err = McpClient::connect_with_roots_and_timeout(
+            transport,
+            Vec::new(),
+            Duration::from_millis(60),
+        )
+        .await
+        .err()
+        .expect("connect must time out at custom timeout");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(err.to_string().contains("timed out"));
+        assert!(closed.load(Ordering::SeqCst));
     }
 }

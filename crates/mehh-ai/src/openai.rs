@@ -3,8 +3,10 @@
 use std::collections::HashMap;
 use futures::StreamExt;
 
+use crate::oauth::redact_error_body_with_limit;
 use crate::retry::{
-    default_http_client, send_with_retry, RetryFailure, RetryPolicy, DEFAULT_STREAM_CHUNK_TIMEOUT,
+    default_http_client, retry_failure_event, send_with_retry_with_secrets, RetryPolicy,
+    DEFAULT_STREAM_CHUNK_TIMEOUT,
 };
 use crate::sse::{SseEvent, SseParser};
 use crate::stream::{create_event_stream, AssistantEventSender, AssistantEventStream, LlmProvider};
@@ -29,6 +31,57 @@ impl OpenAiCompletionsProvider {
     }
 }
 
+pub(crate) fn insert_default_copilot_headers(
+    header_map: &mut reqwest::header::HeaderMap,
+    provider: &str,
+) {
+    if provider.eq_ignore_ascii_case("github-copilot") {
+        header_map.insert(
+            reqwest::header::HeaderName::from_static("copilot-integration-id"),
+            reqwest::header::HeaderValue::from_static("vscode-chat"),
+        );
+        header_map.insert(
+            reqwest::header::HeaderName::from_static("editor-version"),
+            reqwest::header::HeaderValue::from_static("vscode/1.99.0"),
+        );
+        header_map.insert(
+            reqwest::header::HeaderName::from_static("editor-plugin-version"),
+            reqwest::header::HeaderValue::from_static("copilot-chat/0.26.0"),
+        );
+        header_map.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static("GitHubCopilotChat/0.26.0"),
+        );
+    }
+}
+
+fn insert_custom_headers(
+    header_map: &mut reqwest::header::HeaderMap,
+    headers: Option<&HashMap<String, String>>,
+) -> Result<(), String> {
+    if let Some(map) = headers {
+        for (k, v) in map {
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| format!("Invalid header name '{k}': {e}"))?;
+            let value = reqwest::header::HeaderValue::from_str(v)
+                .map_err(|e| format!("Invalid header value for '{k}': {e}"))?;
+            header_map.insert(name, value);
+        }
+    }
+    Ok(())
+}
+
+fn openai_chat_completions_url(base_url: &str) -> String {
+    const DEFAULT_BASE: &str = "https://api.openai.com/v1";
+    let path = crate::http_safety::normalized_endpoint_path(base_url, DEFAULT_BASE);
+    let extra: &[&str] = if path.ends_with("/chat/completions") {
+        &[]
+    } else {
+        &["chat", "completions"]
+    };
+    crate::http_safety::append_endpoint_segments_preserving_query(base_url, DEFAULT_BASE, extra)
+}
+
 #[async_trait::async_trait]
 impl LlmProvider for OpenAiCompletionsProvider {
     fn stream(
@@ -41,77 +94,98 @@ impl LlmProvider for OpenAiCompletionsProvider {
         let (sender, stream) = create_event_stream();
         let client = self.client.clone();
         let model = model.clone();
-        let context = context.clone();
         let options = options.clone();
+        let body_res = serde_json::to_vec(&build_openai_request(&model, context, &options))
+            .map_err(|e| format!("Failed to serialize request body: {e}"));
 
         tokio::spawn(async move {
-            let body = build_openai_request(&model, &context, &options);
-            let url = if model.base_url.ends_with("/chat/completions") {
-                model.base_url.clone()
-            } else {
-                format!("{}/chat/completions", model.base_url.trim_end_matches('/'))
+            let body_bytes = match body_res {
+                Ok(b) => b,
+                Err(msg) => {
+                    let mut err_msg = AssistantMessage::empty_for_model(&model);
+                    err_msg.stop_reason = StopReason::Error;
+                    err_msg.error_message = Some(msg);
+                    let _ = sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: err_msg,
+                        })
+                        .await;
+                    return;
+                }
             };
+            let url = openai_chat_completions_url(&model.base_url);
 
-            let resp = match send_with_retry(
+            let api_key = options
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let secrets_owned: Vec<String> = api_key.clone().into_iter().collect();
+            let secret_refs: Vec<&str> = secrets_owned.iter().map(String::as_str).collect();
+
+            let mut header_map = reqwest::header::HeaderMap::new();
+            header_map.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+            if let Some(ref key) = api_key {
+                match reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+                    Ok(val) => {
+                        header_map.insert(reqwest::header::AUTHORIZATION, val);
+                    }
+                    Err(e) => {
+                        let mut err_msg = AssistantMessage::empty_for_model(&model);
+                        err_msg.stop_reason = StopReason::Error;
+                        err_msg.error_message = Some(redact_error_body_with_limit(
+                            &format!("Invalid authorization header: {e}"),
+                            &secret_refs,
+                            4096,
+                        ));
+                        let _ = sender
+                            .send(AssistantMessageEvent::Error {
+                                reason: StopReason::Error,
+                                error: err_msg,
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+            insert_default_copilot_headers(&mut header_map, &model.provider);
+            if let Err(e) = insert_custom_headers(&mut header_map, model.headers.as_ref())
+                .and_then(|_| insert_custom_headers(&mut header_map, options.headers.as_ref()))
+            {
+                let mut err_msg = AssistantMessage::empty_for_model(&model);
+                err_msg.stop_reason = StopReason::Error;
+                err_msg.error_message =
+                    Some(redact_error_body_with_limit(&e, &secret_refs, 4096));
+                let _ = sender
+                    .send(AssistantMessageEvent::Error {
+                        reason: StopReason::Error,
+                        error: err_msg,
+                    })
+                    .await;
+                return;
+            }
+
+            let resp = match send_with_retry_with_secrets(
                 || {
-                    let mut req = client.post(&url);
-                    req = req.header("content-type", "application/json");
-
-                    if let Some(api_key) = &options.api_key {
-                        req = req.header("authorization", format!("Bearer {api_key}"));
-                    }
-                    if let Some(headers) = &model.headers {
-                        for (k, v) in headers {
-                            req = req.header(k, v);
-                        }
-                    }
-                    if let Some(headers) = &options.headers {
-                        for (k, v) in headers {
-                            req = req.header(k, v);
-                        }
-                    }
-                    req.json(&body)
+                    client
+                        .post(&url)
+                        .headers(header_map.clone())
+                        .body(body_bytes.clone())
                 },
                 &RetryPolicy::default(),
                 &cancel,
+                &secret_refs,
             )
             .await
             {
                 Ok(r) => r,
-                Err(RetryFailure::Cancelled) => {
-                    let mut err_msg = AssistantMessage::empty_for_model(&model);
-                    err_msg.stop_reason = StopReason::Aborted;
-                    err_msg.error_message = Some("Request was cancelled".to_string());
-                    sender
-                        .send(AssistantMessageEvent::Error {
-                            reason: StopReason::Aborted,
-                            error: err_msg,
-                        })
-                        .await;
-                    return;
-                }
-                Err(RetryFailure::HttpStatus { status, body }) => {
-                    let mut err_msg = AssistantMessage::empty_for_model(&model);
-                    err_msg.stop_reason = StopReason::Error;
-                    err_msg.error_message = Some(format!("HTTP {status}: {body}"));
-                    sender
-                        .send(AssistantMessageEvent::Error {
-                            reason: StopReason::Error,
-                            error: err_msg,
-                        })
-                        .await;
-                    return;
-                }
-                Err(RetryFailure::Transport(e)) => {
-                    let mut err_msg = AssistantMessage::empty_for_model(&model);
-                    err_msg.stop_reason = StopReason::Error;
-                    err_msg.error_message = Some(e);
-                    sender
-                        .send(AssistantMessageEvent::Error {
-                            reason: StopReason::Error,
-                            error: err_msg,
-                        })
-                        .await;
+                Err(failure) => {
+                    sender.send(retry_failure_event(failure, &model)).await;
                     return;
                 }
             };
@@ -119,6 +193,7 @@ impl LlmProvider for OpenAiCompletionsProvider {
             let mut byte_stream = resp.bytes_stream();
             let mut sse_parser = SseParser::new();
             let mut state = OpenAiStreamState::new(&model);
+            state.set_secrets(secrets_owned.clone());
 
             loop {
                 tokio::select! {
@@ -144,13 +219,19 @@ impl LlmProvider for OpenAiCompletionsProvider {
                                 for ev in &events {
                                     state.process_chunk_into(&ev.data, &mut batch);
                                 }
-                                sender.send_batch(batch).await;
+                                if !sender.send_batch(batch).await {
+                                    return;
+                                }
                                 if state.done {
-                                    break;
+                                    return;
                                 }
                             }
                             Ok(Some(Err(e))) => {
-                                state.mark_error(e.to_string());
+                                state.mark_error(redact_error_body_with_limit(
+                                    &e.without_url().to_string(),
+                                    &secret_refs,
+                                    4096,
+                                ));
                                 let mut batch = Vec::new();
                                 state.finish_into(&mut batch);
                                 sender.send_batch(batch).await;
@@ -192,13 +273,12 @@ impl LlmProvider for OpenAiCompletionsProvider {
 
 /// Builds the JSON request payload for OpenAI Chat Completions API.
 fn normalize_openai_tool_call_id(id: &str, model: &Model) -> String {
-    if id.contains('|') {
-        let separator_index = id.find('|').unwrap();
-        let call_id: String = id[..separator_index]
+    if let Some((raw_call_id, raw_item_id)) = id.split_once('|') {
+        let call_id: String = raw_call_id
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
             .collect();
-        let item_id: String = id[separator_index + 1..]
+        let item_id: String = raw_item_id
             .chars()
             .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
             .collect();
@@ -237,13 +317,31 @@ fn normalize_openai_tool_call_id(id: &str, model: &Model) -> String {
     id.to_string()
 }
 
+fn expects_reasoning_content(model: &Model) -> bool {
+    let provider = model.provider.trim();
+    let id = model.id.trim().to_ascii_lowercase();
+    let bare_id = id.rsplit('/').next().unwrap_or(&id);
+    provider.eq_ignore_ascii_case("deepseek")
+        || bare_id == "deepseek-reasoner"
+        || bare_id.starts_with("deepseek-reasoner-")
+}
+
+fn supports_reasoning_effort(model: &Model) -> bool {
+    let provider = model.provider.trim();
+    provider.eq_ignore_ascii_case("openai")
+        || provider.eq_ignore_ascii_case("openai-codex")
+        || provider.eq_ignore_ascii_case("opencode")
+        || provider.eq_ignore_ascii_case("azure")
+        || provider.eq_ignore_ascii_case("azure-openai-responses")
+        || provider.eq_ignore_ascii_case("github-copilot")
+}
+
 pub fn build_openai_request(
     model: &Model,
     context: &Context,
     options: &StreamOptions,
 ) -> serde_json::Value {
     use crate::transform_messages::transform_messages;
-    use crate::unicode::sanitize_surrogates;
 
     let transformed_messages = transform_messages(
         &context.messages,
@@ -257,24 +355,32 @@ pub fn build_openai_request(
         if !sys_prompt.is_empty() {
             messages.push(serde_json::json!({
                 "role": "system",
-                "content": sanitize_surrogates(sys_prompt),
+                "content": crate::unicode::sanitize_surrogates_cow(sys_prompt),
             }));
         }
     }
 
+    let mut pending_tool_images: Vec<serde_json::Value> = Vec::new();
+
     for msg in &transformed_messages {
+        if !matches!(msg, Message::ToolResult(_)) && !pending_tool_images.is_empty() {
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": std::mem::take(&mut pending_tool_images),
+            }));
+        }
         match msg {
             Message::System(sys) => {
                 messages.push(serde_json::json!({
                     "role": "system",
-                    "content": sanitize_surrogates(&sys.content),
+                    "content": crate::unicode::sanitize_surrogates_cow(&sys.content),
                 }));
             }
             Message::User(u) => match &u.content {
                 UserContent::Text(text) => {
                     messages.push(serde_json::json!({
                         "role": "user",
-                        "content": sanitize_surrogates(text),
+                        "content": crate::unicode::sanitize_surrogates_cow(text),
                     }));
                 }
                 UserContent::Blocks(blocks) => {
@@ -284,7 +390,7 @@ pub fn build_openai_request(
                             UserContentBlock::Text(tc) => {
                                 serde_json::json!({
                                     "type": "text",
-                                    "text": sanitize_surrogates(&tc.text),
+                                    "text": crate::unicode::sanitize_surrogates_cow(&tc.text),
                                 })
                             }
                             UserContentBlock::Image(img) => {
@@ -304,15 +410,30 @@ pub fn build_openai_request(
                 }
             },
             Message::Assistant(a) => {
-                let mut text_parts = Vec::new();
+                let mut text_content = String::new();
+                let mut has_text = false;
+                let mut thinking_content = String::new();
+                let mut has_thinking = false;
                 let mut tool_calls = Vec::new();
 
                 for block in &a.content {
                     match block {
                         AssistantContentBlock::Text(tc) => {
-                            text_parts.push(sanitize_surrogates(&tc.text));
+                            if has_text {
+                                text_content.push('\n');
+                            }
+                            text_content.push_str(&crate::unicode::sanitize_surrogates_cow(&tc.text));
+                            has_text = true;
                         }
-                        AssistantContentBlock::Thinking(_) => {}
+                        AssistantContentBlock::Thinking(th) => {
+                            if expects_reasoning_content(model) && !th.thinking.is_empty() {
+                                if has_thinking {
+                                    thinking_content.push('\n');
+                                }
+                                thinking_content.push_str(&crate::unicode::sanitize_surrogates_cow(&th.thinking));
+                                has_thinking = true;
+                            }
+                        }
                         AssistantContentBlock::ToolCall(tc) => {
                             tool_calls.push(serde_json::json!({
                                 "id": tc.id,
@@ -329,15 +450,22 @@ pub fn build_openai_request(
 
                 let mut msg_obj = serde_json::Map::new();
                 msg_obj.insert("role".to_string(), serde_json::json!("assistant"));
-                if !text_parts.is_empty() {
+                if has_text {
                     msg_obj.insert(
                         "content".to_string(),
-                        serde_json::json!(text_parts.join("\n")),
+                        serde_json::json!(text_content),
                     );
                 } else if tool_calls.is_empty() {
                     msg_obj.insert("content".to_string(), serde_json::json!(""));
                 } else {
                     msg_obj.insert("content".to_string(), serde_json::Value::Null);
+                }
+
+                if has_thinking {
+                    msg_obj.insert(
+                        "reasoning_content".to_string(),
+                        serde_json::json!(thinking_content),
+                    );
                 }
 
                 if !tool_calls.is_empty() {
@@ -351,17 +479,18 @@ pub fn build_openai_request(
             }
             Message::ToolResult(tr) => {
                 let mut text_content = String::new();
-                let mut image_parts: Vec<serde_json::Value> = Vec::new();
+                let mut has_image = false;
                 for block in &tr.content {
                     match block {
                         ToolResultContentBlock::Text(tc) => {
                             if !text_content.is_empty() {
                                 text_content.push('\n');
                             }
-                            text_content.push_str(&sanitize_surrogates(&tc.text));
+                            text_content.push_str(&crate::unicode::sanitize_surrogates_cow(&tc.text));
                         }
                         ToolResultContentBlock::Image(img) => {
-                            image_parts.push(serde_json::json!({
+                            has_image = true;
+                            pending_tool_images.push(serde_json::json!({
                                 "type": "image_url",
                                 "image_url": {
                                     "url": format!("data:{};base64,{}", img.mime_type, img.data)
@@ -370,14 +499,10 @@ pub fn build_openai_request(
                         }
                     }
                 }
-                let content = if image_parts.is_empty() {
-                    serde_json::Value::String(text_content)
+                let content = if text_content.is_empty() && has_image {
+                    "(image attached after the tool results)".to_string()
                 } else {
-                    let mut parts = vec![serde_json::json!({
-                        "type": "text", "text": text_content
-                    })];
-                    parts.extend(image_parts);
-                    serde_json::Value::Array(parts)
+                    text_content
                 };
                 messages.push(serde_json::json!({
                     "role": "tool",
@@ -386,6 +511,12 @@ pub fn build_openai_request(
                 }));
             }
         }
+    }
+    if !pending_tool_images.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": pending_tool_images,
+        }));
     }
 
     let mut req_map = serde_json::Map::new();
@@ -428,7 +559,12 @@ pub fn build_openai_request(
         || model.id.starts_with("o3")
         || model.id.starts_with("o4");
 
-    if !is_reasoning {
+    let supports_temperature = model
+        .compat
+        .as_ref()
+        .and_then(|c| c.supports_temperature)
+        .unwrap_or(!is_reasoning);
+    if supports_temperature {
         if let Some(temp) = options.temperature {
             req_map.insert("temperature".to_string(), serde_json::json!(temp));
         }
@@ -467,7 +603,7 @@ pub fn build_openai_request(
                         "reasoning".to_string(),
                         serde_json::json!({ "effort": effort }),
                     );
-                } else {
+                } else if supports_reasoning_effort(model) {
                     req_map.insert("reasoning_effort".to_string(), serde_json::json!(effort));
                 }
             }
@@ -495,6 +631,7 @@ pub struct OpenAiStreamState {
     active_thinking_index: Option<usize>,
     active_text_index: Option<usize>,
     tool_calls_by_index: HashMap<usize, ActiveToolCall>,
+    secrets: Vec<String>,
 }
 
 impl OpenAiStreamState {
@@ -509,19 +646,32 @@ impl OpenAiStreamState {
             active_thinking_index: None,
             active_text_index: None,
             tool_calls_by_index: HashMap::new(),
+            secrets: Vec::new(),
         }
+    }
+
+    /// Configures active request secrets to redact from any error messages.
+    pub fn set_secrets(&mut self, secrets: Vec<String>) {
+        self.secrets = secrets;
+    }
+
+    fn redact_error(&self, msg: &str) -> String {
+        let refs: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        redact_error_body_with_limit(msg, &refs, 4096)
     }
 
     /// Marks the stream state as failed with an error message before finalizing.
     pub fn mark_error(&mut self, msg: impl Into<String>) {
         self.output.stop_reason = StopReason::Error;
-        self.output.error_message = Some(msg.into());
+        let raw = msg.into();
+        self.output.error_message = Some(self.redact_error(&raw));
     }
 
     /// Marks the stream state as aborted before finalizing.
     pub fn mark_aborted(&mut self, msg: impl Into<String>) {
         self.output.stop_reason = StopReason::Aborted;
-        self.output.error_message = Some(msg.into());
+        let raw = msg.into();
+        self.output.error_message = Some(self.redact_error(&raw));
     }
 
     /// Processes a raw SSE data payload string (e.g. JSON chunk or `[DONE]`).
@@ -535,6 +685,9 @@ impl OpenAiStreamState {
 
     /// Processes a raw SSE data payload string and appends emitted events into `out`.
     pub fn process_chunk_into(&mut self, data: &str, out: &mut Vec<AssistantMessageEvent>) {
+        if self.done {
+            return;
+        }
         let trimmed = data.trim();
         if trimmed == "[DONE]" {
             self.received_terminal = true;
@@ -546,15 +699,14 @@ impl OpenAiStreamState {
             return;
         };
 
-        if let Some(err_obj) = json.get("error") {
+        if let Some(err_obj) = json.get("error").filter(|v| !v.is_null()) {
             self.received_terminal = true;
-            self.output.stop_reason = StopReason::Error;
             let msg = err_obj
                 .get("message")
                 .and_then(|m| m.as_str())
                 .or_else(|| err_obj.as_str())
                 .unwrap_or("OpenAI API error");
-            self.output.error_message = Some(msg.to_string());
+            self.mark_error(msg);
             self.finish_into(out);
             return;
         }
@@ -572,7 +724,7 @@ impl OpenAiStreamState {
             });
         }
 
-        if let Some(usage) = json.get("usage") {
+        if let Some(usage) = json.get("usage").filter(|u| u.is_object()) {
             let cached = usage
                 .get("prompt_tokens_details")
                 .and_then(|d| d.get("cached_tokens"))
@@ -590,8 +742,12 @@ impl OpenAiStreamState {
             if let Some(total) = usage.get("total_tokens").and_then(|v| v.as_u64()) {
                 self.output.usage.total_tokens = total;
             } else {
-                self.output.usage.total_tokens =
-                    self.output.usage.input + self.output.usage.output + cached;
+                self.output.usage.total_tokens = self
+                    .output
+                    .usage
+                    .input
+                    .saturating_add(self.output.usage.output)
+                    .saturating_add(cached);
             }
             self.output.usage.calculate_cost(&self.model.cost);
         }
@@ -599,17 +755,22 @@ impl OpenAiStreamState {
         if let Some(choice) = json.get("choices").and_then(|c| c.get(0)) {
             if let Some(finish_reason_str) = choice.get("finish_reason").and_then(|r| r.as_str()) {
                 self.received_terminal = true;
-                self.output.stop_reason = match finish_reason_str {
-                    "stop" | "end" => StopReason::Stop,
-                    "length" => StopReason::Length,
-                    "tool_calls" | "function_call" => StopReason::ToolUse,
-                    "content_filter" => {
-                        self.output.error_message =
-                            Some("Provider finish_reason: content_filter".to_string());
-                        StopReason::Error
-                    }
-                    _ => StopReason::Stop,
-                };
+                if !matches!(
+                    self.output.stop_reason,
+                    StopReason::Error | StopReason::Aborted
+                ) {
+                    self.output.stop_reason = match finish_reason_str {
+                        "stop" | "end" => StopReason::Stop,
+                        "length" => StopReason::Length,
+                        "tool_calls" | "function_call" => StopReason::ToolUse,
+                        "content_filter" => {
+                            self.output.error_message =
+                                Some("Provider finish_reason: content_filter".to_string());
+                            StopReason::Error
+                        }
+                        _ => StopReason::Stop,
+                    };
+                }
             }
 
             if let Some(delta) = choice.get("delta") {
@@ -705,7 +866,11 @@ impl OpenAiStreamState {
                 }
 
                 // 3. Tool calls
-                if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                if let Some(tool_calls) = delta
+                    .get("tool_calls")
+                    .and_then(|v| v.as_array())
+                    .filter(|a| !a.is_empty())
+                {
                     // Close thinking or text before tool calls begin
                     if let Some(thinking_idx) = self.active_thinking_index.take() {
                         let thinking_content = if let Some(AssistantContentBlock::Thinking(tc)) =
@@ -745,7 +910,11 @@ impl OpenAiStreamState {
                         let (content_index, args_delta) = if let Some(active) =
                             self.tool_calls_by_index.get_mut(&idx)
                         {
-                            if let Some(id) = tc_chunk.get("id").and_then(|v| v.as_str()) {
+                            if let Some(id) = tc_chunk
+                                .get("id")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                            {
                                 active.id = id.to_string();
                                 if let Some(AssistantContentBlock::ToolCall(tc)) =
                                     self.output.content.get_mut(active.content_index)
@@ -771,17 +940,19 @@ impl OpenAiStreamState {
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("")
                                 .to_string();
-                            let args = active.stream.append(&delta);
-                            if let Some(AssistantContentBlock::ToolCall(tc)) =
-                                self.output.content.get_mut(active.content_index)
-                            {
-                                tc.arguments = args;
+                            if let Some(args) = active.stream.append_if_changed(&delta) {
+                                if let Some(AssistantContentBlock::ToolCall(tc)) =
+                                    self.output.content.get_mut(active.content_index)
+                                {
+                                    tc.arguments = args.clone();
+                                }
                             }
                             (active.content_index, delta)
                         } else {
                             let id = tc_chunk
                                 .get("id")
                                 .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
                                 .unwrap_or("")
                                 .to_string();
                             let name = tc_chunk
@@ -834,7 +1005,7 @@ impl OpenAiStreamState {
                             out.push(AssistantMessageEvent::ToolCallDelta {
                                 content_index,
                                 delta: args_delta,
-                                partial: self.output.metadata_clone_with_block(content_index),
+                                partial: self.output.clone(),
                             });
                         }
                     }
@@ -1347,12 +1518,12 @@ mod tests {
     #[test]
     fn test_normalize_openai_tool_call_id_non_ascii_utf8_truncation() {
         let model = test_model();
-        // 39 ASCII characters + 4-byte UTF-8 character '🦀' (bytes 39..43) + additional characters
+        // 39 ASCII characters + 4-byte UTF-8 character U+1F980 (bytes 39..43) + additional characters
         let mut foreign_id = "a".repeat(39);
-        foreign_id.push('🦀');
+        foreign_id.push('\u{1F980}');
         foreign_id.push_str("extra_tail_after_40_chars");
 
-        // Prior to fix, &id[..40] panicked with: byte index 40 is not a char boundary; it is inside '🦀'
+        // Prior to fix, &id[..40] panicked with: byte index 40 is not a char boundary; it is inside U+1F980
         let normalized = normalize_openai_tool_call_id(&foreign_id, &model);
         // Long ids are truncated to 40 chars with a hash suffix to avoid collisions.
         assert_eq!(normalized.chars().count(), 40);
@@ -1518,5 +1689,479 @@ mod tests {
         let req_o3 = build_openai_request(&model, &ctx, &opts_high);
         assert_eq!(req_o3["reasoning_effort"], serde_json::json!("high"));
         assert!(req_o3.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn openai_url_defaults_empty_and_handles_trailing_slash() {
+        assert_eq!(
+            openai_chat_completions_url(""),
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(
+            openai_chat_completions_url("https://api.openai.com/v1/chat/completions/"),
+            "https://api.openai.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn openai_moves_tool_images_out_of_tool_role_into_user_message() {
+        let model = test_model();
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Read image".to_string()),
+                    timestamp: 1,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContentBlock::ToolCall(ToolCall {
+                        id: "call_img_1".to_string(),
+                        name: "read".to_string(),
+                        arguments: serde_json::Map::new(),
+                        arguments_error: None,
+                        thought_signature: None,
+                    })],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 2,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "call_img_1".to_string(),
+                    tool_name: "read".to_string(),
+                    content: vec![ToolResultContentBlock::Image(ImageContent {
+                        mime_type: "image/png".to_string(),
+                        data: "aGVsbG8=".to_string(),
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 3,
+                    duration_ms: None,
+                    usage: None,
+                }),
+            ],
+            tools: None,
+        };
+
+        let req = build_openai_request(&model, &context, &StreamOptions::default());
+        let msgs = req["messages"].as_array().expect("messages array");
+        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs[2]["role"], "tool");
+        assert!(msgs[2]["content"].is_string());
+        assert_eq!(msgs[3]["role"], "user");
+        assert_eq!(msgs[3]["content"][0]["type"], "image_url");
+        assert_eq!(
+            msgs[3]["content"][0]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn openai_null_error_empty_tool_calls_empty_id_and_multi_block_delta() {
+        let model = test_model();
+        let mut state = OpenAiStreamState::new(&model);
+        let mut events = Vec::new();
+
+        for chunk in [
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "error": null,
+                "usage": null,
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "Hello ", "tool_calls": [] }
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "world", "tool_calls": [] }
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_keep_me",
+                            "function": { "name": "ping", "arguments": "{\"a\":" }
+                        }]
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{
+                    "index": 0,
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "",
+                            "function": { "arguments": "1}" }
+                        }]
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "id": "chatcmpl-1",
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "tool_calls" }],
+                "usage": {
+                    "prompt_tokens": u64::MAX,
+                    "completion_tokens": 5,
+                    "prompt_tokens_details": { "cached_tokens": 0 }
+                }
+            }),
+        ] {
+            state.process_chunk_into(&chunk.to_string(), &mut events);
+        }
+
+        let delta = events
+            .iter()
+            .rfind(|ev| matches!(ev, AssistantMessageEvent::ToolCallDelta { .. }))
+            .expect("ToolCallDelta emitted");
+        match delta {
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                partial,
+                ..
+            } => {
+                assert_eq!(*content_index, 1);
+                assert_eq!(partial.content.len(), 2);
+                assert!(matches!(partial.content[0], AssistantContentBlock::Text(_)));
+            }
+            _ => unreachable!(),
+        }
+
+        let final_msg = state.finish_into(&mut events);
+        assert_eq!(final_msg.stop_reason, StopReason::ToolUse);
+        assert_eq!(final_msg.error_message, None);
+        assert_eq!(final_msg.usage.total_tokens, u64::MAX);
+        assert_eq!(final_msg.content.len(), 2);
+        match &final_msg.content[0] {
+            AssistantContentBlock::Text(t) => assert_eq!(t.text, "Hello world"),
+            other => panic!("Expected single merged Text block, got {other:?}"),
+        }
+        match &final_msg.content[1] {
+            AssistantContentBlock::ToolCall(tc) => {
+                assert_eq!(tc.id, "call_keep_me");
+                assert_eq!(tc.arguments["a"], 1);
+            }
+            other => panic!("Expected ToolCall block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn openai_url_preserves_query_params() {
+        assert_eq!(
+            openai_chat_completions_url("https://proxy.example.com/v1?api-version=2024"),
+            "https://proxy.example.com/v1/chat/completions?api-version=2024"
+        );
+        assert_eq!(
+            openai_chat_completions_url(
+                "https://proxy.example.com/v1/chat/completions/?api-version=2024"
+            ),
+            "https://proxy.example.com/v1/chat/completions?api-version=2024"
+        );
+    }
+
+    #[test]
+    fn openai_ignores_chunks_after_terminal_error_and_preserves_stop_reason() {
+        let model = test_model();
+        let mut state = OpenAiStreamState::new(&model);
+        let mut events = Vec::new();
+
+        state.process_chunk_into(
+            &serde_json::json!({ "error": { "message": "Rate limit exceeded" } }).to_string(),
+            &mut events,
+        );
+        let len_after_error = events.len();
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Error {
+                reason: StopReason::Error,
+                ..
+            })
+        ));
+
+        state.process_chunk_into(
+            &serde_json::json!({
+                "choices": [{
+                    "index": 0,
+                    "delta": { "content": "trailing" },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+            &mut events,
+        );
+        state.process_chunk_into("[DONE]", &mut events);
+
+        assert_eq!(events.len(), len_after_error);
+        assert_eq!(state.output.stop_reason, StopReason::Error);
+        assert_eq!(
+            state.output.error_message.as_deref(),
+            Some("Rate limit exceeded")
+        );
+
+        // Even before `[DONE]` triggers `done = true`, a subsequent `finish_reason` cannot overwrite `Error`.
+        let mut filter_state = OpenAiStreamState::new(&model);
+        let mut filter_events = Vec::new();
+        filter_state.process_chunk_into(
+            &serde_json::json!({
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "content_filter" }]
+            })
+            .to_string(),
+            &mut filter_events,
+        );
+        filter_state.process_chunk_into(
+            &serde_json::json!({
+                "choices": [{ "index": 0, "delta": {}, "finish_reason": "stop" }]
+            })
+            .to_string(),
+            &mut filter_events,
+        );
+        filter_state.process_chunk_into("[DONE]", &mut filter_events);
+        assert_eq!(filter_state.output.stop_reason, StopReason::Error);
+    }
+
+    #[test]
+    fn insert_default_copilot_headers_sets_defaults_and_allows_overrides() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        insert_default_copilot_headers(&mut headers, "GitHub-Copilot");
+        assert_eq!(headers.get("copilot-integration-id").unwrap(), "vscode-chat");
+        assert_eq!(headers.get("editor-version").unwrap(), "vscode/1.99.0");
+        assert_eq!(
+            headers.get("editor-plugin-version").unwrap(),
+            "copilot-chat/0.26.0"
+        );
+        assert_eq!(
+            headers.get(reqwest::header::USER_AGENT).unwrap(),
+            "GitHubCopilotChat/0.26.0"
+        );
+
+        let model_headers = HashMap::from([("Editor-Version".to_string(), "vscode/2.0".to_string())]);
+        let opt_headers = HashMap::from([("User-Agent".to_string(), "MyAgent/1.0".to_string())]);
+        insert_custom_headers(&mut headers, Some(&model_headers)).unwrap();
+        insert_custom_headers(&mut headers, Some(&opt_headers)).unwrap();
+        assert_eq!(headers.get("editor-version").unwrap(), "vscode/2.0");
+        assert_eq!(
+            headers.get(reqwest::header::USER_AGENT).unwrap(),
+            "MyAgent/1.0"
+        );
+
+        let mut non_copilot = reqwest::header::HeaderMap::new();
+        insert_default_copilot_headers(&mut non_copilot, "openai");
+        assert!(non_copilot.is_empty());
+    }
+
+    #[tokio::test]
+    async fn copilot_default_headers_inserted_and_overridden_by_custom_headers() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel::<String>();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 8192];
+                let n = socket.read(&mut buf).await.unwrap_or(0);
+                let raw_req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let _ = tx.send(raw_req);
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let mut model = test_model();
+        model.provider = "github-copilot".to_string();
+        model.base_url = format!("http://{addr}/v1");
+        model.headers = Some(HashMap::from([(
+            "Editor-Version".to_string(),
+            "vscode/custom-1.0".to_string(),
+        )]));
+        let context = Context {
+            system_prompt: None,
+            messages: vec![Message::User(UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 1,
+            })],
+            tools: None,
+        };
+        let options = StreamOptions {
+            api_key: Some("ghu_test".to_string()),
+            headers: Some(HashMap::from([(
+                "User-Agent".to_string(),
+                "CustomCopilotAgent/2.0".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let provider = OpenAiCompletionsProvider::default();
+        let stream = provider.stream(
+            &model,
+            &context,
+            &options,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        let raw_req = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .expect("request timeout")
+            .expect("request channel");
+        drop(stream);
+
+        let lower = raw_req.to_ascii_lowercase();
+        assert!(
+            lower.contains("copilot-integration-id: vscode-chat\r\n"),
+            "missing Copilot-Integration-Id default in:\n{raw_req}"
+        );
+        assert!(
+            lower.contains("editor-plugin-version: copilot-chat/0.26.0\r\n"),
+            "missing Editor-Plugin-Version default in:\n{raw_req}"
+        );
+        assert!(
+            lower.contains("editor-version: vscode/custom-1.0\r\n"),
+            "model.headers must override Editor-Version in:\n{raw_req}"
+        );
+        assert!(
+            lower.contains("user-agent: customcopilotagent/2.0\r\n"),
+            "options.headers must override User-Agent in:\n{raw_req}"
+        );
+    }
+
+    #[test]
+    fn openai_only_sends_reasoning_effort_when_supported() {
+        let ctx = Context::default();
+        let opts = StreamOptions {
+            reasoning: Some(ThinkingLevel::High),
+            ..Default::default()
+        };
+
+        for unsupported_provider in ["deepseek", "xai", "together", "fireworks"] {
+            let mut m = test_model();
+            m.provider = unsupported_provider.to_string();
+            m.id = "custom-reasoning-model".to_string();
+            m.reasoning = true;
+            let req = build_openai_request(&m, &ctx, &opts);
+            assert!(
+                req.get("reasoning_effort").is_none(),
+                "provider '{unsupported_provider}' must not receive reasoning_effort: {req}"
+            );
+            assert!(
+                req.get("reasoning").is_none(),
+                "provider '{unsupported_provider}' must not receive reasoning: {req}"
+            );
+        }
+
+        for supported_provider in ["openai", "azure", "github-copilot"] {
+            let mut m = test_model();
+            m.provider = supported_provider.to_string();
+            m.id = "o3".to_string();
+            m.reasoning = true;
+            let req = build_openai_request(&m, &ctx, &opts);
+            assert_eq!(
+                req["reasoning_effort"], "high",
+                "provider '{supported_provider}' should receive reasoning_effort"
+            );
+        }
+    }
+
+    #[test]
+    fn openai_preserves_thinking_as_reasoning_content_when_expected() {
+        let mut model = test_model();
+        model.provider = "deepseek".to_string();
+        model.id = "deepseek-reasoner".to_string();
+        model.reasoning = true;
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("Solve it".to_string()),
+                    timestamp: 1,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![
+                        AssistantContentBlock::Thinking(ThinkingContent {
+                            thinking: "Step 1: check constraints".to_string(),
+                            thinking_signature: None,
+                            redacted: None,
+                        }),
+                        AssistantContentBlock::ToolCall(ToolCall {
+                            id: "call_ds_1".to_string(),
+                            name: "calc".to_string(),
+                            arguments: serde_json::Map::new(),
+                            arguments_error: None,
+                            thought_signature: None,
+                        }),
+                    ],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::ToolUse,
+                    error_message: None,
+                    timestamp: 2,
+                }),
+                Message::ToolResult(ToolResultMessage {
+                    tool_call_id: "call_ds_1".to_string(),
+                    tool_name: "calc".to_string(),
+                    content: vec![ToolResultContentBlock::Text(TextContent {
+                        text: "42".to_string(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    timestamp: 3,
+                    duration_ms: None,
+                    usage: None,
+                }),
+            ],
+            tools: None,
+        };
+
+        let req = build_openai_request(&model, &context, &StreamOptions::default());
+        let msgs = req["messages"].as_array().expect("messages array");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(
+            msgs[1]["reasoning_content"], "Step 1: check constraints",
+            "deepseek-reasoner must preserve Thinking as reasoning_content: {req}"
+        );
+    }
+
+    #[test]
+    fn openai_honors_compat_supports_temperature_on_reasoning_model() {
+        let mut model = test_model();
+        model.id = "o3-custom".to_string();
+        model.reasoning = true;
+        model.compat = Some(ModelCompat {
+            supports_temperature: Some(true),
+            ..Default::default()
+        });
+        let opts = StreamOptions {
+            temperature: Some(0.6),
+            ..Default::default()
+        };
+        let req = build_openai_request(&model, &Context::default(), &opts);
+        assert_eq!(req["temperature"], 0.6);
+
+        // Explicit false suppresses temperature even on non-reasoning models.
+        model.reasoning = false;
+        model.id = "gpt-4o".to_string();
+        model.compat = Some(ModelCompat {
+            supports_temperature: Some(false),
+            ..Default::default()
+        });
+        let req_disabled = build_openai_request(&model, &Context::default(), &opts);
+        assert!(req_disabled.get("temperature").is_none());
     }
 }

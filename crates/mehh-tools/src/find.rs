@@ -103,6 +103,8 @@ impl AgentTool for FindTool {
             .max(1) as usize;
 
         let search_path = self.resolve_path(&search_path_str)?;
+        let explicit_protected =
+            context::path_targets_protected_credential(&search_path_str, &search_path);
         let cancel_clone = cancel.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -134,7 +136,18 @@ impl AgentTool for FindTool {
             // Apply .gitignore even when there is no .git directory.
             walker.require_git(false);
             walker.sort_by_file_name(|a, b| a.cmp(b));
-            walker.filter_entry(|e| e.file_name().to_str() != Some(".git"));
+            walker.filter_entry(move |e| {
+                if e.depth() == 0 {
+                    return true;
+                }
+                let Some(name) = e.file_name().to_str() else {
+                    return true;
+                };
+                if name == ".git" {
+                    return false;
+                }
+                explicit_protected || !context::is_protected_credential_name(name)
+            });
 
             let mut results = Vec::new();
             let mut total_bytes = 0usize;
@@ -145,6 +158,7 @@ impl AgentTool for FindTool {
             } else {
                 None
             };
+            let pat_is_ascii = pat_lower.as_deref().is_some_and(str::is_ascii);
 
             for entry_res in walker.build() {
                 if cancel_clone.is_cancelled() {
@@ -160,15 +174,21 @@ impl AgentTool for FindTool {
                     continue;
                 }
 
-                let file_path = entry.path();
-                let rel_path = file_path
-                    .strip_prefix(&search_path)
-                    .unwrap_or(file_path);
-                let rel_str = rel_path.to_string_lossy().replace('\\', "/");
                 // This tool finds files; directories are not results.
                 if !entry.file_type().is_some_and(|ft| ft.is_file()) {
                     continue;
                 }
+
+                let file_path = entry.path();
+                let rel_path = file_path
+                    .strip_prefix(&search_path)
+                    .unwrap_or(file_path);
+                let raw_lossy = rel_path.to_string_lossy();
+                let rel_str: std::borrow::Cow<'_, str> = if raw_lossy.contains('\\') {
+                    std::borrow::Cow::Owned(raw_lossy.replace('\\', "/"))
+                } else {
+                    raw_lossy
+                };
 
                 let file_name = file_path
                     .file_name()
@@ -177,14 +197,24 @@ impl AgentTool for FindTool {
 
                 let mut matched = false;
                 if let Some(ref matcher) = glob_matcher {
-                    if matcher.is_match(&rel_str) || matcher.is_match(file_name) {
+                    if matcher.is_match(rel_str.as_ref()) || matcher.is_match(file_name) {
                         matched = true;
                     }
                 }
 
                 if !matched {
                     if let Some(ref pat_lower) = pat_lower {
-                        if file_name.to_lowercase().contains(pat_lower)
+                        if pat_is_ascii {
+                            if crate::web::html_markdown::contains_ascii_ci(
+                                file_name.as_bytes(),
+                                pat_lower.as_bytes(),
+                            ) || crate::web::html_markdown::contains_ascii_ci(
+                                rel_str.as_bytes(),
+                                pat_lower.as_bytes(),
+                            ) {
+                                matched = true;
+                            }
+                        } else if file_name.to_lowercase().contains(pat_lower)
                             || rel_str.to_lowercase().contains(pat_lower)
                         {
                             matched = true;
@@ -197,7 +227,7 @@ impl AgentTool for FindTool {
                         result_cap_reached = true;
                         break;
                     }
-                    results.push(rel_str);
+                    results.push(rel_str.into_owned());
                 }
             }
 
@@ -208,26 +238,28 @@ impl AgentTool for FindTool {
             // Sort before limiting: OS walk order is not stable, and truncating
             // first would make results differ between runs.
             results.sort_by_cached_key(|a| a.to_lowercase());
+            let limit_reached = results.len() > limit;
             results.truncate(limit);
 
-            let mut selected: Vec<String> = Vec::with_capacity(results.len());
+            let mut output = String::new();
             for rel_str in results {
                 let add_bytes = rel_str.len().saturating_add(1);
                 if total_bytes.saturating_add(add_bytes) > FIND_MAX_OUTPUT_BYTES {
                     byte_cap_reached = true;
                     break;
                 }
+                if total_bytes > 0 {
+                    output.push('\n');
+                }
+                output.push_str(&rel_str);
                 total_bytes += add_bytes;
-                selected.push(rel_str);
             }
-
-            let mut output = selected.join("\n");
             if byte_cap_reached {
                 output.push_str(&format!(
                     "\n\n[Output truncated at {} byte limit]",
                     FIND_MAX_OUTPUT_BYTES
                 ));
-            } else if selected.len() >= limit {
+            } else if limit_reached {
                 output.push_str(&format!("\n\n[Reached limit of {} results]", limit));
             } else if result_cap_reached {
                 output.push_str(&format!(
@@ -278,5 +310,75 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.contains("Invalid glob"), "unexpected err: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_find_skips_protected_credentials_unless_explicitly_targeted() {
+        let dir = crate::TempTestDir::new("find_protected");
+        std::fs::create_dir_all(dir.path().join(".mehh")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".mehh/cfg.json"), "{}").unwrap();
+        std::fs::write(dir.path().join(".ssh/config"), "Host *").unwrap();
+        std::fs::write(dir.path().join(".env"), "A=1").unwrap();
+        std::fs::write(dir.path().join(".env.prod"), "A=2").unwrap();
+        std::fs::write(dir.path().join("auth.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("mcp-auth.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("trust.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("main.rs"), "fn main() {}").unwrap();
+
+        let tool = FindTool::new(dir.path().to_path_buf());
+        let params = json!({ "pattern": "*" }).as_object().unwrap().clone();
+        let res = tool
+            .execute("tc1", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt = match &res.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt.contains("main.rs"));
+        for hidden in [".mehh", ".ssh", ".env", "auth.json", "mcp-auth.json", "trust.json"] {
+            assert!(!txt.contains(hidden), "must not leak {hidden}: {txt}");
+        }
+
+        let explicit = json!({ "pattern": "*", "path": ".mehh" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let res2 = tool
+            .execute("tc2", explicit, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt2 = match &res2.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt2.contains("cfg.json"), "got: {txt2}");
+    }
+
+    #[tokio::test]
+    async fn test_find_exact_limit_match_count_does_not_report_reached_limit() {
+        let dir = crate::TempTestDir::new("find_exact_limit");
+        std::fs::write(dir.path().join("a.txt"), "1").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "2").unwrap();
+
+        let tool = FindTool::new(dir.path().to_path_buf());
+        let params = json!({ "pattern": "*.txt", "limit": 2 })
+            .as_object()
+            .unwrap()
+            .clone();
+        let res = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt = match &res.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt.contains("a.txt") && txt.contains("b.txt"), "got: {txt}");
+        assert!(
+            !txt.contains("[Reached limit"),
+            "exact match count == limit must not claim limit was reached: {txt}"
+        );
     }
 }

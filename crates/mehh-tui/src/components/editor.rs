@@ -50,19 +50,20 @@ impl KillRing {
             return;
         }
 
-        if accumulate && !self.ring.is_empty() {
-            let last = self.ring.pop().unwrap();
-            let merged = if prepend {
-                format!("{text}{last}")
-            } else {
-                format!("{last}{text}")
-            };
-            self.ring.push(merged);
-        } else {
-            self.ring.push(text.to_string());
-            if self.ring.len() > self.max_entries {
-                self.ring.remove(0);
+        if accumulate {
+            if let Some(last) = self.ring.pop() {
+                let merged = if prepend {
+                    format!("{text}{last}")
+                } else {
+                    format!("{last}{text}")
+                };
+                self.ring.push(merged);
+                return;
             }
+        }
+        self.ring.push(text.to_string());
+        if self.ring.len() > self.max_entries {
+            self.ring.remove(0);
         }
     }
 
@@ -72,8 +73,7 @@ impl KillRing {
 
     pub fn rotate(&mut self) {
         if self.ring.len() > 1 {
-            let last = self.ring.pop().unwrap();
-            self.ring.insert(0, last);
+            self.ring.rotate_right(1);
         }
     }
 
@@ -130,20 +130,19 @@ pub struct PasteMarkerSpan {
 
 pub fn find_paste_markers(line: &str) -> Vec<PasteMarkerSpan> {
     let mut markers = Vec::new();
-    let s = line.to_string();
     let mut offset = 0;
-    while let Some(start_byte) = s[offset..].find("[paste #") {
+    while let Some(start_byte) = line[offset..].find("[paste #") {
         let abs_start_byte = offset + start_byte;
-        if let Some(end_bracket) = s[abs_start_byte..].find(']') {
+        if let Some(end_bracket) = line[abs_start_byte..].find(']') {
             let abs_end_byte = abs_start_byte + end_bracket + 1;
-            let after_prefix = &s[abs_start_byte + 8..abs_end_byte - 1];
+            let after_prefix = &line[abs_start_byte + 8..abs_end_byte - 1];
             let id_len = after_prefix
                 .chars()
                 .take_while(|c| c.is_ascii_digit())
                 .count();
             if id_len > 0 {
-                let start_col = s[..abs_start_byte].chars().count();
-                let marker_len = s[abs_start_byte..abs_end_byte].chars().count();
+                let start_col = line[..abs_start_byte].chars().count();
+                let marker_len = line[abs_start_byte..abs_end_byte].chars().count();
                 markers.push(PasteMarkerSpan {
                     start_col,
                     end_col: start_col + marker_len,
@@ -295,10 +294,18 @@ pub fn find_word_forward(text: &str, cursor: usize) -> usize {
     pos
 }
 
-fn split_char_at(s: &str, char_idx: usize) -> (String, String) {
+fn split_char_at(s: &str, char_idx: usize) -> (&str, &str) {
     match s.char_indices().nth(char_idx) {
-        Some((byte_idx, _)) => (s[..byte_idx].to_string(), s[byte_idx..].to_string()),
-        None => (s.to_string(), String::new()),
+        Some((byte_idx, _)) => (&s[..byte_idx], &s[byte_idx..]),
+        None => (s, ""),
+    }
+}
+
+fn normalize_line_endings(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\r') {
+        std::borrow::Cow::Borrowed(text)
+    } else {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n").replace('\r', "\n"))
     }
 }
 
@@ -378,14 +385,27 @@ impl Editor {
 
     /// Render only autocomplete rows; the host places them above the prompt dock.
     pub fn render_autocomplete(&self, width: usize) -> Vec<String> {
-        self.autocomplete
-            .as_ref()
-            .map(|ac| ac.render(width))
-            .unwrap_or_default()
+        self.render_autocomplete_with_theme(width, &self.theme).0
+    }
+
+    /// Render autocomplete rows with an explicit `theme` without cloning the `Editor` or `SelectList`,
+    /// returning `(lines, vis_start, vis_end, total_filtered)`.
+    pub fn render_autocomplete_with_theme(
+        &self,
+        width: usize,
+        theme: &Theme,
+    ) -> (Vec<String>, usize, usize, usize) {
+        let Some(ac) = self.autocomplete.as_ref() else {
+            return (Vec::new(), 0, 0, 0);
+        };
+        let filtered = ac.filtered_indices();
+        let total = filtered.len();
+        let (lines, vis_start, vis_end) = ac.render_with_filtered(width, theme, ac.max_visible, &filtered);
+        (lines, vis_start, vis_end, total)
     }
 
     /// Colorize collapsed paste tokens so they read as one atomic chip.
-    fn colorize_paste_markers(&self, line: &str) -> String {
+    fn colorize_paste_markers_with_theme(&self, line: &str, theme: &Theme) -> String {
         if !line.contains("[paste #") {
             return line.to_string();
         }
@@ -396,7 +416,7 @@ impl Editor {
             let tail = &rest[pos..];
             match tail.find(']') {
                 Some(end) => {
-                    out.push_str(&self.theme.fg(&self.theme.accent, &tail[..=end]));
+                    out.push_str(&theme.fg(&theme.accent, &tail[..=end]));
                     rest = &tail[end + 1..];
                 }
                 None => {
@@ -409,16 +429,63 @@ impl Editor {
         out
     }
 
+    /// Renders editor lines with an explicit `theme` and `max_lines` without cloning `Editor` (history, undo stack, or paste payloads).
+    pub fn render_with_options(&self, width: usize, theme: &Theme, max_lines: usize) -> Vec<String> {
+        let mut result = Vec::new();
+
+        if self.is_empty() && !self.placeholder.is_empty() {
+            let line = format!(
+                "{}{CURSOR_MARKER}{}",
+                self.prompt_prefix,
+                theme.fg(&theme.dim, &self.placeholder)
+            );
+            for w in wrap_text_with_ansi(&line, width) {
+                result.push(w);
+            }
+        } else {
+            for (row, line_str) in self.lines.iter().enumerate() {
+                let pref = if row == 0 { &self.prompt_prefix } else { "  " };
+                let formatted = if row == self.cursor_row {
+                    let (b, a) = split_char_at(line_str, self.cursor_col);
+                    let b = crate::ansi::sanitize_terminal_text(b, false);
+                    let a = crate::ansi::sanitize_terminal_text(a, false);
+                    format!("{pref}{b}{CURSOR_MARKER}{a}")
+                } else {
+                    let clean_line = crate::ansi::sanitize_terminal_text(line_str, false);
+                    format!("{pref}{clean_line}")
+                };
+                let formatted = self.colorize_paste_markers_with_theme(&formatted, theme);
+
+                for w in wrap_text_with_ansi(&formatted, width) {
+                    result.push(w);
+                }
+            }
+        }
+
+        let max_lines = max_lines.max(1);
+        if max_lines != usize::MAX && result.len() > max_lines {
+            let marker_row = result
+                .iter()
+                .position(|line| line.contains(CURSOR_MARKER))
+                .unwrap_or(0);
+            let start = marker_row.saturating_sub(max_lines / 2);
+            let end = (start + max_lines).min(result.len());
+            let start = end.saturating_sub(max_lines);
+            result = result.into_iter().skip(start).take(end - start).collect();
+        }
+
+        result
+    }
+
     pub fn is_empty(&self) -> bool {
         self.lines.len() <= 1 && self.lines.first().map(|l| l.is_empty()).unwrap_or(true)
     }
 
     pub fn set_text(&mut self, text: &str) {
         self.push_undo();
-        self.lines = text
-            .split('\n')
-            .map(|s| s.trim_end_matches('\r').to_string())
-            .collect();
+        self.last_action = None;
+        let normalized = normalize_line_endings(text);
+        self.lines = normalized.split('\n').map(str::to_string).collect();
         if self.lines.is_empty() {
             self.lines.push(String::new());
         }
@@ -446,11 +513,12 @@ impl Editor {
             if let Some(end_bracket) = after.find(']') {
                 let marker_body = &after[..end_bracket];
                 // parse ID before space or end
-                let id_str: String = marker_body
-                    .chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect();
-                if let Ok(id) = id_str.parse::<usize>() {
+                let id_end = marker_body
+                    .as_bytes()
+                    .iter()
+                    .take_while(|b| b.is_ascii_digit())
+                    .count();
+                if let Ok(id) = marker_body[..id_end].parse::<usize>() {
                     if let Some(payload) = self.pastes.get(&id) {
                         output.push_str(payload);
                     } else {
@@ -475,12 +543,24 @@ impl Editor {
         self.cursor_row = 0;
         self.cursor_col = 0;
         self.pastes.clear();
-        self.paste_counter = 0;
         self.history_idx = None;
         self.history_draft = None;
+        self.undo_stack.clear();
         self.clear_autocomplete();
         self.last_action = None;
         self.last_typing_undo = None;
+    }
+
+    /// Pop the most recent history entry if `pred` returns `true` for it.
+    pub fn scrub_last_history_if<F: FnOnce(&str) -> bool>(&mut self, pred: F) {
+        if let Some(last) = self.history.last() {
+            if pred(last) {
+                self.history.pop();
+                if self.history_idx.is_some_and(|idx| idx >= self.history.len()) {
+                    self.history_idx = None;
+                }
+            }
+        }
     }
 
     pub fn push_undo(&mut self) {
@@ -532,54 +612,66 @@ impl Editor {
     /// Insert text at cursor, collapsing multi-line pastes > 10 lines into `[paste #N +L lines]`.
     pub fn insert_text(&mut self, text: &str) {
         self.push_undo();
-        let pasted_lines: Vec<&str> = text.split('\n').map(|s| s.trim_end_matches('\r')).collect();
+        self.last_action = None;
+        let normalized = normalize_line_endings(text);
+        let pasted_line_count = normalized.split('\n').count();
 
-        if pasted_lines.len() > 10 || text.len() > 1000 {
+        if pasted_line_count > 10 || normalized.len() > 1000 {
             self.paste_counter += 1;
             let paste_id = self.paste_counter;
-            self.pastes.insert(paste_id, text.to_string());
-            let marker = format!("[paste #{paste_id} +{} lines]", pasted_lines.len());
+            self.pastes.insert(paste_id, normalized.into_owned());
+            let marker = format!("[paste #{paste_id} +{pasted_line_count} lines]");
             self.insert_text_internal(&marker);
         } else {
-            self.insert_text_internal(text);
+            self.insert_text_internal(&normalized);
         }
     }
 
     fn insert_text_internal(&mut self, text: &str) {
-        let input_lines: Vec<&str> = text.split('\n').map(|s| s.trim_end_matches('\r')).collect();
+        let normalized = normalize_line_endings(text);
+        let input_lines: Vec<&str> = normalized.split('\n').collect();
 
         if input_lines.len() <= 1 {
-            let cur = &self.lines[self.cursor_row];
-            let (before, after) = split_char_at(cur, self.cursor_col);
-            self.lines[self.cursor_row] = format!("{before}{text}{after}");
-            self.cursor_col += text.chars().count();
+            let single = input_lines.first().copied().unwrap_or("");
+            let updated = {
+                let cur = &self.lines[self.cursor_row];
+                let (before, after) = split_char_at(cur, self.cursor_col);
+                format!("{before}{single}{after}")
+            };
+            self.lines[self.cursor_row] = updated;
+            self.cursor_col += single.chars().count();
         } else {
-            let cur = &self.lines[self.cursor_row];
-            let (before, after) = split_char_at(cur, self.cursor_col);
-            self.lines[self.cursor_row] = format!("{before}{}", input_lines[0]);
-
             let last_idx = input_lines.len() - 1;
+            let last_line = input_lines[last_idx];
+            let (first, last) = {
+                let cur = &self.lines[self.cursor_row];
+                let (before, after) = split_char_at(cur, self.cursor_col);
+                (
+                    format!("{before}{}", input_lines[0]),
+                    format!("{last_line}{after}"),
+                )
+            };
+            self.lines[self.cursor_row] = first;
+
             for line in &input_lines[1..last_idx] {
                 self.cursor_row += 1;
                 self.lines.insert(self.cursor_row, line.to_string());
             }
 
             self.cursor_row += 1;
-            let last_line = input_lines[last_idx];
-            self.lines
-                .insert(self.cursor_row, format!("{last_line}{after}"));
+            self.lines.insert(self.cursor_row, last);
             self.cursor_col = last_line.chars().count();
         }
     }
 
     pub fn set_autocomplete(&mut self, items: Vec<SelectItem>) {
-        self.autocomplete = Some(SelectList::new(items, 5).with_theme(self.theme.clone()));
+        self.autocomplete = Some(SelectList::new_with_theme(items, 5, self.theme.clone()));
         self.autocomplete_replace_start = None;
     }
 
     /// Sets autocomplete items that replace `[replace_start..cursor_col]` on the active line.
     pub fn set_autocomplete_replacing(&mut self, items: Vec<SelectItem>, replace_start: usize) {
-        self.autocomplete = Some(SelectList::new(items, 5).with_theme(self.theme.clone()));
+        self.autocomplete = Some(SelectList::new_with_theme(items, 5, self.theme.clone()));
         self.autocomplete_replace_start = Some(replace_start);
     }
 
@@ -590,13 +682,18 @@ impl Editor {
 
     fn replace_current_line_range(&mut self, start_col: usize, replacement: &str) {
         self.push_undo();
+        self.last_action = None;
         let line = &self.lines[self.cursor_row];
         let char_len = line.chars().count();
         let start = start_col.min(self.cursor_col).min(char_len);
         let end = self.cursor_col.min(char_len);
-        let (before, _) = split_char_at(line, start);
-        let (_, after) = split_char_at(line, end);
-        self.lines[self.cursor_row] = format!("{before}{replacement}{after}");
+        let updated = {
+            let line = &self.lines[self.cursor_row];
+            let (before, _) = split_char_at(line, start);
+            let (_, after) = split_char_at(line, end);
+            format!("{before}{replacement}{after}")
+        };
+        self.lines[self.cursor_row] = updated;
         self.cursor_col = start + replacement.chars().count();
     }
 
@@ -643,12 +740,16 @@ impl Editor {
         }
 
         self.push_undo();
-        let cur = &self.lines[self.cursor_row];
-        let target = find_word_backward(cur, self.cursor_col);
-        let (before, rest) = split_char_at(cur, target);
-        let (deleted, after) = split_char_at(&rest, self.cursor_col - target);
-        self.kill_ring.push(&deleted, true, was_kill);
-        self.lines[self.cursor_row] = format!("{before}{after}");
+        let target = {
+            let cur = &self.lines[self.cursor_row];
+            let target = find_word_backward(cur, self.cursor_col);
+            let (before, rest) = split_char_at(cur, target);
+            let (deleted, after) = split_char_at(rest, self.cursor_col - target);
+            self.kill_ring.push(deleted, true, was_kill);
+            let updated = format!("{before}{after}");
+            self.lines[self.cursor_row] = updated;
+            target
+        };
         self.cursor_col = target;
         self.last_action = Some(EditorLastAction::Kill);
     }
@@ -668,24 +769,34 @@ impl Editor {
         }
 
         self.push_undo();
-        let cur = &self.lines[self.cursor_row];
-        let target = find_word_forward(cur, self.cursor_col);
-        let (before, rest) = split_char_at(cur, self.cursor_col);
-        let (deleted, after) = split_char_at(&rest, target - self.cursor_col);
-        self.kill_ring.push(&deleted, false, was_kill);
-        self.lines[self.cursor_row] = format!("{before}{after}");
+        let updated = {
+            let cur = &self.lines[self.cursor_row];
+            let target = find_word_forward(cur, self.cursor_col);
+            let (before, rest) = split_char_at(cur, self.cursor_col);
+            let (deleted, after) = split_char_at(rest, target - self.cursor_col);
+            self.kill_ring.push(deleted, false, was_kill);
+            format!("{before}{after}")
+        };
+        self.lines[self.cursor_row] = updated;
         self.last_action = Some(EditorLastAction::Kill);
     }
 
     fn kill_to_end(&mut self) {
         self.push_undo();
         let was_kill = self.last_action == Some(EditorLastAction::Kill);
-        let cur = &self.lines[self.cursor_row];
-        let (before, after) = split_char_at(cur, self.cursor_col);
+        let keep_len = {
+            let cur = &self.lines[self.cursor_row];
+            let (before, after) = split_char_at(cur, self.cursor_col);
+            if !after.is_empty() {
+                self.kill_ring.push(after, false, was_kill);
+                Some(before.len())
+            } else {
+                None
+            }
+        };
 
-        if !after.is_empty() {
-            self.kill_ring.push(&after, false, was_kill);
-            self.lines[self.cursor_row] = before;
+        if let Some(len) = keep_len {
+            self.lines[self.cursor_row].truncate(len);
         } else if self.cursor_row + 1 < self.lines.len() {
             self.kill_ring.push("\n", false, was_kill);
             let next_line = self.lines.remove(self.cursor_row + 1);
@@ -697,12 +808,19 @@ impl Editor {
     fn kill_to_start(&mut self) {
         self.push_undo();
         let was_kill = self.last_action == Some(EditorLastAction::Kill);
-        let cur = &self.lines[self.cursor_row];
-        let (before, after) = split_char_at(cur, self.cursor_col);
+        let drop_len = {
+            let cur = &self.lines[self.cursor_row];
+            let (before, _) = split_char_at(cur, self.cursor_col);
+            if !before.is_empty() {
+                self.kill_ring.push(before, true, was_kill);
+                Some(before.len())
+            } else {
+                None
+            }
+        };
 
-        if !before.is_empty() {
-            self.kill_ring.push(&before, true, was_kill);
-            self.lines[self.cursor_row] = after;
+        if let Some(len) = drop_len {
+            self.lines[self.cursor_row].replace_range(..len, "");
             self.cursor_col = 0;
         } else if self.cursor_row > 0 {
             self.kill_ring.push("\n", true, was_kill);
@@ -715,31 +833,38 @@ impl Editor {
     }
 
     fn insert_yanked_text(&mut self, text: &str) {
-        let lines: Vec<&str> = text.split('\n').map(|s| s.trim_end_matches('\r')).collect();
+        let normalized = normalize_line_endings(text);
+        let lines: Vec<&str> = normalized.split('\n').collect();
         if lines.is_empty() {
             return;
         }
 
         if lines.len() == 1 {
-            let cur = &self.lines[self.cursor_row];
-            let (before, after) = split_char_at(cur, self.cursor_col);
-            self.lines[self.cursor_row] = format!("{before}{text}{after}");
-            self.cursor_col += text.chars().count();
+            let single = lines[0];
+            let updated = {
+                let cur = &self.lines[self.cursor_row];
+                let (before, after) = split_char_at(cur, self.cursor_col);
+                format!("{before}{single}{after}")
+            };
+            self.lines[self.cursor_row] = updated;
+            self.cursor_col += single.chars().count();
         } else {
-            let cur = &self.lines[self.cursor_row];
-            let (before, after) = split_char_at(cur, self.cursor_col);
-            self.lines[self.cursor_row] = format!("{before}{}", lines[0]);
-
             let last_idx = lines.len() - 1;
+            let last_line = lines[last_idx];
+            let (first, last) = {
+                let cur = &self.lines[self.cursor_row];
+                let (before, after) = split_char_at(cur, self.cursor_col);
+                (format!("{before}{}", lines[0]), format!("{last_line}{after}"))
+            };
+            self.lines[self.cursor_row] = first;
+
             for line in &lines[1..last_idx] {
                 self.cursor_row += 1;
                 self.lines.insert(self.cursor_row, line.to_string());
             }
 
             self.cursor_row += 1;
-            let last_line = lines[last_idx];
-            self.lines
-                .insert(self.cursor_row, format!("{last_line}{after}"));
+            self.lines.insert(self.cursor_row, last);
             self.cursor_col = last_line.chars().count();
         }
     }
@@ -750,21 +875,23 @@ impl Editor {
             None => return,
         };
 
-        let yank_lines: Vec<&str> = yanked_text
-            .split('\n')
-            .map(|s| s.trim_end_matches('\r'))
-            .collect();
+        let normalized = normalize_line_endings(&yanked_text);
+        let yank_lines: Vec<&str> = normalized.split('\n').collect();
         if yank_lines.is_empty() {
             return;
         }
 
         if yank_lines.len() == 1 {
-            let current_line = &self.lines[self.cursor_row];
-            let delete_len = yanked_text.chars().count();
+            let delete_len = yank_lines[0].chars().count();
             if self.cursor_col >= delete_len {
-                let (before, rest) = split_char_at(current_line, self.cursor_col - delete_len);
-                let (_, after) = split_char_at(&rest, delete_len);
-                self.lines[self.cursor_row] = format!("{before}{after}");
+                let updated = {
+                    let current_line = &self.lines[self.cursor_row];
+                    let (before, rest) =
+                        split_char_at(current_line, self.cursor_col - delete_len);
+                    let (_, after) = split_char_at(rest, delete_len);
+                    format!("{before}{after}")
+                };
+                self.lines[self.cursor_row] = updated;
                 self.cursor_col -= delete_len;
             }
         } else {
@@ -781,9 +908,10 @@ impl Editor {
             let (before_yank, _) = split_char_at(&self.lines[start_line], start_col);
 
             let drain_count = yank_lines.len();
+            let splice_end = (start_line + drain_count).min(self.lines.len());
             let merged = format!("{before_yank}{after_cursor}");
             self.lines.splice(
-                start_line..start_line + drain_count,
+                start_line..splice_end,
                 std::iter::once(merged),
             );
             self.cursor_row = start_line;
@@ -820,6 +948,7 @@ impl Editor {
     }
 
     fn history_prev(&mut self) {
+        self.last_action = None;
         if self.history.is_empty() {
             return;
         }
@@ -843,7 +972,9 @@ impl Editor {
     }
 
     fn history_next(&mut self) {
+        self.last_action = None;
         if let Some(i) = self.history_idx {
+            self.push_undo();
             if i + 1 < self.history.len() {
                 let new_idx = i + 1;
                 self.history_idx = Some(new_idx);
@@ -861,7 +992,9 @@ impl Editor {
                     self.cursor_row = row;
                     self.cursor_col = col;
                 } else {
-                    self.clear();
+                    self.lines = vec![String::new()];
+                    self.cursor_row = 0;
+                    self.cursor_col = 0;
                 }
             }
         }
@@ -869,32 +1002,29 @@ impl Editor {
 
     /// Process a key event and return `EditorOutput`.
     pub fn handle_editor_key(&mut self, key: &str, bindings: &Keybindings) -> EditorOutput {
-        if self.autocomplete.is_some() {
+        if let Some(ac) = self.autocomplete.as_mut() {
             match key {
                 "up" => {
-                    self.autocomplete.as_mut().unwrap().move_up();
+                    ac.move_up();
                     return EditorOutput::None;
                 }
                 "down" => {
-                    self.autocomplete.as_mut().unwrap().move_down();
+                    ac.move_down();
                     return EditorOutput::None;
                 }
                 "pageup" => {
-                    self.autocomplete.as_mut().unwrap().page_up();
+                    ac.page_up();
                     return EditorOutput::None;
                 }
                 "pagedown" => {
-                    self.autocomplete.as_mut().unwrap().page_down();
+                    ac.page_down();
                     return EditorOutput::None;
                 }
                 "enter" | "tab" => {
-                    if let Some(item) = self
-                        .autocomplete
-                        .as_ref()
-                        .and_then(|ac| ac.selected_item().cloned())
-                    {
+                    if let Some(item) = ac.selected_item().cloned() {
                         let replace_start = self.autocomplete_replace_start;
                         self.clear_autocomplete();
+                        self.last_action = None;
                         if let Some(start) = replace_start {
                             self.replace_current_line_range(start, &item.id);
                         } else {
@@ -925,10 +1055,14 @@ impl Editor {
 
         if bindings.matches(key, TuiAction::Newline) {
             self.push_undo();
-            let cur = &self.lines[self.cursor_row];
-            let (before, after) = split_char_at(cur, self.cursor_col);
-            self.lines[self.cursor_row] = before;
-            self.lines.insert(self.cursor_row + 1, after);
+            self.last_action = None;
+            let (before_len, after_owned) = {
+                let cur = &self.lines[self.cursor_row];
+                let (before, after) = split_char_at(cur, self.cursor_col);
+                (before.len(), after.to_string())
+            };
+            self.lines[self.cursor_row].truncate(before_len);
+            self.lines.insert(self.cursor_row + 1, after_owned);
             self.cursor_row += 1;
             self.cursor_col = 0;
             return EditorOutput::Changed(self.text());
@@ -1014,16 +1148,22 @@ impl Editor {
                 let line = &self.lines[self.cursor_row];
                 let markers = find_paste_markers(line);
                 if let Some(m) = markers.iter().find(|m| m.end_col == self.cursor_col) {
-                    let (before, rest) = split_char_at(line, m.start_col);
-                    let (_, after) = split_char_at(&rest, m.end_col - m.start_col);
-                    self.lines[self.cursor_row] = format!("{before}{after}");
+                    let (del_start, del_end) = {
+                        let line = &self.lines[self.cursor_row];
+                        let (before, rest) = split_char_at(line, m.start_col);
+                        let (_, after) = split_char_at(rest, m.end_col - m.start_col);
+                        (before.len(), line.len() - after.len())
+                    };
+                    self.lines[self.cursor_row].replace_range(del_start..del_end, "");
                     self.cursor_col = m.start_col;
                 } else {
-                    let chars: Vec<char> = line.chars().collect();
-                    let mut new_chars = Vec::with_capacity(chars.len());
-                    new_chars.extend_from_slice(&chars[..self.cursor_col - 1]);
-                    new_chars.extend_from_slice(&chars[self.cursor_col..]);
-                    self.lines[self.cursor_row] = new_chars.into_iter().collect();
+                    if let Some((byte_start, ch)) = self.lines[self.cursor_row]
+                        .char_indices()
+                        .nth(self.cursor_col - 1)
+                    {
+                        let byte_end = byte_start + ch.len_utf8();
+                        self.lines[self.cursor_row].replace_range(byte_start..byte_end, "");
+                    }
                     self.cursor_col -= 1;
                 }
                 return EditorOutput::Changed(self.text());
@@ -1043,18 +1183,21 @@ impl Editor {
             let len = self.lines[self.cursor_row].chars().count();
             if self.cursor_col < len {
                 self.push_undo();
-                let line = &self.lines[self.cursor_row];
-                let markers = find_paste_markers(line);
+                let markers = find_paste_markers(&self.lines[self.cursor_row]);
                 if let Some(m) = markers.iter().find(|m| m.start_col == self.cursor_col) {
-                    let (before, rest) = split_char_at(line, m.start_col);
-                    let (_, after) = split_char_at(&rest, m.end_col - m.start_col);
-                    self.lines[self.cursor_row] = format!("{before}{after}");
-                } else {
-                    let chars: Vec<char> = line.chars().collect();
-                    let mut new_chars = Vec::with_capacity(chars.len());
-                    new_chars.extend_from_slice(&chars[..self.cursor_col]);
-                    new_chars.extend_from_slice(&chars[self.cursor_col + 1..]);
-                    self.lines[self.cursor_row] = new_chars.into_iter().collect();
+                    let (del_start, del_end) = {
+                        let line = &self.lines[self.cursor_row];
+                        let (before, rest) = split_char_at(line, m.start_col);
+                        let (_, after) = split_char_at(rest, m.end_col - m.start_col);
+                        (before.len(), line.len() - after.len())
+                    };
+                    self.lines[self.cursor_row].replace_range(del_start..del_end, "");
+                } else if let Some((byte_start, ch)) = self.lines[self.cursor_row]
+                    .char_indices()
+                    .nth(self.cursor_col)
+                {
+                    let byte_end = byte_start + ch.len_utf8();
+                    self.lines[self.cursor_row].replace_range(byte_start..byte_end, "");
                 }
                 return EditorOutput::Changed(self.text());
             } else if self.cursor_row + 1 < self.lines.len() {
@@ -1142,52 +1285,14 @@ impl Editor {
 
 impl Component for Editor {
     fn render(&self, width: usize) -> Vec<String> {
-        let mut result = Vec::new();
-
-        if self.is_empty() && !self.placeholder.is_empty() {
-            let line = format!(
-                "{}{CURSOR_MARKER}{}",
-                self.prompt_prefix,
-                self.theme.fg(&self.theme.dim, &self.placeholder)
-            );
-            for w in wrap_text_with_ansi(&line, width) {
-                result.push(w);
-            }
-        } else {
-            for (row, line_str) in self.lines.iter().enumerate() {
-                let pref = if row == 0 { &self.prompt_prefix } else { "  " };
-                let formatted = if row == self.cursor_row {
-                    let (b, a) = split_char_at(line_str, self.cursor_col);
-                    format!("{pref}{b}{CURSOR_MARKER}{a}")
-                } else {
-                    format!("{pref}{line_str}")
-                };
-                let formatted = self.colorize_paste_markers(&formatted);
-
-                for w in wrap_text_with_ansi(&formatted, width) {
-                    result.push(w);
-                }
-            }
-        }
-
-        if self.max_lines != usize::MAX && result.len() > self.max_lines {
-            let marker_row = result
-                .iter()
-                .position(|line| line.contains(CURSOR_MARKER))
-                .unwrap_or(0);
-            let start = marker_row.saturating_sub(self.max_lines / 2);
-            let end = (start + self.max_lines).min(result.len());
-            let start = end.saturating_sub(self.max_lines);
-            result = result.into_iter().skip(start).take(end - start).collect();
-        }
-
-        result
+        self.render_with_options(width, &self.theme, self.max_lines)
     }
 
     fn handle_key(&mut self, key: &str) -> bool {
-        let default_bindings = Keybindings::default_bindings();
+        static DEFAULT_BINDINGS: std::sync::LazyLock<Keybindings> =
+            std::sync::LazyLock::new(Keybindings::default_bindings);
         matches!(
-            self.handle_editor_key(key, &default_bindings),
+            self.handle_editor_key(key, &DEFAULT_BINDINGS),
             EditorOutput::Changed(_) | EditorOutput::Submit(_)
         )
     }
@@ -1497,5 +1602,225 @@ mod tests {
             editor.set_text(&format!("v{i}"));
         }
         assert_eq!(editor.undo_stack.len(), MAX_UNDO_SNAPSHOTS);
+    }
+
+    #[test]
+    fn cr_and_crlf_line_endings_normalize_to_newlines() {
+        let mut editor = Editor::new();
+        editor.set_text("a\rb\r\nc");
+        assert_eq!(editor.lines, vec!["a", "b", "c"]);
+        assert_eq!(editor.text(), "a\nb\nc");
+
+        editor.clear();
+        editor.insert_text("one\rtwo\r\nthree");
+        assert_eq!(editor.lines, vec!["one", "two", "three"]);
+        assert_eq!(editor.text(), "one\ntwo\nthree");
+
+        // Large CR-delimited paste collapses properly (>10 lines)
+        editor.clear();
+        let big_cr = (1..=12).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\r");
+        editor.insert_text(&big_cr);
+        assert!(editor.lines[0].contains("[paste #1 +12 lines]"));
+        assert!(!editor.text().contains('\r'));
+
+        // Yank with CR normalizes across lines
+        editor.clear();
+        editor.kill_ring.push("x\ry\r\nz", false, false);
+        assert!(editor.yank());
+        assert_eq!(editor.lines, vec!["x", "y", "z"]);
+    }
+
+    #[test]
+    fn clear_wipes_undo_stack_so_secrets_cannot_be_resurrected() {
+        let mut editor = Editor::new();
+        editor.insert_text("/login openai sk-secret-token");
+        assert!(!editor.undo_stack.is_empty());
+
+        editor.clear();
+        assert!(editor.undo_stack.is_empty());
+        assert!(!editor.undo());
+        assert_eq!(editor.text(), "");
+    }
+
+    #[test]
+    fn scrub_last_history_if_pops_only_when_predicate_matches() {
+        let mut editor = Editor::new();
+        let kb = Keybindings::default_bindings();
+
+        editor.set_text("normal prompt");
+        let _ = editor.handle_editor_key("enter", &kb);
+        editor.set_text("/login openai sk-secret");
+        let _ = editor.handle_editor_key("enter", &kb);
+        assert_eq!(editor.history.len(), 2);
+
+        editor.scrub_last_history_if(|entry| entry.starts_with("/login "));
+        assert_eq!(editor.history, vec!["normal prompt".to_string()]);
+
+        // Predicate false -> preserves remaining entry
+        editor.scrub_last_history_if(|entry| entry.starts_with("/login "));
+        assert_eq!(editor.history, vec!["normal prompt".to_string()]);
+    }
+
+    #[test]
+    fn render_with_options_strips_escape_and_bidi_sequences_preserving_cursor_and_paste_chip() {
+        let theme = Theme::dark();
+        let mut editor = Editor::new().with_prefix("> ");
+        let big_paste = (1..=12)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        editor.insert_text(&big_paste);
+        editor.insert_text(" \x1b]52;c;ZHVtbXk=\x07\x1b[31mred\x1b_Gevil\x1b\\\u{202e}tail");
+        // Insert a second line (non-cursor row when cursor moves back to row 0, or keep row 0 non-cursor)
+        editor.insert_text("\n\x1b]0;title\x07\x1b[32mnext\u{202e}line");
+        // Place cursor on row 1 between "next" and "line"
+        editor.cursor_row = 1;
+        editor.cursor_col = editor.lines[1].chars().count() - 4;
+
+        let rendered = editor.render_with_options(120, &theme, 10);
+        let joined = rendered.join("\n");
+
+        assert!(!joined.contains("\x1b]52;"), "OSC 52 leaked: {joined:?}");
+        assert!(!joined.contains("\x1b]0;"), "OSC 0 leaked: {joined:?}");
+        assert!(!joined.contains("\x1b[31m"), "CSI color leaked: {joined:?}");
+        assert!(!joined.contains("\x1b[32m"), "CSI color leaked: {joined:?}");
+        assert!(!joined.contains("\x1b_Gevil"), "APC leaked: {joined:?}");
+        assert!(!joined.contains('\u{202e}'), "Bidi override leaked: {joined:?}");
+
+        assert!(joined.contains(CURSOR_MARKER), "CURSOR_MARKER missing: {joined:?}");
+        let expected_chip = theme.fg(&theme.accent, "[paste #1 +12 lines]");
+        assert!(joined.contains(&expected_chip),
+            "colorized paste chip missing: {joined:?}"
+        );
+        assert!(joined.contains("redtail"), "sanitized text missing: {joined:?}");
+    }
+
+    #[test]
+    fn c1_ctrl_y_up_alt_y_three_line_yank_one_line_history_does_not_panic() {
+        let mut editor = Editor::new();
+        let kb = Keybindings::default_bindings();
+        editor.kill_ring.push("older", false, false);
+        editor.kill_ring.push("line1\nline2\nline3", false, false);
+        editor.history.push("single line history".to_string());
+
+        // Ctrl+Y -> yanks 3 lines
+        let out = editor.handle_editor_key("ctrl+y", &kb);
+        assert!(matches!(out, EditorOutput::Changed(_)));
+        assert_eq!(editor.lines.len(), 3);
+
+        // Ctrl+P (HistoryPrev) jumps straight to 1-line history; Alt+Y must not panic or yank_pop
+        let _ = editor.handle_editor_key("ctrl+p", &kb);
+        assert_eq!(editor.text(), "single line history");
+        let pop_out = editor.handle_editor_key("alt+y", &kb);
+        assert_eq!(pop_out, EditorOutput::None);
+        assert_eq!(editor.text(), "single line history");
+
+        // Also test Ctrl+Y -> Up -> Up -> Up -> Alt+Y
+        editor.clear();
+        let _ = editor.handle_editor_key("ctrl+y", &kb);
+        assert_eq!(editor.cursor_row, 2);
+        let _ = editor.handle_editor_key("up", &kb);
+        let _ = editor.handle_editor_key("up", &kb);
+        let _ = editor.handle_editor_key("up", &kb);
+        assert_eq!(editor.text(), "single line history");
+        let pop_out2 = editor.handle_editor_key("alt+y", &kb);
+        assert_eq!(pop_out2, EditorOutput::None);
+        assert_eq!(editor.text(), "single line history");
+
+        // Direct delete_yanked_text clamp when buffer has fewer lines than yank
+        editor.clear();
+        assert!(editor.yank());
+        editor.lines = vec!["only".to_string()];
+        editor.cursor_row = 0;
+        editor.cursor_col = 4;
+        assert!(editor.yank_pop());
+    }
+
+    #[test]
+    fn c1_clear_keeps_paste_counter_monotonic() {
+        let mut editor = Editor::new();
+        let big1 = (1..=12).map(|i| format!("a{i}")).collect::<Vec<_>>().join("\n");
+        let big2 = (1..=12).map(|i| format!("b{i}")).collect::<Vec<_>>().join("\n");
+        editor.insert_text(&big1);
+        assert!(editor.lines[0].contains("[paste #1 +12 lines]"));
+
+        editor.clear();
+        editor.insert_text(&big2);
+        assert!(
+            editor.lines[0].contains("[paste #2 +12 lines]"),
+            "paste_counter must remain monotonic across clear(): {:?}",
+            editor.lines
+        );
+    }
+
+    #[test]
+    fn c1_history_next_pushes_undo_and_preserves_undo_and_pastes() {
+        let mut editor = Editor::new();
+        let big = (1..=12).map(|i| format!("p{i}")).collect::<Vec<_>>().join("\n");
+        editor.insert_text(&big);
+        editor.history.push("hist1".to_string());
+
+        editor.history_prev();
+        assert_eq!(editor.text(), "hist1");
+        let undo_before_next = editor.undo_stack.len();
+
+        // Clear history_draft to exercise the fallback branch of history_next()
+        editor.history_draft = None;
+        editor.history_next();
+        assert_eq!(editor.text(), "");
+        assert_eq!(
+            editor.undo_stack.len(),
+            undo_before_next + 1,
+            "history_next must push undo instead of clearing undo_stack"
+        );
+        assert!(editor.undo());
+        assert_eq!(editor.text(), "hist1");
+        assert!(editor.undo());
+        assert_eq!(editor.text(), big, "pastes map must survive history_next");
+    }
+
+    #[test]
+    fn c1_last_action_reset_on_edits_and_navigation() {
+        let mut editor = Editor::new();
+        let kb = Keybindings::default_bindings();
+        editor.kill_ring.push("a", false, false);
+        editor.kill_ring.push("b", false, false);
+        editor.history.push("h".to_string());
+
+        editor.yank();
+        assert_eq!(editor.last_action, Some(EditorLastAction::Yank));
+        editor.set_text("x");
+        assert_eq!(editor.last_action, None);
+
+        editor.yank();
+        assert_eq!(editor.last_action, Some(EditorLastAction::Yank));
+        editor.insert_text("y");
+        assert_eq!(editor.last_action, None);
+
+        editor.yank();
+        assert_eq!(editor.last_action, Some(EditorLastAction::Yank));
+        editor.replace_current_line_range(0, "z");
+        assert_eq!(editor.last_action, None);
+
+        editor.yank();
+        assert_eq!(editor.last_action, Some(EditorLastAction::Yank));
+        editor.history_prev();
+        assert_eq!(editor.last_action, None);
+
+        editor.yank();
+        assert_eq!(editor.last_action, Some(EditorLastAction::Yank));
+        editor.history_next();
+        assert_eq!(editor.last_action, None);
+
+        editor.yank();
+        assert_eq!(editor.last_action, Some(EditorLastAction::Yank));
+        let _ = editor.handle_editor_key("shift+enter", &kb);
+        assert_eq!(editor.last_action, None);
+
+        editor.yank();
+        assert_eq!(editor.last_action, Some(EditorLastAction::Yank));
+        editor.set_autocomplete(vec![SelectItem::new("id", "label")]);
+        let _ = editor.handle_editor_key("enter", &kb);
+        assert_eq!(editor.last_action, None);
     }
 }

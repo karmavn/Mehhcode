@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::skills::parse_frontmatter;
+use crate::skills::{parse_frontmatter, read_bounded_utf8_file, MAX_MARKDOWN_FILE_BYTES};
 
 /// A prompt template loaded from markdown with parameter placeholders.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -78,171 +78,188 @@ pub fn parse_command_args(args_string: &str) -> Vec<String> {
 /// - `${@:N}`: bash-style argument slicing from 1-indexed Nth onward
 /// - `${@:N:L}`: slice L arguments starting from 1-indexed Nth
 pub fn substitute_args(content: &str, args: &[String]) -> String {
-    let all_args = args.join(" ");
+    let mut all_args_cache: Option<String> = None;
     let mut result = String::with_capacity(content.len());
-    let chars: Vec<char> = content.chars().collect();
-    let mut i = 0;
+    let mut rest = content;
 
-    while i < chars.len() {
-        if chars[i] == '$' {
-            if i + 1 < chars.len() && chars[i + 1] == '{' {
-                // Bracketed placeholder: ${...}
-                if let Some(closing) = chars[i + 2..].iter().position(|&c| c == '}') {
-                    let end = i + 2 + closing;
-                    let inner: String = chars[i + 2..end].iter().collect();
+    while let Some(dollar_pos) = rest.find('$') {
+        result.push_str(&rest[..dollar_pos]);
+        let after_dollar = &rest[dollar_pos + 1..];
 
-                    if let Some((target, default_val)) = inner.split_once(":-") {
-                        let val = match target {
-                            "@" | "ARGUMENTS" => {
-                                if all_args.is_empty() {
-                                    default_val.to_string()
-                                } else {
-                                    all_args.clone()
-                                }
-                            }
-                            _ => {
-                                if let Ok(n) = target.parse::<usize>() {
-                                    if n > 0 && n <= args.len() && !args[n - 1].is_empty() {
-                                        args[n - 1].clone()
-                                    } else {
-                                        default_val.to_string()
-                                    }
-                                } else {
-                                    default_val.to_string()
-                                }
-                            }
-                        };
-                        result.push_str(&val);
-                        i = end + 1;
-                        continue;
-                    } else if let Some(stripped) = inner.strip_prefix("@:") {
-                        let parts: Vec<&str> = stripped.split(':').collect();
-                        if let Ok(start_1idx) = parts[0].parse::<usize>() {
-                            let start = if start_1idx > 0 { start_1idx - 1 } else { 0 };
-                            let slice_str = if parts.len() > 1 {
-                                if let Ok(len) = parts[1].parse::<usize>() {
-                                    let end = (start + len).min(args.len());
-                                    if start < args.len() {
-                                        args[start..end].join(" ")
-                                    } else {
-                                        String::new()
-                                    }
-                                } else if start < args.len() {
-                                    args[start..].join(" ")
-                                } else {
-                                    String::new()
-                                }
-                            } else if start < args.len() {
-                                args[start..].join(" ")
+        if let Some(after_brace) = after_dollar.strip_prefix('{') {
+            if let Some(closing) = after_brace.find('}') {
+                let inner = &after_brace[..closing];
+                let after_close = &after_brace[closing + 1..];
+
+                if let Some((target, default_val)) = inner.split_once(":-") {
+                    match target {
+                        "@" | "ARGUMENTS" => {
+                            let joined = all_args_cache
+                                .get_or_insert_with(|| args.join(" "))
+                                .as_str();
+                            if joined.is_empty() {
+                                result.push_str(default_val);
                             } else {
-                                String::new()
-                            };
-                            result.push_str(&slice_str);
-                            i = end + 1;
-                            continue;
+                                result.push_str(joined);
+                            }
                         }
-                    } else if inner == "*" || inner == "ARGUMENTS" {
-                        result.push_str(&all_args);
-                        i = end + 1;
+                        _ => {
+                            if let Ok(n) = target.parse::<usize>() {
+                                if n > 0 && n <= args.len() && !args[n - 1].is_empty() {
+                                    result.push_str(&args[n - 1]);
+                                } else {
+                                    result.push_str(default_val);
+                                }
+                            } else {
+                                result.push_str(default_val);
+                            }
+                        }
+                    }
+                    rest = after_close;
+                    continue;
+                } else if let Some(stripped) = inner.strip_prefix("@:") {
+                    let mut split_it = stripped.split(':');
+                    let first_part = split_it.next().unwrap_or("");
+                    if let Ok(start_1idx) = first_part.parse::<usize>() {
+                        let start = if start_1idx > 0 { start_1idx - 1 } else { 0 };
+                        let second_part = split_it.next();
+                        let end = if let Some(len_str) = second_part {
+                            if let Ok(len) = len_str.parse::<usize>() {
+                                start.saturating_add(len).min(args.len())
+                            } else {
+                                args.len()
+                            }
+                        } else {
+                            args.len()
+                        };
+                        if start < end {
+                            for (idx, a) in args[start..end].iter().enumerate() {
+                                if idx > 0 {
+                                    result.push(' ');
+                                }
+                                result.push_str(a);
+                            }
+                        }
+                        rest = after_close;
                         continue;
-                    } else if let Ok(n) = inner.parse::<usize>() {
-                        if n > 0 && n <= args.len() {
-                            result.push_str(&args[n - 1]);
-                        }
-                        i = end + 1;
-                        continue;
                     }
-                }
-            }
-
-            // Simple placeholders: $@, $ARGUMENTS, $1..$N
-            let remaining: String = chars[i + 1..].iter().collect();
-            if remaining.starts_with("ARGUMENTS") {
-                result.push_str(&all_args);
-                i += 1 + "ARGUMENTS".len();
-                continue;
-            } else if remaining.starts_with('@') {
-                result.push_str(&all_args);
-                i += 2;
-                continue;
-            } else if let Some(first_digit) = chars.get(i + 1) {
-                if first_digit.is_ascii_digit() {
-                    let mut digit_end = i + 1;
-                    while digit_end < chars.len() && chars[digit_end].is_ascii_digit() {
-                        digit_end += 1;
+                } else if inner == "*" || inner == "ARGUMENTS" {
+                    let joined = all_args_cache
+                        .get_or_insert_with(|| args.join(" "))
+                        .as_str();
+                    result.push_str(joined);
+                    rest = after_close;
+                    continue;
+                } else if let Ok(n) = inner.parse::<usize>() {
+                    if n > 0 && n <= args.len() {
+                        result.push_str(&args[n - 1]);
                     }
-                    let num_str: String = chars[i + 1..digit_end].iter().collect();
-                    if let Ok(n) = num_str.parse::<usize>() {
-                        if n > 0 && n <= args.len() {
-                            result.push_str(&args[n - 1]);
-                        }
-                    }
-                    i = digit_end;
+                    rest = after_close;
                     continue;
                 }
             }
         }
 
-        result.push(chars[i]);
-        i += 1;
+        // Simple placeholders: $@, $ARGUMENTS, $1..$N
+        if let Some(after_kw) = after_dollar.strip_prefix("ARGUMENTS") {
+            let joined = all_args_cache
+                .get_or_insert_with(|| args.join(" "))
+                .as_str();
+            result.push_str(joined);
+            rest = after_kw;
+            continue;
+        } else if let Some(after_at) = after_dollar.strip_prefix('@') {
+            let joined = all_args_cache
+                .get_or_insert_with(|| args.join(" "))
+                .as_str();
+            result.push_str(joined);
+            rest = after_at;
+            continue;
+        } else {
+            let digits_end = after_dollar
+                .as_bytes()
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .unwrap_or(after_dollar.len());
+            if digits_end > 0 {
+                if let Ok(n) = after_dollar[..digits_end].parse::<usize>() {
+                    if n > 0 && n <= args.len() {
+                        result.push_str(&args[n - 1]);
+                    }
+                }
+                rest = &after_dollar[digits_end..];
+                continue;
+            }
+        }
+
+        result.push('$');
+        rest = after_dollar;
     }
 
+    result.push_str(rest);
     result
 }
 
 /// Loads prompt templates from a directory (non-recursive) by reading `*.md` files.
+/// Enforces bounded reads, strips UTF-8 BOM, and requires symlinks to stay within `dir`.
 fn load_templates_from_dir(dir: &Path, out: &mut Vec<PromptTemplate>) {
-    if !dir.is_dir() {
+    let Ok(canon_root) = std::fs::canonicalize(dir) else {
+        return;
+    };
+    if !canon_root.is_dir() {
         return;
     }
 
-    let entries = match std::fs::read_dir(dir) {
+    let entries = match std::fs::read_dir(&canon_root) {
         Ok(e) => e,
         Err(_) => return,
     };
 
     for entry in entries.flatten() {
         let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("md") {
-                    let name = match path.file_stem().and_then(|s| s.to_str()) {
-                        Some(s) => s.to_string(),
-                        None => continue,
+        let Ok(canon_path) = std::fs::canonicalize(&path) else {
+            continue;
+        };
+        if !canon_path.starts_with(&canon_root) || !canon_path.is_file() {
+            continue;
+        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ext.eq_ignore_ascii_case("md") {
+                let name = match path.file_stem().and_then(|s| s.to_str()) {
+                    Some(s) => s.to_string(),
+                    None => continue,
+                };
+
+                if let Some(clean) = read_bounded_utf8_file(&canon_path, MAX_MARKDOWN_FILE_BYTES) {
+                    let (fm, body) = parse_frontmatter(&clean);
+                    let body_trimmed = body.trim();
+
+                    let description = if let Some(desc) = fm.get("description") {
+                        desc.clone()
+                    } else {
+                        let first_line = body_trimmed
+                            .lines()
+                            .find(|l| !l.trim().is_empty())
+                            .unwrap_or("");
+                        let mut d = first_line.chars().take(60).collect::<String>();
+                        if first_line.chars().count() > 60 {
+                            d.push_str("...");
+                        }
+                        d
                     };
 
-                    if let Ok(raw) = std::fs::read_to_string(&path) {
-                        let clean = raw.strip_prefix('\u{feff}').unwrap_or(&raw);
-                        let (fm, body) = parse_frontmatter(clean);
-                        let body_trimmed = body.trim();
+                    let argument_hint = fm
+                        .get("argument-hint")
+                        .or_else(|| fm.get("argument_hint"))
+                        .cloned();
 
-                        let description = if let Some(desc) = fm.get("description") {
-                            desc.clone()
-                        } else {
-                            let first_line = body_trimmed
-                                .lines()
-                                .find(|l| !l.trim().is_empty())
-                                .unwrap_or("");
-                            let mut d = first_line.chars().take(60).collect::<String>();
-                            if first_line.chars().count() > 60 {
-                                d.push_str("...");
-                            }
-                            d
-                        };
-
-                        let argument_hint = fm
-                            .get("argument-hint")
-                            .or_else(|| fm.get("argument_hint"))
-                            .cloned();
-
-                        out.push(PromptTemplate {
-                            name,
-                            description,
-                            argument_hint,
-                            content: body_trimmed.to_string(),
-                            file_path: path,
-                        });
-                    }
+                    out.push(PromptTemplate {
+                        name,
+                        description,
+                        argument_hint,
+                        content: body_trimmed.to_string(),
+                        file_path: path,
+                    });
                 }
             }
         }
@@ -255,12 +272,7 @@ fn load_templates_from_dir(dir: &Path, out: &mut Vec<PromptTemplate>) {
 pub fn load_prompt_templates_with_trust(cwd: &Path, trusted: bool) -> Vec<PromptTemplate> {
     let mut template_map: HashMap<String, PromptTemplate> = HashMap::new();
 
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-
-    if let Some(home_path) = home {
+    if let Some(home_path) = crate::user_home_dir() {
         let global_dir = home_path.join(".mehh").join("agent").join("prompts");
         let mut global_templates = Vec::new();
         load_templates_from_dir(&global_dir, &mut global_templates);
@@ -419,5 +431,46 @@ mod tests {
         assert_eq!(found.content, "Check $@");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_substitute_args_slice_saturates_on_huge_length() {
+        let out = substitute_args(
+            "Slice: ${@:2:18446744073709551615}",
+            &["a".to_string(), "b".to_string(), "c".to_string()],
+        );
+        assert_eq!(out, "Slice: b c");
+    }
+
+    #[test]
+    fn test_load_prompt_templates_bounds_reads_and_strips_bom_without_frontmatter() {
+        let dir = crate::TempTestDir::new("prompt_bounds");
+        let tpl_dir = dir.path().join(".mehh").join("prompts");
+        std::fs::create_dir_all(&tpl_dir).unwrap();
+        std::fs::write(tpl_dir.join("plain.md"), "\u{feff}Plain body $@").unwrap();
+        std::fs::write(
+            tpl_dir.join("huge.md"),
+            "x".repeat(MAX_MARKDOWN_FILE_BYTES + 1024),
+        )
+        .unwrap();
+
+        let loaded = load_prompt_templates_with_trust(dir.path(), true);
+        let plain = loaded.iter().find(|t| t.name == "plain").unwrap();
+        assert_eq!(plain.content, "Plain body $@");
+        assert!(!loaded.iter().any(|t| t.name == "huge"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_load_prompt_templates_rejects_symlink_escape() {
+        let dir = crate::TempTestDir::new("prompt_symlink");
+        let tpl_dir = dir.path().join(".mehh").join("prompts");
+        let outside = dir.path().join("secret.md");
+        std::fs::create_dir_all(&tpl_dir).unwrap();
+        std::fs::write(&outside, "top secret").unwrap();
+        std::os::unix::fs::symlink(&outside, tpl_dir.join("escape.md")).unwrap();
+
+        let loaded = load_prompt_templates_with_trust(dir.path(), true);
+        assert!(!loaded.iter().any(|t| t.name == "escape"));
     }
 }

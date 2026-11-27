@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::PathBuf;
 use std::sync::Arc;
 use async_trait::async_trait;
@@ -7,11 +8,12 @@ use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
 use crate::core::context::{self, PathPolicy};
-use crate::core::fs::atomic_write_checked;
+use crate::core::fs::{atomic_write_checked, read_file_bounded};
 use crate::core::output::truncate_head;
 use crate::undo_edit::{EditUndoStore, FileSnapshot, UNDO_UNAVAILABLE_WARNING};
 
 const MAX_DIFF_BYTES: usize = 64 * 1024;
+const MAX_EDIT_FILE_BYTES: u64 = 50 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EditTool {
@@ -147,9 +149,12 @@ fn apply_replacements_to_original(original: &str, replacements: &[MatchedEdit]) 
         }
 
         // Last line has no terminator: use the file's dominant style.
-        let crlf_count = content.matches("\r\n").count();
-        let lf_count = content.matches('\n').count();
-        if crlf_count > 0 && crlf_count == lf_count {
+        if crlf_indices.is_empty() {
+            return "\n";
+        }
+        let crlf_count = crlf_indices.len();
+        let lf_count = content.as_bytes().iter().filter(|&&b| b == b'\n').count();
+        if crlf_count == lf_count {
             "\r\n"
         } else {
             "\n"
@@ -181,14 +186,19 @@ fn required_string<'a>(
 ) -> Result<&'a str, String> {
     aliases
         .iter()
-        .find_map(|key| value.get(*key).and_then(|v| v.as_str()))
+        .find_map(|key| {
+            value
+                .get(*key)
+                .filter(|v| !v.is_null())
+                .and_then(|v| v.as_str())
+        })
         .ok_or_else(|| format!("{label} must be a string"))
 }
 
 fn parse_edits(params: &serde_json::Map<String, serde_json::Value>) -> Result<Vec<SingleEdit>, String> {
     let mut edits = Vec::new();
 
-    if let Some(edits_val) = params.get("edits") {
+    if let Some(edits_val) = params.get("edits").filter(|v| !v.is_null()) {
         let items: Vec<serde_json::Value> = if let Some(arr) = edits_val.as_array() {
             arr.clone()
         } else if let Some(s) = edits_val.as_str() {
@@ -222,13 +232,15 @@ fn parse_edits(params: &serde_json::Map<String, serde_json::Value>) -> Result<Ve
     if edits.is_empty() {
         let old = params
             .get("oldText")
-            .or_else(|| params.get("old_text"))
-            .or_else(|| params.get("old_string"))
+            .filter(|v| !v.is_null())
+            .or_else(|| params.get("old_text").filter(|v| !v.is_null()))
+            .or_else(|| params.get("old_string").filter(|v| !v.is_null()))
             .and_then(|v| v.as_str());
         let new = params
             .get("newText")
-            .or_else(|| params.get("new_text"))
-            .or_else(|| params.get("new_string"))
+            .filter(|v| !v.is_null())
+            .or_else(|| params.get("new_text").filter(|v| !v.is_null()))
+            .or_else(|| params.get("new_string").filter(|v| !v.is_null()))
             .and_then(|v| v.as_str());
 
         if let (Some(old), Some(new)) = (old, new) {
@@ -254,7 +266,15 @@ fn parse_edits(params: &serde_json::Map<String, serde_json::Value>) -> Result<Ve
     Ok(edits)
 }
 
-use crate::file_mutation_queue::with_file_mutation_queue;
+use crate::file_mutation_queue::with_file_mutation_queue_key;
+
+fn normalize_crlf_cow(s: &str) -> Cow<'_, str> {
+    if s.contains("\r\n") {
+        Cow::Owned(s.replace("\r\n", "\n"))
+    } else {
+        Cow::Borrowed(s)
+    }
+}
 
 const CLOSEST_HINT_MIN_SCORE: f64 = 0.4;
 
@@ -347,12 +367,16 @@ fn find_fuzzy_matches(content: &str, old_norm: &str) -> Vec<(usize, usize)> {
     matches
 }
 
-fn char_bigrams(s: &str) -> std::collections::HashSet<(char, char)> {
-    let chars: Vec<char> = s.chars().collect();
-    if chars.len() < 2 {
-        std::collections::HashSet::new()
-    } else {
-        chars.windows(2).map(|w| (w[0], w[1])).collect()
+fn fill_char_bigrams(
+    s: &str,
+    chars: &mut Vec<char>,
+    out: &mut std::collections::HashSet<(char, char)>,
+) {
+    chars.clear();
+    chars.extend(s.chars());
+    out.clear();
+    for w in chars.windows(2) {
+        out.insert((w[0], w[1]));
     }
 }
 
@@ -360,6 +384,8 @@ fn line_similarity(
     a: &str,
     b: &str,
     a_bigrams: &std::collections::HashSet<(char, char)>,
+    b_chars: &mut Vec<char>,
+    b_bigrams: &mut std::collections::HashSet<(char, char)>,
 ) -> f64 {
     if a.is_empty() || b.is_empty() {
         return 0.0;
@@ -377,11 +403,11 @@ fn line_similarity(
     if a_bigrams.is_empty() {
         return 0.0;
     }
-    let b_bigrams = char_bigrams(b);
+    fill_char_bigrams(b, b_chars, b_bigrams);
     if b_bigrams.is_empty() {
         return 0.0;
     }
-    let shared = a_bigrams.intersection(&b_bigrams).count() as f64;
+    let shared = a_bigrams.intersection(b_bigrams).count() as f64;
     (2.0 * shared) / ((a_bigrams.len() + b_bigrams.len()) as f64)
 }
 
@@ -390,14 +416,18 @@ fn closest_line_hint(content: &str, old_norm: &str) -> Option<String> {
         .lines()
         .map(str::trim)
         .find(|l| !l.is_empty())?;
-    let target_bigrams = char_bigrams(target);
+    let mut target_chars = Vec::new();
+    let mut target_bigrams = std::collections::HashSet::new();
+    fill_char_bigrams(target, &mut target_chars, &mut target_bigrams);
+    let mut b_chars = Vec::new();
+    let mut b_bigrams = std::collections::HashSet::new();
     let mut best: Option<(usize, f64, &str)> = None;
     for (idx, line) in content.lines().enumerate() {
         let candidate = line.trim();
         if candidate.is_empty() {
             continue;
         }
-        let score = line_similarity(target, candidate, &target_bigrams);
+        let score = line_similarity(target, candidate, &target_bigrams, &mut b_chars, &mut b_bigrams);
         if score >= CLOSEST_HINT_MIN_SCORE
             && best.is_none_or(|(_, best_s, _)| score > best_s)
         {
@@ -494,42 +524,87 @@ impl AgentTool for EditTool {
         self.path_policy.validate(&inspected_target)?;
         let undo_store = self.undo_store.clone();
         let cancel_inner = cancel.clone();
-        with_file_mutation_queue(&full_path, async {
+        let queue_target = inspected_target.clone();
+        with_file_mutation_queue_key(&queue_target, |queue_key| async move {
             // The queue await may have been waiting while the caller cancelled.
             if cancel_inner.is_cancelled() {
                 return Err("Tool execution cancelled".to_string());
             }
-            if !full_path.exists() {
-                return Err(format!("File not found: {}", path_str));
+            let current_target = crate::core::fs::resolve_write_target(&full_path).await;
+            if !crate::core::fs::targets_match(&current_target, &inspected_target) {
+                return Err(format!(
+                    "Refusing to edit {}: target changed since it was inspected",
+                    path_str
+                ));
+            }
+            let meta = match tokio::fs::metadata(&full_path).await {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(format!("File not found: {}", path_str));
+                }
+                Err(e) => return Err(format!("Failed to stat {}: {}", path_str, e)),
+            };
+            if meta.is_dir() {
+                return Err(format!("Path is a directory: {}", path_str));
+            }
+            if meta.len() > MAX_EDIT_FILE_BYTES {
+                return Err(format!(
+                    "File {} is too large to edit ({} bytes exceeds {} byte limit)",
+                    path_str,
+                    meta.len(),
+                    MAX_EDIT_FILE_BYTES
+                ));
             }
 
-            let raw_bytes = tokio::fs::read(&full_path)
+            let raw_bytes = match read_file_bounded(&full_path, MAX_EDIT_FILE_BYTES)
                 .await
-                .map_err(|e| format!("Failed to read {}: {}", path_str, e))?;
+                .map_err(|e| format!("Failed to read {}: {}", path_str, e))?
+            {
+                Some(b) => b,
+                None => {
+                    return Err(format!(
+                        "File {} is too large to edit (exceeds {} byte limit)",
+                        path_str, MAX_EDIT_FILE_BYTES
+                    ));
+                }
+            };
 
-            let raw_content = String::from_utf8(raw_bytes.clone())
+            let undo_bytes = if undo_store.is_some()
+                && raw_bytes.len() <= crate::undo_edit::MAX_SNAPSHOT_BYTES
+            {
+                Some(raw_bytes.clone())
+            } else {
+                None
+            };
+
+            let raw_content = String::from_utf8(raw_bytes)
                 .map_err(|e| format!("File {} is not valid UTF-8: {}", path_str, e))?;
 
             let (bom, content) = split_bom(&raw_content);
-            let normalized_content = content.replace("\r\n", "\n");
+            let normalized_content = normalize_crlf_cow(content);
+            let content_is_lf = matches!(normalized_content, Cow::Borrowed(_));
 
             let mut matched_edits: Vec<MatchedEdit> = Vec::with_capacity(edits.len());
 
             for (i, edit) in edits.iter().enumerate() {
-                let old_norm = edit.old_text.replace("\r\n", "\n");
-                let new_norm = edit.new_text.replace("\r\n", "\n");
+                let old_norm = normalize_crlf_cow(&edit.old_text);
+                let new_norm = normalize_crlf_cow(&edit.new_text).into_owned();
 
-                let exact_matches: Vec<(usize, usize)> = normalized_content
-                    .match_indices(&old_norm)
-                    .map(|(start, _)| (start, start + old_norm.len()))
-                    .collect();
+                let mut exact_count = 0usize;
+                let mut first_exact = (0usize, 0usize);
+                for (m_start, _) in normalized_content.match_indices(old_norm.as_ref()) {
+                    if exact_count == 0 {
+                        first_exact = (m_start, m_start + old_norm.len());
+                    }
+                    exact_count += 1;
+                }
 
-                let (start, end) = if exact_matches.len() == 1 {
-                    exact_matches[0]
-                } else if exact_matches.len() > 1 {
+                let (start, end) = if exact_count == 1 {
+                    first_exact
+                } else if exact_count > 1 {
                     return Err(format!(
                         "Found {} occurrences of edits[{}] in {}. Each oldText must be unique. Please provide more context to make it unique.",
-                        exact_matches.len(), i, path_str
+                        exact_count, i, path_str
                     ));
                 } else {
                     let fuzzy_matches = find_fuzzy_matches(&normalized_content, &old_norm);
@@ -580,19 +655,26 @@ impl AgentTool for EditTool {
             }
             new_normalized.push_str(&normalized_content[last_idx..]);
 
-            if new_normalized == normalized_content {
+            if new_normalized == normalized_content.as_ref() {
                 return Err(format!(
                     "No changes made to {}. Replacement produced identical content.",
                     path_str
                 ));
             }
 
-            let final_body = if content == normalized_content {
+            let final_body = if content_is_lf {
                 new_normalized
             } else {
                 apply_replacements_to_original(content, &matched_edits)
             };
-            let final_content = format!("{bom}{final_body}");
+            let final_content = if bom.is_empty() {
+                final_body
+            } else {
+                let mut s = String::with_capacity(bom.len() + final_body.len());
+                s.push_str(bom);
+                s.push_str(&final_body);
+                s
+            };
 
             atomic_write_checked(&full_path, &inspected_target, final_content.as_bytes()).await?;
 
@@ -600,32 +682,40 @@ impl AgentTool for EditTool {
             // otherwise a failed write would leave a phantom snapshot.
             let mut undo_unavailable = false;
             if let Some(ref store) = undo_store {
-                let timestamp_ms = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis() as i64)
-                    .unwrap_or(0);
-                if !store.push_snapshot(
-                    &full_path,
-                    FileSnapshot::Existed {
-                        bytes: raw_bytes,
-                        timestamp_ms,
-                        target: inspected_target.clone(),
-                    },
-                ) {
+                if let Some(bytes) = undo_bytes {
+                    let timestamp_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
+                    if !store.push_snapshot_with_key(
+                        queue_key.clone(),
+                        FileSnapshot::Existed {
+                            bytes,
+                            timestamp_ms,
+                            target: inspected_target.clone(),
+                        },
+                    ) {
+                        undo_unavailable = true;
+                    }
+                } else {
                     undo_unavailable = true;
+                }
+                if undo_unavailable {
+                    store.invalidate_file_with_key(&queue_key);
                 }
             }
 
-            let diff = similar::TextDiff::from_lines(&raw_content, &final_content)
-                .unified_diff()
-                .context_radius(3)
-                .header(path_str, path_str)
-                .to_string();
-            let diff = truncate_head(
-                &diff,
-                MAX_DIFF_BYTES,
-                "\n... [diff truncated]",
-            );
+            let path_header = path_str.to_string();
+            let diff = tokio::task::spawn_blocking(move || {
+                let raw_diff = similar::TextDiff::from_lines(&raw_content, &final_content)
+                    .unified_diff()
+                    .context_radius(3)
+                    .header(&path_header, &path_header)
+                    .to_string();
+                truncate_head(&raw_diff, MAX_DIFF_BYTES, "\n... [diff truncated]")
+            })
+            .await
+            .map_err(|e| format!("Edit diff task failed: {e}"))?;
 
             let warning = if undo_unavailable {
                 format!("\n\n{}", UNDO_UNAVAILABLE_WARNING)
@@ -859,5 +949,130 @@ mod tests {
             !out.contains("const s = 'a';\r\nconst t = 'b';"),
             "must not bleed past single-quoted string into later CRLF: {out:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_rejects_oversized_file_before_reading() {
+        let dir = crate::TempTestDir::new("edit_too_large");
+        let file = dir.path().join("too_big.txt");
+        {
+            let f = std::fs::File::create(&file).unwrap();
+            f.set_len(MAX_EDIT_FILE_BYTES + 1).unwrap();
+        }
+
+        let tool = EditTool::new(dir.path().to_path_buf());
+        let params = json!({
+            "path": "too_big.txt",
+            "oldText": "a",
+            "newText": "b"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let err = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("too large"), "unexpected error: {err}");
+    }
+
+    #[tokio::test]
+    async fn edit_refuses_target_mismatch_at_queue_entry() {
+        let dir = crate::TempTestDir::new("edit_target_mismatch");
+        let file = dir.path().join("target.txt");
+        let other = dir.path().join("other.txt");
+        std::fs::write(&file, "hello").unwrap();
+        std::fs::write(&other, "hello").unwrap();
+
+        let tool = EditTool::new(dir.path().to_path_buf());
+        let mut params = serde_json::Map::new();
+        params.insert("path".into(), json!("target.txt"));
+        params.insert("oldText".into(), json!("hello"));
+        params.insert("newText".into(), json!("world"));
+        params.insert(
+            mehh_agent::INSPECTED_TARGET_ARG.into(),
+            json!(other.to_string_lossy()),
+        );
+
+        let err = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("changed since it was inspected"), "got: {err}");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
+    }
+
+    #[tokio::test]
+    async fn write_then_oversized_edit_invalidates_undo_instead_of_deleting_file() {
+        let dir = crate::TempTestDir::new("edit_c15_no_delete");
+        let file = dir.path().join("big.txt");
+        let store = Arc::new(EditUndoStore::new());
+        let write_tool =
+            crate::WriteTool::new(dir.path().to_path_buf()).with_undo_store(store.clone());
+        let edit_tool = EditTool::new(dir.path().to_path_buf()).with_undo_store(store.clone());
+
+        let mut initial = "x".repeat(crate::undo_edit::MAX_SNAPSHOT_BYTES + 128);
+        initial.push_str("\nUNIQUE_TARGET old\n");
+        let wp = json!({ "path": "big.txt", "content": initial })
+            .as_object()
+            .unwrap()
+            .clone();
+        write_tool
+            .execute("tc_w", wp, CancellationToken::new(), None)
+            .await
+            .unwrap();
+
+        let ep = json!({
+            "path": "big.txt",
+            "oldText": "UNIQUE_TARGET old",
+            "newText": "UNIQUE_TARGET new"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let edit_res = edit_tool
+            .execute("tc_e", ep, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let edit_txt = match &edit_res.content[0] {
+            ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(
+            edit_txt.contains("undo is unavailable"),
+            "got: {edit_txt}"
+        );
+
+        let undo = crate::UndoEditTool::new(dir.path().to_path_buf(), store);
+        let up = json!({ "path": "big.txt" }).as_object().unwrap().clone();
+        let err = undo
+            .execute("tc_u", up, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_lowercase().contains("unavailable"), "got: {err}");
+        assert!(file.exists(), "undo must not delete the edited file");
+        let on_disk = std::fs::read_to_string(&file).unwrap();
+        assert!(on_disk.ends_with("UNIQUE_TARGET new\n"));
+    }
+
+    #[test]
+    fn parse_edits_ignores_null_optional_keys_and_aliases() {
+        let params = json!({
+            "path": "a.txt",
+            "edits": null,
+            "oldText": null,
+            "old_text": "before",
+            "newText": null,
+            "new_string": "after"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+
+        let parsed = parse_edits(&params).expect("null edits and aliases must fall back");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].old_text, "before");
+        assert_eq!(parsed[0].new_text, "after");
     }
 }

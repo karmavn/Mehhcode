@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use futures::StreamExt;
 
+use crate::oauth::redact_error_body_with_limit;
 use crate::retry::{
-    default_http_client, retry_failure_event, send_with_retry, RetryPolicy,
+    default_http_client, retry_failure_event, send_with_retry_with_secrets, RetryPolicy,
     DEFAULT_STREAM_CHUNK_TIMEOUT,
 };
 use crate::sse::{SseEvent, SseParser};
@@ -113,7 +114,6 @@ pub fn build_mistral_request(
     options: &StreamOptions,
 ) -> serde_json::Value {
     use crate::transform_messages::transform_messages;
-    use crate::unicode::sanitize_surrogates;
 
     let mut normalizer = MistralToolCallIdNormalizer::new();
     let transformed_messages = transform_messages(
@@ -125,23 +125,27 @@ pub fn build_mistral_request(
     let mut messages: Vec<serde_json::Value> = Vec::new();
 
     // System prompt
-    let mut system_texts = Vec::new();
-    if let Some(sys) = &context.system_prompt {
-        if !sys.is_empty() {
-            system_texts.push(sanitize_surrogates(sys));
+    let mut system_text = String::new();
+    let mut push_sys = |s: &str| {
+        if !s.is_empty() {
+            if !system_text.is_empty() {
+                system_text.push_str("\n\n");
+            }
+            system_text.push_str(&crate::unicode::sanitize_surrogates_cow(s));
         }
+    };
+    if let Some(sys) = &context.system_prompt {
+        push_sys(sys);
     }
     for msg in &transformed_messages {
         if let Message::System(sys) = msg {
-            if !sys.content.is_empty() {
-                system_texts.push(sanitize_surrogates(&sys.content));
-            }
+            push_sys(&sys.content);
         }
     }
-    if !system_texts.is_empty() {
+    if !system_text.is_empty() {
         messages.push(serde_json::json!({
             "role": "system",
-            "content": system_texts.join("\n\n"),
+            "content": system_text,
         }));
     }
 
@@ -150,7 +154,9 @@ pub fn build_mistral_request(
             Message::System(_) => {}
             Message::User(u) => {
                 let content_val = match &u.content {
-                    UserContent::Text(text) => serde_json::json!(sanitize_surrogates(text)),
+                    UserContent::Text(text) => {
+                        serde_json::json!(crate::unicode::sanitize_surrogates_cow(text))
+                    }
                     UserContent::Blocks(blocks) => {
                         let chunks: Vec<serde_json::Value> = blocks
                             .iter()
@@ -158,7 +164,7 @@ pub fn build_mistral_request(
                                 UserContentBlock::Text(t) => {
                                     serde_json::json!({
                                         "type": "text",
-                                        "text": sanitize_surrogates(&t.text),
+                                        "text": crate::unicode::sanitize_surrogates_cow(&t.text),
                                     })
                                 }
                                 UserContentBlock::Image(img) => {
@@ -183,7 +189,10 @@ pub fn build_mistral_request(
 
                 let text_content = a.text_content();
                 if !text_content.is_empty() {
-                    asst_map.insert("content".to_string(), serde_json::json!(sanitize_surrogates(&text_content)));
+                    asst_map.insert(
+                        "content".to_string(),
+                        serde_json::json!(crate::unicode::sanitize_surrogates_cow(&text_content)),
+                    );
                 }
 
                 let tool_calls = a.tool_calls();
@@ -214,15 +223,17 @@ pub fn build_mistral_request(
                 messages.push(serde_json::Value::Object(asst_map));
             }
             Message::ToolResult(tr) => {
-                let text = tr
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        ToolResultContentBlock::Text(tc) => Some(sanitize_surrogates(&tc.text)),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                let mut text = String::new();
+                let mut has_text = false;
+                for b in &tr.content {
+                    if let ToolResultContentBlock::Text(tc) = b {
+                        if has_text {
+                            text.push('\n');
+                        }
+                        text.push_str(&crate::unicode::sanitize_surrogates_cow(&tc.text));
+                        has_text = true;
+                    }
+                }
 
                 let images: Vec<serde_json::Value> = tr
                     .content
@@ -291,6 +302,33 @@ pub fn build_mistral_request(
     serde_json::Value::Object(req_map)
 }
 
+fn insert_custom_headers(
+    header_map: &mut reqwest::header::HeaderMap,
+    headers: Option<&HashMap<String, String>>,
+) -> Result<(), String> {
+    if let Some(map) = headers {
+        for (k, v) in map {
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| format!("Invalid header name '{k}': {e}"))?;
+            let value = reqwest::header::HeaderValue::from_str(v)
+                .map_err(|e| format!("Invalid header value for '{k}': {e}"))?;
+            header_map.insert(name, value);
+        }
+    }
+    Ok(())
+}
+
+fn mistral_chat_completions_url(base_url: &str) -> String {
+    const DEFAULT_BASE: &str = "https://api.mistral.ai/v1";
+    let path = crate::http_safety::normalized_endpoint_path(base_url, DEFAULT_BASE);
+    let extra: &[&str] = if path.ends_with("/chat/completions") {
+        &[]
+    } else {
+        &["chat", "completions"]
+    };
+    crate::http_safety::append_endpoint_segments_preserving_query(base_url, DEFAULT_BASE, extra)
+}
+
 #[async_trait::async_trait]
 impl LlmProvider for MistralProvider {
     fn stream(
@@ -303,45 +341,95 @@ impl LlmProvider for MistralProvider {
         let (sender, stream) = create_event_stream();
         let client = self.client.clone();
         let model = model.clone();
-        let context = context.clone();
         let options = options.clone();
+        let body_res = serde_json::to_vec(&build_mistral_request(&model, context, &options))
+            .map_err(|e| format!("Failed to serialize request body: {e}"));
 
         tokio::spawn(async move {
-            let body = build_mistral_request(&model, &context, &options);
-            let base_url = if model.base_url.is_empty() {
-                "https://api.mistral.ai/v1"
-            } else {
-                model.base_url.trim_end_matches('/')
+            let body_bytes = match body_res {
+                Ok(b) => b,
+                Err(msg) => {
+                    let mut err_msg = AssistantMessage::empty_for_model(&model);
+                    err_msg.stop_reason = StopReason::Error;
+                    err_msg.error_message = Some(msg);
+                    let _ = sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: err_msg,
+                        })
+                        .await;
+                    return;
+                }
             };
-            let url = if base_url.ends_with("/chat/completions") {
-                base_url.to_string()
-            } else {
-                format!("{base_url}/chat/completions")
-            };
+            let url = mistral_chat_completions_url(&model.base_url);
 
-            let resp = match send_with_retry(
+            let api_key = options
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let secrets_owned: Vec<String> = api_key.clone().into_iter().collect();
+            let secret_refs: Vec<&str> = secrets_owned.iter().map(String::as_str).collect();
+
+            let mut header_map = reqwest::header::HeaderMap::new();
+            header_map.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+            header_map.insert(
+                reqwest::header::ACCEPT,
+                reqwest::header::HeaderValue::from_static("text/event-stream"),
+            );
+            if let Some(ref key) = api_key {
+                match reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")) {
+                    Ok(val) => {
+                        header_map.insert(reqwest::header::AUTHORIZATION, val);
+                    }
+                    Err(e) => {
+                        let mut err_msg = AssistantMessage::empty_for_model(&model);
+                        err_msg.stop_reason = StopReason::Error;
+                        err_msg.error_message = Some(redact_error_body_with_limit(
+                            &format!("Invalid authorization header: {e}"),
+                            &secret_refs,
+                            4096,
+                        ));
+                        let _ = sender
+                            .send(AssistantMessageEvent::Error {
+                                reason: StopReason::Error,
+                                error: err_msg,
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+            if let Err(e) = insert_custom_headers(&mut header_map, model.headers.as_ref())
+                .and_then(|_| insert_custom_headers(&mut header_map, options.headers.as_ref()))
+            {
+                let mut err_msg = AssistantMessage::empty_for_model(&model);
+                err_msg.stop_reason = StopReason::Error;
+                err_msg.error_message =
+                    Some(redact_error_body_with_limit(&e, &secret_refs, 4096));
+                let _ = sender
+                    .send(AssistantMessageEvent::Error {
+                        reason: StopReason::Error,
+                        error: err_msg,
+                    })
+                    .await;
+                return;
+            }
+
+            let resp = match send_with_retry_with_secrets(
                 || {
-                    let mut req = client.post(&url);
-                    req = req.header("content-type", "application/json");
-                    req = req.header("accept", "text/event-stream");
-
-                    if let Some(api_key) = &options.api_key {
-                        req = req.header("authorization", format!("Bearer {api_key}"));
-                    }
-                    if let Some(headers) = &model.headers {
-                        for (k, v) in headers {
-                            req = req.header(k, v);
-                        }
-                    }
-                    if let Some(headers) = &options.headers {
-                        for (k, v) in headers {
-                            req = req.header(k, v);
-                        }
-                    }
-                    req.json(&body)
+                    client
+                        .post(&url)
+                        .headers(header_map.clone())
+                        .body(body_bytes.clone())
                 },
                 &RetryPolicy::default(),
                 &cancel,
+                &secret_refs,
             )
             .await
             {
@@ -355,6 +443,7 @@ impl LlmProvider for MistralProvider {
             let mut byte_stream = resp.bytes_stream();
             let mut sse_parser = SseParser::new();
             let mut state = MistralStreamState::new(&model);
+            state.set_secrets(secrets_owned.clone());
 
             loop {
                 tokio::select! {
@@ -380,13 +469,19 @@ impl LlmProvider for MistralProvider {
                                 for ev in events {
                                     state.process_chunk_into(&ev.data, &mut batch);
                                 }
-                                sender.send_batch(batch).await;
+                                if !sender.send_batch(batch).await {
+                                    return;
+                                }
                                 if state.done {
-                                    break;
+                                    return;
                                 }
                             }
                             Ok(Some(Err(e))) => {
-                                state.mark_error(e.to_string());
+                                state.mark_error(redact_error_body_with_limit(
+                                    &e.without_url().to_string(),
+                                    &secret_refs,
+                                    4096,
+                                ));
                                 let mut batch = Vec::new();
                                 state.finish_into(&mut batch);
                                 sender.send_batch(batch).await;
@@ -443,6 +538,7 @@ pub struct MistralStreamState {
     active_text_index: Option<usize>,
     active_tool_calls: HashMap<usize, ToolCallInProgress>,
     tool_call_id_normalizer: MistralToolCallIdNormalizer,
+    secrets: Vec<String>,
 }
 
 impl MistralStreamState {
@@ -458,19 +554,31 @@ impl MistralStreamState {
             active_text_index: None,
             active_tool_calls: HashMap::new(),
             tool_call_id_normalizer: MistralToolCallIdNormalizer::new(),
+            secrets: Vec::new(),
         }
+    }
+
+    /// Configures active request secrets to redact from any error messages.
+    pub fn set_secrets(&mut self, secrets: Vec<String>) {
+        self.secrets = secrets;
+    }
+
+    fn redact_error(&self, msg: &str) -> String {
+        let refs: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        redact_error_body_with_limit(msg, &refs, 4096)
     }
 
     /// Marks the stream as aborted so `finish_into` emits an aborted terminal event.
     pub fn mark_aborted(&mut self, msg: &str) {
         self.output.stop_reason = StopReason::Aborted;
-        self.output.error_message = Some(msg.to_string());
+        self.output.error_message = Some(self.redact_error(msg));
     }
 
     /// Marks the stream as failed so `finish_into` emits an error terminal event.
     pub fn mark_error(&mut self, msg: impl Into<String>) {
         self.output.stop_reason = StopReason::Error;
-        self.output.error_message = Some(msg.into());
+        let raw = msg.into();
+        self.output.error_message = Some(self.redact_error(&raw));
     }
 
     /// Processes a raw SSE data payload string and sends produced events.
@@ -484,6 +592,9 @@ impl MistralStreamState {
 
     /// Processes a raw SSE data payload string, appending produced events to `events`.
     pub fn process_chunk_into(&mut self, data: &str, events: &mut Vec<AssistantMessageEvent>) {
+        if self.done {
+            return;
+        }
         let trimmed = data.trim();
         if trimmed.is_empty() {
             return;
@@ -498,15 +609,14 @@ impl MistralStreamState {
             return;
         };
 
-        if let Some(err_val) = json.get("error") {
+        if let Some(err_val) = json.get("error").filter(|v| !v.is_null()) {
             self.received_terminal = true;
-            self.output.stop_reason = StopReason::Error;
             let msg = err_val
                 .get("message")
                 .and_then(|m| m.as_str())
                 .or_else(|| err_val.as_str())
                 .unwrap_or("Mistral API error");
-            self.output.error_message = Some(msg.to_string());
+            self.mark_error(msg);
             self.finish_into(events);
             return;
         }
@@ -514,8 +624,7 @@ impl MistralStreamState {
         if let Some(msg_val) = json.get("message").and_then(|m| m.as_str()) {
             if json.get("choices").is_none() {
                 self.received_terminal = true;
-                self.output.stop_reason = StopReason::Error;
-                self.output.error_message = Some(msg_val.to_string());
+                self.mark_error(msg_val);
                 self.finish_into(events);
                 return;
             }
@@ -535,7 +644,7 @@ impl MistralStreamState {
         }
 
         // Usage
-        if let Some(usage) = json.get("usage") {
+        if let Some(usage) = json.get("usage").filter(|u| u.is_object()) {
             let prompt = usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
             let completion = usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
             let total = usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -553,7 +662,11 @@ impl MistralStreamState {
             self.output.usage.total_tokens = if total > 0 {
                 total
             } else {
-                self.output.usage.input + self.output.usage.output + cached
+                self.output
+                    .usage
+                    .input
+                    .saturating_add(self.output.usage.output)
+                    .saturating_add(cached)
             };
             self.output.usage.calculate_cost(&self.model.cost);
         }
@@ -565,13 +678,24 @@ impl MistralStreamState {
         if let Some(finish_reason) = choice.get("finish_reason").and_then(|r| r.as_str()) {
             if !finish_reason.is_empty() {
                 self.received_terminal = true;
-                self.output.stop_reason = match finish_reason {
-                    "stop" => StopReason::Stop,
-                    "tool_calls" => StopReason::ToolUse,
-                    "length" => StopReason::Length,
-                    "error" => StopReason::Error,
-                    _ => StopReason::Stop,
-                };
+                if !matches!(
+                    self.output.stop_reason,
+                    StopReason::Error | StopReason::Aborted
+                ) {
+                    self.output.stop_reason = match finish_reason {
+                        "stop" => StopReason::Stop,
+                        "tool_calls" => StopReason::ToolUse,
+                        "length" | "model_length" => StopReason::Length,
+                        "error" => {
+                            if self.output.error_message.is_none() {
+                                self.output.error_message =
+                                    Some("Mistral stream finished with reason: error".to_string());
+                            }
+                            StopReason::Error
+                        }
+                        _ => StopReason::Stop,
+                    };
+                }
             }
         }
 
@@ -610,14 +734,21 @@ impl MistralStreamState {
         }
 
         // 2. Tool calls
-        if let Some(tool_calls) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+        if let Some(tool_calls) = delta
+            .get("tool_calls")
+            .and_then(|v| v.as_array())
+            .filter(|a| !a.is_empty())
+        {
             // Close active text or thinking before tool calls
             self.flush_text_block(events);
             self.flush_thinking_block(events);
 
             for tc_val in tool_calls {
                 let idx = tc_val.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                let id_opt = tc_val.get("id").and_then(|v| v.as_str());
+                let id_opt = tc_val
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty());
                 let fn_obj = tc_val.get("function");
                 let name_opt = fn_obj.and_then(|f| f.get("name")).and_then(|v| v.as_str());
                 let args_opt = fn_obj.and_then(|f| f.get("arguments")).and_then(|v| v.as_str());
@@ -693,7 +824,7 @@ impl MistralStreamState {
                             events.push(AssistantMessageEvent::ToolCallDelta {
                                 content_index: in_progress.content_index,
                                 delta: args_delta.to_string(),
-                                partial: self.output.metadata_clone(),
+                                partial: self.output.clone(),
                             });
                         }
                     }
@@ -1407,5 +1538,188 @@ mod tests {
             "later provider id must replace the generated id, got {:?}",
             end.id
         );
+    }
+
+    #[test]
+    fn mistral_null_error_model_length_error_message_empty_tool_calls_and_multi_block_delta() {
+        let model = Model {
+            id: "mistral-large-latest".to_string(),
+            api: "mistral-conversations".to_string(),
+            provider: "mistral".to_string(),
+            ..Default::default()
+        };
+
+        // 1. "error": null, "usage": null, empty tool_calls: [], empty id: "" followed by real id,
+        //    and finish_reason "model_length" + saturating usage totals.
+        let mut state = MistralStreamState::new(&model);
+        let mut events = Vec::new();
+        for chunk in [
+            serde_json::json!({
+                "id": "cmpl-m1",
+                "error": null,
+                "usage": null,
+                "choices": [{
+                    "delta": { "content": "Part 1 ", "tool_calls": [] }
+                }]
+            }),
+            serde_json::json!({
+                "choices": [{
+                    "delta": { "content": "Part 2", "tool_calls": [] }
+                }]
+            }),
+            serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "",
+                            "function": { "name": "ping", "arguments": "{\"x\":" }
+                        }]
+                    }
+                }]
+            }),
+            serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "realid999",
+                            "function": { "arguments": "1}" }
+                        }]
+                    },
+                    "finish_reason": "model_length"
+                }],
+                "usage": {
+                    "prompt_tokens": u64::MAX,
+                    "completion_tokens": 5
+                }
+            }),
+        ] {
+            state.process_chunk_into(&chunk.to_string(), &mut events);
+        }
+        let delta = events
+            .iter()
+            .rfind(|ev| matches!(ev, AssistantMessageEvent::ToolCallDelta { .. }))
+            .expect("ToolCallDelta emitted");
+        match delta {
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                partial,
+                ..
+            } => {
+                assert_eq!(*content_index, 1);
+                assert_eq!(partial.content.len(), 2);
+            }
+            _ => unreachable!(),
+        }
+        let res = state.finish_into(&mut events);
+        assert_eq!(res.stop_reason, StopReason::Length);
+        assert_eq!(res.error_message, None);
+        assert_eq!(res.usage.total_tokens, u64::MAX);
+        assert_eq!(res.content.len(), 2);
+        match &res.content[0] {
+            AssistantContentBlock::Text(t) => assert_eq!(t.text, "Part 1 Part 2"),
+            other => panic!("Expected merged Text block, got {other:?}"),
+        }
+        match &res.content[1] {
+            AssistantContentBlock::ToolCall(tc) => assert_eq!(tc.id, "realid999"),
+            other => panic!("Expected ToolCall block, got {other:?}"),
+        }
+
+        // 2. finish_reason "error" sets error_message
+        let mut err_state = MistralStreamState::new(&model);
+        let mut err_events = Vec::new();
+        err_state.process_chunk_into(
+            &serde_json::json!({
+                "choices": [{ "delta": {}, "finish_reason": "error" }]
+            })
+            .to_string(),
+            &mut err_events,
+        );
+        let err_res = err_state.finish_into(&mut err_events);
+        assert_eq!(err_res.stop_reason, StopReason::Error);
+        assert!(err_res.error_message.is_some());
+    }
+
+    #[test]
+    fn mistral_url_preserves_query_params() {
+        assert_eq!(
+            mistral_chat_completions_url("https://proxy.example.com/v1?api-version=2024"),
+            "https://proxy.example.com/v1/chat/completions?api-version=2024"
+        );
+        assert_eq!(
+            mistral_chat_completions_url(
+                "https://proxy.example.com/v1/chat/completions/?api-version=2024"
+            ),
+            "https://proxy.example.com/v1/chat/completions?api-version=2024"
+        );
+        assert_eq!(
+            mistral_chat_completions_url(""),
+            "https://api.mistral.ai/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn mistral_ignores_chunks_after_terminal_error_and_preserves_stop_reason() {
+        let model = Model {
+            id: "mistral-large-latest".to_string(),
+            api: "mistral-conversations".to_string(),
+            provider: "mistral".to_string(),
+            ..Default::default()
+        };
+        let mut state = MistralStreamState::new(&model);
+        let mut events = Vec::new();
+
+        state.process_chunk_into(
+            &serde_json::json!({ "error": { "message": "Service unavailable" } }).to_string(),
+            &mut events,
+        );
+        let len_after_error = events.len();
+        assert!(matches!(
+            events.last(),
+            Some(AssistantMessageEvent::Error {
+                reason: StopReason::Error,
+                ..
+            })
+        ));
+
+        state.process_chunk_into(
+            &serde_json::json!({
+                "choices": [{
+                    "delta": { "content": "trailing" },
+                    "finish_reason": "stop"
+                }]
+            })
+            .to_string(),
+            &mut events,
+        );
+        state.process_chunk_into("[DONE]", &mut events);
+
+        assert_eq!(events.len(), len_after_error);
+        assert_eq!(state.output.stop_reason, StopReason::Error);
+        assert_eq!(
+            state.output.error_message.as_deref(),
+            Some("Service unavailable")
+        );
+
+        // Even before `[DONE]` triggers `done = true`, a subsequent `finish_reason` cannot overwrite `Error`.
+        let mut err_state = MistralStreamState::new(&model);
+        let mut err_events = Vec::new();
+        err_state.process_chunk_into(
+            &serde_json::json!({
+                "choices": [{ "delta": {}, "finish_reason": "error" }]
+            })
+            .to_string(),
+            &mut err_events,
+        );
+        err_state.process_chunk_into(
+            &serde_json::json!({
+                "choices": [{ "delta": {}, "finish_reason": "stop" }]
+            })
+            .to_string(),
+            &mut err_events,
+        );
+        err_state.process_chunk_into("[DONE]", &mut err_events);
+        assert_eq!(err_state.output.stop_reason, StopReason::Error);
     }
 }

@@ -12,20 +12,28 @@ pub struct AssistantEventSender {
 }
 
 impl AssistantEventSender {
-    pub fn push(&self, event: AssistantMessageEvent) {
-        let _ = self.sender.try_send(event);
+    pub fn push(&self, event: AssistantMessageEvent) -> bool {
+        self.sender.try_send(event).is_ok()
     }
 
-    pub async fn send(&self, event: AssistantMessageEvent) {
-        let _ = self.sender.send(event).await;
+    pub fn try_push(
+        &self,
+        event: AssistantMessageEvent,
+    ) -> Result<(), Box<tokio::sync::mpsc::error::TrySendError<AssistantMessageEvent>>> {
+        self.sender.try_send(event).map_err(Box::new)
     }
 
-    pub async fn send_batch(&self, events: Vec<AssistantMessageEvent>) {
+    pub async fn send(&self, event: AssistantMessageEvent) -> bool {
+        self.sender.send(event).await.is_ok()
+    }
+
+    pub async fn send_batch(&self, events: Vec<AssistantMessageEvent>) -> bool {
         for event in events {
             if self.sender.send(event).await.is_err() {
-                break;
+                return false;
             }
         }
+        true
     }
 }
 
@@ -39,7 +47,6 @@ impl AssistantEventStream {
     }
 
     pub async fn collect_final_message(&mut self) -> Result<AssistantMessage> {
-        let mut last_partial: Option<AssistantMessage> = None;
         while let Some(event) = self.next().await {
             match event {
                 AssistantMessageEvent::Done { message, .. } => {
@@ -48,25 +55,19 @@ impl AssistantEventStream {
                 AssistantMessageEvent::Error { error, .. } => {
                     return Ok(error);
                 }
-                AssistantMessageEvent::Start { partial }
-                | AssistantMessageEvent::TextStart { partial, .. }
-                | AssistantMessageEvent::TextEnd { partial, .. }
-                | AssistantMessageEvent::ThinkingStart { partial, .. }
-                | AssistantMessageEvent::ThinkingEnd { partial, .. }
-                | AssistantMessageEvent::ToolCallStart { partial, .. }
-                | AssistantMessageEvent::ToolCallEnd { partial, .. } => {
-                    last_partial = Some(partial);
-                }
-                AssistantMessageEvent::TextDelta { partial, .. }
-                | AssistantMessageEvent::ThinkingDelta { partial, .. }
-                | AssistantMessageEvent::ToolCallDelta { partial, .. } => {
-                    if last_partial.is_none() || !partial.content.is_empty() {
-                        last_partial = Some(partial);
-                    }
-                }
+                AssistantMessageEvent::Start { .. }
+                | AssistantMessageEvent::TextStart { .. }
+                | AssistantMessageEvent::TextDelta { .. }
+                | AssistantMessageEvent::TextEnd { .. }
+                | AssistantMessageEvent::ThinkingStart { .. }
+                | AssistantMessageEvent::ThinkingDelta { .. }
+                | AssistantMessageEvent::ThinkingEnd { .. }
+                | AssistantMessageEvent::ToolCallStart { .. }
+                | AssistantMessageEvent::ToolCallDelta { .. }
+                | AssistantMessageEvent::ToolCallEnd { .. } => {}
             }
         }
-        last_partial.ok_or_else(|| anyhow!("Stream closed without final message or error"))
+        Err(anyhow!("Stream closed without final Done or Error event"))
     }
 }
 
@@ -110,13 +111,13 @@ mod tests {
             timestamp: now_ms(),
         };
 
-        sender.push(AssistantMessageEvent::Start {
+        assert!(sender.push(AssistantMessageEvent::Start {
             partial: message.clone(),
-        });
-        sender.push(AssistantMessageEvent::Done {
+        }));
+        assert!(sender.push(AssistantMessageEvent::Done {
             reason: StopReason::Stop,
             message: message.clone(),
-        });
+        }));
 
         let final_msg = stream.collect_final_message().await.unwrap();
         assert_eq!(final_msg.model, "test-model");
@@ -139,13 +140,63 @@ mod tests {
             timestamp: now_ms(),
         };
 
-        sender.push(AssistantMessageEvent::Error {
+        assert!(sender.push(AssistantMessageEvent::Error {
             reason: StopReason::Error,
             error: error_msg.clone(),
-        });
+        }));
 
         let final_msg = stream.collect_final_message().await.unwrap();
         assert_eq!(final_msg.stop_reason, StopReason::Error);
         assert_eq!(final_msg.error_message.as_deref(), Some("rate limited"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_truncation_without_terminal_event_errors() {
+        let (sender, mut stream) = create_event_stream();
+        let partial = AssistantMessage::empty_for_model(&crate::faux::faux_model());
+        assert!(sender.push(AssistantMessageEvent::Start { partial }));
+        drop(sender);
+        let err = stream.collect_final_message().await.unwrap_err();
+        assert!(err.to_string().contains("without final Done or Error"));
+    }
+
+    #[tokio::test]
+    async fn test_stream_try_push_reports_closed_and_full() {
+        let (sender, stream) = create_event_stream();
+        let partial = AssistantMessage::empty_for_model(&crate::faux::faux_model());
+
+        assert!(sender
+            .try_push(AssistantMessageEvent::Start {
+                partial: partial.clone(),
+            })
+            .is_ok());
+
+        for _ in 1..EVENT_CHANNEL_CAPACITY {
+            assert!(sender
+                .try_push(AssistantMessageEvent::Start {
+                    partial: partial.clone(),
+                })
+                .is_ok());
+        }
+
+        assert!(matches!(
+            sender
+                .try_push(AssistantMessageEvent::Start {
+                    partial: partial.clone(),
+                })
+                .map_err(|e| *e),
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_))
+        ));
+        assert!(!sender.push(AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        }));
+
+        drop(stream);
+        assert!(matches!(
+            sender
+                .try_push(AssistantMessageEvent::Start { partial })
+                .map_err(|e| *e),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_))
+        ));
     }
 }

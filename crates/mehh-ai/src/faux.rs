@@ -85,17 +85,17 @@ impl LlmProvider for FauxProvider {
             let mut message = AssistantMessage::empty_for_model(model);
             message.stop_reason = StopReason::Aborted;
             message.error_message = Some("Request was cancelled".to_string());
-            sender.push(AssistantMessageEvent::Start {
+            let _ = sender.push(AssistantMessageEvent::Start {
                 partial: message.clone(),
             });
-            sender.push(AssistantMessageEvent::Error {
+            let _ = sender.push(AssistantMessageEvent::Error {
                 reason: StopReason::Aborted,
                 error: message,
             });
             return stream;
         }
 
-        let message = {
+        let response_opt = {
             let mut state = crate::lock_recover(&self.inner);
             state.requests.push(RecordedRequest {
                 model: model.clone(),
@@ -103,13 +103,15 @@ impl LlmProvider for FauxProvider {
                 options: options.clone(),
             });
             if !state.responses.is_empty() {
-                match state.responses.remove(0) {
-                    FauxResponse::Message(msg) => msg,
-                    FauxResponse::Handler(h) => h(model, context, options),
-                }
+                Some(state.responses.remove(0))
             } else {
-                faux_assistant_message("faux default response")
+                None
             }
+        };
+        let message = match response_opt {
+            Some(FauxResponse::Message(msg)) => msg,
+            Some(FauxResponse::Handler(h)) => h(model, context, options),
+            None => faux_assistant_message("faux default response"),
         };
 
         let mut partial = AssistantMessage {
@@ -124,52 +126,53 @@ impl LlmProvider for FauxProvider {
             timestamp: message.timestamp,
         };
 
-        sender.push(AssistantMessageEvent::Start {
+        let mut events = Vec::with_capacity(message.content.len() * 3 + 2);
+        events.push(AssistantMessageEvent::Start {
             partial: partial.clone(),
         });
 
         for (index, block) in message.content.iter().enumerate() {
             match block {
                 AssistantContentBlock::Text(t) => {
-                    sender.push(AssistantMessageEvent::TextStart {
+                    events.push(AssistantMessageEvent::TextStart {
                         content_index: index,
                         partial: partial.clone(),
                     });
                     partial
                         .content
                         .push(AssistantContentBlock::Text(t.clone()));
-                    sender.push(AssistantMessageEvent::TextDelta {
+                    events.push(AssistantMessageEvent::TextDelta {
                         content_index: index,
                         delta: t.text.clone(),
                         partial: partial.clone(),
                     });
-                    sender.push(AssistantMessageEvent::TextEnd {
+                    events.push(AssistantMessageEvent::TextEnd {
                         content_index: index,
                         content: t.text.clone(),
                         partial: partial.clone(),
                     });
                 }
                 AssistantContentBlock::Thinking(th) => {
-                    sender.push(AssistantMessageEvent::ThinkingStart {
+                    events.push(AssistantMessageEvent::ThinkingStart {
                         content_index: index,
                         partial: partial.clone(),
                     });
                     partial
                         .content
                         .push(AssistantContentBlock::Thinking(th.clone()));
-                    sender.push(AssistantMessageEvent::ThinkingDelta {
+                    events.push(AssistantMessageEvent::ThinkingDelta {
                         content_index: index,
                         delta: th.thinking.clone(),
                         partial: partial.clone(),
                     });
-                    sender.push(AssistantMessageEvent::ThinkingEnd {
+                    events.push(AssistantMessageEvent::ThinkingEnd {
                         content_index: index,
                         content: th.thinking.clone(),
                         partial: partial.clone(),
                     });
                 }
                 AssistantContentBlock::ToolCall(tc) => {
-                    sender.push(AssistantMessageEvent::ToolCallStart {
+                    events.push(AssistantMessageEvent::ToolCallStart {
                         content_index: index,
                         partial: partial.clone(),
                     });
@@ -177,12 +180,12 @@ impl LlmProvider for FauxProvider {
                         .content
                         .push(AssistantContentBlock::ToolCall(tc.clone()));
                     let delta = serde_json::to_string(&tc.arguments).unwrap_or_default();
-                    sender.push(AssistantMessageEvent::ToolCallDelta {
+                    events.push(AssistantMessageEvent::ToolCallDelta {
                         content_index: index,
                         delta,
                         partial: partial.clone(),
                     });
-                    sender.push(AssistantMessageEvent::ToolCallEnd {
+                    events.push(AssistantMessageEvent::ToolCallEnd {
                         content_index: index,
                         tool_call: tc.clone(),
                         partial: partial.clone(),
@@ -192,15 +195,32 @@ impl LlmProvider for FauxProvider {
         }
 
         if message.stop_reason == StopReason::Error || message.stop_reason == StopReason::Aborted {
-            sender.push(AssistantMessageEvent::Error {
+            events.push(AssistantMessageEvent::Error {
                 reason: message.stop_reason,
                 error: message,
             });
         } else {
-            sender.push(AssistantMessageEvent::Done {
+            events.push(AssistantMessageEvent::Done {
                 reason: message.stop_reason,
                 message,
             });
+        }
+
+        let mut iter = events.into_iter();
+        while let Some(ev) = iter.next() {
+            if let Err(err) = sender.try_push(ev) {
+                if let tokio::sync::mpsc::error::TrySendError::Full(unsent) = *err {
+                    let mut rest = Vec::with_capacity(iter.len() + 1);
+                    rest.push(unsent);
+                    rest.extend(iter);
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        handle.spawn(async move {
+                            let _ = sender.send_batch(rest).await;
+                        });
+                    }
+                }
+                break;
+            }
         }
 
         stream
@@ -363,5 +383,25 @@ mod tests {
 
         assert_eq!(final_message.stop_reason, StopReason::Aborted);
         assert_eq!(final_message.error_message.as_deref(), Some("Request was cancelled"));
+    }
+
+    #[tokio::test]
+    async fn test_faux_handler_can_call_provider_without_deadlock() {
+        let provider = std::sync::Arc::new(FauxProvider::new());
+        let p_clone = std::sync::Arc::clone(&provider);
+        provider.add_handler(move |_, _, _| {
+            let count = p_clone.recorded_requests().len();
+            faux_assistant_message(format!("requests={count}"))
+        });
+
+        let model = faux_model();
+        let mut stream = provider.stream(
+            &model,
+            &Context::default(),
+            &StreamOptions::default(),
+            CancellationToken::new(),
+        );
+        let msg = stream.collect_final_message().await.unwrap();
+        assert_eq!(msg.text_content(), "requests=1");
     }
 }

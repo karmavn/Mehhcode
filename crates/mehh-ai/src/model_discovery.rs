@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::anthropic::is_oauth_token;
-use crate::catalog::builtin_models;
+use crate::catalog::builtin_models_slice;
 use crate::http_safety::{check_url_host_policy, normalize_and_validate_http_url, DnsPolicy};
 use crate::oauth::redact_error_body;
 use crate::types::{Model, ModelCost, ThinkingLevel};
@@ -386,14 +386,13 @@ pub fn infer_reasoning_capability(_provider: &str, model_id: &str) -> bool {
     }
 
     if bare.starts_with("deepseek-r1")
-        || bare.contains("-r1")
-        || bare.starts_with("grok-3")
+        || bare.ends_with("-r1")
+        || bare.contains("-r1-")
+        || bare.starts_with("grok-3-mini")
         || bare.starts_with("grok-4")
         || bare.contains("magistral")
         || bare.starts_with("qwq")
         || bare.contains("-qwq")
-        || bare.contains("qwen3")
-        || bare.contains("qwen-3")
     {
         return true;
     }
@@ -465,6 +464,16 @@ pub fn enrich_discovered_model(
     raw_model: Model,
     builtin_catalog: &[Model],
 ) -> Model {
+    enrich_discovered_model_indexed(provider, raw_model, None, builtin_catalog, None)
+}
+
+fn enrich_discovered_model_indexed(
+    provider: &str,
+    raw_model: Model,
+    explicit_reasoning: Option<bool>,
+    builtin_catalog: &[Model],
+    catalog_index: Option<&HashMap<String, usize>>,
+) -> Model {
     let provider_norm = if provider.trim().is_empty() {
         raw_model.provider.trim().to_ascii_lowercase()
     } else {
@@ -475,22 +484,38 @@ pub fn enrich_discovered_model(
         .map(|spec| spec.api)
         .unwrap_or("openai-completions");
 
-    let catalog_match = builtin_catalog
-        .iter()
-        .find(|m| {
-            m.provider.eq_ignore_ascii_case(&provider_norm)
-                && m.id.eq_ignore_ascii_case(&raw_model.id)
-        })
-        .or_else(|| {
-            let stripped = strip_trailing_date_suffix(&raw_model.id);
-            if stripped.len() == raw_model.id.len() {
-                return None;
-            }
-            builtin_catalog.iter().find(|m| {
-                m.provider.eq_ignore_ascii_case(&provider_norm)
-                    && m.id.eq_ignore_ascii_case(stripped)
+    let catalog_match = if let Some(index_map) = catalog_index {
+        let raw_lower = raw_model.id.to_ascii_lowercase();
+        index_map
+            .get(&raw_lower)
+            .map(|&i| &builtin_catalog[i])
+            .or_else(|| {
+                let stripped = strip_trailing_date_suffix(&raw_model.id);
+                if stripped.len() == raw_model.id.len() {
+                    return None;
+                }
+                index_map
+                    .get(&stripped.to_ascii_lowercase())
+                    .map(|&i| &builtin_catalog[i])
             })
-        });
+    } else {
+        builtin_catalog
+            .iter()
+            .find(|m| {
+                m.provider.eq_ignore_ascii_case(&provider_norm)
+                    && m.id.eq_ignore_ascii_case(&raw_model.id)
+            })
+            .or_else(|| {
+                let stripped = strip_trailing_date_suffix(&raw_model.id);
+                if stripped.len() == raw_model.id.len() {
+                    return None;
+                }
+                builtin_catalog.iter().find(|m| {
+                    m.provider.eq_ignore_ascii_case(&provider_norm)
+                        && m.id.eq_ignore_ascii_case(stripped)
+                })
+            })
+    };
 
     if let Some(cat) = catalog_match {
         let mut enriched = cat.clone();
@@ -502,7 +527,9 @@ pub fn enrich_discovered_model(
         if !raw_model.base_url.trim().is_empty() {
             enriched.base_url = raw_model.base_url;
         }
-        if raw_model.reasoning {
+        if let Some(explicit) = explicit_reasoning {
+            enriched.reasoning = explicit;
+        } else if raw_model.reasoning {
             enriched.reasoning = true;
         }
         if raw_model.headers.is_some() {
@@ -526,9 +553,10 @@ pub fn enrich_discovered_model(
             enriched.base_url = spec.default_base_url.to_string();
         }
     }
-    if !enriched.reasoning {
-        enriched.reasoning = infer_reasoning_capability(&provider_norm, &enriched.id);
-    }
+    enriched.reasoning = match explicit_reasoning {
+        Some(explicit) => explicit,
+        None => enriched.reasoning || infer_reasoning_capability(&provider_norm, &enriched.id),
+    };
     if enriched.context_window == 0 {
         enriched.context_window = default_ctx;
     }
@@ -541,13 +569,23 @@ pub fn enrich_discovered_model(
     enriched
 }
 
-async fn read_bounded_bytes(mut resp: reqwest::Response, max_bytes: usize) -> Result<Vec<u8>, String> {
-    let mut buf = Vec::new();
-    while let Some(chunk) = resp
-        .chunk()
-        .await
-        .map_err(|e| format!("Failed to read response body: {e}"))?
-    {
+async fn read_bounded_bytes(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+    secrets: &[&str],
+) -> Result<Vec<u8>, String> {
+    let initial_cap = resp
+        .content_length()
+        .map(|l| (l as usize).min(max_bytes).min(256 * 1024))
+        .unwrap_or(0);
+    let mut buf = Vec::with_capacity(initial_cap);
+    while let Some(chunk) = resp.chunk().await.map_err(|e| {
+        let clean = redact_error_body(&e.without_url().to_string(), secrets);
+        format!("Failed to read response body: {clean}")
+    })? {
+        if chunk.is_empty() {
+            continue;
+        }
         let remaining = max_bytes.saturating_sub(buf.len());
         if remaining == 0 {
             return Err(format!("Response body exceeded {max_bytes} byte limit"));
@@ -576,19 +614,11 @@ async fn read_error_snippet(resp: reqwest::Response, secrets: &[&str]) -> String
         }
     }
     let raw = String::from_utf8_lossy(&buf);
-    let redacted = redact_error_body(&raw, secrets);
-    let mut chars = redacted.chars();
-    let truncated: String = chars.by_ref().take(MAX_DISCOVERY_ERROR_CHARS).collect();
-    if chars.next().is_some() {
-        format!("{truncated}...")
-    } else {
-        truncated
-    }
+    crate::oauth::redact_error_body_with_limit(&raw, secrets, MAX_DISCOVERY_ERROR_CHARS)
 }
 
 #[derive(Debug, Deserialize)]
 struct AnthropicModelsResponse {
-    #[serde(default)]
     data: Vec<AnthropicModelItem>,
 }
 
@@ -601,7 +631,6 @@ struct AnthropicModelItem {
 
 #[derive(Debug, Deserialize)]
 struct GoogleModelsResponse {
-    #[serde(default)]
     models: Vec<GoogleModelItem>,
 }
 
@@ -623,7 +652,6 @@ struct GoogleModelItem {
 
 #[derive(Debug, Deserialize)]
 struct OpenRouterModelsResponse {
-    #[serde(default)]
     data: Vec<OpenRouterModelItem>,
 }
 
@@ -639,7 +667,7 @@ struct OpenRouterModelItem {
     #[serde(default)]
     pricing: Option<OpenRouterPricing>,
     #[serde(default)]
-    supported_parameters: Vec<String>,
+    supported_parameters: Option<Vec<String>>,
     #[serde(default)]
     architecture: Option<OpenRouterArchitecture>,
 }
@@ -707,7 +735,13 @@ fn parse_per_million_price(raw: Option<&str>) -> f64 {
     raw.and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|v| v.is_finite() && *v >= 0.0)
         .map(|per_tok| per_tok * 1_000_000.0)
+        .filter(|per_m| per_m.is_finite())
         .unwrap_or(0.0)
+}
+
+struct RawDiscoveredModel {
+    model: Model,
+    explicit_reasoning: Option<bool>,
 }
 
 fn parse_anthropic_models(
@@ -715,7 +749,7 @@ fn parse_anthropic_models(
     provider: &str,
     base_url: &str,
     api: &str,
-) -> Result<Vec<Model>, String> {
+) -> Result<Vec<RawDiscoveredModel>, String> {
     let items: Vec<AnthropicModelItem> =
         if let Ok(wrapped) = serde_json::from_slice::<AnthropicModelsResponse>(bytes) {
             wrapped.data
@@ -725,14 +759,27 @@ fn parse_anthropic_models(
         };
     Ok(items
         .into_iter()
-        .filter(|item| !item.id.trim().is_empty())
-        .map(|item| Model {
-            id: item.id.clone(),
-            name: item.display_name.unwrap_or(item.id),
-            api: api.to_string(),
-            provider: provider.to_string(),
-            base_url: base_url.to_string(),
-            ..Default::default()
+        .filter_map(|item| {
+            let id = item.id.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let name = item
+                .display_name
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| id.clone());
+            Some(RawDiscoveredModel {
+                model: Model {
+                    id,
+                    name,
+                    api: api.to_string(),
+                    provider: provider.to_string(),
+                    base_url: base_url.to_string(),
+                    ..Default::default()
+                },
+                explicit_reasoning: None,
+            })
         })
         .collect())
 }
@@ -742,7 +789,7 @@ fn parse_google_models(
     provider: &str,
     base_url: &str,
     api: &str,
-) -> Result<Vec<Model>, String> {
+) -> Result<Vec<RawDiscoveredModel>, String> {
     let parsed: GoogleModelsResponse = serde_json::from_slice(bytes)
         .map_err(|e| format!("Failed to parse Google models response: {e}"))?;
 
@@ -771,24 +818,28 @@ fn parse_google_models(
         {
             continue;
         }
-        let explicit_thinking = match &item.thinking {
-            Some(serde_json::Value::Bool(b)) => *b,
-            Some(serde_json::Value::Object(_)) => true,
-            _ => false,
+        let explicit_reasoning = match &item.thinking {
+            Some(serde_json::Value::Bool(b)) => Some(*b),
+            Some(serde_json::Value::Object(_)) => Some(true),
+            _ => None,
         };
-        models.push(Model {
-            id: id.clone(),
-            name: item
-                .display_name
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(id),
-            api: api.to_string(),
-            provider: provider.to_string(),
-            base_url: base_url.to_string(),
-            reasoning: explicit_thinking,
-            context_window: item.input_token_limit.unwrap_or(0),
-            max_tokens: item.output_token_limit.unwrap_or(0),
-            ..Default::default()
+        models.push(RawDiscoveredModel {
+            model: Model {
+                id: id.clone(),
+                name: item
+                    .display_name
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(id),
+                api: api.to_string(),
+                provider: provider.to_string(),
+                base_url: base_url.to_string(),
+                reasoning: explicit_reasoning.unwrap_or(false),
+                context_window: item.input_token_limit.unwrap_or(0),
+                max_tokens: item.output_token_limit.unwrap_or(0),
+                ..Default::default()
+            },
+            explicit_reasoning,
         });
     }
     Ok(models)
@@ -799,17 +850,23 @@ fn parse_openrouter_models(
     provider: &str,
     base_url: &str,
     api: &str,
-) -> Result<Vec<Model>, String> {
+) -> Result<Vec<RawDiscoveredModel>, String> {
     let parsed: OpenRouterModelsResponse = serde_json::from_slice(bytes)
         .map_err(|e| format!("Failed to parse OpenRouter models response: {e}"))?;
 
     Ok(parsed
         .data
         .into_iter()
-        .filter(|item| !item.id.trim().is_empty())
-        .map(|item| {
-            let reasoning = item.supported_parameters.iter().any(|p| {
-                p.eq_ignore_ascii_case("reasoning") || p.eq_ignore_ascii_case("include_reasoning")
+        .filter_map(|item| {
+            let id = item.id.trim().to_string();
+            if id.is_empty() {
+                return None;
+            }
+            let explicit_reasoning = item.supported_parameters.as_ref().map(|params| {
+                params.iter().any(|p| {
+                    p.eq_ignore_ascii_case("reasoning")
+                        || p.eq_ignore_ascii_case("include_reasoning")
+                })
             });
             let cost = if let Some(pricing) = &item.pricing {
                 ModelCost {
@@ -830,25 +887,29 @@ fn parse_openrouter_models(
                         .collect()
                 })
                 .unwrap_or_default();
-            Model {
-                id: item.id.clone(),
-                name: item
-                    .name
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or(item.id),
-                api: api.to_string(),
-                provider: provider.to_string(),
-                base_url: base_url.to_string(),
-                reasoning,
-                input,
-                cost,
-                context_window: item.context_length.unwrap_or(0),
-                max_tokens: item
-                    .top_provider
-                    .and_then(|tp| tp.max_completion_tokens)
-                    .unwrap_or(0),
-                ..Default::default()
-            }
+            Some(RawDiscoveredModel {
+                model: Model {
+                    id: id.clone(),
+                    name: item
+                        .name
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(id),
+                    api: api.to_string(),
+                    provider: provider.to_string(),
+                    base_url: base_url.to_string(),
+                    reasoning: explicit_reasoning.unwrap_or(false),
+                    input,
+                    cost,
+                    context_window: item.context_length.unwrap_or(0),
+                    max_tokens: item
+                        .top_provider
+                        .and_then(|tp| tp.max_completion_tokens)
+                        .unwrap_or(0),
+                    ..Default::default()
+                },
+                explicit_reasoning,
+            })
         })
         .collect())
 }
@@ -858,7 +919,7 @@ fn parse_openai_models(
     provider: &str,
     base_url: &str,
     api: &str,
-) -> Result<Vec<Model>, String> {
+) -> Result<Vec<RawDiscoveredModel>, String> {
     let items = match serde_json::from_slice::<OpenAiModelsEnvelope>(bytes)
         .map_err(|e| format!("Failed to parse OpenAI-compatible models response: {e}"))?
     {
@@ -870,25 +931,68 @@ fn parse_openai_models(
 
     Ok(items
         .into_iter()
-        .filter(|item| !item.id.trim().is_empty())
-        .filter(|item| !is_openai || !is_non_chat_openai_id(&item.id))
-        .map(|item| Model {
-            id: item.id.clone(),
-            name: item
-                .name
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(item.id),
-            api: api.to_string(),
-            provider: provider.to_string(),
-            base_url: base_url.to_string(),
-            context_window: item.context_length.unwrap_or(0),
-            max_tokens: item.max_tokens.unwrap_or(0),
-            ..Default::default()
+        .filter_map(|item| {
+            let id = item.id.trim().to_string();
+            if id.is_empty() || (is_openai && is_non_chat_openai_id(&id)) {
+                return None;
+            }
+            Some(RawDiscoveredModel {
+                model: Model {
+                    id: id.clone(),
+                    name: item
+                        .name
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or(id),
+                    api: api.to_string(),
+                    provider: provider.to_string(),
+                    base_url: base_url.to_string(),
+                    context_window: item.context_length.unwrap_or(0),
+                    max_tokens: item.max_tokens.unwrap_or(0),
+                    ..Default::default()
+                },
+                explicit_reasoning: None,
+            })
         })
         .collect())
 }
 
+fn append_discovery_path_and_query(
+    base: &reqwest::Url,
+    extra_segments: &[&str],
+    query_pairs: &[(&str, &str)],
+) -> Result<reqwest::Url, String> {
+    let mut url = base.clone();
+    url.set_fragment(None);
+    {
+        let mut segs = url
+            .path_segments_mut()
+            .map_err(|_| "Base URL cannot have path segments".to_string())?;
+        segs.pop_if_empty();
+        segs.extend(extra_segments);
+    }
+    if !query_pairs.is_empty() {
+        let mut qp = url.query_pairs_mut();
+        for &(k, v) in query_pairs {
+            qp.append_pair(k, v);
+        }
+    }
+    Ok(url)
+}
+
+fn sanitize_url_for_error(url: &reqwest::Url, secrets: &[&str]) -> String {
+    let mut clean = url.clone();
+    clean.set_query(None);
+    clean.set_fragment(None);
+    crate::oauth::redact_error_body(clean.as_ref(), secrets)
+}
+
 /// Fetches and enriches the live model list from a provider API endpoint.
+///
+/// # Security
+/// Callers must pass a `reqwest::Client` constructed via [`crate::http_safety::build_safe_http_client`]
+/// (redirects disabled and connect-time [`crate::http_safety::SafeDnsResolver`]) so redirects or
+/// DNS rebinding cannot forward API keys or reach blocked targets.
 pub async fn fetch_provider_models(
     client: &reqwest::Client,
     provider: &str,
@@ -906,27 +1010,36 @@ pub async fn fetch_provider_models(
 
     let clean_base = parsed_url.as_str().trim_end_matches('/').to_string();
     let trimmed_key = api_key.map(str::trim).filter(|k| !k.is_empty());
+    let secret_slice: [&str; 1];
+    let secrets: &[&str] = if let Some(key) = trimmed_key {
+        secret_slice = [key];
+        &secret_slice
+    } else {
+        &[]
+    };
 
     let canonical_api = api_override
         .map(str::trim)
         .filter(|a| !a.is_empty())
         .or_else(|| find_provider_spec(&provider_norm).map(|s| s.api))
-        .unwrap_or("openai-completions");
+        .unwrap_or("openai-completions")
+        .to_ascii_lowercase();
 
-    let (request_url, mut req) = match provider_norm.as_str() {
-        "anthropic" => {
-            let needs_v1 = !clean_base.ends_with("/v1")
+    let (request_url, mut req) = match canonical_api.as_str() {
+        "anthropic-messages" => {
+            let needs_v1 = !parsed_url.path().trim_end_matches('/').ends_with("/v1")
                 && parsed_url
                     .host_str()
                     .is_some_and(|h| h.eq_ignore_ascii_case("api.anthropic.com"))
                 && (parsed_url.path().is_empty() || parsed_url.path() == "/");
-            let url = if needs_v1 {
-                format!("{clean_base}/v1/models?limit=100")
+            let segments: &[&str] = if needs_v1 {
+                &["v1", "models"]
             } else {
-                format!("{clean_base}/models?limit=100")
+                &["models"]
             };
+            let url = append_discovery_path_and_query(&parsed_url, segments, &[("limit", "100")])?;
             let mut rb = client
-                .get(&url)
+                .get(url.clone())
                 .header("anthropic-version", "2023-06-01");
             if let Some(key) = trimmed_key {
                 if is_oauth_token(key) {
@@ -939,25 +1052,18 @@ pub async fn fetch_provider_models(
             }
             (url, rb)
         }
-        "google" => {
-            let url = format!("{clean_base}/models?pageSize=200");
-            let mut rb = client.get(&url);
+        "google-generative-ai" | "google-vertex" => {
+            let url =
+                append_discovery_path_and_query(&parsed_url, &["models"], &[("pageSize", "200")])?;
+            let mut rb = client.get(url.clone());
             if let Some(key) = trimmed_key {
                 rb = rb.header("x-goog-api-key", key);
             }
             (url, rb)
         }
-        "openrouter" => {
-            let url = format!("{clean_base}/models");
-            let mut rb = client.get(&url);
-            if let Some(key) = trimmed_key {
-                rb = rb.bearer_auth(key);
-            }
-            (url, rb)
-        }
         _ => {
-            let url = format!("{clean_base}/models");
-            let mut rb = client.get(&url);
+            let url = append_discovery_path_and_query(&parsed_url, &["models"], &[])?;
+            let mut rb = client.get(url.clone());
             if let Some(key) = trimmed_key {
                 rb = rb.bearer_auth(key);
             }
@@ -971,20 +1077,18 @@ pub async fn fetch_provider_models(
     };
 
     req = req.timeout(MODEL_DISCOVERY_TIMEOUT);
+    let safe_err_url = sanitize_url_for_error(&request_url, secrets);
 
     let resp = tokio::time::timeout(MODEL_DISCOVERY_TIMEOUT, req.send())
         .await
-        .map_err(|_| format!("Timed out fetching models from {provider_norm} ({request_url})"))?
-        .map_err(|e| format!("Failed to fetch models from {provider_norm}: {e}"))?;
+        .map_err(|_| format!("Timed out fetching models from {provider_norm} ({safe_err_url})"))?
+        .map_err(|e| {
+            let sanitized = redact_error_body(&e.without_url().to_string(), secrets);
+            format!("Failed to fetch models from {provider_norm} ({safe_err_url}): {sanitized}")
+        })?;
 
     let status = resp.status();
     if !status.is_success() {
-        let secret_slice: [&str; 1] = [trimmed_key.unwrap_or_default()];
-        let secrets = if trimmed_key.is_some() {
-            &secret_slice[..]
-        } else {
-            &[]
-        };
         let snippet = read_error_snippet(resp, secrets).await;
         return Err(format!(
             "Provider {provider_norm} returned HTTP {status}: {snippet}"
@@ -993,24 +1097,29 @@ pub async fn fetch_provider_models(
 
     let bytes = tokio::time::timeout(
         MODEL_DISCOVERY_TIMEOUT,
-        read_bounded_bytes(resp, MAX_MODEL_LIST_BYTES),
+        read_bounded_bytes(resp, MAX_MODEL_LIST_BYTES, secrets),
     )
     .await
-    .map_err(|_| format!("Timed out reading models from {provider_norm}"))??;
+    .map_err(|_| format!("Timed out reading models from {provider_norm} ({safe_err_url})"))??;
 
-    let raw_models = match provider_norm.as_str() {
-        "anthropic" => parse_anthropic_models(&bytes, &provider_norm, &clean_base, canonical_api)?,
-        "google" => parse_google_models(&bytes, &provider_norm, &clean_base, canonical_api)?,
-        "openrouter" => parse_openrouter_models(&bytes, &provider_norm, &clean_base, canonical_api)?,
-        _ => parse_openai_models(&bytes, &provider_norm, &clean_base, canonical_api)?,
+    let raw_models = match canonical_api.as_str() {
+        "anthropic-messages" => {
+            parse_anthropic_models(&bytes, &provider_norm, &clean_base, &canonical_api)?
+        }
+        "google-generative-ai" | "google-vertex" => {
+            parse_google_models(&bytes, &provider_norm, &clean_base, &canonical_api)?
+        }
+        _ if provider_norm == "openrouter" => {
+            parse_openrouter_models(&bytes, &provider_norm, &clean_base, &canonical_api)?
+        }
+        _ => parse_openai_models(&bytes, &provider_norm, &clean_base, &canonical_api)?,
     };
 
-    let catalog = builtin_models();
+    let catalog = builtin_models_slice();
     let mut seen: HashSet<String> = HashSet::new();
     let mut enriched = Vec::with_capacity(raw_models.len());
 
-    // Keep featured catalog order ahead of extra discovered models? Wait: preserve response order
-    // while deduplicating case-insensitively and preferring earlier occurrence cleanly.
+    // Preserve catalog order for known featured models, followed by remaining discovered models.
     let mut catalog_index: HashMap<String, usize> = HashMap::new();
     for (idx, m) in catalog.iter().enumerate() {
         if m.provider.eq_ignore_ascii_case(&provider_norm) {
@@ -1019,20 +1128,24 @@ pub async fn fetch_provider_models(
     }
 
     for raw in raw_models {
-        let key = raw.id.trim().to_ascii_lowercase();
+        let key = raw.model.id.trim().to_ascii_lowercase();
         if key.is_empty() || !seen.insert(key) {
             continue;
         }
-        let mut model = enrich_discovered_model(&provider_norm, raw, &catalog);
-        if let Some(api) = api_override.map(str::trim).filter(|a| !a.is_empty()) {
-            model.api = api.to_string();
+        let mut model = enrich_discovered_model_indexed(
+            &provider_norm,
+            raw.model,
+            raw.explicit_reasoning,
+            catalog,
+            Some(&catalog_index),
+        );
+        if api_override.is_some_and(|a| !a.trim().is_empty()) {
+            model.api = canonical_api.clone();
         }
         enriched.push(model);
     }
 
-    // Place built-in featured catalog matches first (preserving catalog order), followed by the
-    // remaining discovered models in API order.
-    enriched.sort_by_key(|m| {
+    enriched.sort_by_cached_key(|m| {
         let key = strip_trailing_date_suffix(&m.id).to_ascii_lowercase();
         catalog_index
             .get(&m.id.to_ascii_lowercase())
@@ -1316,7 +1429,7 @@ mod tests {
 
     #[test]
     fn test_enrich_and_thinking_profiles() {
-        let catalog = builtin_models();
+        let catalog = builtin_models_slice();
 
         let claude_opus = enrich_discovered_model(
             "anthropic",
@@ -1324,7 +1437,7 @@ mod tests {
                 id: "claude-opus-4-6".to_string(),
                 ..Default::default()
             },
-            &catalog,
+            catalog,
         );
         assert!(claude_opus.reasoning);
         assert_eq!(claude_opus.context_window, 200_000);
@@ -1340,7 +1453,7 @@ mod tests {
                 id: "o3".to_string(),
                 ..Default::default()
             },
-            &catalog,
+            catalog,
         );
         let p_o3 = model_thinking_profile(&o3);
         assert!(p_o3.supported);
@@ -1354,7 +1467,7 @@ mod tests {
                 id: "gpt-4.1".to_string(),
                 ..Default::default()
             },
-            &catalog,
+            catalog,
         );
         assert!(!gpt41.reasoning);
         let p_gpt41 = model_thinking_profile(&gpt41);
@@ -1367,7 +1480,7 @@ mod tests {
                 id: "gemini-2.5-pro".to_string(),
                 ..Default::default()
             },
-            &catalog,
+            catalog,
         );
         let p_gem = model_thinking_profile(&gem_pro);
         assert!(p_gem.supported);
@@ -1375,5 +1488,157 @@ mod tests {
         assert_eq!(p_gem.default_level, ThinkingLevel::Medium);
 
         assert!(find_provider_spec("OpenRouter").is_some());
+    }
+
+    #[tokio::test]
+    async fn test_discovery_rejects_wrong_schema_envelopes_fail_closed() {
+        let client = reqwest::Client::new();
+        for (prov, body) in [
+            ("anthropic", r#"{"error":"bad"}"#),
+            ("google", r#"{"error":{"message":"bad"}}"#),
+            ("openrouter", r#"{"error":"bad"}"#),
+            ("anthropic", "{}"),
+            ("google", "{}"),
+            ("openrouter", "{}"),
+        ] {
+            let (base_url, _rx) = spawn_mock_http_server("200 OK", body).await;
+            let err = fetch_provider_models(&client, prov, &base_url, Some("key"), None)
+                .await
+                .expect_err("wrong schema HTTP 200 must fail closed");
+            assert!(
+                err.to_ascii_lowercase().contains("parse"),
+                "expected parse error for {prov} on {body}, got: {err}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_discovery_respects_explicit_false_reasoning_and_tightened_heuristics() {
+        let client = reqwest::Client::new();
+
+        // OpenRouter explicitly omits reasoning from supported_parameters on qwen3 & grok-3
+        let or_body = serde_json::json!({
+            "data": [
+                {
+                    "id": "qwen/qwen3-coder",
+                    "name": "Qwen3 Coder",
+                    "supported_parameters": ["temperature", "tools"]
+                },
+                {
+                    "id": "x-ai/grok-3",
+                    "name": "Grok 3",
+                    "supported_parameters": ["temperature"]
+                }
+            ]
+        })
+        .to_string();
+        let (or_url, _rx1) = spawn_mock_http_server("200 OK", &or_body).await;
+        let or_models = fetch_provider_models(&client, "openrouter", &or_url, Some("sk-or"), None)
+            .await
+            .unwrap();
+        assert!(!or_models.iter().find(|m| m.id == "qwen/qwen3-coder").unwrap().reasoning);
+        assert!(!or_models.iter().find(|m| m.id == "x-ai/grok-3").unwrap().reasoning);
+
+        // Google explicitly declares thinking: false even on gemini-2.5-*
+        let g_body = serde_json::json!({
+            "models": [
+                {
+                    "name": "models/gemini-2.5-custom-nothink",
+                    "supportedGenerationMethods": ["generateContent"],
+                    "thinking": false
+                }
+            ]
+        })
+        .to_string();
+        let (g_url, _rx2) = spawn_mock_http_server("200 OK", &g_body).await;
+        let g_models = fetch_provider_models(&client, "google", &g_url, Some("gk"), None)
+            .await
+            .unwrap();
+        assert!(!g_models[0].reasoning);
+
+        // Tightened heuristics: non-thinking qwen3 and non-mini grok-3 stay false;
+        // explicit thinking / grok-3-mini / -r1 stay true.
+        assert!(!infer_reasoning_capability("openai", "qwen3-coder"));
+        assert!(!infer_reasoning_capability("xai", "grok-3"));
+        assert!(infer_reasoning_capability("xai", "grok-3-mini"));
+        assert!(infer_reasoning_capability("openrouter", "qwen/qwen3-235b-a22b-thinking"));
+        assert!(!infer_reasoning_capability("custom", "model-r1x"));
+    }
+
+    #[tokio::test]
+    async fn test_discovery_dispatches_by_canonical_api_preserves_query_redacts_urls_and_trims_ids() {
+        let client = reqwest::Client::new();
+        let anth_body = serde_json::json!({
+            "data": [{ "id": " claude-sonnet-4-5 ", "display_name": "Claude Sonnet 4.5" }]
+        })
+        .to_string();
+        let (base, rx) = spawn_mock_http_server("200 OK", &anth_body).await;
+        let models = fetch_provider_models(
+            &client,
+            "my-claude-proxy",
+            &format!("{base}/proxy?api-version=2024-10-01"),
+            Some("sk-proxy-secret"),
+            Some("anthropic-messages"),
+        )
+        .await
+        .expect("custom anthropic proxy should succeed");
+
+        let req_raw = rx.await.unwrap();
+        assert!(
+            req_raw.starts_with("GET /proxy/models?api-version=2024-10-01&limit=100 "),
+            "unexpected request line: {req_raw}"
+        );
+        let req_lower = req_raw.to_ascii_lowercase();
+        assert!(req_lower.contains("x-api-key: sk-proxy-secret"));
+        assert!(req_lower.contains("anthropic-version: 2023-06-01"));
+        assert_eq!(models[0].id, "claude-sonnet-4-5");
+
+        // Transport error must strip URL query parameters and redact secrets.
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_addr = closed.local_addr().unwrap();
+        drop(closed);
+        let err = fetch_provider_models(
+            &client,
+            "my-proxy",
+            &format!("http://{closed_addr}/v1?token=super_secret_qp"),
+            Some("sk-proxy-secret"),
+            None,
+        )
+        .await
+        .expect_err("closed port must fail");
+        assert!(!err.contains("super_secret_qp"), "query leaked in error: {err}");
+        assert!(!err.contains("sk-proxy-secret"), "secret leaked in error: {err}");
+
+        // Mixed-case canonical API override still dispatches via Anthropic handler & headers.
+        let (base_mixed, rx_mixed) = spawn_mock_http_server("200 OK", &anth_body).await;
+        let mixed = fetch_provider_models(
+            &client,
+            "my-claude-proxy",
+            &base_mixed,
+            Some("sk-mixed-case"),
+            Some("Anthropic-Messages"),
+        )
+        .await
+        .expect("mixed-case canonical_api must match anthropic-messages");
+        let raw_mixed = rx_mixed.await.unwrap().to_ascii_lowercase();
+        assert!(
+            raw_mixed.contains("x-api-key: sk-mixed-case")
+                && raw_mixed.contains("anthropic-version: 2023-06-01"),
+            "mixed-case api_override fell back to OpenAI headers: {raw_mixed}"
+        );
+        assert_eq!(mixed[0].api, "anthropic-messages");
+    }
+
+    #[test]
+    fn test_parse_per_million_price_rejects_overflow_and_sanitize_url_redacts() {
+        assert_eq!(parse_per_million_price(Some("1e308")), 0.0);
+        assert_eq!(parse_per_million_price(Some("0.000002")), 2.0);
+
+        let url = reqwest::Url::parse("https://sk-testsecretkey123456@api.example.com/v1/my-path-secret?key=abc")
+            .unwrap();
+        let sanitized = sanitize_url_for_error(&url, &["my-path-secret"]);
+        assert!(!sanitized.contains("key=abc"));
+        assert!(!sanitized.contains("sk-testsecretkey123456"));
+        assert!(!sanitized.contains("my-path-secret"));
     }
 }

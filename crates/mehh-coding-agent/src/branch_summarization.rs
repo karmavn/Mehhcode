@@ -1,13 +1,13 @@
 //! Automatic branch summarization for session tree navigation.
 
 use anyhow::{anyhow, Result};
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use tokio_util::sync::CancellationToken;
 
 use crate::compaction::{
     estimate_message_tokens, serialize_conversation, SUMMARIZATION_SYSTEM_PROMPT,
 };
-use crate::session::{SessionEntry, SessionEntryKind, SessionManager};
+use crate::session::{ContextEditReplacement, SessionEntry, SessionEntryKind, SessionManager};
 use mehh_ai::{Context, LlmProvider, Message, Model, UserContent, UserMessage};
 
 pub const BRANCH_SUMMARY_PREAMBLE: &str = r#"The user explored a different conversation branch before returning here.
@@ -74,25 +74,31 @@ pub fn collect_entries_for_branch_summary(
         }
     };
 
-    let mut old_path = Vec::new();
+    let mut old_path: Vec<&SessionEntry> = Vec::new();
     let mut curr = Some(old_leaf);
-    let mut old_path_set = HashSet::new();
+    let mut old_path_set: HashSet<&str> = HashSet::new();
 
     while let Some(id) = curr {
         if let Some(entry) = session.get_entry(id) {
-            old_path.push(entry.clone());
-            old_path_set.insert(id.to_string());
+            if !old_path_set.insert(entry.id.as_str()) {
+                break;
+            }
+            old_path.push(entry);
             curr = entry.parent_id.as_deref();
         } else {
             break;
         }
     }
 
-    let mut target_path = Vec::new();
+    let mut target_path: Vec<&SessionEntry> = Vec::new();
     let mut curr_t = Some(target_id);
+    let mut target_visited: HashSet<&str> = HashSet::new();
     while let Some(id) = curr_t {
         if let Some(entry) = session.get_entry(id) {
-            target_path.push(entry.clone());
+            if !target_visited.insert(entry.id.as_str()) {
+                break;
+            }
+            target_path.push(entry);
             curr_t = entry.parent_id.as_deref();
         } else {
             break;
@@ -113,7 +119,7 @@ pub fn collect_entries_for_branch_summary(
         if Some(entry.id.as_str()) == common_ancestor_id.as_deref() {
             break;
         }
-        entries.push(entry);
+        entries.push(entry.clone());
     }
     entries.reverse();
 
@@ -128,41 +134,120 @@ pub fn prepare_branch_entries(entries: &[SessionEntry], token_budget: usize) -> 
     let mut read_files_set = BTreeSet::new();
     let mut modified_files_set = BTreeSet::new();
 
+    let mut edits: HashMap<&str, &Option<ContextEditReplacement>> = HashMap::new();
+    for entry in entries {
+        if let SessionEntryKind::ContextEdit {
+            target_id,
+            replacement,
+        } = &entry.kind
+        {
+            edits.insert(target_id.as_str(), replacement);
+        }
+    }
+
+    let mut removed_result_ids: HashSet<String> = HashSet::new();
+    let mut removed_call_ids: HashSet<String> = HashSet::new();
     let mut messages = Vec::new();
     let mut total_tokens = 0;
 
     for entry in entries.iter().rev() {
-        let entry_msgs = match &entry.kind {
-            SessionEntryKind::Message { message } => vec![message.clone()],
+        if let Some(edit) = edits.get(entry.id.as_str()) {
+            if edit.is_none() {
+                if let SessionEntryKind::Message { message } = &entry.kind {
+                    match message {
+                        Message::ToolResult(tr) => {
+                            removed_result_ids.insert(tr.tool_call_id.clone());
+                        }
+                        Message::Assistant(a) => {
+                            for b in &a.content {
+                                if let mehh_ai::AssistantContentBlock::ToolCall(tc) = b {
+                                    removed_call_ids.insert(tc.id.clone());
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                continue;
+            }
+        }
+        let replacement = edits.get(entry.id.as_str()).and_then(|r| r.as_ref());
+
+        let entry_msg = match &entry.kind {
+            SessionEntryKind::Message { message } => {
+                if let Some(rep) = replacement {
+                    let mut msg = message.clone();
+                    match &mut msg {
+                        Message::User(u) => {
+                            u.content = rep.content.to_user_content();
+                        }
+                        Message::Assistant(a) => {
+                            a.content = rep.content.to_assistant_content();
+                        }
+                        Message::ToolResult(tr) => {
+                            tr.content = rep.content.to_tool_result_content();
+                        }
+                        Message::System(s) => {
+                            s.content = rep.content.to_text();
+                        }
+                    }
+                    Some(msg)
+                } else {
+                    Some(message.clone())
+                }
+            }
             SessionEntryKind::CustomMessage { content, .. } => {
+                let effective_content = if let Some(rep) = replacement {
+                    rep.content.to_user_content()
+                } else {
+                    content.clone()
+                };
                 let ts = crate::session::parse_iso8601_or_now(&entry.timestamp);
-                vec![Message::User(UserMessage {
-                    content: content.clone(),
+                Some(Message::User(UserMessage {
+                    content: effective_content,
                     timestamp: ts,
-                })]
+                }))
             }
             SessionEntryKind::BranchSummary { summary, .. } => {
                 let ts = crate::session::parse_iso8601_or_now(&entry.timestamp);
-                vec![Message::User(UserMessage {
+                Some(Message::User(UserMessage {
                     content: UserContent::Text(format!(
                         "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n{summary}\n</summary>"
                     )),
                     timestamp: ts,
-                })]
+                }))
             }
-            _ => Vec::new(),
+            SessionEntryKind::Compaction { summary, .. } => {
+                let ts = crate::session::parse_iso8601_or_now(&entry.timestamp);
+                Some(Message::User(UserMessage {
+                    content: UserContent::Text(format!(
+                        "The following is a summary of earlier conversation in this branch:\n\n<summary>\n{summary}\n</summary>"
+                    )),
+                    timestamp: ts,
+                }))
+            }
+            _ => None,
         };
 
-        if entry_msgs.is_empty() {
+        let Some(msg) = entry_msg else {
             continue;
+        };
+
+        let entry_tokens = estimate_message_tokens(&msg);
+        let within_budget = total_tokens + entry_tokens <= token_budget;
+        let allow_summary_overrun = matches!(
+            &entry.kind,
+            SessionEntryKind::Compaction { .. } | SessionEntryKind::BranchSummary { .. }
+        ) && total_tokens < (token_budget * 9 / 10);
+        let must_keep_latest = messages.is_empty();
+
+        if !within_budget && !allow_summary_overrun && !must_keep_latest {
+            break;
         }
 
-        let mut entry_tokens = 0;
-        for msg in &entry_msgs {
-            entry_tokens += estimate_message_tokens(msg);
-
-            if let Message::Assistant(ast) = msg {
-                for call in ast.tool_calls() {
+        if let Message::Assistant(ast) = &msg {
+            for b in &ast.content {
+                if let mehh_ai::AssistantContentBlock::ToolCall(call) = b {
                     if let Some(path_val) = call.arguments.get("path").and_then(|v| v.as_str()) {
                         match call.name.as_str() {
                             "read" => {
@@ -178,26 +263,30 @@ pub fn prepare_branch_entries(entries: &[SessionEntry], token_budget: usize) -> 
             }
         }
 
-        if token_budget > 0 && total_tokens + entry_tokens > token_budget {
-            if matches!(
-                &entry.kind,
-                SessionEntryKind::Compaction { .. } | SessionEntryKind::BranchSummary { .. }
-            ) && total_tokens < (token_budget * 9 / 10)
-            {
-                for msg in entry_msgs.into_iter().rev() {
-                    messages.push(msg);
-                }
-                total_tokens += entry_tokens;
-            }
+        messages.push(msg);
+        total_tokens += entry_tokens;
+        if !within_budget {
             break;
         }
-
-        for msg in entry_msgs.into_iter().rev() {
-            messages.push(msg);
-        }
-        total_tokens += entry_tokens;
     }
     messages.reverse();
+
+    if !removed_result_ids.is_empty() || !removed_call_ids.is_empty() {
+        messages.retain_mut(|msg| match msg {
+            Message::ToolResult(tr) => !removed_call_ids.contains(&tr.tool_call_id),
+            Message::Assistant(a) if !removed_result_ids.is_empty() => {
+                a.content.retain(|block| match block {
+                    mehh_ai::AssistantContentBlock::ToolCall(tc) => {
+                        !removed_result_ids.contains(&tc.id)
+                    }
+                    _ => true,
+                });
+                !a.content.is_empty()
+            }
+            _ => true,
+        });
+        total_tokens = messages.iter().map(estimate_message_tokens).sum();
+    }
 
     let read_files: Vec<String> = read_files_set
         .into_iter()
@@ -229,14 +318,14 @@ pub async fn generate_branch_summary(
         128_000
     };
     let reserve = reserve_tokens.unwrap_or(16_384);
-    let token_budget = context_window.saturating_sub(reserve);
+    let token_budget = context_window.saturating_sub(reserve).max(1024);
 
     let prep = prepare_branch_entries(entries, token_budget);
     if prep.messages.is_empty() {
         return Ok("No content to summarize".to_string());
     }
 
-    let conversation_text = serialize_conversation(&prep.messages);
+    let mut conversation_text = serialize_conversation(&prep.messages);
     let instructions = if let Some(ci) = custom_instructions {
         if !ci.trim().is_empty() {
             format!("{BRANCH_SUMMARY_PROMPT}\n\nAdditional focus: {}", ci.trim())
@@ -246,6 +335,25 @@ pub async fn generate_branch_summary(
     } else {
         BRANCH_SUMMARY_PROMPT.to_string()
     };
+
+    let total_budget_chars = context_window
+        .saturating_sub(8192)
+        .saturating_mul(3)
+        .max(4096);
+    let overhead_chars =
+        SUMMARIZATION_SYSTEM_PROMPT.chars().count() + instructions.chars().count() + 64;
+    let conv_budget_chars = total_budget_chars.saturating_sub(overhead_chars).max(1024);
+    if conversation_text.chars().count() > conv_budget_chars {
+        if let Some((byte_start, _)) = conversation_text
+            .char_indices()
+            .rev()
+            .nth(conv_budget_chars - 1)
+        {
+            let newest = conversation_text[byte_start..].to_string();
+            conversation_text =
+                format!("[... older history truncated for summarization]\n\n{newest}");
+        }
+    }
 
     let prompt_text =
         format!("<conversation>\n{conversation_text}\n</conversation>\n\n{instructions}");
@@ -418,5 +526,231 @@ mod tests {
         // Very small budget should trim older entries
         let prep_trimmed = prepare_branch_entries(&entries, 10);
         assert!(prep_trimmed.messages.len() <= 1);
+    }
+
+    #[test]
+    fn prepare_branch_entries_includes_compaction_and_skips_dropped_file_ops() {
+        let mut old_ast = mehh_ai::faux_assistant_message("z".repeat(400));
+        old_ast
+            .content
+            .push(mehh_ai::AssistantContentBlock::ToolCall(ToolCall {
+                id: "c_old".to_string(),
+                name: "edit".to_string(),
+                arguments: [("path".to_string(), serde_json::json!("src/dropped.rs"))]
+                    .into_iter()
+                    .collect(),
+                arguments_error: None,
+                thought_signature: None,
+            }));
+
+        let entries = vec![
+            SessionEntry {
+                id: "e1".to_string(),
+                parent_id: None,
+                timestamp: "2026-11-15T10:00:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::Assistant(old_ast),
+                },
+            },
+            SessionEntry {
+                id: "c1".to_string(),
+                parent_id: Some("e1".to_string()),
+                timestamp: "2026-11-15T10:01:00.000Z".to_string(),
+                kind: SessionEntryKind::Compaction {
+                    summary: "compacted checkpoint".to_string(),
+                    first_kept_entry_id: "e1".to_string(),
+                    tokens_before: 500,
+                },
+            },
+        ];
+
+        // Budget allows c1 (with overrun allowance) but drops e1:
+        // e1's file ops must NOT leak into modified_files, and c1 must be included.
+        let prep = prepare_branch_entries(&entries, 50);
+        assert_eq!(prep.messages.len(), 1);
+        assert!(prep.modified_files.is_empty());
+        let conv = serialize_conversation(&prep.messages);
+        assert!(conv.contains("compacted checkpoint"));
+    }
+
+    #[test]
+    fn collect_entries_for_branch_summary_terminates_on_parent_cycle() {
+        let dir = std::env::temp_dir().join(format!("mehh_bs_cycle_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cyclic.jsonl");
+        {
+            let mut s = SessionManager::open_file(&file, &dir).unwrap();
+            s.append_message(Message::User(UserMessage {
+                content: UserContent::Text("one".to_string()),
+                timestamp: now_ms(),
+            }))
+            .unwrap();
+        }
+        // Rewrite with cyclic parentId links and reopen.
+        let raw = std::fs::read_to_string(&file).unwrap();
+        let header_line = raw.lines().next().unwrap();
+        let e1 = serde_json::json!({
+            "id": "n1",
+            "parentId": "n2",
+            "timestamp": "2026-11-15T10:00:00.000Z",
+            "type": "message",
+            "message": Message::User(UserMessage { content: UserContent::Text("a".into()), timestamp: 1 })
+        });
+        let e2 = serde_json::json!({
+            "id": "n2",
+            "parentId": "n1",
+            "timestamp": "2026-11-15T10:01:00.000Z",
+            "type": "message",
+            "message": Message::User(UserMessage { content: UserContent::Text("b".into()), timestamp: 2 })
+        });
+        std::fs::write(&file, format!("{header_line}\n{e1}\n{e2}\n")).unwrap();
+        let session = SessionManager::open_existing_file(&file, dir.clone()).unwrap();
+        let res = collect_entries_for_branch_summary(&session, Some("n1"), "n2");
+        assert!(res.entries.len() <= 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn generate_branch_summary_clamps_small_model_budget_and_handles_oversized_last_entry() {
+        let mut model = mehh_ai::faux_model();
+        model.context_window = 8192; // <= 16k: previously saturating_sub(16_384) == 0 (unlimited!)
+
+        let old_marker = "OLD_OUT_OF_BUDGET_MARKER";
+        let entries = vec![
+            SessionEntry {
+                id: "e1".to_string(),
+                parent_id: None,
+                timestamp: "2026-11-15T10:00:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::User(UserMessage {
+                        content: UserContent::Text(format!("{old_marker} {}", "a".repeat(20_000))),
+                        timestamp: now_ms(),
+                    }),
+                },
+            },
+            SessionEntry {
+                id: "e2".to_string(),
+                parent_id: Some("e1".to_string()),
+                timestamp: "2026-11-15T10:01:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::User(UserMessage {
+                        content: UserContent::Text("RECENT_MARKER".to_string()),
+                        timestamp: now_ms(),
+                    }),
+                },
+            },
+        ];
+
+        let faux = mehh_ai::FauxProvider::with_responses(vec![
+            mehh_ai::faux_assistant_message("## Goal\nTrimmed summary"),
+        ]);
+        let summary = generate_branch_summary(
+            &entries,
+            &model,
+            &faux,
+            None,
+            None,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert!(summary.contains("Trimmed summary"));
+        let req = faux.recorded_requests();
+        let prompt = match &req[0].context.messages[0] {
+            Message::User(u) => u.content.text(),
+            _ => panic!("expected user"),
+        };
+        assert!(prompt.contains("RECENT_MARKER"));
+        assert!(
+            !prompt.contains(old_marker),
+            "<= 16k model must not treat 0 budget as unlimited: {prompt}"
+        );
+
+        // Oversized single last entry must NOT return "No content to summarize"
+        let oversized = vec![SessionEntry {
+            id: "big".to_string(),
+            parent_id: None,
+            timestamp: "2026-11-15T10:02:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::User(UserMessage {
+                    content: UserContent::Text("x".repeat(40_000)),
+                    timestamp: now_ms(),
+                }),
+            },
+        }];
+        let faux2 = mehh_ai::FauxProvider::with_responses(vec![
+            mehh_ai::faux_assistant_message("## Goal\nOversized handled"),
+        ]);
+        let sum2 = generate_branch_summary(
+            &oversized,
+            &model,
+            &faux2,
+            None,
+            None,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_ne!(sum2, "No content to summarize");
+        assert!(sum2.contains("Oversized handled"));
+    }
+
+    #[test]
+    fn prepare_branch_entries_applies_context_edits() {
+        let entries = vec![
+            SessionEntry {
+                id: "u1".to_string(),
+                parent_id: None,
+                timestamp: "2026-11-15T10:00:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::User(UserMessage {
+                        content: UserContent::Text("secret hidden".to_string()),
+                        timestamp: now_ms(),
+                    }),
+                },
+            },
+            SessionEntry {
+                id: "u2".to_string(),
+                parent_id: Some("u1".to_string()),
+                timestamp: "2026-11-15T10:01:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::User(UserMessage {
+                        content: UserContent::Text("original".to_string()),
+                        timestamp: now_ms(),
+                    }),
+                },
+            },
+            SessionEntry {
+                id: "ce1".to_string(),
+                parent_id: Some("u2".to_string()),
+                timestamp: "2026-11-15T10:02:00.000Z".to_string(),
+                kind: SessionEntryKind::ContextEdit {
+                    target_id: "u1".to_string(),
+                    replacement: None,
+                },
+            },
+            SessionEntry {
+                id: "ce2".to_string(),
+                parent_id: Some("ce1".to_string()),
+                timestamp: "2026-11-15T10:03:00.000Z".to_string(),
+                kind: SessionEntryKind::ContextEdit {
+                    target_id: "u2".to_string(),
+                    replacement: Some(crate::session::ContextEditReplacement {
+                        content: crate::session::ContextEditableContent::Text(
+                            "edited replacement".to_string(),
+                        ),
+                    }),
+                },
+            },
+        ];
+
+        let prep = prepare_branch_entries(&entries, 100_000);
+        assert_eq!(prep.messages.len(), 1);
+        match &prep.messages[0] {
+            Message::User(u) => assert_eq!(u.content.text(), "edited replacement"),
+            other => panic!("expected user message, got {other:?}"),
+        }
     }
 }

@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use crate::types::{
     AssistantContentBlock, AssistantMessage, ImageContent, Message, Model, StopReason,
-    TextContent, ToolCall, ToolResultContentBlock, ToolResultMessage, UserContent,
+    TextContent, ToolResultContentBlock, ToolResultMessage, UserContent,
     UserContentBlock, UserMessage, now_ms,
 };
 
@@ -143,38 +143,30 @@ fn to_base36(mut val: u32) -> String {
     digits.into_iter().rev().collect()
 }
 
-fn downgrade_unsupported_images(messages: &[Message], model: &Model) -> Vec<Message> {
-    if model.input.iter().any(|i| i == "image") {
-        return messages.to_vec();
-    }
-
-    messages
-        .iter()
-        .map(|msg| match msg {
-            Message::User(u) => {
-                if let UserContent::Blocks(ref blocks) = u.content {
-                    Message::User(UserMessage {
-                        content: UserContent::Blocks(replace_images_with_placeholder(
-                            blocks,
-                            NON_VISION_USER_IMAGE_PLACEHOLDER,
-                        )),
-                        timestamp: u.timestamp,
-                    })
-                } else {
-                    Message::User(u.clone())
-                }
+/// Sanitizes a tool call ID to `[A-Za-z0-9_-]` and caps its length to `max_len`.
+/// When truncation is required, appends a deterministic `_<hash>` suffix derived
+/// from the original ID so distinct long IDs sharing a prefix do not collide.
+pub(crate) fn sanitize_and_cap_tool_call_id(id: &str, max_len: usize) -> String {
+    let sanitized: String = id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
             }
-            Message::ToolResult(tr) => {
-                let mut tr_clone = tr.clone();
-                tr_clone.content = replace_images_with_placeholder(
-                    &tr.content,
-                    NON_VISION_TOOL_IMAGE_PLACEHOLDER,
-                );
-                Message::ToolResult(tr_clone)
-            }
-            _ => msg.clone(),
         })
-        .collect()
+        .collect();
+    if sanitized.len() <= max_len {
+        return sanitized;
+    }
+    let full_hash = short_hash(id);
+    let hash = &full_hash[..full_hash.len().min(8)];
+    if max_len <= hash.len() + 1 {
+        return hash[..max_len.min(hash.len())].to_string();
+    }
+    let prefix_len = max_len - hash.len() - 1;
+    format!("{}_{}", &sanitized[..prefix_len], hash)
 }
 
 pub fn transform_messages<F>(
@@ -186,31 +178,66 @@ where
     F: FnMut(&str, &Model, &AssistantMessage) -> String,
 {
     let mut tool_call_id_map: HashMap<String, String> = HashMap::new();
-    let image_aware_messages = downgrade_unsupported_images(messages, model);
+    let supports_images = model.input.iter().any(|i| i == "image");
 
     // First pass: transform messages (unsupported image downgrade, thinking blocks, tool call ID normalization)
-    let mut transformed = Vec::with_capacity(image_aware_messages.len());
-    for msg in image_aware_messages {
+    let mut transformed = Vec::with_capacity(messages.len());
+    for msg in messages {
         match msg {
-            Message::System(_) | Message::User(_) => {
-                transformed.push(msg);
+            Message::System(_) => {
+                transformed.push(msg.clone());
             }
-            Message::ToolResult(mut tr) => {
-                if let Some(normalized_id) = tool_call_id_map.get(&tr.tool_call_id) {
-                    if normalized_id != &tr.tool_call_id {
-                        tr.tool_call_id = normalized_id.clone();
+            Message::User(u) => {
+                if !supports_images {
+                    if let UserContent::Blocks(ref blocks) = u.content {
+                        transformed.push(Message::User(UserMessage {
+                            content: UserContent::Blocks(replace_images_with_placeholder(
+                                blocks,
+                                NON_VISION_USER_IMAGE_PLACEHOLDER,
+                            )),
+                            timestamp: u.timestamp,
+                        }));
+                        continue;
                     }
                 }
-                transformed.push(Message::ToolResult(tr));
+                transformed.push(Message::User(u.clone()));
             }
-            Message::Assistant(mut assistant_msg) => {
+            Message::ToolResult(tr) => {
+                let content = if supports_images {
+                    tr.content.clone()
+                } else {
+                    replace_images_with_placeholder(
+                        &tr.content,
+                        NON_VISION_TOOL_IMAGE_PLACEHOLDER,
+                    )
+                };
+                let tool_call_id = tool_call_id_map
+                    .get(&tr.tool_call_id)
+                    .filter(|normalized_id| *normalized_id != &tr.tool_call_id)
+                    .cloned()
+                    .unwrap_or_else(|| tr.tool_call_id.clone());
+                transformed.push(Message::ToolResult(ToolResultMessage {
+                    tool_call_id,
+                    tool_name: tr.tool_name.clone(),
+                    content,
+                    details: tr.details.clone(),
+                    is_error: tr.is_error,
+                    timestamp: tr.timestamp,
+                    duration_ms: tr.duration_ms,
+                    usage: tr.usage.clone(),
+                }));
+            }
+            Message::Assistant(assistant_msg) => {
                 let is_same_model = assistant_msg.provider == model.provider
                     && assistant_msg.api == model.api
                     && assistant_msg.model == model.id;
+                let is_errored_or_aborted = matches!(
+                    assistant_msg.stop_reason,
+                    StopReason::Error | StopReason::Aborted
+                );
 
-                let original_content = std::mem::take(&mut assistant_msg.content);
-                let mut transformed_content = Vec::new();
-                for block in original_content {
+                let mut transformed_content = Vec::with_capacity(assistant_msg.content.len());
+                for block in &assistant_msg.content {
                     match block {
                         AssistantContentBlock::Thinking(thinking) => {
                             if !is_same_model {
@@ -220,31 +247,35 @@ where
                                 || thinking.thinking_signature.is_some()
                                 || !thinking.thinking.trim().is_empty()
                             {
-                                transformed_content.push(AssistantContentBlock::Thinking(thinking));
+                                transformed_content
+                                    .push(AssistantContentBlock::Thinking(thinking.clone()));
                             }
                         }
                         AssistantContentBlock::Text(text) => {
                             if is_same_model {
-                                transformed_content.push(AssistantContentBlock::Text(text));
+                                transformed_content.push(AssistantContentBlock::Text(text.clone()));
                             } else {
                                 transformed_content.push(AssistantContentBlock::Text(TextContent {
-                                    text: text.text,
+                                    text: text.text.clone(),
                                     text_signature: None,
                                 }));
                             }
                         }
-                        AssistantContentBlock::ToolCall(mut tool_call) => {
+                        AssistantContentBlock::ToolCall(tool_call) => {
+                            let mut tool_call = tool_call.clone();
                             if !is_same_model {
                                 if tool_call.thought_signature.is_some() {
                                     tool_call.thought_signature = None;
                                 }
-                                if let Some(ref mut normalize) = normalize_tool_call_id {
-                                    let normalized_id =
-                                        normalize(&tool_call.id, model, &assistant_msg);
-                                    if normalized_id != tool_call.id {
-                                        tool_call_id_map
-                                            .insert(tool_call.id.clone(), normalized_id.clone());
-                                        tool_call.id = normalized_id;
+                                if !is_errored_or_aborted {
+                                    if let Some(ref mut normalize) = normalize_tool_call_id {
+                                        let normalized_id =
+                                            normalize(&tool_call.id, model, assistant_msg);
+                                        if normalized_id != tool_call.id {
+                                            tool_call_id_map
+                                                .insert(tool_call.id.clone(), normalized_id.clone());
+                                            tool_call.id = normalized_id;
+                                        }
                                     }
                                 }
                             }
@@ -253,28 +284,32 @@ where
                     }
                 }
 
-                assistant_msg.content = transformed_content;
-                transformed.push(Message::Assistant(assistant_msg));
+                if !is_same_model && transformed_content.is_empty() {
+                    continue;
+                }
+                let mut assistant_out = assistant_msg.metadata_clone();
+                assistant_out.content = transformed_content;
+                transformed.push(Message::Assistant(assistant_out));
             }
         }
     }
 
     // Second pass: insert synthetic empty tool results for orphaned tool calls
-    let mut result = Vec::new();
-    let mut pending_tool_calls: Vec<ToolCall> = Vec::new();
+    let mut result = Vec::with_capacity(transformed.len());
+    let mut pending_tool_calls: Vec<(String, String)> = Vec::new();
     let mut existing_tool_result_ids: HashSet<String> = HashSet::new();
     let mut held_system_messages: Vec<Message> = Vec::new();
 
     let close_pending_tool_calls = |result: &mut Vec<Message>,
-                                        pending_tool_calls: &mut Vec<ToolCall>,
+                                        pending_tool_calls: &mut Vec<(String, String)>,
                                         existing_tool_result_ids: &mut HashSet<String>,
                                         held_system_messages: &mut Vec<Message>| {
         if !pending_tool_calls.is_empty() {
-            for tc in pending_tool_calls.iter() {
-                if !existing_tool_result_ids.contains(&tc.id) {
+            for (tc_id, tc_name) in pending_tool_calls.iter() {
+                if !existing_tool_result_ids.contains(tc_id) {
                     result.push(Message::ToolResult(ToolResultMessage {
-                        tool_call_id: tc.id.clone(),
-                        tool_name: tc.name.clone(),
+                        tool_call_id: tc_id.clone(),
+                        tool_name: tc_name.clone(),
                         content: vec![ToolResultContentBlock::Text(TextContent {
                             text: "No result provided".to_string(),
                             text_signature: None,
@@ -310,16 +345,27 @@ where
                     continue;
                 }
 
-                let tool_calls = assistant_msg.tool_calls();
-                if !tool_calls.is_empty() {
-                    pending_tool_calls = tool_calls;
+                for block in &assistant_msg.content {
+                    if let AssistantContentBlock::ToolCall(tc) = block {
+                        pending_tool_calls.push((tc.id.clone(), tc.name.clone()));
+                    }
+                }
+                if !pending_tool_calls.is_empty() {
                     existing_tool_result_ids.clear();
                 }
 
                 result.push(Message::Assistant(assistant_msg));
             }
             Message::ToolResult(tr) => {
-                existing_tool_result_ids.insert(tr.tool_call_id.clone());
+                if !pending_tool_calls
+                    .iter()
+                    .any(|(tc_id, _)| tc_id == &tr.tool_call_id)
+                {
+                    continue;
+                }
+                if !existing_tool_result_ids.insert(tr.tool_call_id.clone()) {
+                    continue;
+                }
                 result.push(Message::ToolResult(tr));
             }
             Message::System(_) => {
@@ -354,7 +400,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{ModelCost, SystemMessage, ThinkingContent, Usage};
+    use crate::types::{ModelCost, SystemMessage, ThinkingContent, ToolCall, Usage};
 
     fn make_test_model(id: &str, provider: &str, api: &str, images: bool) -> Model {
         Model {
@@ -801,6 +847,17 @@ mod tests {
                 ]),
                 timestamp: 1,
             }),
+            Message::Assistant(make_assistant_message(
+                &non_vision_model,
+                vec![AssistantContentBlock::ToolCall(ToolCall {
+                    id: "call_1".to_string(),
+                    name: "capture".to_string(),
+                    arguments: serde_json::Map::new(),
+                    arguments_error: None,
+                    thought_signature: None,
+                })],
+                StopReason::ToolUse,
+            )),
             Message::ToolResult(ToolResultMessage {
                 tool_call_id: "call_1".to_string(),
                 tool_name: "capture".to_string(),
@@ -819,7 +876,7 @@ mod tests {
         // Non-vision model: images replaced with collapsed placeholders
         let result_non_vision =
             transform_messages(&messages, &non_vision_model, None::<fn(&str, &Model, &AssistantMessage) -> String>);
-        assert_eq!(result_non_vision.len(), 2);
+        assert_eq!(result_non_vision.len(), 3);
 
         if let Message::User(ref u) = result_non_vision[0] {
             if let UserContent::Blocks(ref blocks) = u.content {
@@ -847,7 +904,7 @@ mod tests {
             panic!("Expected user message");
         }
 
-        if let Message::ToolResult(ref tr) = result_non_vision[1] {
+        if let Message::ToolResult(ref tr) = result_non_vision[2] {
             assert_eq!(tr.content.len(), 1);
             match &tr.content[0] {
                 ToolResultContentBlock::Text(t) => {
@@ -995,5 +1052,188 @@ mod tests {
             ToolResultContentBlock::Text(t) => assert_eq!(t.text, "Script error"),
             _ => panic!("Expected text at content[2]"),
         }
+    }
+
+    #[test]
+    fn dropped_errored_assistant_turn_drops_orphaned_tool_result_and_skips_normalize() {
+        let target = make_test_model("claude-sonnet-4.6", "anthropic", "anthropic-messages", true);
+        let other = make_test_model("gpt-5", "openai", "openai-completions", true);
+
+        let messages = vec![
+            Message::User(UserMessage {
+                content: UserContent::Text("go".to_string()),
+                timestamp: 1,
+            }),
+            Message::Assistant(make_assistant_message(
+                &other,
+                vec![AssistantContentBlock::ToolCall(ToolCall {
+                    id: "call_err".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::Map::new(),
+                    arguments_error: None,
+                    thought_signature: None,
+                })],
+                StopReason::Error,
+            )),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "call_err".to_string(),
+                tool_name: "bash".to_string(),
+                content: vec![ToolResultContentBlock::Text(TextContent {
+                    text: "stale".to_string(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: 2,
+                duration_ms: None,
+                usage: None,
+            }),
+        ];
+
+        let mut normalized_ids = Vec::new();
+        let result = transform_messages(
+            &messages,
+            &target,
+            Some(|id: &str, _m: &Model, _ast: &AssistantMessage| -> String {
+                normalized_ids.push(id.to_string());
+                format!("norm_{id}")
+            }),
+        );
+        assert!(normalized_ids.is_empty());
+        assert_eq!(result.len(), 1);
+        assert!(matches!(result[0], Message::User(_)));
+    }
+
+    #[test]
+    fn normalize_tool_call_id_observes_non_empty_assistant_content() {
+        let target = make_test_model("claude-sonnet-4.6", "anthropic", "anthropic-messages", true);
+        let other = make_test_model("gpt-5", "openai", "openai-completions", true);
+
+        let messages = vec![Message::Assistant(make_assistant_message(
+            &other,
+            vec![
+                AssistantContentBlock::Text(TextContent {
+                    text: "calling tool".to_string(),
+                    text_signature: None,
+                }),
+                AssistantContentBlock::ToolCall(ToolCall {
+                    id: "raw_id".to_string(),
+                    name: "bash".to_string(),
+                    arguments: serde_json::Map::new(),
+                    arguments_error: None,
+                    thought_signature: None,
+                }),
+            ],
+            StopReason::ToolUse,
+        ))];
+
+        let mut observed_len = 0usize;
+        let _ = transform_messages(
+            &messages,
+            &target,
+            Some(|id: &str, _m: &Model, ast: &AssistantMessage| -> String {
+                observed_len = ast.content.len();
+                format!("norm_{id}")
+            }),
+        );
+        assert_eq!(observed_len, 2);
+    }
+
+    #[test]
+    fn empty_cross_model_thinking_only_assistant_turn_is_skipped() {
+        let target = make_test_model("claude-sonnet-4.6", "anthropic", "anthropic-messages", true);
+        let other = make_test_model("gpt-5", "openai", "openai-completions", true);
+
+        let messages = vec![
+            Message::User(UserMessage {
+                content: UserContent::Text("hi".to_string()),
+                timestamp: 1,
+            }),
+            Message::Assistant(make_assistant_message(
+                &other,
+                vec![AssistantContentBlock::Thinking(ThinkingContent {
+                    thinking: "internal thoughts only".to_string(),
+                    thinking_signature: Some("sig".to_string()),
+                    redacted: None,
+                })],
+                StopReason::Stop,
+            )),
+            Message::User(UserMessage {
+                content: UserContent::Text("follow-up".to_string()),
+                timestamp: 2,
+            }),
+        ];
+
+        let result = transform_messages(
+            &messages,
+            &target,
+            None::<fn(&str, &Model, &AssistantMessage) -> String>,
+        );
+        assert_eq!(result.len(), 2);
+        assert!(matches!(result[0], Message::User(_)));
+        assert!(matches!(result[1], Message::User(_)));
+    }
+
+    #[test]
+    fn duplicate_tool_results_for_same_call_id_are_deduplicated() {
+        let model = make_test_model("claude-sonnet-4.6", "anthropic", "anthropic-messages", true);
+        let mk_result = |text: &str| {
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "call_dup".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![ToolResultContentBlock::Text(TextContent {
+                    text: text.to_string(),
+                    text_signature: None,
+                })],
+                details: None,
+                is_error: false,
+                timestamp: 2,
+                duration_ms: None,
+                usage: None,
+            })
+        };
+        let messages = vec![
+            Message::Assistant(make_assistant_message(
+                &model,
+                vec![AssistantContentBlock::ToolCall(ToolCall {
+                    id: "call_dup".to_string(),
+                    name: "read".to_string(),
+                    arguments: serde_json::Map::new(),
+                    arguments_error: None,
+                    thought_signature: None,
+                })],
+                StopReason::ToolUse,
+            )),
+            mk_result("first"),
+            mk_result("duplicate"),
+        ];
+        let result = transform_messages(
+            &messages,
+            &model,
+            None::<fn(&str, &Model, &AssistantMessage) -> String>,
+        );
+        assert_eq!(result.len(), 2);
+        match &result[1] {
+            Message::ToolResult(tr) => match &tr.content[0] {
+                ToolResultContentBlock::Text(t) => assert_eq!(t.text, "first"),
+                other => panic!("unexpected block: {other:?}"),
+            },
+            other => panic!("expected tool result, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sanitize_and_cap_tool_call_id_avoids_long_prefix_collisions() {
+        let prefix = "a".repeat(70);
+        let id1 = format!("{prefix}_1");
+        let id2 = format!("{prefix}_2");
+        let n1 = sanitize_and_cap_tool_call_id(&id1, 64);
+        let n2 = sanitize_and_cap_tool_call_id(&id2, 64);
+        assert!(n1.len() <= 64);
+        assert!(n2.len() <= 64);
+        assert_ne!(n1, n2);
+        assert!(n1
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
     }
 }

@@ -23,8 +23,8 @@ pub use powershell::PowerShellTool;
 pub use read::ReadTool;
 pub use undo_edit::{EditUndoStore, FileSnapshot, UndoEditTool};
 pub use web::{
-    ProviderId, UrlPolicyChecker, WebConfig, WebFetchTool, WebProviderChoice, WebRuntime,
-    WebSearchTool,
+    LazyWebRuntime, ProviderId, UrlPolicyChecker, WebConfig, WebFetchTool, WebProviderChoice,
+    WebRuntime, WebSearchTool,
 };
 pub use write::WriteTool;
 
@@ -145,14 +145,12 @@ pub fn select_coding_tools_with_web(
     }
 
     if wants("web_search") || wants("web_fetch") {
-        let runtime = WebRuntime::try_new(web)
-            .map(Arc::new)
-            .map_err(|e| e.to_string());
+        let runtime = Arc::new(LazyWebRuntime::new(web));
         if wants("web_search") {
-            selected.push(Arc::new(WebSearchTool::new(runtime.clone())));
+            selected.push(Arc::new(WebSearchTool::lazy(runtime.clone())));
         }
         if wants("web_fetch") {
-            selected.push(Arc::new(WebFetchTool::new(runtime)));
+            selected.push(Arc::new(WebFetchTool::lazy(runtime)));
         }
     }
 
@@ -164,6 +162,24 @@ pub fn select_coding_tools_with_web(
             .unwrap_or(usize::MAX)
     });
     Ok(selected)
+}
+
+/// Creates only the enabled web tools (`web_search`, `web_fetch`) sharing one [`LazyWebRuntime`].
+pub fn create_web_tools(web: WebConfig) -> Vec<Arc<dyn AgentTool>> {
+    let want_search = web.enabled && web.provider != WebProviderChoice::Disabled;
+    let want_fetch = web.enabled;
+    if !want_search && !want_fetch {
+        return Vec::new();
+    }
+    let runtime = Arc::new(LazyWebRuntime::new(web));
+    let mut out: Vec<Arc<dyn AgentTool>> = Vec::with_capacity(2);
+    if want_search {
+        out.push(Arc::new(WebSearchTool::lazy(runtime.clone())));
+    }
+    if want_fetch {
+        out.push(Arc::new(WebFetchTool::lazy(runtime)));
+    }
+    out
 }
 
 #[cfg(test)]

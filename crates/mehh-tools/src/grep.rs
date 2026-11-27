@@ -40,9 +40,10 @@ fn truncate_line(s: &str, max_len: usize) -> String {
     }
 }
 
-/// Returns (formatted lines, number of matches, and the index inside
-/// `lines` of each match row). The last part lets the parallel assembly cut
-/// by match count without accidentally dropping context lines.
+/// Returns (formatted lines, number of matches, and the exclusive end index in
+/// `lines` for keeping `1..=match_count` matches). Cutting at `match_cut_ends[k - 1]`
+/// preserves trailing context for the `k`-th match without leaking leading context
+/// lines belonging to the dropped `(k + 1)`-th match.
 fn search_in_file(
     path_display: &str,
     content: &str,
@@ -50,30 +51,34 @@ fn search_in_file(
     context: usize,
     remaining_limit: usize,
 ) -> (Vec<String>, usize, Vec<usize>) {
-    let mut match_positions = Vec::new();
+    let mut match_cut_ends = Vec::new();
 
     if context == 0 {
         let mut output_lines = Vec::new();
         let mut match_count = 0usize;
-        for (idx, raw_line) in content.split('\n').enumerate() {
-            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        for (idx, raw_line) in content.split_inclusive('\n').enumerate() {
+            let line = raw_line.strip_suffix('\n').unwrap_or(raw_line);
+            let line = line.strip_suffix('\r').unwrap_or(line);
             if re.is_match(line) {
-                match_positions.push(output_lines.len());
                 match_count += 1;
                 let line_num = idx + 1;
                 let line_text = truncate_line(line, 500);
                 output_lines.push(format!("{}:{}:{}", path_display, line_num, line_text));
+                match_cut_ends.push(output_lines.len());
                 if match_count >= remaining_limit {
                     break;
                 }
             }
         }
-        return (output_lines, match_count, match_positions);
+        return (output_lines, match_count, match_cut_ends);
     }
 
     let lines: Vec<&str> = content
-        .split('\n')
-        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .split_inclusive('\n')
+        .map(|l| {
+            let l = l.strip_suffix('\n').unwrap_or(l);
+            l.strip_suffix('\r').unwrap_or(l)
+        })
         .collect();
 
     let mut match_indices = Vec::new();
@@ -87,11 +92,12 @@ fn search_in_file(
     }
 
     if match_indices.is_empty() {
-        return (Vec::new(), 0, match_positions);
+        return (Vec::new(), 0, match_cut_ends);
     }
 
     let match_count = match_indices.len();
     let mut output_lines = Vec::new();
+    let mut emitted_src_lines = Vec::new();
 
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for &idx in &match_indices {
@@ -106,15 +112,18 @@ fn search_in_file(
         ranges.push((start, end));
     }
 
-    let match_set: std::collections::HashSet<usize> = match_indices.iter().copied().collect();
+    let mut match_cursor = 0usize;
 
     for (start, end) in ranges {
         for (offset, line) in lines[start..end].iter().enumerate() {
             let idx = start + offset;
             let line_num = idx + 1;
             let line_text = truncate_line(line, 500);
-            if match_set.contains(&idx) {
-                match_positions.push(output_lines.len());
+            emitted_src_lines.push(idx);
+            while match_cursor < match_indices.len() && match_indices[match_cursor] < idx {
+                match_cursor += 1;
+            }
+            if match_indices.get(match_cursor) == Some(&idx) {
                 output_lines.push(format!("{}:{}:{}", path_display, line_num, line_text));
             } else {
                 output_lines.push(format!("{}-{}-{}", path_display, line_num, line_text));
@@ -122,12 +131,37 @@ fn search_in_file(
         }
     }
 
-    (output_lines, match_count, match_positions)
+    for (k, &match_line) in match_indices.iter().enumerate() {
+        let max_src = match_line.saturating_add(context);
+        let upper_bound = match_indices
+            .get(k + 1)
+            .copied()
+            .map_or(max_src, |next_m| max_src.min(next_m.saturating_sub(1)));
+        let cut = emitted_src_lines.partition_point(|&src| src <= upper_bound);
+        match_cut_ends.push(cut);
+    }
+
+    (output_lines, match_count, match_cut_ends)
+}
+
+fn read_grep_file_bounded(path: &std::path::Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(GREP_MAX_FILE_BYTES.saturating_add(1))
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > GREP_MAX_FILE_BYTES {
+        return Ok(None);
+    }
+    Ok(Some(buf))
 }
 
 const GREP_MAX_FILE_BYTES: u64 = 10 * 1024 * 1024;
 const GREP_MAX_OUTPUT_BYTES: usize = 100 * 1024;
 const GREP_MAX_FILES: usize = 20_000;
+const GREP_MAX_LIMIT: u64 = 5_000;
+const GREP_MAX_CONTEXT: u64 = 50;
+const GREP_BATCH_SIZE: usize = 64;
 
 #[async_trait]
 impl AgentTool for GrepTool {
@@ -212,7 +246,8 @@ impl AgentTool for GrepTool {
 
         let ignore_case = params
             .get("ignoreCase")
-            .or_else(|| params.get("ignore_case"))
+            .filter(|v| !v.is_null())
+            .or_else(|| params.get("ignore_case").filter(|v| !v.is_null()))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
@@ -224,13 +259,14 @@ impl AgentTool for GrepTool {
         let context = params
             .get("context")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
+            .unwrap_or(0)
+            .min(GREP_MAX_CONTEXT) as usize;
 
         let limit = params
             .get("limit")
             .and_then(|v| v.as_u64())
             .unwrap_or(100)
-            .max(1) as usize;
+            .clamp(1, GREP_MAX_LIMIT) as usize;
 
         let regex_pattern = if literal {
             regex::escape(pattern)
@@ -262,6 +298,8 @@ impl AgentTool for GrepTool {
         };
 
         let target_path = self.resolve_path(&search_path_str)?;
+        let explicit_protected =
+            context::path_targets_protected_credential(&search_path_str, &target_path);
         let cwd = self.cwd.clone();
         let cancel_clone = cancel.clone();
 
@@ -306,8 +344,17 @@ impl AgentTool for GrepTool {
                 }
                 // Check the whole bounded file for NUL bytes, not just the
                 // first 1 KB: a NUL past byte 1024 still means it is binary.
-                let bytes = std::fs::read(&target_path)
-                    .map_err(|e| format!("Failed to read {}: {}", search_path_str, e))?;
+                let bytes = match read_grep_file_bounded(&target_path)
+                    .map_err(|e| format!("Failed to read {}: {}", search_path_str, e))?
+                {
+                    Some(b) => b,
+                    None => {
+                        return Err(format!(
+                            "File {} exceeds maximum searchable size of {} bytes",
+                            search_path_str, GREP_MAX_FILE_BYTES
+                        ));
+                    }
+                };
                 if bytes.contains(&0) {
                     return Err(format!("File {} appears to be binary", search_path_str));
                 }
@@ -327,124 +374,301 @@ impl AgentTool for GrepTool {
                 walker.git_ignore(true);
                 walker.require_git(false);
                 walker.sort_by_file_name(|a, b| a.cmp(b));
-                walker.filter_entry(|e| e.file_name().to_str() != Some(".git"));
-
-                // Collect the candidate paths in deterministic (sorted) order,
-                // then scan them in parallel and assemble results in that same
-                // order so the output does not depend on thread scheduling.
-                let mut files: Vec<(PathBuf, String)> = Vec::new();
-                for entry_res in walker.build() {
-                    if cancel_clone.is_cancelled() {
-                        return Err("Tool execution cancelled".to_string());
+                walker.filter_entry(move |e| {
+                    if e.depth() == 0 {
+                        return true;
                     }
-
-                    let entry = match entry_res {
-                        Ok(e) => e,
-                        Err(_) => continue,
+                    let Some(name) = e.file_name().to_str() else {
+                        return true;
                     };
-                    if !entry.file_type().is_some_and(|ft| ft.is_file()) {
-                        continue;
+                    if name == ".git" {
+                        return false;
                     }
-
-                    let file_path = entry.path();
-                    // glob is relative to the requested search path, not cwd.
-                    let rel_path = file_path.strip_prefix(&target_path).unwrap_or(file_path);
-                    let rel_path_str = rel_path.to_string_lossy().replace('\\', "/");
-                    let file_name = file_path
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("");
-
-                    if let Some(ref matcher) = glob_matcher {
-                        if !matcher.is_match(&rel_path_str) && !matcher.is_match(file_name) {
-                            continue;
-                        }
-                    }
-                    if let Ok(meta) = entry.metadata() {
-                        if meta.len() > GREP_MAX_FILE_BYTES {
-                            skipped_large_files = true;
-                            continue;
-                        }
-                    }
-
-                    files.push((file_path.to_path_buf(), rel_path_str));
-                    if files.len() >= GREP_MAX_FILES {
-                        file_cap_reached = true;
-                        break;
-                    }
-                }
-
-                let parallelism = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-                    .min(files.len().max(1));
-                let chunk_size = files.len().div_ceil(parallelism).max(1);
-                let mut per_file: Vec<Option<(Vec<String>, usize, Vec<usize>)>> =
-                    vec![None; files.len()];
-
-                std::thread::scope(|scope| {
-                    for (chunk, results) in files
-                        .chunks(chunk_size)
-                        .zip(per_file.chunks_mut(chunk_size))
-                    {
-                        let matcher_re = &re;
-                        let token = &cancel_clone;
-                        scope.spawn(move || {
-                            for ((file_path, display), result) in
-                                chunk.iter().zip(results.iter_mut())
-                            {
-                                if token.is_cancelled() {
-                                    return;
-                                }
-                                // Check the whole bounded file for NUL bytes,
-                                // not just the first 1 KB: a NUL past byte
-                                // 1024 still means the file is binary.
-                                let bytes = match std::fs::read(file_path) {
-                                    Ok(b) => b,
-                                    Err(_) => continue,
-                                };
-                                if bytes.contains(&0) {
-                                    continue;
-                                }
-                                let content = match std::str::from_utf8(&bytes) {
-                                    Ok(s) => s,
-                                    Err(_) => continue,
-                                };
-                                let (lines, count, positions) =
-                                    search_in_file(display, content, matcher_re, context, limit);
-                                *result = Some((lines, count, positions));
-                            }
-                        });
-                    }
+                    explicit_protected || !context::is_protected_credential_name(name)
                 });
 
-                if cancel_clone.is_cancelled() {
-                    return Err("Tool execution cancelled".to_string());
+                // Walk in deterministic (sorted) order and scan lazily in
+                // bounded waves of `GREP_BATCH_SIZE` so early match/byte limits
+                // stop walking the tree immediately.
+                struct WalkCursor<'a> {
+                    walk_iter: ignore::Walk,
+                    target_path: &'a std::path::Path,
+                    glob_matcher: Option<&'a globset::GlobMatcher>,
+                    cancel: &'a CancellationToken,
+                    files_queued: usize,
+                    walk_done: bool,
+                    file_cap_reached: bool,
+                    skipped_large_files: bool,
+                }
+                impl WalkCursor<'_> {
+                    fn next_wave(&mut self, out: &mut Vec<(PathBuf, String)>) -> Result<(), String> {
+                        out.clear();
+                        while !self.walk_done && out.len() < GREP_BATCH_SIZE {
+                            if self.cancel.is_cancelled() {
+                                return Err("Tool execution cancelled".to_string());
+                            }
+                            let Some(entry_res) = self.walk_iter.next() else {
+                                self.walk_done = true;
+                                break;
+                            };
+                            let entry = match entry_res {
+                                Ok(e) => e,
+                                Err(_) => continue,
+                            };
+                            if !entry.file_type().is_some_and(|ft| ft.is_file()) {
+                                continue;
+                            }
+
+                            let file_path = entry.path();
+                            // glob is relative to the requested search path, not cwd.
+                            let rel_path =
+                                file_path.strip_prefix(self.target_path).unwrap_or(file_path);
+                            let mut rel_path_str_opt = None;
+                            if let Some(matcher) = self.glob_matcher {
+                                let rel_s = rel_path.to_string_lossy().replace('\\', "/");
+                                let file_name = file_path
+                                    .file_name()
+                                    .and_then(|s| s.to_str())
+                                    .unwrap_or("");
+                                if !matcher.is_match(&rel_s) && !matcher.is_match(file_name) {
+                                    continue;
+                                }
+                                rel_path_str_opt = Some(rel_s);
+                            }
+                            if let Ok(meta) = entry.metadata() {
+                                if meta.len() > GREP_MAX_FILE_BYTES {
+                                    self.skipped_large_files = true;
+                                    continue;
+                                }
+                            }
+
+                            let rel_path_str = rel_path_str_opt
+                                .unwrap_or_else(|| rel_path.to_string_lossy().replace('\\', "/"));
+                            out.push((file_path.to_path_buf(), rel_path_str));
+                            self.files_queued += 1;
+                            if self.files_queued >= GREP_MAX_FILES {
+                                self.file_cap_reached = true;
+                                self.walk_done = true;
+                                break;
+                            }
+                        }
+                        Ok(())
+                    }
                 }
 
-                for result in per_file {
-                    if byte_cap_reached {
-                        break;
-                    }
-                    let Some((mut lines, count, match_positions)) = result else {
-                        continue;
+                let mut cursor = WalkCursor {
+                    walk_iter: walker.build(),
+                    target_path: &target_path,
+                    glob_matcher: glob_matcher.as_ref(),
+                    cancel: &cancel_clone,
+                    files_queued: 0,
+                    walk_done: false,
+                    file_cap_reached: false,
+                    skipped_large_files: false,
+                };
+
+                let mut wave: Vec<(PathBuf, String)> = Vec::with_capacity(GREP_BATCH_SIZE);
+                cursor.next_wave(&mut wave)?;
+
+                let max_threads = std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(1);
+                let num_workers = if cursor.walk_done {
+                    max_threads.min(wave.len()).min(GREP_BATCH_SIZE)
+                } else {
+                    max_threads.min(GREP_BATCH_SIZE)
+                };
+                let saw_large_in_read = std::sync::atomic::AtomicBool::new(false);
+
+                let scan_one = |file_path: &std::path::Path,
+                                display: &str,
+                                batch_limit: usize|
+                 -> Option<(Vec<String>, usize, Vec<usize>)> {
+                    // Check the whole bounded file for NUL bytes,
+                    // not just the first 1 KB: a NUL past byte
+                    // 1024 still means the file is binary.
+                    let bytes = match read_grep_file_bounded(file_path) {
+                        Ok(Some(b)) => b,
+                        Ok(None) => {
+                            saw_large_in_read.store(true, std::sync::atomic::Ordering::Relaxed);
+                            return None;
+                        }
+                        Err(_) => return None,
                     };
-                    let remaining = limit.saturating_sub(total_matches);
-                    if remaining == 0 {
-                        break;
+                    if bytes.contains(&0) {
+                        return None;
                     }
-                    // `remaining` counts matches, not formatted lines: with
-                    // context > 0 each match contributes several lines. Cut at
-                    // the next match row so whole context blocks are kept.
-                    let keep = remaining.min(count);
-                    let cut = match_positions
-                        .get(keep)
-                        .copied()
-                        .unwrap_or(lines.len());
-                    lines.truncate(cut);
-                    push_lines(lines, &mut output_lines, &mut total_bytes, &mut byte_cap_reached);
-                    total_matches += keep;
+                    let content = std::str::from_utf8(&bytes).ok()?;
+                    Some(search_in_file(display, content, &re, context, batch_limit))
+                };
+
+                if num_workers <= 1 {
+                    while !wave.is_empty() {
+                        if cancel_clone.is_cancelled() {
+                            return Err("Tool execution cancelled".to_string());
+                        }
+                        if byte_cap_reached || total_matches >= limit {
+                            break;
+                        }
+                        let batch_limit = limit.saturating_sub(total_matches);
+                        for (file_path, display) in &wave {
+                            if cancel_clone.is_cancelled() {
+                                return Err("Tool execution cancelled".to_string());
+                            }
+                            if byte_cap_reached || total_matches >= limit {
+                                break;
+                            }
+                            let Some((mut lines, count, match_cut_ends)) =
+                                scan_one(file_path, display, batch_limit)
+                            else {
+                                continue;
+                            };
+                            let remaining = limit.saturating_sub(total_matches);
+                            if remaining == 0 {
+                                break;
+                            }
+                            let keep = remaining.min(count);
+                            if keep > 0 {
+                                let cut = match_cut_ends
+                                    .get(keep - 1)
+                                    .copied()
+                                    .unwrap_or(lines.len());
+                                lines.truncate(cut);
+                                push_lines(
+                                    lines,
+                                    &mut output_lines,
+                                    &mut total_bytes,
+                                    &mut byte_cap_reached,
+                                );
+                                total_matches += keep;
+                            }
+                        }
+                        if byte_cap_reached || total_matches >= limit || cursor.walk_done {
+                            break;
+                        }
+                        cursor.next_wave(&mut wave)?;
+                    }
+                } else {
+                    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+                    use std::sync::{Barrier, Mutex, RwLock};
+
+                    let shared_wave: RwLock<Vec<(PathBuf, String)>> = RwLock::new(Vec::new());
+                    let wave_len = AtomicUsize::new(0);
+                    let wave_limit = AtomicUsize::new(0);
+                    let wave_stop = AtomicBool::new(false);
+                    let next_idx = AtomicUsize::new(0);
+                    let per_file: Vec<Mutex<Option<(Vec<String>, usize, Vec<usize>)>>> =
+                        (0..GREP_BATCH_SIZE).map(|_| Mutex::new(None)).collect();
+                    let start_barrier = Barrier::new(num_workers + 1);
+                    let end_barrier = Barrier::new(num_workers + 1);
+
+                    let mut cancelled_mid_scan = false;
+                    std::thread::scope(|scope| {
+                        for _ in 0..num_workers {
+                            scope.spawn(|| loop {
+                                start_barrier.wait();
+                                if wave_stop.load(Ordering::Acquire) {
+                                    break;
+                                }
+                                let wl = wave_len.load(Ordering::Relaxed);
+                                let blimit = wave_limit.load(Ordering::Relaxed);
+                                let wave_guard =
+                                    shared_wave.read().unwrap_or_else(|e| e.into_inner());
+                                loop {
+                                    let idx = next_idx.fetch_add(1, Ordering::Relaxed);
+                                    if idx >= wl || cancel_clone.is_cancelled() {
+                                        break;
+                                    }
+                                    let (ref file_path, ref display) = wave_guard[idx];
+                                    let res = scan_one(file_path, display, blimit);
+                                    *per_file[idx].lock().unwrap_or_else(|e| e.into_inner()) = res;
+                                }
+                                drop(wave_guard);
+                                end_barrier.wait();
+                            });
+                        }
+
+                        while !wave.is_empty() {
+                            if cancel_clone.is_cancelled() {
+                                cancelled_mid_scan = true;
+                                break;
+                            }
+                            if byte_cap_reached || total_matches >= limit {
+                                break;
+                            }
+                            let wl = wave.len();
+                            {
+                                let mut dst =
+                                    shared_wave.write().unwrap_or_else(|e| e.into_inner());
+                                std::mem::swap(&mut *dst, &mut wave);
+                            }
+                            for slot in &per_file[..wl] {
+                                *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            }
+                            wave_len.store(wl, Ordering::Relaxed);
+                            wave_limit.store(limit.saturating_sub(total_matches), Ordering::Relaxed);
+                            next_idx.store(0, Ordering::Relaxed);
+
+                            start_barrier.wait();
+                            end_barrier.wait();
+
+                            if cancel_clone.is_cancelled() {
+                                cancelled_mid_scan = true;
+                                break;
+                            }
+
+                            for slot in &per_file[..wl] {
+                                if byte_cap_reached {
+                                    break;
+                                }
+                                let result = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                                let Some((mut lines, count, match_cut_ends)) = result else {
+                                    continue;
+                                };
+                                let remaining = limit.saturating_sub(total_matches);
+                                if remaining == 0 {
+                                    break;
+                                }
+                                // `remaining` counts matches, not formatted lines: cut right
+                                // after the last kept match's context so dropped matches do
+                                // not leak leading context rows.
+                                let keep = remaining.min(count);
+                                if keep > 0 {
+                                    let cut = match_cut_ends
+                                        .get(keep - 1)
+                                        .copied()
+                                        .unwrap_or(lines.len());
+                                    lines.truncate(cut);
+                                    push_lines(
+                                        lines,
+                                        &mut output_lines,
+                                        &mut total_bytes,
+                                        &mut byte_cap_reached,
+                                    );
+                                    total_matches += keep;
+                                }
+                            }
+
+                            if byte_cap_reached || total_matches >= limit || cursor.walk_done {
+                                break;
+                            }
+                            if cursor.next_wave(&mut wave).is_err() {
+                                cancelled_mid_scan = true;
+                                break;
+                            }
+                        }
+
+                        wave_stop.store(true, Ordering::Release);
+                        start_barrier.wait();
+                    });
+
+                    if cancelled_mid_scan {
+                        return Err("Tool execution cancelled".to_string());
+                    }
                 }
+                file_cap_reached = cursor.file_cap_reached;
+                skipped_large_files = cursor.skipped_large_files
+                    || saw_large_in_read.load(std::sync::atomic::Ordering::Relaxed);
             }
 
             if total_matches == 0 {
@@ -558,6 +782,186 @@ mod tests {
         assert_eq!(
             txt, "No matches found",
             "binary file must be skipped: {txt}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_grep_skips_protected_credentials_unless_explicitly_targeted() {
+        let dir = crate::TempTestDir::new("grep_protected");
+        std::fs::create_dir_all(dir.path().join(".mehh")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".mehh/secret.txt"), "token_value\n").unwrap();
+        std::fs::write(dir.path().join(".ssh/id_rsa"), "token_value\n").unwrap();
+        std::fs::write(dir.path().join(".env"), "API_KEY=token_value\n").unwrap();
+        std::fs::write(dir.path().join(".env.local"), "API_KEY=token_value\n").unwrap();
+        std::fs::write(dir.path().join("auth.json"), "token_value\n").unwrap();
+        std::fs::write(dir.path().join("mcp-auth.json"), "token_value\n").unwrap();
+        std::fs::write(dir.path().join("trust.json"), "token_value\n").unwrap();
+        std::fs::write(dir.path().join("src.rs"), "let s = \"token_value\";\n").unwrap();
+
+        let tool = GrepTool::new(dir.path().to_path_buf());
+        let params = json!({ "pattern": "token_value" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let res = tool
+            .execute("tc1", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt = match &res.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt.contains("src.rs"), "expected src.rs in: {txt}");
+        for hidden in [".mehh", ".ssh", ".env", "auth.json", "mcp-auth.json", "trust.json"] {
+            assert!(!txt.contains(hidden), "must not leak {hidden}: {txt}");
+        }
+
+        // Explicitly targeting .mehh or .env must still work.
+        let explicit_dir = json!({ "pattern": "token_value", "path": ".mehh" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let res_dir = tool
+            .execute("tc2", explicit_dir, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt_dir = match &res_dir.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt_dir.contains("secret.txt"), "got: {txt_dir}");
+
+        let explicit_file = json!({ "pattern": "token_value", "path": ".env" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let res_file = tool
+            .execute("tc3", explicit_file, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt_file = match &res_file.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt_file.contains("API_KEY=token_value"), "got: {txt_file}");
+    }
+
+    #[tokio::test]
+    async fn test_grep_clamps_limits_and_stops_across_batches() {
+        let dir = crate::TempTestDir::new("grep_batches");
+        for i in 0..80 {
+            std::fs::write(
+                dir.path().join(format!("file_{i:03}.txt")),
+                format!("before\nneedle_match_{i}\nafter\n"),
+            )
+            .unwrap();
+        }
+        let tool = GrepTool::new(dir.path().to_path_buf());
+        let params = json!({
+            "pattern": "needle_match_",
+            "limit": 5,
+            "context": 999_999
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let res = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt = match &res.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt.contains("[Reached limit of 5 matches]"), "got: {txt}");
+
+        let big_limit = json!({
+            "pattern": "needle_match_",
+            "limit": 999_999_999u64
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(tool
+            .execute("tc2", big_limit, CancellationToken::new(), None)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_grep_context_limit_does_not_leak_dropped_match_leading_context() {
+        let dir = crate::TempTestDir::new("grep_ctx_cut");
+        std::fs::write(dir.path().join("a.txt"), "hit_one\n").unwrap();
+        std::fs::write(
+            dir.path().join("b.txt"),
+            "b_l1\nb_hit_two\nb_after_two\nfiller1\nfiller2\nfiller3\ndropped_leading_ctx\nb_hit_three\n",
+        )
+        .unwrap();
+
+        let tool = GrepTool::new(dir.path().to_path_buf());
+        let params = json!({
+            "pattern": "hit_",
+            "limit": 2,
+            "context": 1
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let res = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt = match &res.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt.contains("b_hit_two"), "got: {txt}");
+        assert!(txt.contains("b_after_two"), "trailing ctx of kept match missing: {txt}");
+        assert!(
+            !txt.contains("dropped_leading_ctx"),
+            "leading context of dropped match leaked: {txt}"
+        );
+        assert!(!txt.contains("b_hit_three"), "dropped match leaked: {txt}");
+    }
+
+    #[tokio::test]
+    async fn test_grep_ignores_null_ignore_case_alias() {
+        let dir = crate::TempTestDir::new("grep_null_alias");
+        std::fs::write(dir.path().join("case.txt"), "HelloWorld\n").unwrap();
+
+        let tool = GrepTool::new(dir.path().to_path_buf());
+        let params = json!({
+            "pattern": "helloworld",
+            "ignoreCase": null,
+            "ignore_case": true
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let res = tool
+            .execute("tc", params, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt = match &res.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt.contains("HelloWorld"), "got: {txt}");
+    }
+
+    #[test]
+    fn test_grep_trailing_newline_does_not_create_phantom_empty_line() {
+        let re = regex::Regex::new("^$").unwrap();
+        let (lines_no_ctx, count_no_ctx, _) = search_in_file("f.txt", "a\nb\n", &re, 0, 10);
+        assert_eq!(count_no_ctx, 0, "unexpected matches: {lines_no_ctx:?}");
+
+        let (lines_ctx, count_ctx, _) = search_in_file("f.txt", "a\nb\n", &regex::Regex::new("b").unwrap(), 1, 10);
+        assert_eq!(count_ctx, 1);
+        assert_eq!(
+            lines_ctx,
+            vec!["f.txt-1-a".to_string(), "f.txt:2:b".to_string()],
+            "trailing newline must not emit phantom empty line 3"
         );
     }
 }

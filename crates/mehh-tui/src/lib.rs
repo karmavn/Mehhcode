@@ -37,7 +37,7 @@ mod tests {
         assert_eq!(visible_width("hello"), 5);
         assert_eq!(visible_width("tab\tstop"), 3 + 3 + 4);
         assert_eq!(visible_width("hello\x1b[32m world\x1b[0m"), 11);
-        assert_eq!(visible_width("🦀"), 2);
+        assert_eq!(visible_width("\u{1F980}"), 2);
         assert_eq!(visible_width("你好"), 4);
     }
 

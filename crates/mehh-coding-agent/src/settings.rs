@@ -5,11 +5,39 @@ use std::path::{Path, PathBuf};
 
 static ATOMIC_TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Strips Windows verbatim path prefixes (`\\?\` and `\\?\UNC\`, plus forward-slash
+/// `//?/` / `//?/UNC/` equivalents) while preserving the underlying drive or UNC path.
+///
+/// Maps `\\?\UNC\server\share` -> `\\server\share` and `\\?\C:\...` -> `C:\...`.
+pub(crate) fn strip_windows_verbatim_prefix(path: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = path.strip_prefix(r"\\?\") {
+        if let Some(unc_rest) = rest.get(..4).filter(|p| p.eq_ignore_ascii_case(r"unc\")) {
+            let _ = unc_rest;
+            return std::borrow::Cow::Owned(format!(r"\\{}", &rest[4..]));
+        }
+        if rest.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("unc/")) {
+            return std::borrow::Cow::Owned(format!(r"\\{}", &rest[4..]));
+        }
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    if let Some(rest) = path.strip_prefix("//?/") {
+        if rest.get(..4).is_some_and(|p| p.eq_ignore_ascii_case("unc/")) {
+            return std::borrow::Cow::Owned(format!("//{}", &rest[4..]));
+        }
+        if rest.get(..4).is_some_and(|p| p.eq_ignore_ascii_case(r"unc\")) {
+            return std::borrow::Cow::Owned(format!(r"\\{}", &rest[4..]));
+        }
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    std::borrow::Cow::Borrowed(path)
+}
+
 /// Replaces the DACL on a freshly created temp file with a single entry for the
 /// current process user. On Windows there is no std API for this; without it
 /// `restricted` writes (credentials, permissions) inherit the parent ACL.
 #[cfg(windows)]
 fn restrict_to_current_user_windows(path: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Foundation::{CloseHandle, LocalFree, ERROR_SUCCESS, HANDLE};
     use windows_sys::Win32::Security::Authorization::{
         SetEntriesInAclW, SetNamedSecurityInfoW, EXPLICIT_ACCESS_W, GRANT_ACCESS, SE_FILE_OBJECT,
@@ -59,8 +87,8 @@ fn restrict_to_current_user_windows(path: &Path) -> anyhow::Result<()> {
             anyhow::bail!("SetEntriesInAclW failed with {status}");
         }
         let wide: Vec<u16> = path
-            .to_string_lossy()
-            .encode_utf16()
+            .as_os_str()
+            .encode_wide()
             .chain(std::iter::once(0))
             .collect();
         let status = SetNamedSecurityInfoW(
@@ -117,6 +145,18 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], restricted: bool) -> 
         }
     };
 
+    // Restrict Windows DACL right after creating the temp file and before writing sensitive bytes.
+    #[cfg(windows)]
+    if restricted {
+        if let Err(e) = restrict_to_current_user_windows(&tmp_path) {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e).with_context(|| {
+                format!("Failed to restrict permissions on: {}", tmp_path.display())
+            });
+        }
+    }
+
     let write_res = (|| -> std::io::Result<()> {
         use std::io::Write;
         file.write_all(bytes)?;
@@ -143,16 +183,29 @@ pub(crate) fn write_file_atomic(path: &Path, bytes: &[u8], restricted: bool) -> 
     }
 
     #[cfg(windows)]
-    if restricted {
-        if let Err(e) = restrict_to_current_user_windows(&tmp_path) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e).with_context(|| {
-                format!("Failed to restrict permissions on: {}", tmp_path.display())
-            });
+    let rename_res = {
+        let delays_ms = [5u64, 15, 30, 60];
+        let mut attempt = 0usize;
+        loop {
+            match std::fs::rename(&tmp_path, path) {
+                Ok(()) => break Ok(()),
+                Err(e)
+                    if attempt < delays_ms.len()
+                        && (e.kind() == std::io::ErrorKind::PermissionDenied
+                            || matches!(e.raw_os_error(), Some(32 | 33))) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(delays_ms[attempt]));
+                    attempt += 1;
+                }
+                Err(e) => break Err(e),
+            }
         }
-    }
+    };
 
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
+    #[cfg(not(windows))]
+    let rename_res = std::fs::rename(&tmp_path, path);
+
+    if let Err(e) = rename_res {
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e).with_context(|| {
             format!(
@@ -175,6 +228,7 @@ use mehh_ai::ThinkingLevel;
 pub enum WebProviderSetting {
     Auto,
     Disabled,
+    Mehh,
     Exa,
     Parallel,
     Firecrawl,
@@ -189,6 +243,7 @@ impl From<WebProviderSetting> for mehh_tools::web::WebProviderChoice {
         match value {
             WebProviderSetting::Auto => WebProviderChoice::Auto,
             WebProviderSetting::Disabled => WebProviderChoice::Disabled,
+            WebProviderSetting::Mehh => WebProviderChoice::Fixed(ProviderId::Mehh),
             WebProviderSetting::Exa => WebProviderChoice::Fixed(ProviderId::Exa),
             WebProviderSetting::Parallel => WebProviderChoice::Fixed(ProviderId::Parallel),
             WebProviderSetting::Firecrawl => WebProviderChoice::Fixed(ProviderId::Firecrawl),
@@ -280,15 +335,11 @@ pub struct SettingsManager;
 impl SettingsManager {
     /// Returns the global settings file path `~/.mehh/agent/settings.json`.
     pub fn global_path() -> anyhow::Result<PathBuf> {
-        let home = std::env::var_os("USERPROFILE")
-            .or_else(|| std::env::var_os("HOME"))
-            .filter(|s| !s.is_empty())
-            .map(PathBuf::from)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Cannot determine global settings path: neither USERPROFILE nor HOME is set"
-                )
-            })?;
+        let home = crate::user_home_dir().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot determine global settings path: neither USERPROFILE nor HOME is set"
+            )
+        })?;
         Ok(home.join(".mehh").join("agent").join("settings.json"))
     }
 
@@ -451,7 +502,7 @@ fn enforce_web_escalation_guard(global: &Option<WebSettings>, local: &mut Option
 
 /// Permissiveness ranking used by the project-settings escalation guard: Chat is the strictest
 /// and Auto is the most permissive.
-fn permission_mode_rank(mode: crate::tool_inspection::PermissionMode) -> u8 {
+pub(crate) fn permission_mode_rank(mode: crate::tool_inspection::PermissionMode) -> u8 {
     use crate::tool_inspection::PermissionMode::*;
     match mode {
         Chat => 0,
@@ -751,5 +802,62 @@ mod tests {
             tighten.web.unwrap().provider,
             Some(WebProviderSetting::Disabled)
         );
+
+        // Mehh provider roundtrip & legacy "searxng" fails closed
+        std::fs::write(&global, r#"{"web":{"provider":"mehh"}}"#).unwrap();
+        let mehh_loaded = SettingsManager::load_file(&global).unwrap();
+        assert_eq!(
+            mehh_loaded.to_web_config().provider,
+            mehh_tools::web::WebProviderChoice::Fixed(mehh_tools::web::ProviderId::Mehh)
+        );
+
+        std::fs::write(&project, r#"{"web":{"provider":"searxng"}}"#).unwrap();
+        assert!(SettingsManager::load_file(&project).is_err());
+    }
+
+    #[test]
+    fn test_strip_windows_verbatim_prefix() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\Users\Admin\repo").as_ref(),
+            r"C:\Users\Admin\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\repo").as_ref(),
+            r"\\server\share\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\unc\server\share\repo").as_ref(),
+            r"\\server\share\repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\Unc\server\share").as_ref(),
+            r"\\server\share"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("//?/UNC/server/share/repo").as_ref(),
+            "//server/share/repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("//?/C:/Users/Admin").as_ref(),
+            "C:/Users/Admin"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("/var/tmp/repo").as_ref(),
+            "/var/tmp/repo"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\server\share\repo").as_ref(),
+            r"\\server\share\repo"
+        );
+    }
+
+    #[test]
+    fn test_write_file_atomic_overwrites_existing_with_restricted_acl() {
+        let dir = crate::TempTestDir::new("atomic_write");
+        let path = dir.path().join("secret.json");
+        write_file_atomic(&path, b"first", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+        write_file_atomic(&path, b"second", true).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second");
     }
 }

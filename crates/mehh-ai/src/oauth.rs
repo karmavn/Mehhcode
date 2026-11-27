@@ -10,7 +10,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::types::now_ms;
 
 /// Stored credential format corresponding to `~/.mehh/agent/auth.json`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum StoredCredential {
     #[serde(rename = "api_key")]
@@ -32,6 +32,33 @@ pub enum StoredCredential {
         #[serde(default, skip_serializing_if = "Option::is_none", rename = "availableModelIds", alias = "available_model_ids")]
         available_model_ids: Option<Vec<String>>,
     },
+}
+
+impl std::fmt::Debug for StoredCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StoredCredential::ApiKey { key, env } => f
+                .debug_struct("ApiKey")
+                .field("key", &key.as_ref().map(|_| "[REDACTED]"))
+                .field("env", &env.as_ref().map(|e| format!("[{} vars]", e.len())))
+                .finish(),
+            StoredCredential::OAuth {
+                expires,
+                client_id,
+                scopes,
+                available_model_ids,
+                ..
+            } => f
+                .debug_struct("OAuth")
+                .field("access", &"[REDACTED]")
+                .field("refresh", &"[REDACTED]")
+                .field("expires", expires)
+                .field("client_id", client_id)
+                .field("scopes", scopes)
+                .field("available_model_ids", available_model_ids)
+                .finish(),
+        }
+    }
 }
 
 impl StoredCredential {
@@ -62,10 +89,19 @@ impl CredentialInfo {
 }
 
 /// A PKCE code verifier and code challenge pair.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct PkcePair {
     pub verifier: String,
     pub challenge: String,
+}
+
+impl std::fmt::Debug for PkcePair {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PkcePair")
+            .field("verifier", &"[REDACTED]")
+            .field("challenge", &self.challenge)
+            .finish()
+    }
 }
 
 /// Generates a PKCE code verifier and S256 code challenge pair.
@@ -109,13 +145,25 @@ pub enum OAuthProviderKind {
 }
 
 /// Device code flow challenge returned by GitHub Copilot.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct DeviceCodeChallenge {
     pub device_code: String,
     pub user_code: String,
     pub verification_uri: String,
     pub interval_secs: u64,
     pub expires_in_secs: u64,
+}
+
+impl std::fmt::Debug for DeviceCodeChallenge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodeChallenge")
+            .field("device_code", &"[REDACTED]")
+            .field("user_code", &self.user_code)
+            .field("verification_uri", &self.verification_uri)
+            .field("interval_secs", &self.interval_secs)
+            .field("expires_in_secs", &self.expires_in_secs)
+            .finish()
+    }
 }
 
 /// Builds the browser authorization URL for PKCE-based OAuth providers.
@@ -163,8 +211,11 @@ const OAUTH_HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// block the real callback behind it.
 const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Maximum characters of a provider error body kept in an error message.
+/// Maximum characters of a provider error body kept in an OAuth error message.
 const MAX_OAUTH_ERROR_BODY_CHARS: usize = 512;
+
+/// Maximum bytes read for an OAuth token/device JSON response body.
+const MAX_OAUTH_RESPONSE_BYTES: usize = 256 * 1024;
 
 /// Converts a provider relative TTL (seconds) into an absolute expiry (ms),
 /// saturating instead of overflowing on hostile provider values.
@@ -178,19 +229,26 @@ fn copilot_expiry_from_expires_at(expires_at: i64) -> i64 {
     expires_at.saturating_mul(1000).saturating_sub(300_000)
 }
 
-/// Removes credentials from a provider error body and caps its length.
-pub(crate) fn redact_error_body(body: &str, secrets: &[&str]) -> String {
+/// Removes credentials from a provider error body and caps its length to `max_chars`.
+pub(crate) fn redact_error_body_with_limit(
+    body: &str,
+    secrets: &[&str],
+    max_chars: usize,
+) -> String {
     static JSON_SECRET: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(
-            r#"(?i)("(?:(?:access|refresh|client|api|auth|session)[_-]?(?:token|secret|key)|token|secret|authorization|password)"\s*:\s*)"(?:[^"\\]|\\.)*""#,
+            r#"(?i)("(?:(?:access|refresh|client|api|auth|session)[_-]?(?:token|secret|key)|token|secret|authorization|password)"\s*:\s*)"(?:[^"\\]|\\.)*(?:"|$)"#,
         )
         .expect("valid secret-key regex")
     });
     static BEARER_TOKEN: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)bearer\s+[A-Za-z0-9._~+/=-]+").expect("valid bearer regex")
     });
-    static SK_KEY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
-        regex::Regex::new(r"sk-[A-Za-z0-9_-]+").expect("valid sk-key regex")
+    static TOKEN_SHAPED: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:sk-[A-Za-z0-9_-]+|AIza[0-9A-Za-z_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|(?:AKIA|ASIA)[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})",
+        )
+        .expect("valid token-shaped regex")
     });
 
     // Replace exact request secrets first: providers often echo them in free
@@ -203,40 +261,15 @@ pub(crate) fn redact_error_body(body: &str, secrets: &[&str]) -> String {
     }
     let redacted = JSON_SECRET.replace_all(&redacted, r#"$1"[REDACTED]""#);
     let redacted = BEARER_TOKEN.replace_all(&redacted, "Bearer [REDACTED]");
-    let redacted = SK_KEY.replace_all(&redacted, "[REDACTED]");
+    let redacted = TOKEN_SHAPED.replace_all(&redacted, "[REDACTED]");
     // Truncate last: cutting first can remove the closing quote a regex needs,
     // leaving a secret prefix intact.
-    crate::retry::truncate_error_body(&redacted, MAX_OAUTH_ERROR_BODY_CHARS)
+    crate::retry::truncate_error_body(&redacted, max_chars)
 }
 
-/// Rejects addresses a refresh token must never be sent to.
-fn reject_unsafe_ip(ip: std::net::IpAddr, host: &str) -> anyhow::Result<()> {
-    let disallowed = match ip {
-        std::net::IpAddr::V4(v4) => {
-            let o = v4.octets();
-            v4.is_private()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_unspecified()
-                || v4.is_multicast()
-                || (o[0] == 100 && (64..=127).contains(&o[1])) // CGNAT 100.64.0.0/10
-                || o[0] == 0 // "this network" 0.0.0.0/8
-                || o[0] >= 240 // reserved / broadcast
-        }
-        std::net::IpAddr::V6(v6) => {
-            let o = v6.octets();
-            v6.is_loopback()
-                || v6.is_unspecified()
-                || v6.is_multicast()
-                || (0xfc..=0xfd).contains(&o[0]) // unique local fc00::/7
-                || (o[0] == 0xfe && (o[1] & 0xc0) == 0x80) // link-local fe80::/10
-                || v6.to_ipv4().is_some()
-        }
-    };
-    if disallowed {
-        anyhow::bail!("OAuth token URL resolves to a disallowed address ({host})");
-    }
-    Ok(())
+/// Removes credentials from a provider error body and caps its length.
+pub(crate) fn redact_error_body(body: &str, secrets: &[&str]) -> String {
+    redact_error_body_with_limit(body, secrets, MAX_OAUTH_ERROR_BODY_CHARS)
 }
 
 /// DANGER: `MEHH_OAUTH_ALLOW_INSECURE_REFRESH=1` (or `true`) permits plain http
@@ -254,11 +287,12 @@ struct ValidatedTokenUrl {
     url: reqwest::Url,
     /// `Some((host, addrs))` for hostname URLs; IP literals connect directly.
     pinned: Option<(String, Vec<std::net::SocketAddr>)>,
+    policy: crate::http_safety::DnsPolicy,
 }
 
 /// Validates a (possibly env-overridden) token URL before a refresh token is sent to it.
 async fn validate_token_url(url: &str) -> anyhow::Result<ValidatedTokenUrl> {
-    let parsed =
+    let mut parsed =
         reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("Invalid OAuth token URL: {e}"))?;
     let allow_insecure = insecure_refresh_allowed();
     if parsed.scheme() != "https" && !(allow_insecure && parsed.scheme() == "http") {
@@ -267,46 +301,68 @@ async fn validate_token_url(url: &str) -> anyhow::Result<ValidatedTokenUrl> {
     if !parsed.username().is_empty() || parsed.password().is_some() {
         anyhow::bail!("OAuth token URL must not contain userinfo");
     }
-    let host = parsed
-        .host_str()
+    let policy = if allow_insecure {
+        crate::http_safety::DnsPolicy::AllowPrivate
+    } else {
+        crate::http_safety::DnsPolicy::PublicOnly
+    };
+    crate::http_safety::check_url_host_policy(policy, &parsed)
+        .map_err(|e| anyhow::anyhow!("OAuth token URL rejected: {e}"))?;
+
+    let clean_host = crate::http_safety::normalized_url_host(&parsed)
         .ok_or_else(|| anyhow::anyhow!("OAuth token URL has no host"))?;
     let port = parsed.port_or_known_default().unwrap_or(443);
-    let pinned = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        // A literal is the address we connect to; there is no second resolution.
-        if !allow_insecure {
-            reject_unsafe_ip(ip, host)?;
-        }
+    let pinned = if clean_host.parse::<std::net::IpAddr>().is_ok() {
+        // IP literal was already checked by `check_url_host_policy`.
         None
     } else {
-        let resolved: Vec<_> = tokio::net::lookup_host((host, port))
+        // Normalize trailing-dot FQDNs (e.g. `example.com.`) on the request URL
+        // so `reqwest`'s `resolve_to_addrs` lookup key matches the request host.
+        if parsed.host_str() != Some(clean_host.as_str()) {
+            parsed
+                .set_host(Some(&clean_host))
+                .map_err(|_| anyhow::anyhow!("Invalid OAuth token URL host '{clean_host}'"))?;
+        }
+        let resolved: Vec<_> = tokio::net::lookup_host((clean_host.as_str(), port))
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to resolve OAuth token URL host '{host}': {e}"))?
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to resolve OAuth token URL host '{clean_host}': {e}")
+            })?
             .collect();
         if resolved.is_empty() {
-            anyhow::bail!("OAuth token URL host '{host}' did not resolve");
+            anyhow::bail!("OAuth token URL host '{clean_host}' did not resolve");
         }
-        if !allow_insecure {
-            for addr in &resolved {
-                reject_unsafe_ip(addr.ip(), host)?;
+        for addr in &resolved {
+            if !crate::http_safety::ip_allowed_for_policy(policy, &clean_host, addr.ip()) {
+                anyhow::bail!(
+                    "OAuth token URL resolves to a disallowed address ({clean_host})"
+                );
             }
         }
-        Some((host.to_string(), resolved))
+        Some((clean_host, resolved))
     };
     Ok(ValidatedTokenUrl {
         url: parsed,
         pinned,
+        policy,
     })
 }
 
-/// Builds the client used for token refreshes. Redirects stay disabled, and a
-/// hostname URL is pinned to the addresses that were validated: `resolve_to_addrs`
-/// keeps the Host header and TLS SNI bound to the original hostname.
+/// Builds the client used for token refreshes. Redirects stay disabled, a safe
+/// DNS resolver enforces `policy` at connect time, and a hostname URL is pinned
+/// to the addresses that were validated: `resolve_to_addrs` keeps the Host header
+/// and TLS SNI bound to the original hostname.
 fn build_refresh_client(
     pinned: Option<(&str, &[std::net::SocketAddr])>,
+    policy: crate::http_safety::DnsPolicy,
 ) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(OAUTH_HTTP_TIMEOUT);
+        .dns_resolver(std::sync::Arc::new(
+            crate::http_safety::SafeDnsResolver::new(policy),
+        ))
+        .connect_timeout(OAUTH_HTTP_TIMEOUT)
+        .timeout(OAUTH_HTTP_TIMEOUT);
     if let Some((host, addrs)) = pinned {
         builder = builder.resolve_to_addrs(host, addrs);
     }
@@ -321,7 +377,13 @@ async fn send_oauth_request(
 ) -> anyhow::Result<reqwest::Response> {
     let resp = tokio::time::timeout(OAUTH_HTTP_TIMEOUT, req.send())
         .await
-        .map_err(|_| anyhow::anyhow!("OAuth HTTP request timed out after 30s"))??;
+        .map_err(|_| anyhow::anyhow!("OAuth HTTP request timed out after 30s"))?
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "OAuth HTTP request failed: {}",
+                redact_error_body(&e.without_url().to_string(), secrets)
+            )
+        })?;
     if resp.status().is_success() {
         return Ok(resp);
     }
@@ -331,6 +393,47 @@ async fn send_oauth_request(
     let status = resp.status();
     let body = crate::retry::read_error_body_bytes_capped(resp).await;
     anyhow::bail!("OAuth HTTP {status}: {}", redact_error_body(&body, secrets))
+}
+
+async fn read_bounded_oauth_json<T: serde::de::DeserializeOwned>(
+    mut resp: reqwest::Response,
+    secrets: &[&str],
+) -> anyhow::Result<T> {
+    let deadline = tokio::time::Instant::now() + OAUTH_HTTP_TIMEOUT;
+    let initial_cap = resp
+        .content_length()
+        .map(|l| (l as usize).min(MAX_OAUTH_RESPONSE_BYTES))
+        .unwrap_or(0);
+    let mut buf = Vec::with_capacity(initial_cap);
+    loop {
+        let chunk_opt = tokio::time::timeout_at(deadline, resp.chunk())
+            .await
+            .map_err(|_| anyhow::anyhow!("Timed out reading OAuth JSON response body"))?
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed reading OAuth response body: {}",
+                    redact_error_body(&e.without_url().to_string(), secrets)
+                )
+            })?;
+        let Some(chunk) = chunk_opt else {
+            break;
+        };
+        if chunk.is_empty() {
+            continue;
+        }
+        let remaining = MAX_OAUTH_RESPONSE_BYTES.saturating_sub(buf.len());
+        if chunk.len() > remaining {
+            anyhow::bail!(
+                "OAuth response body exceeded {} byte limit",
+                MAX_OAUTH_RESPONSE_BYTES
+            );
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    serde_json::from_slice(&buf).map_err(|e| {
+        let snippet = redact_error_body(&String::from_utf8_lossy(&buf), secrets);
+        anyhow::anyhow!("Failed to parse OAuth JSON response: {e} ({snippet})")
+    })
 }
 
 fn html_escape(s: &str) -> String {
@@ -392,7 +495,7 @@ pub async fn exchange_code_for_tokens(
 
             let res = send_oauth_request(client.post(token_url).form(&params), &[verifier, code]).await?;
 
-            let json: serde_json::Value = res.json().await?;
+            let json: serde_json::Value = read_bounded_oauth_json(res, &[verifier, code]).await?;
             let access = json["access_token"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing access_token in token response"))?
@@ -423,7 +526,7 @@ pub async fn exchange_code_for_tokens(
 
             let res = send_oauth_request(client.post(token_url).form(&params), &[verifier, code]).await?;
 
-            let json: serde_json::Value = res.json().await?;
+            let json: serde_json::Value = read_bounded_oauth_json(res, &[verifier, code]).await?;
             let access = json["access_token"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing access_token in token response"))?
@@ -473,11 +576,12 @@ pub async fn refresh_oauth_credential(
         OAuthProviderKind::Anthropic => {
             let token_url = std::env::var("ANTHROPIC_TOKEN_URL")
                 .unwrap_or_else(|_| "https://platform.claude.com/v1/oauth/token".to_string());
-            let ValidatedTokenUrl { url, pinned } = validate_token_url(&token_url).await?;
+            let ValidatedTokenUrl { url, pinned, policy } = validate_token_url(&token_url).await?;
             let client = build_refresh_client(
                 pinned
                     .as_ref()
                     .map(|(host, addrs)| (host.as_str(), addrs.as_slice())),
+                policy,
             )?;
             let mut params = HashMap::new();
             params.insert("grant_type", "refresh_token");
@@ -486,7 +590,7 @@ pub async fn refresh_oauth_credential(
 
             let res = send_oauth_request(client.post(url).form(&params), &[refresh_token.as_str()]).await?;
 
-            let json: serde_json::Value = res.json().await?;
+            let json: serde_json::Value = read_bounded_oauth_json(res, &[refresh_token.as_str()]).await?;
             let access = json["access_token"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing access_token in refresh response"))?
@@ -509,11 +613,12 @@ pub async fn refresh_oauth_credential(
         OAuthProviderKind::OpenAiChatGpt => {
             let token_url = std::env::var("OPENAI_TOKEN_URL")
                 .unwrap_or_else(|_| "https://auth.openai.com/api/accounts/oauth/token".to_string());
-            let ValidatedTokenUrl { url, pinned } = validate_token_url(&token_url).await?;
+            let ValidatedTokenUrl { url, pinned, policy } = validate_token_url(&token_url).await?;
             let client = build_refresh_client(
                 pinned
                     .as_ref()
                     .map(|(host, addrs)| (host.as_str(), addrs.as_slice())),
+                policy,
             )?;
             let c_id = client_id_opt
                 .as_deref()
@@ -525,7 +630,7 @@ pub async fn refresh_oauth_credential(
 
             let res = send_oauth_request(client.post(url).form(&params), &[refresh_token.as_str()]).await?;
 
-            let json: serde_json::Value = res.json().await?;
+            let json: serde_json::Value = read_bounded_oauth_json(res, &[refresh_token.as_str()]).await?;
             let access = json["access_token"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing access_token in refresh response"))?
@@ -546,7 +651,15 @@ pub async fn refresh_oauth_credential(
             })
         }
         OAuthProviderKind::GitHubCopilot => {
-            let client = build_refresh_client(None)?;
+            static COPILOT_REFRESH_CLIENT: std::sync::OnceLock<reqwest::Client> =
+                std::sync::OnceLock::new();
+            let client = if let Some(c) = COPILOT_REFRESH_CLIENT.get() {
+                c.clone()
+            } else {
+                let built = build_refresh_client(None, crate::http_safety::DnsPolicy::PublicOnly)?;
+                let _ = COPILOT_REFRESH_CLIENT.set(built.clone());
+                built
+            };
             let res = send_oauth_request(
                 client
                     .get("https://api.github.com/copilot_internal/v2/token")
@@ -560,7 +673,7 @@ pub async fn refresh_oauth_credential(
             )
             .await?;
 
-            let json: serde_json::Value = res.json().await?;
+            let json: serde_json::Value = read_bounded_oauth_json(res, &[refresh_token.as_str()]).await?;
             let token = json["token"]
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Missing token in Copilot token response"))?
@@ -597,7 +710,7 @@ pub async fn start_copilot_device_flow(client: &reqwest::Client) -> anyhow::Resu
     )
     .await?;
 
-    let json: serde_json::Value = res.json().await?;
+    let json: serde_json::Value = read_bounded_oauth_json(res, &[]).await?;
     let device_code = json["device_code"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing device_code"))?
@@ -653,7 +766,7 @@ pub async fn poll_copilot_device_token(
     )
     .await?;
 
-    let json: serde_json::Value = res.json().await?;
+    let json: serde_json::Value = read_bounded_oauth_json(res, &[device_code]).await?;
 
     if let Some(err) = json.get("error").and_then(|e| e.as_str()) {
         match err {
@@ -664,7 +777,8 @@ pub async fn poll_copilot_device_token(
                     .get("error_description")
                     .and_then(|d| d.as_str())
                     .unwrap_or(other);
-                anyhow::bail!("GitHub OAuth device flow error: {desc}");
+                let safe_desc = redact_error_body(desc, &[device_code]);
+                anyhow::bail!("GitHub OAuth device flow error: {safe_desc}");
             }
         }
     }
@@ -688,7 +802,7 @@ pub async fn poll_copilot_device_token(
     )
     .await?;
 
-    let copilot_json: serde_json::Value = copilot_res.json().await?;
+    let copilot_json: serde_json::Value = read_bounded_oauth_json(copilot_res, &[github_token.as_str()]).await?;
     let token = copilot_json["token"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("Missing token in Copilot token exchange"))?
@@ -732,18 +846,21 @@ pub async fn wait_for_loopback_callback(
             loop {
                 let n = match tokio::time::timeout(CALLBACK_READ_TIMEOUT, socket.read(&mut chunk)).await {
                     Ok(Ok(n)) => n,
-                    Ok(Err(e)) => return Err(e.into()),
-                    // A preconnect socket that sends nothing must not block the
-                    // real callback behind it.
-                    Err(_) if request_buf.is_empty() => break,
-                    Err(_) => anyhow::bail!("Timed out reading OAuth callback request"),
+                    // A browser speculative preconnect or transient peer RST must not kill the login flow.
+                    Ok(Err(_)) => break,
+                    // A preconnect or stalled socket must not block the real
+                    // callback behind it.
+                    Err(_) => break,
                 };
                 if n == 0 {
                     break;
                 }
                 request_buf.extend_from_slice(&chunk[..n]);
                 if request_buf.len() > MAX_CALLBACK_REQUEST_BYTES {
-                    anyhow::bail!("OAuth callback request exceeds maximum size");
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                        .await;
+                    break;
                 }
                 if let Some(end) = request_buf.windows(4).position(|w| w == b"\r\n\r\n") {
                     complete_request =
@@ -755,11 +872,19 @@ pub async fn wait_for_loopback_callback(
                 continue;
             };
 
-            let path = request_str
+            let mut req_parts = request_str
                 .lines()
                 .next()
-                .and_then(|line| line.split_whitespace().nth(1))
-                .unwrap_or("");
+                .unwrap_or("")
+                .split_whitespace();
+            let method = req_parts.next().unwrap_or("");
+            let path = req_parts.next().unwrap_or("");
+            if method != "GET" {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
+            }
             let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
 
             let mut code_opt = None;
@@ -777,6 +902,20 @@ pub async fn wait_for_loopback_callback(
                         _ => {}
                     }
                 }
+            }
+
+            if code_opt.is_none() && state_opt.is_none() && error_opt.is_none() {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
+            }
+
+            if state_opt.as_deref() != Some(expected_state) {
+                let _ = socket
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+                continue;
             }
 
             if let Some(error) = error_opt {
@@ -797,20 +936,12 @@ pub async fn wait_for_loopback_callback(
                 }
             }
 
-            if code_opt.is_none() && state_opt.is_none() {
+            let Some(code) = code_opt.filter(|c| !c.is_empty()) else {
                 let _ = socket
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                     .await;
-                continue;
-            }
-
-            let state = state_opt
-                .ok_or_else(|| anyhow::anyhow!("Missing state in callback URL"))?;
-            if state != expected_state {
-                anyhow::bail!("State mismatch in callback URL");
-            }
-            let code = code_opt
-                .ok_or_else(|| anyhow::anyhow!("Missing code in callback URL"))?;
+                anyhow::bail!("Missing code in callback URL");
+            };
 
             let html = "<!DOCTYPE html><html><body><h1>Authentication Successful</h1><p>You can close this tab and return to the application.</p></body></html>";
             let response = format!(
@@ -863,42 +994,67 @@ pub trait CredentialStore: Send + Sync {
 /// In-process lock registry keyed by canonical normalized lock path to prevent
 /// blocking Tokio runtime worker threads on OS file locks.
 static FILE_LOCK_REGISTRY: std::sync::LazyLock<
-    std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    std::sync::Mutex<HashMap<std::path::PathBuf, std::sync::Weak<tokio::sync::Mutex<()>>>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
 
 /// Returns or creates an in-process mutex for the given lock file path.
 pub fn get_path_lock_mutex(path: &std::path::Path) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     let normalized = normalize_lock_path(path);
     let mut reg = FILE_LOCK_REGISTRY.lock().unwrap_or_else(|p| p.into_inner());
-    reg.entry(normalized)
-        .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
+    reg.retain(|_, weak| weak.strong_count() > 0);
+    if let Some(existing) = reg.get(&normalized).and_then(|w| w.upgrade()) {
+        return existing;
+    }
+    let arc = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+    reg.insert(normalized, std::sync::Arc::downgrade(&arc));
+    arc
 }
 
-/// Normalizes a path for lock registry keying.
+/// Normalizes a path for lock registry keying, canonicalizing the nearest
+/// existing ancestor so pre-creation and post-creation calls derive the same key.
 pub fn normalize_lock_path(path: &std::path::Path) -> std::path::PathBuf {
-    let p = if let Ok(c) = std::fs::canonicalize(path) {
-        c
-    } else if let Some(parent) = path.parent() {
-        if let Ok(c_parent) = std::fs::canonicalize(parent) {
-            if let Some(file_name) = path.file_name() {
-                c_parent.join(file_name)
-            } else {
-                path.to_path_buf()
-            }
-        } else {
-            path.to_path_buf()
-        }
-    } else {
+    let anchored = if path.is_absolute() {
         path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .unwrap_or_else(|_| path.to_path_buf())
     };
+    let mut cur = anchored.as_path();
+    let mut tail = Vec::new();
+    let base = loop {
+        if let Ok(c) = std::fs::canonicalize(cur) {
+            break c;
+        }
+        match cur.file_name() {
+            Some(name) => tail.push(name.to_os_string()),
+            None => break cur.to_path_buf(),
+        }
+        match cur.parent() {
+            Some(parent) => cur = parent,
+            None => break cur.to_path_buf(),
+        }
+    };
+    let mut resolved = base;
+    for part in tail.into_iter().rev() {
+        resolved.push(part);
+    }
     #[cfg(windows)]
     {
-        std::path::PathBuf::from(p.to_string_lossy().to_ascii_lowercase())
+        let s = resolved.to_string_lossy();
+        let bytes = s.as_bytes();
+        let stripped = if bytes.len() >= 8 && bytes[..8].eq_ignore_ascii_case(br"\\?\UNC\") {
+            format!(r"\\{}", &s[8..])
+        } else if let Some(rest) = s.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            s.into_owned()
+        };
+        std::path::PathBuf::from(stripped.to_ascii_lowercase())
     }
     #[cfg(not(windows))]
     {
-        p
+        resolved
     }
 }
 
@@ -1585,17 +1741,72 @@ mod tests {
         );
     }
 
-    #[test]
-    fn reject_unsafe_ip_blocks_cgnat_and_this_network() {
-        for ip in ["100.64.0.1", "100.127.255.254", "0.1.2.3"] {
-            let parsed: std::net::IpAddr = ip.parse().unwrap();
+    #[tokio::test]
+    async fn validate_token_url_blocks_ssrf_and_transition_metadata() {
+        let _env_lock = ENV_MUTEX.lock().await;
+        let _flag_guard = EnvVarGuard::set("MEHH_OAUTH_ALLOW_INSECURE_REFRESH", "");
+        for url in [
+            "https://100.64.0.1/token",
+            "https://0.1.2.3/token",
+            "https://[64:ff9b::169.254.169.254]/token",
+            "https://192.0.0.192/token",
+            "https://[::1]/token",
+            "https://metadata.google.internal/token",
+        ] {
             assert!(
-                reject_unsafe_ip(parsed, "example.test").is_err(),
-                "{ip} must be rejected"
+                validate_token_url(url).await.is_err(),
+                "{url} must be rejected"
             );
         }
-        let public: std::net::IpAddr = "93.184.216.34".parse().unwrap();
-        assert!(reject_unsafe_ip(public, "example.test").is_ok());
+        assert!(validate_token_url("https://93.184.216.34/token").await.is_ok());
+
+        let _enabled = EnvVarGuard::set("MEHH_OAUTH_ALLOW_INSECURE_REFRESH", "1");
+        assert!(validate_token_url("http://[::1]/token").await.is_ok());
+        assert!(
+            validate_token_url("http://169.254.169.254/token").await.is_err(),
+            "metadata floor must hold even when MEHH_OAUTH_ALLOW_INSECURE_REFRESH=1"
+        );
+    }
+
+    #[tokio::test]
+    async fn loopback_callback_ignores_unauthenticated_error_before_real_code() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            wait_for_loopback_callback(listener, "expected-state", Duration::from_secs(5)).await
+        });
+
+        // Rogue request with wrong state & error=access_denied must NOT abort login.
+        let mut s1 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s1.write_all(b"GET /callback?error=access_denied&state=wrong HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut resp1 = [0u8; 256];
+        let n = s1.read(&mut resp1).await.unwrap();
+        assert!(String::from_utf8_lossy(&resp1[..n]).contains("400 Bad Request"));
+
+        // Legitimate callback succeeds.
+        let mut s2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        s2.write_all(b"GET /callback?code=real-code&state=expected-state HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let code = handle.await.unwrap().unwrap();
+        assert_eq!(code, "real-code");
+    }
+
+    #[test]
+    fn normalize_lock_path_matches_before_and_after_dir_creation() {
+        let base = std::env::temp_dir().join(format!("oauth_lock_norm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let lock_file = base.join("nested").join("auth.json.lock");
+        let before = normalize_lock_path(&lock_file);
+        std::fs::create_dir_all(lock_file.parent().unwrap()).unwrap();
+        std::fs::write(&lock_file, b"").unwrap();
+        let after = normalize_lock_path(&lock_file);
+        assert_eq!(before, after);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[tokio::test]
@@ -1624,12 +1835,51 @@ mod tests {
         let validated = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
 
         // Sanity: an unpinned client cannot resolve the hostname at all.
-        let unpinned = build_refresh_client(None).unwrap();
+        let unpinned =
+            build_refresh_client(None, crate::http_safety::DnsPolicy::AllowPrivate).unwrap();
         assert!(unpinned.post(&url).send().await.is_err());
 
-        let pinned = build_refresh_client(Some(("token.invalid", &[validated]))).unwrap();
+        let pinned = build_refresh_client(
+            Some(("token.invalid", &[validated])),
+            crate::http_safety::DnsPolicy::AllowPrivate,
+        )
+        .unwrap();
         let resp = pinned.post(&url).send().await.unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::OK);
         assert_eq!(resp.text().await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn validate_token_url_normalizes_trailing_dot_and_refresh_client_enforces_dns_policy() {
+        let _env_lock = ENV_MUTEX.lock().await;
+        let _enabled = EnvVarGuard::set("MEHH_OAUTH_ALLOW_INSECURE_REFRESH", "1");
+
+        let validated = validate_token_url("http://localhost.:8080/token")
+            .await
+            .expect("trailing-dot localhost should validate when insecure refresh is enabled");
+        assert_eq!(validated.url.host_str(), Some("localhost"));
+        assert_eq!(
+            validated.pinned.as_ref().map(|(h, _)| h.as_str()),
+            Some("localhost")
+        );
+
+        let public_only =
+            build_refresh_client(None, crate::http_safety::DnsPolicy::PublicOnly).unwrap();
+        assert!(
+            public_only
+                .get("http://localhost:1/token")
+                .send()
+                .await
+                .is_err(),
+            "PublicOnly refresh client must reject loopback at connect time"
+        );
+        assert!(
+            public_only
+                .get("http://metadata.google.internal/token")
+                .send()
+                .await
+                .is_err(),
+            "PublicOnly refresh client must reject metadata hostnames at connect time"
+        );
     }
 }

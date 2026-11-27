@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use tokio::sync::Mutex as TokioMutex;
 
@@ -14,67 +14,10 @@ fn lock_queues() -> MutexGuard<'static, QueueMap> {
     QUEUES.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn normalize_path(path: &Path) -> PathBuf {
-    let mut components = Vec::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                if let Some(last) = components.last() {
-                    if matches!(last, std::path::Component::Normal(_)) {
-                        components.pop();
-                        continue;
-                    }
-                }
-                components.push(component);
-            }
-            _ => components.push(component),
-        }
-    }
-    components.into_iter().collect()
-}
-
 pub fn get_mutation_queue_key(file_path: &Path) -> String {
-    let resolved = if file_path.is_absolute() {
-        normalize_path(file_path)
-    } else {
-        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-        normalize_path(&cwd.join(file_path))
-    };
-
-    let canonical = resolved.canonicalize().unwrap_or_else(|_| {
-        let mut ancestors = Vec::new();
-        let mut curr = resolved.as_path();
-        while let Some(parent) = curr.parent() {
-            if let Some(file_name) = curr.file_name() {
-                ancestors.push(file_name);
-            }
-            if let Ok(canon_parent) = parent.canonicalize() {
-                let mut p = canon_parent;
-                for component in ancestors.into_iter().rev() {
-                    p.push(component);
-                }
-                return p;
-            }
-            curr = parent;
-        }
-        resolved
-    });
-
-    let mut normalized = canonical.to_string_lossy().replace('\\', "/");
-    let lower = normalized.to_ascii_lowercase();
-    if lower.starts_with("//?/unc/") {
-        normalized = format!("//{}", &normalized[8..]);
-    } else if lower.starts_with("//?/") {
-        normalized = normalized[4..].to_string();
-    }
-
-    // macOS APFS is case-insensitive by default, like Windows NTFS.
-    if cfg!(any(windows, target_os = "macos")) {
-        normalized.to_ascii_lowercase()
-    } else {
-        normalized
-    }
+    let canonical = crate::core::context::canonicalize_lossy(file_path);
+    let normalized = crate::core::context::normalize_path_for_comparison(&canonical);
+    normalized.to_string_lossy().replace('\\', "/")
 }
 
 struct QueueCleanupGuard {
@@ -93,8 +36,9 @@ impl Drop for QueueCleanupGuard {
     }
 }
 
-pub async fn with_file_mutation_queue<Fut, T>(file_path: &Path, future: Fut) -> T
+pub async fn with_file_mutation_queue_key<F, Fut, T>(file_path: &Path, f: F) -> T
 where
+    F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = T>,
 {
     // canonicalize() hits the filesystem; keep it off the Tokio worker.
@@ -121,11 +65,18 @@ where
     };
 
     let guard = lock.lock().await;
-    let result = future.await;
+    let result = f(key).await;
     drop(guard);
     drop(lock);
     drop(cleanup);
     result
+}
+
+pub async fn with_file_mutation_queue<Fut, T>(file_path: &Path, future: Fut) -> T
+where
+    Fut: std::future::Future<Output = T>,
+{
+    with_file_mutation_queue_key(file_path, |_| future).await
 }
 
 #[cfg(test)]
@@ -184,14 +135,18 @@ mod tests {
         // 2. Different files run concurrently
         let active_diff = Arc::new(AtomicUsize::new(0));
         let max_concurrent_diff = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
 
         let act_a = active_diff.clone();
         let max_diff_a = max_concurrent_diff.clone();
+        let barrier_a = barrier.clone();
         let t_a = tokio::spawn(async move {
             with_file_mutation_queue(&file_a, async {
                 let cur = act_a.fetch_add(1, Ordering::SeqCst) + 1;
                 max_diff_a.fetch_max(cur, Ordering::SeqCst);
-                sleep(Duration::from_millis(60)).await;
+                tokio::time::timeout(Duration::from_secs(2), barrier_a.wait())
+                    .await
+                    .expect("task A timed out waiting for concurrent task B");
                 act_a.fetch_sub(1, Ordering::SeqCst);
             })
             .await;
@@ -199,17 +154,22 @@ mod tests {
 
         let act_b = active_diff.clone();
         let max_diff_b = max_concurrent_diff.clone();
+        let barrier_b = barrier;
         let t_b = tokio::spawn(async move {
             with_file_mutation_queue(&file_b, async {
                 let cur = act_b.fetch_add(1, Ordering::SeqCst) + 1;
                 max_diff_b.fetch_max(cur, Ordering::SeqCst);
-                sleep(Duration::from_millis(60)).await;
+                tokio::time::timeout(Duration::from_secs(2), barrier_b.wait())
+                    .await
+                    .expect("task B timed out waiting for concurrent task A");
                 act_b.fetch_sub(1, Ordering::SeqCst);
             })
             .await;
         });
 
-        let _ = tokio::join!(t_a, t_b);
+        let (res_a, res_b) = tokio::join!(t_a, t_b);
+        res_a.unwrap();
+        res_b.unwrap();
         assert_eq!(
             max_concurrent_diff.load(Ordering::SeqCst),
             2,
@@ -279,6 +239,42 @@ mod tests {
         assert!(
             !map.contains_key(&key),
             "Queue entry must be removed after hold_task and cancelled task finish"
+        );
+    }
+
+    #[test]
+    fn test_mutation_queue_key_resolves_symlinks_before_folding_parent_dir() {
+        let ws = crate::TempTestDir::new("queue_symlink_ws");
+        let outside = crate::TempTestDir::new("queue_symlink_outside");
+        let outside_sub = outside.path().join("sub");
+        std::fs::create_dir_all(&outside_sub).unwrap();
+        let link = ws.path().join("symlink");
+
+        #[cfg(unix)]
+        let link_res = std::os::unix::fs::symlink(&outside_sub, &link);
+        #[cfg(windows)]
+        let link_res = std::os::windows::fs::symlink_dir(&outside_sub, &link);
+        #[cfg(not(any(unix, windows)))]
+        let link_res: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ));
+
+        if let Err(e) = link_res {
+            eprintln!("skipping symlink queue key test: {e}");
+            return;
+        }
+
+        let via_symlink = link.join("..").join("new.txt");
+        let direct_outside = outside.path().join("new.txt");
+        let direct_ws = ws.path().join("new.txt");
+        assert_eq!(
+            get_mutation_queue_key(&via_symlink),
+            get_mutation_queue_key(&direct_outside)
+        );
+        assert_ne!(
+            get_mutation_queue_key(&via_symlink),
+            get_mutation_queue_key(&direct_ws)
         );
     }
 }

@@ -184,15 +184,110 @@ pub fn agent_store_dir(cwd: &Path) -> PathBuf {
     }
 }
 
-/// Writes a manifest as pretty JSON to `<dir>/<agent_id>.json`.
+/// Maximum number of manifest files retained in the agent store directory.
+pub const MAX_RETAINED_MANIFESTS: usize = 200;
+
+/// Validates that `agent_id` is non-empty, bounded, and uses only safe filename
+/// characters (`A-Za-z0-9_-`), rejecting path separators, `..`, and control bytes.
+pub fn validate_agent_id(agent_id: &str) -> Result<(), String> {
+    if agent_id.is_empty() {
+        return Err("agent_id must not be empty".to_string());
+    }
+    if agent_id.len() > 128 {
+        return Err(format!(
+            "agent_id exceeds maximum length (128): {}",
+            agent_id.len()
+        ));
+    }
+    if agent_id.contains("..")
+        || agent_id.contains('/')
+        || agent_id.contains('\\')
+        || !agent_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(format!(
+            "invalid agent_id '{agent_id}': must contain only ASCII letters, digits, '-' or '_'"
+        ));
+    }
+    Ok(())
+}
+
+/// Prunes older manifest files in `dir` so at most `max_keep` remain.
+pub fn prune_old_manifests(dir: &Path, max_keep: usize) -> usize {
+    prune_old_manifests_preserving(dir, max_keep, None)
+}
+
+fn prune_old_manifests_preserving(
+    dir: &Path,
+    max_keep: usize,
+    protected_path: Option<&Path>,
+) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+
+    let mut manifests: Vec<(std::time::SystemTime, String, PathBuf)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if file_name.starts_with('.') {
+            continue;
+        }
+        let Some(stem) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        if validate_agent_id(stem).is_err() {
+            continue;
+        }
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        manifests.push((modified, file_name.to_string(), path));
+    }
+
+    if manifests.len() <= max_keep {
+        return 0;
+    }
+
+    // Oldest first so excess entries can be removed from the front.
+    manifests.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+
+    let to_remove = manifests.len() - max_keep;
+    let mut removed = 0usize;
+    for (_, _, path) in manifests.into_iter() {
+        if removed >= to_remove {
+            break;
+        }
+        if protected_path.is_some_and(|p| p == path.as_path()) {
+            continue;
+        }
+        match std::fs::remove_file(&path) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {}
+        }
+    }
+    removed
+}
+
+/// Writes a manifest atomically with restricted permissions to `<dir>/<agent_id>.json`.
 pub fn write_manifest(dir: &Path, manifest: &SubagentManifest) -> Result<PathBuf, String> {
+    validate_agent_id(&manifest.agent_id)?;
     std::fs::create_dir_all(dir)
         .map_err(|err| format!("failed to create {}: {err}", dir.display()))?;
     let path = dir.join(format!("{}.json", manifest.agent_id));
     let json = serde_json::to_string_pretty(manifest)
         .map_err(|err| format!("failed to serialize manifest: {err}"))?;
-    std::fs::write(&path, json)
-        .map_err(|err| format!("failed to write {}: {err}", path.display()))?;
+    crate::settings::write_file_atomic(&path, json.as_bytes(), true)
+        .map_err(|err| format!("failed to write {}: {err:#}", path.display()))?;
+    let _ = prune_old_manifests_preserving(dir, MAX_RETAINED_MANIFESTS, Some(&path));
     Ok(path)
 }
 
@@ -347,6 +442,64 @@ mod tests {
         assert_eq!(raw["completed_at_ms"], 2500);
         assert_eq!(raw["failure_class"], "test");
         assert!(raw.get("iso8601_now").is_none());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn validate_agent_id_rejects_empty_traversal_and_unsafe_chars() {
+        assert!(validate_agent_id("sub-123_abc").is_ok());
+        for bad in [
+            "",
+            "..",
+            "../evil",
+            "sub/../evil",
+            "sub/child",
+            "sub\\child",
+            "sub.json",
+            "sub space",
+            "sub\0id",
+        ] {
+            assert!(
+                validate_agent_id(bad).is_err(),
+                "expected agent_id {bad:?} to be rejected"
+            );
+        }
+        let too_long = "a".repeat(129);
+        assert!(validate_agent_id(&too_long).is_err());
+    }
+
+    #[test]
+    fn write_manifest_rejects_path_traversal_agent_id() {
+        let dir = std::env::temp_dir().join(format!("mehh_lc_trav_{}", uuid::Uuid::now_v7()));
+        let m = new_manifest("../escape".into(), "research".into(), "m".into(), 1000);
+        let err = write_manifest(&dir, &m).unwrap_err();
+        assert!(err.contains("invalid agent_id"), "unexpected err: {err}");
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn prune_old_manifests_caps_retained_files_and_skips_non_manifests() {
+        let dir = std::env::temp_dir().join(format!("mehh_lc_prune_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Non-manifest files must never be removed by manifest pruning.
+        std::fs::write(dir.join("notes.txt"), "keep").unwrap();
+        std::fs::write(dir.join(".hidden.json"), "{}").unwrap();
+
+        for i in 0..5u64 {
+            let mut m = new_manifest(format!("sub-{i}"), "research".into(), "m".into(), 1000 + i as i64);
+            m.completed_at_ms = Some(2000 + i as i64);
+            write_manifest(&dir, &m).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+
+        let removed = prune_old_manifests(&dir, 2);
+        assert_eq!(removed, 3);
+        assert!(dir.join("notes.txt").exists());
+        assert!(dir.join(".hidden.json").exists());
+        assert!(dir.join("sub-3.json").exists());
+        assert!(dir.join("sub-4.json").exists());
+        assert!(!dir.join("sub-0.json").exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

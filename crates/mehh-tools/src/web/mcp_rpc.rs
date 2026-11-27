@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 use super::types::ProviderError;
 
 pub const MAX_PROVIDER_RESPONSE_BYTES: usize = 512 * 1024;
+pub const MAX_PROVIDER_ERROR_BODY_BYTES: usize = 16 * 1024;
 pub const MAX_PROVIDER_ERROR_SNIPPET: usize = 300;
 pub const WEB_USER_AGENT: &str = "mehh-code/0.1";
 pub const MIN_RETRY_AFTER_SECS: u64 = 5;
@@ -23,26 +24,55 @@ pub struct McpToolResult {
 
 /// Reads a `reqwest::Response` body up to `max_bytes`, respecting `deadline` and `cancel`.
 pub async fn read_bounded_body(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     max_bytes: usize,
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Result<Vec<u8>, ProviderError> {
-    if let Some(len) = response.content_length() {
-        if len > max_bytes as u64 {
-            return Err(ProviderError::VendorUnavailable {
-                status: None,
-                detail: format!("Response exceeded {max_bytes} byte limit"),
-            });
+    read_bounded_inner(response, max_bytes, deadline, cancel, false).await
+}
+
+/// Reads up to `max_bytes` prefix of a `reqwest::Response` body, truncating cleanly at `max_bytes`
+/// instead of failing on oversized responses.
+pub async fn read_bounded_prefix(
+    response: reqwest::Response,
+    max_bytes: usize,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<Vec<u8>, ProviderError> {
+    read_bounded_inner(response, max_bytes, deadline, cancel, true).await
+}
+
+async fn read_bounded_inner(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    deadline: Instant,
+    cancel: &CancellationToken,
+    truncate_at_limit: bool,
+) -> Result<Vec<u8>, ProviderError> {
+    if !truncate_at_limit {
+        if let Some(len) = response.content_length() {
+            if len > max_bytes as u64 {
+                return Err(ProviderError::VendorUnavailable {
+                    status: None,
+                    detail: format!("Response exceeded {max_bytes} byte limit"),
+                });
+            }
         }
     }
 
-    let mut buf = Vec::new();
+    let initial_cap = response
+        .content_length()
+        .map(|l| (l as usize).min(max_bytes).min(256 * 1024))
+        .unwrap_or_else(|| max_bytes.min(16 * 1024));
+    let mut buf = Vec::with_capacity(initial_cap);
+    let sleep = tokio::time::sleep_until(deadline);
+    tokio::pin!(sleep);
     loop {
         let next_chunk = tokio::select! {
             biased;
             _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
-            _ = tokio::time::sleep_until(deadline) => {
+            _ = &mut sleep => {
                 return Err(ProviderError::VendorUnavailable {
                     status: None,
                     detail: "Request timed out while reading response body".to_string(),
@@ -53,13 +83,22 @@ pub async fn read_bounded_body(
 
         match next_chunk {
             Ok(Some(chunk)) => {
-                if buf.len().saturating_add(chunk.len()) > max_bytes {
-                    return Err(ProviderError::VendorUnavailable {
-                        status: None,
-                        detail: format!("Response exceeded {max_bytes} byte limit"),
-                    });
+                if truncate_at_limit {
+                    let remaining = max_bytes.saturating_sub(buf.len());
+                    if chunk.len() >= remaining {
+                        buf.extend_from_slice(&chunk[..remaining]);
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk);
+                } else {
+                    if buf.len().saturating_add(chunk.len()) > max_bytes {
+                        return Err(ProviderError::VendorUnavailable {
+                            status: None,
+                            detail: format!("Response exceeded {max_bytes} byte limit"),
+                        });
+                    }
+                    buf.extend_from_slice(&chunk);
                 }
-                buf.extend_from_slice(&chunk);
             }
             Ok(None) => break,
             Err(err) => {
@@ -72,6 +111,39 @@ pub async fn read_bounded_body(
     }
 
     Ok(buf)
+}
+
+/// Reads up to `max_bytes` of an HTTP error body without failing when the error page is larger
+/// or discarding HTTP status/`Retry-After` if the body stream stalls.
+pub async fn read_error_body_snippet(
+    mut response: reqwest::Response,
+    max_bytes: usize,
+    deadline: Instant,
+    cancel: &CancellationToken,
+) -> Result<String, ProviderError> {
+    let snippet_deadline = deadline.min(Instant::now() + Duration::from_secs(2));
+    let mut buf = Vec::new();
+    let sleep = tokio::time::sleep_until(snippet_deadline);
+    tokio::pin!(sleep);
+    while buf.len() < max_bytes {
+        let next_chunk = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(ProviderError::Cancelled),
+            _ = &mut sleep => break,
+            res = response.chunk() => res,
+        };
+        match next_chunk {
+            Ok(Some(chunk)) => {
+                let take = chunk.len().min(max_bytes - buf.len());
+                buf.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Executes an HTTP request builder under cancellation and total deadline.
@@ -122,12 +194,18 @@ pub fn parse_retry_after(header: Option<&str>, now: SystemTime) -> Option<Durati
 
 fn parse_imf_fixdate(raw: &str) -> Option<u64> {
     // e.g. "Wed, 21 Oct 2015 07:28:00 GMT"
-    let parts: Vec<&str> = raw.split_whitespace().collect();
-    if parts.len() != 6 || parts[5] != "GMT" || !parts[0].ends_with(',') {
+    let mut parts = raw.split_whitespace();
+    let dow = parts.next()?;
+    let day_str = parts.next()?;
+    let month_str = parts.next()?;
+    let year_str = parts.next()?;
+    let time_str = parts.next()?;
+    let tz = parts.next()?;
+    if parts.next().is_some() || tz != "GMT" || !dow.ends_with(',') {
         return None;
     }
-    let day: u32 = parts[1].parse().ok()?;
-    let month: u32 = match parts[2] {
+    let day: u32 = day_str.parse().ok()?;
+    let month: u32 = match month_str {
         "Jan" => 1,
         "Feb" => 2,
         "Mar" => 3,
@@ -142,33 +220,46 @@ fn parse_imf_fixdate(raw: &str) -> Option<u64> {
         "Dec" => 12,
         _ => return None,
     };
-    let year: i64 = parts[3].parse().ok()?;
-    let hms: Vec<&str> = parts[4].split(':').collect();
-    if hms.len() != 3 {
+    let year: i64 = year_str.parse().ok()?;
+    if !(1970..=9999).contains(&year) {
         return None;
     }
-    let hour: u64 = hms[0].parse().ok()?;
-    let minute: u64 = hms[1].parse().ok()?;
-    let second: u64 = hms[2].parse().ok()?;
-    if !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+    let mut hms = time_str.split(':');
+    let hour: u64 = hms.next()?.parse().ok()?;
+    let minute: u64 = hms.next()?.parse().ok()?;
+    let second: u64 = hms.next()?.parse().ok()?;
+    if hms.next().is_some() || !(1..=31).contains(&day) || hour > 23 || minute > 59 || second > 60 {
         return None;
     }
-    let days = days_from_civil(year, month, day);
-    if days < 0 {
-        return None;
-    }
-    Some((days as u64) * 86_400 + hour * 3_600 + minute * 60 + second)
+    let days = days_from_civil(year, month, day)?;
+    let days_u64 = u64::try_from(days).ok()?;
+    days_u64
+        .checked_mul(86_400)?
+        .checked_add(hour.checked_mul(3_600)?)?
+        .checked_add(minute.checked_mul(60)?)?
+        .checked_add(second)
 }
 
 /// Converts Gregorian calendar date to days since 1970-01-01 (Howard Hinnant's algorithm).
-fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
-    let y = year - i64::from(month <= 2);
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
+fn days_from_civil(year: i64, month: u32, day: u32) -> Option<i64> {
+    let y = year.checked_sub(i64::from(month <= 2))?;
+    let era = if y >= 0 { y } else { y.checked_sub(399)? } / 400;
+    let yoe = y.checked_sub(era.checked_mul(400)?)?;
     let m = i64::from(month);
-    let doy = (153 * (m + if m > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    let doy = 153i64
+        .checked_mul(m.checked_add(if m > 2 { -3 } else { 9 })?)?
+        .checked_add(2)?
+        / 5
+        + i64::from(day)
+        - 1;
+    let doe = yoe
+        .checked_mul(365)?
+        .checked_add(yoe / 4)?
+        .checked_sub(yoe / 100)?
+        .checked_add(doy)?;
+    era.checked_mul(146_097)?
+        .checked_add(doe)?
+        .checked_sub(719_468)
 }
 
 pub fn snippet_for_error(raw: &str) -> String {
@@ -178,23 +269,23 @@ pub fn snippet_for_error(raw: &str) -> String {
 }
 
 pub fn is_rate_limit_message(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
+    let bytes = message.as_bytes();
     [
-        "rate limit",
-        "rate-limit",
-        "ratelimit",
-        "too many requests",
-        "quota exceeded",
-        "slow down",
+        b"rate limit".as_slice(),
+        b"rate-limit".as_slice(),
+        b"ratelimit".as_slice(),
+        b"too many requests".as_slice(),
+        b"quota exceeded".as_slice(),
+        b"slow down".as_slice(),
     ]
     .iter()
-    .any(|marker| lower.contains(marker))
-        || has_word_429(&lower)
+    .any(|marker| super::html_markdown::contains_ascii_ci(bytes, marker))
+        || has_word_429(message)
 }
 
-fn has_word_429(lower: &str) -> bool {
-    let bytes = lower.as_bytes();
-    lower.match_indices("429").any(|(idx, _)| {
+fn has_word_429(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    text.match_indices("429").any(|(idx, _)| {
         let before_ok =
             idx == 0 || !(bytes[idx - 1].is_ascii_alphanumeric() || bytes[idx - 1] == b'_');
         let after = idx + 3;
@@ -364,16 +455,19 @@ pub async fn call_mcp_tool(
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
 
-    let bytes = read_bounded_body(response, MAX_PROVIDER_RESPONSE_BYTES, deadline, cancel).await?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
-
     if status >= 400 {
+        let text =
+            read_error_body_snippet(response, MAX_PROVIDER_ERROR_BODY_BYTES, deadline, cancel)
+                .await?;
         return Err(classify_http_status(
             status,
             retry_after.as_deref(),
             &snippet_for_error(&text),
         ));
     }
+
+    let bytes = read_bounded_body(response, MAX_PROVIDER_RESPONSE_BYTES, deadline, cancel).await?;
+    let text = String::from_utf8_lossy(&bytes).into_owned();
 
     parse_mcp_response_body(&text)
 }
@@ -446,6 +540,29 @@ mod tests {
         assert_eq!(parse_retry_after(Some("not-a-date"), now), None);
     }
 
+    #[test]
+    fn test_parse_imf_fixdate_rejects_extreme_years_without_overflow() {
+        let now = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 999999999999 07:28:00 GMT"), now),
+            None
+        );
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct -9223372036854775808 07:28:00 GMT"), now),
+            None
+        );
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct -100000000000000000 07:28:00 GMT"), now),
+            None
+        );
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 1969 07:28:00 GMT"), now),
+            None
+        );
+        assert_eq!(days_from_civil(i64::MIN, 1, 1), None);
+        assert_eq!(days_from_civil(i64::MAX, 12, 31), None);
+    }
+
     #[tokio::test]
     async fn test_bounded_body_exceeds_512k_fails_cleanly() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -513,5 +630,89 @@ mod tests {
         )
         .await;
         assert_eq!(res.unwrap_err(), ProviderError::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn test_oversized_429_preserves_status_and_retry_after() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = sock.read(&mut req_buf).await;
+            let body = "x".repeat(MAX_PROVIDER_RESPONSE_BYTES + 1024);
+            let resp = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 45\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{body}"
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+        });
+
+        let client = reqwest::Client::new();
+        let err = call_mcp_tool(
+            &client,
+            &format!("http://{addr}/mcp"),
+            "test_tool",
+            json!({}),
+            &[],
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ProviderError::RateLimited {
+                    retry_after: Some(d),
+                    ..
+                } if d == Duration::from_secs(45)
+            ),
+            "expected RateLimited(45s), got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stalled_429_error_body_preserves_status_and_retry_after() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut req_buf = [0u8; 1024];
+            let _ = sock.read(&mut req_buf).await;
+            let header = "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 42\r\nContent-Type: text/html\r\n\r\npartial";
+            let _ = sock.write_all(header.as_bytes()).await;
+            tokio::time::sleep(Duration::from_secs(10)).await;
+        });
+
+        let client = reqwest::Client::new();
+        let start = Instant::now();
+        let err = call_mcp_tool(
+            &client,
+            &format!("http://{addr}/mcp"),
+            "test_tool",
+            json!({}),
+            &[],
+            Duration::from_secs(8),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "stalled error body should time out quickly, took {:?}",
+            start.elapsed()
+        );
+        assert!(
+            matches!(
+                err,
+                ProviderError::RateLimited {
+                    retry_after: Some(d),
+                    ..
+                } if d == Duration::from_secs(42)
+            ),
+            "expected RateLimited(42s) despite stalled body, got: {err:?}"
+        );
     }
 }

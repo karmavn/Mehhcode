@@ -11,29 +11,37 @@ use tokio_util::sync::CancellationToken;
 use super::output::format_search_results;
 use super::router::ProgressFn;
 use super::types::WebProviderChoice;
-use super::WebRuntime;
+use super::{LazyWebRuntime, WebRuntime, WebRuntimeHandle};
 
 /// Built-in web search tool using Mehhcode's 6 keyless search providers.
 #[derive(Clone)]
 pub struct WebSearchTool {
-    runtime: Result<Arc<WebRuntime>, String>,
+    runtime: WebRuntimeHandle,
     description: String,
 }
 
 impl WebSearchTool {
     pub fn new(runtime: Result<Arc<WebRuntime>, String>) -> Self {
+        Self::with_handle(WebRuntimeHandle::Eager(runtime))
+    }
+
+    pub fn from_runtime(runtime: Arc<WebRuntime>) -> Self {
+        Self::new(Ok(runtime))
+    }
+
+    pub fn lazy(runtime: Arc<LazyWebRuntime>) -> Self {
+        Self::with_handle(WebRuntimeHandle::Lazy(runtime))
+    }
+
+    fn with_handle(runtime: WebRuntimeHandle) -> Self {
         let year = current_utc_year();
         let description = format!(
-            "Search the web for up-to-date information, documentation, and current events beyond your knowledge cutoff. Returns concise markdown search results.\n\nThe current year is {year}. Include {year} when querying recent releases or current events."
+            "Search the live web for real-time information (weather, news, latest releases), documentation, and external projects/repositories beyond your knowledge cutoff. Use this whenever a question requires live or external information rather than local workspace files. Returns concise markdown search results.\n\nThe current year is {year}. Include {year} when querying recent releases or current events."
         );
         Self {
             runtime,
             description,
         }
-    }
-
-    pub fn from_runtime(runtime: Arc<WebRuntime>) -> Self {
-        Self::new(Ok(runtime))
     }
 }
 
@@ -100,7 +108,7 @@ impl AgentTool for WebSearchTool {
         if cancel.is_cancelled() {
             return Err("Web search aborted".to_string());
         }
-        let runtime = self.runtime.as_ref().map_err(Clone::clone)?;
+        let runtime = self.runtime.resolve()?;
         if !runtime.config.enabled || runtime.config.provider == WebProviderChoice::Disabled {
             return Err("Web search is disabled in settings".to_string());
         }

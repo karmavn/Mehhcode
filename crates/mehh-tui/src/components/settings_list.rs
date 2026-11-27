@@ -1,10 +1,13 @@
 //! Two-column settings list with description pane and value cycling,
 //! ported from TypeScript `packages/tui/src/components/settings-list.ts`.
 
-use crate::ansi::{truncate_to_width, visible_width, wrap_text_with_ansi};
+use crate::ansi::{sanitize_terminal_text, truncate_to_width, visible_width, wrap_text_with_ansi};
 use crate::fuzzy::fuzzy_filter_indexed;
 use crate::theme::Theme;
 use crate::tui::Component;
+
+/// Row-to-item mapping for clickable settings rows: `(row_index -> (item_index, setting_id))`.
+pub type SettingsListRowMap = Vec<Option<(usize, String)>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SettingItem {
@@ -243,8 +246,8 @@ impl SettingsList {
     pub fn cycle_prev(&mut self) -> Option<(String, String)> {
         self.cycle_with_delta(false)
     }
-    fn render_option_chips(&self, item: &SettingItem, width: usize) -> Vec<String> {
-        let label_prefix = format!("  {} ", self.theme.fg(&self.theme.muted, "Options:"));
+    fn render_option_chips(&self, item: &SettingItem, width: usize, theme: &Theme) -> Vec<String> {
+        let label_prefix = format!("  {} ", theme.fg(&theme.muted, "Options:"));
         let cont_prefix = "           ";
         let prefix_width = 11usize;
         let mut lines = Vec::new();
@@ -254,11 +257,12 @@ impl SettingsList {
 
         for v in &item.values {
             let is_active = v == &item.current_value;
-            let plain_len = visible_width(v) + if is_active { 2 } else { 0 };
+            let clean_v = sanitize_terminal_text(v, false);
+            let plain_len = visible_width(&clean_v) + if is_active { 2 } else { 0 };
             let styled = if is_active {
-                format!("\x1b[1m{}[{}]\x1b[0m", self.theme.accent, v)
+                format!("\x1b[1m{}[{}]\x1b[0m", theme.accent, clean_v)
             } else {
-                self.theme.fg(&self.theme.dim, v)
+                theme.fg(&theme.dim, &clean_v)
             };
             let gap = if has_chip_on_line { 2 } else { 0 };
             if has_chip_on_line && cur_width + gap + plain_len > width {
@@ -281,14 +285,17 @@ impl SettingsList {
         lines
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_with_layout_and_map(
         &self,
         width: usize,
         max_visible: usize,
         include_categories: bool,
         include_description: bool,
+        filtered: &[usize],
+        max_label_width: usize,
+        theme: &Theme,
     ) -> (Vec<String>, Vec<Option<(usize, String)>>) {
-        let filtered = self.filtered_indices();
         if filtered.is_empty() {
             if self.filter.trim().is_empty() {
                 return (
@@ -301,16 +308,17 @@ impl SettingsList {
                     vec![None],
                 );
             }
+            let clean_filter = sanitize_terminal_text(self.filter.trim(), false);
             let msg = format!(
                 "No match for '{}' · Backspace or Esc to clear",
-                self.filter.trim()
+                clean_filter
             );
             let mut lines: Vec<String> =
                 wrap_text_with_ansi(&msg, width.saturating_sub(4).max(10))
                     .into_iter()
                     .map(|w| {
                         truncate_to_width(
-                            &format!("  {}", self.theme.fg(&self.theme.dim, &w)),
+                            &format!("  {}", theme.fg(&theme.dim, &w)),
                             width,
                             "...",
                             false,
@@ -321,8 +329,8 @@ impl SettingsList {
             lines.push(truncate_to_width(
                 &format!(
                     "  {}",
-                    self.theme.fg(
-                        &self.theme.dim,
+                    theme.fg(
+                        &theme.dim,
                         "↑↓ Move · ←→/Enter Change · Backspace · Esc Clear filter",
                     )
                 ),
@@ -341,14 +349,6 @@ impl SettingsList {
             .clamp(0, (total as isize - max_vis as isize).max(0)) as usize;
         let end = (start + max_vis).min(total);
 
-        let max_label_width = self
-            .items
-            .iter()
-            .map(|it| visible_width(&it.label))
-            .max()
-            .unwrap_or(12)
-            .clamp(10, 36);
-
         let show_categories = include_categories && self.filter.trim().is_empty();
         let mut last_category: Option<&str> = None;
         let mut lines = Vec::new();
@@ -359,8 +359,9 @@ impl SettingsList {
             if show_categories {
                 if let Some(cat) = item.category.as_deref() {
                     if last_category != Some(cat) {
+                        let clean_cat = sanitize_terminal_text(cat, false);
                         lines.push(truncate_to_width(
-                            &format!("  {}", self.theme.fg(&self.theme.muted, cat)),
+                            &format!("  {}", theme.fg(&theme.muted, &clean_cat)),
                             width,
                             "...",
                             false,
@@ -372,36 +373,38 @@ impl SettingsList {
             }
             let is_selected = actual_idx == selected;
 
+            let clean_label = sanitize_terminal_text(&item.label, false);
+            let clean_val = sanitize_terminal_text(&item.current_value, false);
             let val_display = if is_selected && item.values.len() > 1 {
-                format!("‹ {} ›", item.current_value)
+                format!("‹ {clean_val} ›")
             } else {
-                item.current_value.clone()
+                clean_val
             };
-            let label_len = visible_width(&item.label);
+            let label_len = visible_width(&clean_label);
             let pad = " ".repeat(max_label_width.saturating_sub(label_len));
             let value_len = visible_width(&val_display);
             let used = 2 + label_len + pad.len() + 2 + value_len;
             let tail_pad = " ".repeat(width.saturating_sub(used));
             let reset = "\x1b[0m";
-            let bg = self.theme.selected_bg.as_str();
+            let bg = theme.selected_bg.as_str();
             let rebg = bg;
 
             let row = if is_selected {
                 format!(
                     "{bg}{accent}▎ {reset}{rebg}\x1b[1m{label}{pad}  {reset}{rebg}{value_color}{val_display}{tail_pad}{reset}",
-                    accent = self.theme.accent,
-                    label = item.label,
-                    value_color = self.theme.accent,
+                    accent = theme.accent,
+                    label = clean_label,
+                    value_color = theme.accent,
                 )
             } else {
                 let val_color = match item.current_value.as_str() {
-                    "auto" => &self.theme.warning,
-                    "off" | "hide" | "false" => &self.theme.dim,
-                    _ => &self.theme.text,
+                    "auto" => &theme.warning,
+                    "off" | "hide" | "false" => &theme.dim,
+                    _ => &theme.text,
                 };
                 format!(
                     "  {label}{pad}  {reset}{val_color}{val_display}{tail_pad}{reset}",
-                    label = item.label,
+                    label = clean_label,
                 )
             };
             lines.push(truncate_to_width(&row, width, "...", false));
@@ -412,10 +415,7 @@ impl SettingsList {
             lines.push(truncate_to_width(
                 &format!(
                     "  {}",
-                    self.theme.fg(
-                        &self.theme.dim,
-                        &format!("({}/{}) · ↑↓ scroll", selected + 1, total)
-                    )
+                    theme.fg(&theme.dim, &format!("({}/{}) · ↑↓ scroll", selected + 1, total))
                 ),
                 width,
                 "...",
@@ -424,7 +424,7 @@ impl SettingsList {
             row_map.push(None);
         }
 
-        let selected_item = self.selected_item();
+        let selected_item = Some(&self.items[filtered[selected]]);
         let has_inspector = selected_item.is_some_and(|it| {
             !it.values.is_empty()
                 || (include_description && it.description.is_some())
@@ -436,7 +436,7 @@ impl SettingsList {
             lines.push(truncate_to_width(
                 &format!(
                     "  {}",
-                    self.theme.fg(&self.theme.border_muted, &"─".repeat(sep_len))
+                    theme.fg(&theme.border_muted, &"─".repeat(sep_len))
                 ),
                 width,
                 "...",
@@ -447,7 +447,7 @@ impl SettingsList {
 
         if let Some(item) = selected_item {
             if !item.values.is_empty() {
-                let chip_lines = self.render_option_chips(item, width);
+                let chip_lines = self.render_option_chips(item, width, theme);
                 let count = chip_lines.len();
                 lines.extend(chip_lines);
                 row_map.extend(std::iter::repeat_n(None, count));
@@ -455,10 +455,11 @@ impl SettingsList {
 
             if include_description {
                 if let Some(desc) = item.description.as_deref() {
-                    let wrapped = wrap_text_with_ansi(desc, width.saturating_sub(4).max(10));
+                    let clean_desc = sanitize_terminal_text(desc, false);
+                    let wrapped = wrap_text_with_ansi(&clean_desc, width.saturating_sub(4).max(10));
                     for w in wrapped {
                         lines.push(truncate_to_width(
-                            &format!("  {}", self.theme.fg(&self.theme.muted, &w)),
+                            &format!("  {}", theme.fg(&theme.muted, &w)),
                             width,
                             "...",
                             false,
@@ -473,7 +474,7 @@ impl SettingsList {
                 for (idx, w) in wrapped.into_iter().enumerate() {
                     let prefix = if idx == 0 { "  ▸ " } else { "    " };
                     lines.push(truncate_to_width(
-                        &format!("{prefix}{}", self.theme.fg(&self.theme.dim, &w)),
+                        &format!("{prefix}{}", theme.fg(&theme.dim, &w)),
                         width,
                         "...",
                         false,
@@ -485,12 +486,12 @@ impl SettingsList {
 
         if let Some((ref msg, is_err)) = self.status_message {
             let (icon, color) = if is_err {
-                ("✗", &self.theme.error)
+                ("✗", &theme.error)
             } else {
-                ("✓", &self.theme.success)
+                ("✓", &theme.success)
             };
             lines.push(truncate_to_width(
-                &format!("  {}", self.theme.fg(color, &format!("{icon} {msg}"))),
+                &format!("  {}", theme.fg(color, &format!("{icon} {msg}"))),
                 width,
                 "...",
                 false,
@@ -504,7 +505,7 @@ impl SettingsList {
             "↑↓ Move · ←→ / Enter Change · Type to filter · Esc Close"
         };
         lines.push(truncate_to_width(
-            &format!("  {}", self.theme.fg(&self.theme.dim, controls)),
+            &format!("  {}", theme.fg(&theme.dim, controls)),
             width,
             "...",
             false,
@@ -514,16 +515,111 @@ impl SettingsList {
         (lines, row_map)
     }
 
-    /// Renders the settings list together with a 1-to-1 line map of `(filtered_pos, setting_id)`
-    /// for clickable setting rows (headers, chips, descriptions, and status lines map to `None`).
-    pub fn render_with_row_map(&self, width: usize) -> (Vec<String>, Vec<Option<(usize, String)>>) {
-        let Some(budget) = self.max_height else {
-            return self.render_with_layout_and_map(width, self.max_visible, true, true);
+    fn option_chip_line_count(&self, item: &SettingItem, width: usize) -> usize {
+        if item.values.is_empty() {
+            return 0;
+        }
+        let prefix_width = 11usize;
+        let mut lines = 0usize;
+        let mut cur_width = prefix_width;
+        let mut has_chip_on_line = false;
+        for v in &item.values {
+            let clean_v = sanitize_terminal_text(v, false);
+            let is_active = v == &item.current_value;
+            let plain_len = visible_width(&clean_v) + if is_active { 2 } else { 0 };
+            let gap = if has_chip_on_line { 2 } else { 0 };
+            if has_chip_on_line && cur_width + gap + plain_len > width {
+                lines += 1;
+                cur_width = prefix_width + plain_len;
+            } else {
+                if has_chip_on_line {
+                    cur_width += 2;
+                }
+                cur_width += plain_len;
+                has_chip_on_line = true;
+            }
+        }
+        if has_chip_on_line {
+            lines += 1;
+        }
+        lines
+    }
+
+    fn layout_line_count(
+        &self,
+        _width: usize,
+        max_visible: usize,
+        include_categories: bool,
+        filtered: &[usize],
+        footer_base: usize,
+        desc_rows: usize,
+    ) -> usize {
+        let total = filtered.len();
+        let selected = self.selected.min(total.saturating_sub(1));
+        let max_vis = max_visible.max(1).min(total);
+        let start = (selected as isize - (max_vis as isize / 2))
+            .clamp(0, (total as isize - max_vis as isize).max(0)) as usize;
+        let end = (start + max_vis).min(total);
+
+        let show_categories = include_categories && self.filter.trim().is_empty();
+        let mut count = end - start;
+        if show_categories {
+            let mut last_category: Option<&str> = None;
+            for &item_idx in &filtered[start..end] {
+                if let Some(cat) = self.items[item_idx].category.as_deref() {
+                    if last_category != Some(cat) {
+                        count += 1;
+                        last_category = Some(cat);
+                    }
+                }
+            }
+        }
+        if total > max_vis {
+            count += 1;
+        }
+        count + footer_base + desc_rows
+    }
+
+    /// Renders the settings list with an explicit `theme` and `max_height` override without cloning `SettingsList`,
+    /// computing `filtered_indices()` once and returning `(lines, row_map, shown_count)`.
+    pub fn render_with_row_map_themed(
+        &self,
+        width: usize,
+        theme: &Theme,
+        max_height: Option<usize>,
+    ) -> (Vec<String>, SettingsListRowMap, usize) {
+        let filtered = self.filtered_indices();
+        let total = filtered.len();
+        let max_label_width = self
+            .items
+            .iter()
+            .map(|it| visible_width(&sanitize_terminal_text(&it.label, false)))
+            .max()
+            .unwrap_or(12)
+            .clamp(10, 36);
+
+        let Some(budget) = max_height else {
+            let (lines, row_map) = self.render_with_layout_and_map(
+                width,
+                self.max_visible,
+                true,
+                true,
+                &filtered,
+                max_label_width,
+                theme,
+            );
+            return (lines, row_map, total);
         };
-        let total = self.filtered_indices().len();
         if total == 0 {
-            let (mut lines, mut row_map) =
-                self.render_with_layout_and_map(width, self.max_visible, true, true);
+            let (mut lines, mut row_map) = self.render_with_layout_and_map(
+                width,
+                self.max_visible,
+                true,
+                true,
+                &filtered,
+                max_label_width,
+                theme,
+            );
             if lines.len() > budget {
                 let last_line = lines.pop();
                 let last_map = row_map.pop();
@@ -537,18 +633,70 @@ impl SettingsList {
                     }
                 }
             }
-            return (lines, row_map);
+            return (lines, row_map, total);
         }
+
+        let selected = self.selected.min(total.saturating_sub(1));
+        let selected_item = &self.items[filtered[selected]];
+        let chips_count = self.option_chip_line_count(selected_item, width);
+        let desc_count = selected_item
+            .description
+            .as_deref()
+            .map(|desc| {
+                let clean_desc = sanitize_terminal_text(desc, false);
+                wrap_text_with_ansi(&clean_desc, width.saturating_sub(4).max(10)).len()
+            })
+            .unwrap_or(0);
+        let val_desc_count = selected_item
+            .current_value_description()
+            .map(|v| wrap_text_with_ansi(v, width.saturating_sub(6).max(10)).len())
+            .unwrap_or(0);
+        let status_count = usize::from(self.status_message.is_some());
+        let sep_no_desc = usize::from(
+            !selected_item.values.is_empty()
+                || selected_item.current_value_description().is_some()
+                || self.status_message.is_some(),
+        );
+        let sep_with_desc = usize::from(
+            !selected_item.values.is_empty()
+                || selected_item.description.is_some()
+                || selected_item.current_value_description().is_some()
+                || self.status_message.is_some(),
+        );
+        let footer_no_desc = sep_no_desc + chips_count + val_desc_count + status_count + 1;
+        let footer_with_desc = sep_with_desc + chips_count + val_desc_count + status_count + 1;
+
         let start_vis = self.max_visible.min(total);
         for (cats, desc) in [(true, true), (true, false), (false, false)] {
+            let (f_base, d_rows) = if desc {
+                (footer_with_desc, desc_count)
+            } else {
+                (footer_no_desc, 0)
+            };
             for vis in (1..=start_vis).rev() {
-                let (lines, row_map) = self.render_with_layout_and_map(width, vis, cats, desc);
-                if lines.len() <= budget {
-                    return (lines, row_map);
+                if self.layout_line_count(width, vis, cats, &filtered, f_base, d_rows) <= budget {
+                    let (lines, row_map) = self.render_with_layout_and_map(
+                        width,
+                        vis,
+                        cats,
+                        desc,
+                        &filtered,
+                        max_label_width,
+                        theme,
+                    );
+                    return (lines, row_map, total);
                 }
             }
         }
-        let (mut lines, mut row_map) = self.render_with_layout_and_map(width, 1, false, false);
+        let (mut lines, mut row_map) = self.render_with_layout_and_map(
+            width,
+            1,
+            false,
+            false,
+            &filtered,
+            max_label_width,
+            theme,
+        );
         if lines.len() > budget {
             let last_line = lines.pop();
             let last_map = row_map.pop();
@@ -562,6 +710,14 @@ impl SettingsList {
                 }
             }
         }
+        (lines, row_map, total)
+    }
+
+    /// Renders the settings list together with a 1-to-1 line map of `(filtered_pos, setting_id)`
+    /// for clickable setting rows (headers, chips, descriptions, and status lines map to `None`).
+    pub fn render_with_row_map(&self, width: usize) -> (Vec<String>, Vec<Option<(usize, String)>>) {
+        let (lines, row_map, _) =
+            self.render_with_row_map_themed(width, &self.theme, self.max_height);
         (lines, row_map)
     }
 }
@@ -881,5 +1037,39 @@ mod tests {
         assert_eq!(blines.len(), bmap.len());
         assert!(blines.len() <= 6);
         assert!(bmap.iter().flatten().any(|(idx, id)| *idx == 0 && id == "mode"));
+    }
+
+    #[test]
+    fn settings_list_sanitizes_all_rendered_fields() {
+        let items = vec![SettingItem::new(
+            "s1",
+            "\x1b]0;pwn\x07\x1b[31mLab\u{202E}el",
+            "\x1b]52;c;AA\x07val\u{2066}1",
+        )
+        .with_category("\x1b[33mCAT\u{202E}1")
+        .with_description("\x1b]0;bad\x07desc\u{202E}ription")
+        .with_values(vec![
+            "\x1b]52;c;AA\x07val\u{2066}1".into(),
+            "\x1b[32mval\u{202E}2".into(),
+        ])];
+        let mut list = SettingsList::new(items, 5);
+        let joined = list.render(60).join("\n");
+        for forbidden in ["\x1b]0;", "\x1b]52;", "\x1b[31m", "\x1b[32m", "\x1b[33m", "\u{202E}", "\u{2066}"] {
+            assert!(!joined.contains(forbidden), "unsanitized {forbidden:?} in {joined:?}");
+        }
+        let plain = crate::ansi::strip_ansi(&joined);
+        assert!(plain.contains("CAT1"), "{plain}");
+        assert!(plain.contains("Label"), "{plain}");
+        assert!(plain.contains("val1"), "{plain}");
+        assert!(plain.contains("val2"), "{plain}");
+        assert!(plain.contains("description"), "{plain}");
+
+        list.set_filter("\x1b]0;pwn\x07\x1b[31mnomatch\u{202E}");
+        let empty_joined = list.render(60).join("\n");
+        for forbidden in ["\x1b]0;", "\x1b[31m", "\u{202E}"] {
+            assert!(!empty_joined.contains(forbidden), "unsanitized {forbidden:?} in {empty_joined:?}");
+        }
+        let empty_plain = crate::ansi::strip_ansi(&empty_joined);
+        assert!(empty_plain.contains("No match for 'nomatch'"), "{empty_plain}");
     }
 }

@@ -61,6 +61,7 @@ async fn test_mcp_agent_tool_reflects_read_only_hint() {
     let read_tool = McpAgentTool::new("test_server", read_tool_info, client.clone());
     assert_eq!(read_tool.is_read_only(), Some(true));
     assert_eq!(read_tool.execution_mode(), ToolExecutionMode::Parallel);
+    assert_eq!(read_tool.is_safe_for_auto_approve(&serde_json::Map::new()), Some(false));
 
     let mutate_tool_info = McpToolInfo {
         name: "drop_table".to_string(),
@@ -75,6 +76,25 @@ async fn test_mcp_agent_tool_reflects_read_only_hint() {
     let mutate_tool = McpAgentTool::new("test_server", mutate_tool_info, client.clone());
     assert_eq!(mutate_tool.is_read_only(), Some(false));
     assert_eq!(mutate_tool.execution_mode(), ToolExecutionMode::Sequential);
+    assert_eq!(mutate_tool.is_safe_for_auto_approve(&serde_json::Map::new()), Some(false));
+
+    let conflicting_tool_info = McpToolInfo {
+        name: "read_and_wipe".to_string(),
+        description: Some("Conflicting annotations".to_string()),
+        input_schema: serde_json::json!({ "type": "object" }),
+        annotations: Some(McpToolAnnotations {
+            read_only_hint: Some(true),
+            destructive_hint: Some(true),
+            ..Default::default()
+        }),
+    };
+    let conflicting_tool = McpAgentTool::new("test_server", conflicting_tool_info, client.clone());
+    assert_eq!(conflicting_tool.is_read_only(), Some(false));
+    assert_eq!(conflicting_tool.execution_mode(), ToolExecutionMode::Sequential);
+    assert_eq!(
+        conflicting_tool.is_safe_for_auto_approve(&serde_json::Map::new()),
+        Some(false)
+    );
 
     let unannotated_info = McpToolInfo {
         name: "unknown_action".to_string(),
@@ -85,4 +105,8 @@ async fn test_mcp_agent_tool_reflects_read_only_hint() {
     let unannotated_tool = McpAgentTool::new("test_server", unannotated_info, client);
     assert_eq!(unannotated_tool.is_read_only(), None);
     assert_eq!(unannotated_tool.execution_mode(), ToolExecutionMode::Sequential);
+    assert_eq!(
+        unannotated_tool.is_safe_for_auto_approve(&serde_json::Map::new()),
+        Some(false)
+    );
 }

@@ -18,22 +18,33 @@ pub struct DeferredToolMatch {
 
 fn tokenize_terms(text: &str) -> Vec<String> {
     let mut tokens = Vec::new();
-    for chunk in
-        text.split(|c: char| c.is_whitespace() || c == '_' || c == '-' || c == ':' || c == '.')
-    {
+    for chunk in text.split(|c: char| !c.is_alphanumeric()) {
         if chunk.is_empty() {
             continue;
         }
+        let chars: Vec<char> = chunk.chars().collect();
+        let mut sub_tokens = Vec::new();
         let mut curr = String::new();
-        for ch in chunk.chars() {
-            if ch.is_uppercase() && !curr.is_empty() {
-                tokens.push(curr);
-                curr = String::new();
+        for i in 0..chars.len() {
+            let ch = chars[i];
+            if i > 0 && ch.is_uppercase() {
+                let prev_is_upper = chars[i - 1].is_uppercase();
+                let next_is_lower = chars.get(i + 1).is_some_and(|n| n.is_lowercase());
+                if (!prev_is_upper || next_is_lower) && !curr.is_empty() {
+                    sub_tokens.push(std::mem::take(&mut curr));
+                }
             }
-            curr.push(ch.to_ascii_lowercase());
+            for lc in ch.to_lowercase() {
+                curr.push(lc);
+            }
         }
         if !curr.is_empty() {
-            tokens.push(curr);
+            sub_tokens.push(curr);
+        }
+        let emit_whole = sub_tokens.len() > 1;
+        tokens.extend(sub_tokens);
+        if emit_whole {
+            tokens.push(chunk.to_lowercase());
         }
     }
     tokens
@@ -62,25 +73,114 @@ fn extract_schema_terms(val: &Value, out: &mut Vec<String>) {
     }
 }
 
+struct IndexedDoc {
+    tool: Arc<dyn AgentTool>,
+    name_lower: String,
+    tf_map: std::collections::HashMap<String, f64>,
+    doc_len: f64,
+}
+
+struct DeferredIndex {
+    docs: Vec<IndexedDoc>,
+    avgdl: f64,
+    df_map: std::collections::HashMap<String, f64>,
+}
+
+impl DeferredIndex {
+    fn build(deferred: &[Arc<dyn AgentTool>]) -> Self {
+        let num_docs = deferred.len() as f64;
+        let mut docs = Vec::with_capacity(deferred.len());
+        let mut df_map = std::collections::HashMap::new();
+        let mut total_len = 0.0;
+
+        for tool in deferred {
+            let mut tf_map = std::collections::HashMap::new();
+            let mut doc_len = 0.0;
+
+            for tok in tokenize_terms(tool.name()) {
+                *tf_map.entry(tok).or_insert(0.0) += 3.0;
+                doc_len += 3.0;
+            }
+            for tok in tokenize_terms(tool.description()) {
+                *tf_map.entry(tok).or_insert(0.0) += 1.0;
+                doc_len += 1.0;
+            }
+            let mut schema_raw = Vec::new();
+            extract_schema_terms(&tool.parameters(), &mut schema_raw);
+            for s in schema_raw {
+                for tok in tokenize_terms(&s) {
+                    *tf_map.entry(tok).or_insert(0.0) += 1.0;
+                    doc_len += 1.0;
+                }
+            }
+
+            for term in tf_map.keys() {
+                *df_map.entry(term.clone()).or_insert(0.0) += 1.0;
+            }
+
+            total_len += doc_len;
+            docs.push(IndexedDoc {
+                tool: Arc::clone(tool),
+                name_lower: tool.name().to_ascii_lowercase(),
+                tf_map,
+                doc_len,
+            });
+        }
+
+        let avgdl = if num_docs > 0.0 {
+            total_len / num_docs
+        } else {
+            1.0
+        };
+
+        Self {
+            docs,
+            avgdl,
+            df_map,
+        }
+    }
+}
+
 /// Catalog of deferred tools that can be searched and dynamically activated mid-session.
 pub struct DeferredToolCatalog {
     deferred: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
     active_tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
+    index: Arc<RwLock<DeferredIndex>>,
 }
 
 impl DeferredToolCatalog {
     /// Creates a catalog wrapping `deferred` tools alongside an empty dynamic tool slot.
     pub fn new(deferred: Vec<Arc<dyn AgentTool>>) -> Self {
+        let index = DeferredIndex::build(&deferred);
         Self {
             deferred: Arc::new(RwLock::new(deferred)),
             active_tools: Arc::new(RwLock::new(Vec::new())),
+            index: Arc::new(RwLock::new(index)),
         }
     }
 
-    /// Replaces the registered deferred tools in the catalog.
+    /// Replaces the registered deferred tools in the catalog and reconciles `active_tools`
+    /// so removed tools are deactivated and updated tools point to the new instances.
     pub fn replace_deferred(&self, deferred: Vec<Arc<dyn AgentTool>>) {
-        let mut guard = mehh_ai::write_recover(&self.deferred);
-        *guard = deferred;
+        let new_index = DeferredIndex::build(&deferred);
+        let mut deferred_guard = mehh_ai::write_recover(&self.deferred);
+        let mut active_guard = mehh_ai::write_recover(&self.active_tools);
+        let mut index_guard = mehh_ai::write_recover(&self.index);
+
+        let mut reconciled = Vec::with_capacity(active_guard.len());
+        for active in active_guard.iter() {
+            if let Some(updated) = deferred.iter().find(|t| t.name() == active.name()) {
+                if !reconciled
+                    .iter()
+                    .any(|existing: &Arc<dyn AgentTool>| existing.name() == updated.name())
+                {
+                    reconciled.push(Arc::clone(updated));
+                }
+            }
+        }
+        *active_guard = reconciled;
+        *deferred_guard = deferred;
+        *index_guard = new_index;
     }
 
     /// Returns the shared handle wired into `AgentLoopConfig.dynamic_tools`.
@@ -138,6 +238,8 @@ impl DeferredToolCatalog {
             desc,
             params: parameters,
         }));
+        let rebuilt = DeferredIndex::build(&guard);
+        *mehh_ai::write_recover(&self.index) = rebuilt;
     }
 
     /// Searches deferred tools using Okapi BM25 (k1=1.2, b=0.75) across names, descriptions,
@@ -146,82 +248,30 @@ impl DeferredToolCatalog {
         let max_results = max_results.clamp(1, 25);
         let q = query.trim();
         let query_norm = q.to_ascii_lowercase();
-        let query_tokens = tokenize_terms(&query_norm);
+        let query_tokens = tokenize_terms(q);
 
-        let deferred_guard = mehh_ai::read_recover(&self.deferred);
-        if deferred_guard.is_empty() {
+        let index_guard = mehh_ai::read_recover(&self.index);
+        if index_guard.docs.is_empty() {
             return Vec::new();
         }
         if query_tokens.is_empty() {
-            return deferred_guard
+            return index_guard
+                .docs
                 .iter()
                 .take(max_results)
-                .map(Arc::clone)
+                .map(|d| Arc::clone(&d.tool))
                 .collect();
         }
 
-        let num_docs = deferred_guard.len() as f64;
+        let num_docs = index_guard.docs.len() as f64;
         const K1: f64 = 1.2;
         const B: f64 = 0.75;
+        let avgdl = index_guard.avgdl;
 
-        // Build document representations
-        struct DocRep<'a> {
-            tool: &'a Arc<dyn AgentTool>,
-            tf_map: std::collections::HashMap<String, f64>,
-            doc_len: f64,
-        }
-
-        let mut docs = Vec::with_capacity(deferred_guard.len());
-        let mut total_len = 0.0;
-
-        for tool in deferred_guard.iter() {
-            let mut tf_map = std::collections::HashMap::new();
-            let mut doc_len = 0.0;
-
-            // Name tokens weighted 3.0
-            for tok in tokenize_terms(tool.name()) {
-                *tf_map.entry(tok).or_insert(0.0) += 3.0;
-                doc_len += 3.0;
-            }
-
-            // Description tokens weighted 1.0
-            for tok in tokenize_terms(tool.description()) {
-                *tf_map.entry(tok).or_insert(0.0) += 1.0;
-                doc_len += 1.0;
-            }
-
-            // Parameter schema tokens weighted 1.0
-            let mut schema_raw = Vec::new();
-            extract_schema_terms(&tool.parameters(), &mut schema_raw);
-            for s in schema_raw {
-                for tok in tokenize_terms(&s) {
-                    *tf_map.entry(tok).or_insert(0.0) += 1.0;
-                    doc_len += 1.0;
-                }
-            }
-
-            total_len += doc_len;
-            docs.push(DocRep {
-                tool,
-                tf_map,
-                doc_len,
-            });
-        }
-
-        let avgdl = if num_docs > 0.0 {
-            total_len / num_docs
-        } else {
-            1.0
-        };
-
-        // Precompute IDF for each query token across docs (reduces complexity from O(D^2 * T) to O(D * T))
         let idfs: Vec<(&String, f64)> = query_tokens
             .iter()
             .filter_map(|q_term| {
-                let df = docs
-                    .iter()
-                    .filter(|d| d.tf_map.contains_key(q_term))
-                    .count() as f64;
+                let df = index_guard.df_map.get(q_term).copied().unwrap_or(0.0);
                 if df > 0.0 {
                     let idf = ((num_docs - df + 0.5) / (df + 0.5) + 1.0).ln();
                     Some((q_term, idf))
@@ -231,9 +281,9 @@ impl DeferredToolCatalog {
             })
             .collect();
 
-        let mut scored: Vec<(f64, &Arc<dyn AgentTool>)> = Vec::with_capacity(docs.len());
+        let mut scored: Vec<(f64, &Arc<dyn AgentTool>)> = Vec::with_capacity(index_guard.docs.len());
 
-        for doc in &docs {
+        for doc in &index_guard.docs {
             let mut score = 0.0f64;
 
             for &(q_term, idf) in &idfs {
@@ -244,15 +294,14 @@ impl DeferredToolCatalog {
                 }
             }
 
-            let tool_name_lower = doc.tool.name().to_ascii_lowercase();
-            if tool_name_lower == query_norm {
+            if doc.name_lower == query_norm {
                 score += 50.0;
-            } else if tool_name_lower.contains(&query_norm) {
+            } else if doc.name_lower.contains(&query_norm) {
                 score += 15.0;
             }
 
             if score > 0.001 {
-                scored.push((score, doc.tool));
+                scored.push((score, &doc.tool));
             }
         }
 
@@ -477,5 +526,49 @@ mod tests {
         let active = handle.read().unwrap();
         assert_eq!(active.len(), 1);
         assert_eq!(active[0].name(), "mcp__gh__list_issues");
+    }
+
+    #[test]
+    fn replace_deferred_reconciles_removed_and_updated_active_tools() {
+        let initial: Vec<Arc<dyn AgentTool>> = vec![
+            Arc::new(FakeDeferredTool("mcp__gh__list_issues", "old description")),
+            Arc::new(FakeDeferredTool("mcp__gh__old_tool", "to be removed")),
+        ];
+        let catalog = DeferredToolCatalog::new(initial);
+        let handle = catalog.dynamic_tools_handle();
+        let (activated, missing) = catalog.activate_by_names(&[
+            "mcp__gh__list_issues".to_string(),
+            "mcp__gh__old_tool".to_string(),
+        ]);
+        assert_eq!(activated.len(), 2);
+        assert!(missing.is_empty());
+
+        let updated: Vec<Arc<dyn AgentTool>> = vec![
+            Arc::new(FakeDeferredTool("mcp__gh__list_issues", "new description")),
+            Arc::new(FakeDeferredTool("mcp__gh__new_tool", "not yet activated")),
+        ];
+        catalog.replace_deferred(updated);
+
+        let active = handle.read().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].name(), "mcp__gh__list_issues");
+        assert_eq!(active[0].description(), "new description");
+    }
+
+    #[test]
+    fn search_handles_uppercase_acronyms_and_camelcase_symmetrically() {
+        let deferred: Vec<Arc<dyn AgentTool>> = vec![
+            Arc::new(FakeDeferredTool("mcp__gh__issues", "List GitHub issues")),
+            Arc::new(FakeDeferredTool("db_exec", "Execute SQL queries")),
+            Arc::new(FakeDeferredTool("http_srv", "Manage HTTPServer endpoints")),
+            Arc::new(FakeDeferredTool("json_fmt", "Format JSON payloads")),
+        ];
+        let catalog = DeferredToolCatalog::new(deferred);
+
+        assert_eq!(catalog.search("github", 5)[0].name(), "mcp__gh__issues");
+        assert_eq!(catalog.search("GitHub", 5)[0].name(), "mcp__gh__issues");
+        assert_eq!(catalog.search("SQL", 5)[0].name(), "db_exec");
+        assert_eq!(catalog.search("HTTP", 5)[0].name(), "http_srv");
+        assert_eq!(catalog.search("JSON", 5)[0].name(), "json_fmt");
     }
 }

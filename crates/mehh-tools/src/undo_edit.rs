@@ -10,10 +10,11 @@ use tokio_util::sync::CancellationToken;
 use crate::core::context::{self, PathPolicy};
 use crate::core::fs::atomic_write_checked;
 use crate::core::output::truncate_head;
-use crate::file_mutation_queue::{get_mutation_queue_key, with_file_mutation_queue};
+use crate::file_mutation_queue::{get_mutation_queue_key, with_file_mutation_queue_key};
 
 const MAX_DIFF_BYTES: usize = 64 * 1024;
 const MAX_SNAPSHOTS_PER_FILE: usize = 20;
+const MAX_TOTAL_UNDO_ENTRIES: usize = 1024;
 pub const MAX_SNAPSHOT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_TOTAL_UNDO_BYTES: usize = 16 * 1024 * 1024;
 
@@ -69,6 +70,11 @@ impl EditUndoStore {
     /// Returns `false` when the snapshot exceeds [`MAX_SNAPSHOT_BYTES`], so
     /// callers can warn that undo is unavailable instead of reporting success.
     pub fn push_snapshot(&self, path: &Path, snapshot: FileSnapshot) -> bool {
+        let key = get_mutation_queue_key(path);
+        self.push_snapshot_with_key(key, snapshot)
+    }
+
+    pub(crate) fn push_snapshot_with_key(&self, key: String, snapshot: FileSnapshot) -> bool {
         let size = match &snapshot {
             FileSnapshot::Existed { bytes, .. } => {
                 if bytes.len() > MAX_SNAPSHOT_BYTES {
@@ -79,20 +85,29 @@ impl EditUndoStore {
             FileSnapshot::DidNotExist { .. } => 0,
         };
 
-        let key = get_mutation_queue_key(path);
         let mut inner = self.lock_inner();
 
-        while inner.total_bytes + size > MAX_TOTAL_UNDO_BYTES {
+        while inner.order.len() >= MAX_TOTAL_UNDO_ENTRIES
+            || inner.total_bytes + size > MAX_TOTAL_UNDO_BYTES
+        {
             let Some(oldest_key) = inner.order.pop_front() else {
                 break;
             };
-            if let Some(history) = inner.snapshots.get_mut(&oldest_key) {
-                if !history.is_empty() {
-                    let evicted = history.remove(0);
-                    inner.total_bytes = inner.total_bytes.saturating_sub(evicted.size);
-                }
+            let (evicted_size, became_empty) =
+                if let Some(history) = inner.snapshots.get_mut(&oldest_key) {
+                    let evicted_size = if !history.is_empty() {
+                        history.remove(0).size
+                    } else {
+                        0
+                    };
+                    (evicted_size, history.is_empty())
+                } else {
+                    (0, false)
+                };
+            inner.total_bytes = inner.total_bytes.saturating_sub(evicted_size);
+            if became_empty {
+                inner.snapshots.remove(&oldest_key);
             }
-            inner.snapshots.retain(|_, v| !v.is_empty());
         }
 
         let history = inner.snapshots.entry(key.clone()).or_default();
@@ -118,19 +133,27 @@ impl EditUndoStore {
     /// first and pop afterwards keep the undo history if the write fails.
     pub fn peek_snapshot(&self, path: &Path) -> Option<FileSnapshot> {
         let key = get_mutation_queue_key(path);
+        self.peek_snapshot_with_key(&key)
+    }
+
+    pub(crate) fn peek_snapshot_with_key(&self, key: &str) -> Option<FileSnapshot> {
         let inner = self.lock_inner();
         inner
             .snapshots
-            .get(&key)
+            .get(key)
             .and_then(|history| history.last())
             .map(|entry| entry.snapshot.clone())
     }
 
     pub fn pop_snapshot(&self, path: &Path) -> Option<FileSnapshot> {
         let key = get_mutation_queue_key(path);
+        self.pop_snapshot_with_key(&key)
+    }
+
+    pub(crate) fn pop_snapshot_with_key(&self, key: &str) -> Option<FileSnapshot> {
         let mut inner = self.lock_inner();
         let (entry, is_empty) = {
-            if let Some(history) = inner.snapshots.get_mut(&key) {
+            if let Some(history) = inner.snapshots.get_mut(key) {
                 let popped = history.pop();
                 let empty = history.is_empty();
                 (popped, empty)
@@ -141,11 +164,11 @@ impl EditUndoStore {
 
         if let Some(entry) = entry {
             inner.total_bytes = inner.total_bytes.saturating_sub(entry.size);
-            if let Some(pos) = inner.order.iter().rposition(|k| k == &key) {
+            if let Some(pos) = inner.order.iter().rposition(|k| k == key) {
                 inner.order.remove(pos);
             }
             if is_empty {
-                inner.snapshots.remove(&key);
+                inner.snapshots.remove(key);
             }
             Some(entry.snapshot)
         } else {
@@ -157,6 +180,22 @@ impl EditUndoStore {
         let key = get_mutation_queue_key(path);
         let inner = self.lock_inner();
         inner.snapshots.get(&key).is_some_and(|h| !h.is_empty())
+    }
+
+    /// Clears all recorded undo snapshots for `path`, adjusting `total_bytes`
+    /// and `order` accordingly.
+    pub fn invalidate_file(&self, path: &Path) {
+        let key = get_mutation_queue_key(path);
+        self.invalidate_file_with_key(&key);
+    }
+
+    pub(crate) fn invalidate_file_with_key(&self, key: &str) {
+        let mut inner = self.lock_inner();
+        if let Some(history) = inner.snapshots.remove(key) {
+            let removed_bytes: usize = history.iter().map(|e| e.size).sum();
+            inner.total_bytes = inner.total_bytes.saturating_sub(removed_bytes);
+            inner.order.retain(|k| k != key);
+        }
     }
 }
 
@@ -242,42 +281,55 @@ impl AgentTool for UndoEditTool {
         self.path_policy.validate(&inspected_target)?;
         let undo_store = self.undo_store.clone();
         let cancel_inner = cancel.clone();
+        let queue_target = inspected_target.clone();
 
-        with_file_mutation_queue(&full_path, async {
+        with_file_mutation_queue_key(&queue_target, |queue_key| async move {
             if cancel_inner.is_cancelled() {
                 return Err("Tool execution cancelled".to_string());
             }
 
-            let snapshot = undo_store.peek_snapshot(&full_path).ok_or_else(|| {
-                format!(
-                    "Undo is unavailable for {}: no previous edit snapshot was recorded (the file may be too large to snapshot)",
+            let current_target = crate::core::fs::resolve_write_target(&full_path).await;
+            if !crate::core::fs::targets_match(&current_target, &inspected_target) {
+                return Err(format!(
+                    "Refusing to undo {}: target changed since it was inspected",
                     path_str
-                )
-            })?;
+                ));
+            }
+
+            let snapshot = undo_store
+                .peek_snapshot_with_key(&queue_key)
+                .ok_or_else(|| {
+                    format!(
+                        "Undo is unavailable for {}: no previous edit snapshot was recorded (the file may be too large to snapshot)",
+                        path_str
+                    )
+                })?;
 
             match snapshot {
                 FileSnapshot::DidNotExist {
                     target: recorded_target,
                 } => {
-                    if full_path.exists() {
+                    if tokio::fs::try_exists(&current_target)
+                        .await
+                        .unwrap_or(false)
+                    {
                         // A creation through a (possibly dangling) symlink puts
                         // the new file at the resolved target, not at the link.
                         // Remove the target so the link itself survives, but
                         // only if the link still points where it did when the
                         // creation was recorded; otherwise a swapped symlink
                         // would delete an unrelated pre-existing file.
-                        let target = crate::core::fs::resolve_write_target(&full_path).await;
-                        if !crate::core::fs::targets_match(&target, &recorded_target) {
+                        if !crate::core::fs::targets_match(&current_target, &recorded_target) {
                             return Err(format!(
                                 "Refusing to undo creation of {}: target changed since it was recorded",
                                 path_str
                             ));
                         }
-                        tokio::fs::remove_file(&target)
+                        tokio::fs::remove_file(&current_target)
                             .await
                             .map_err(|e| format!("Failed to remove {}: {}", path_str, e))?;
                     }
-                    undo_store.pop_snapshot(&full_path);
+                    undo_store.pop_snapshot_with_key(&queue_key);
                     Ok(AgentToolResult::text(format!(
                         "Reverted creation of {}: file deleted.",
                         path_str
@@ -288,34 +340,45 @@ impl AgentTool for UndoEditTool {
                     target: recorded_target,
                     ..
                 } => {
-                    let current_target = crate::core::fs::resolve_write_target(&full_path).await;
                     if !crate::core::fs::targets_match(&current_target, &recorded_target) {
                         return Err(format!(
                             "Refusing to undo {}: target changed since the edit was recorded",
                             path_str
                         ));
                     }
-                    let current_str = if full_path.exists() {
-                        tokio::fs::read(&full_path)
-                            .await
-                            .ok()
-                            .and_then(|b| String::from_utf8(b).ok())
+                    let current_str = if tokio::fs::try_exists(&current_target)
+                        .await
+                        .unwrap_or(false)
+                    {
+                        crate::core::fs::read_file_bounded(
+                            &current_target,
+                            MAX_TOTAL_UNDO_BYTES as u64,
+                        )
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|b| String::from_utf8(b).ok())
                     } else {
                         None
                     };
 
-                    atomic_write_checked(&full_path, &recorded_target, &original_bytes).await?;
-                    undo_store.pop_snapshot(&full_path);
+                    atomic_write_checked(&full_path, &inspected_target, &original_bytes).await?;
+                    undo_store.pop_snapshot_with_key(&queue_key);
 
-                    let restored_str = String::from_utf8_lossy(&original_bytes);
-                    let diff = if let Some(ref curr) = current_str {
-                        let raw_diff =
-                            similar::TextDiff::from_lines(curr.as_str(), restored_str.as_ref())
-                                .unified_diff()
-                                .context_radius(3)
-                                .header(path_str, path_str)
-                                .to_string();
-                        truncate_head(&raw_diff, MAX_DIFF_BYTES, "\n... [diff truncated]")
+                    let diff = if let Some(curr) = current_str {
+                        let path_header = path_str.to_string();
+                        tokio::task::spawn_blocking(move || {
+                            let restored_str = String::from_utf8_lossy(&original_bytes);
+                            let raw_diff =
+                                similar::TextDiff::from_lines(curr.as_str(), restored_str.as_ref())
+                                    .unified_diff()
+                                    .context_radius(3)
+                                    .header(&path_header, &path_header)
+                                    .to_string();
+                            truncate_head(&raw_diff, MAX_DIFF_BYTES, "\n... [diff truncated]")
+                        })
+                        .await
+                        .map_err(|e| format!("Undo diff task failed: {e}"))?
                     } else {
                         format!("Restored {} bytes", original_bytes.len())
                     };
@@ -443,5 +506,46 @@ mod tests {
             !target.exists(),
             "undo must delete the file created through the symlink"
         );
+    }
+
+    #[test]
+    fn invalidate_file_clears_stack_and_adjusts_total_bytes_and_order() {
+        let store = EditUndoStore::new();
+        let path_a = Path::new("a.rs");
+        let path_b = Path::new("b.rs");
+
+        assert!(store.push_snapshot(
+            path_a,
+            FileSnapshot::Existed {
+                bytes: vec![1u8; 100],
+                timestamp_ms: 1,
+                target: path_a.to_path_buf(),
+            },
+        ));
+        assert!(store.push_snapshot(
+            path_b,
+            FileSnapshot::Existed {
+                bytes: vec![2u8; 50],
+                timestamp_ms: 2,
+                target: path_b.to_path_buf(),
+            },
+        ));
+        assert!(store.push_snapshot(
+            path_a,
+            FileSnapshot::Existed {
+                bytes: vec![3u8; 200],
+                timestamp_ms: 3,
+                target: path_a.to_path_buf(),
+            },
+        ));
+
+        store.invalidate_file(path_a);
+
+        assert!(!store.has_snapshot(path_a));
+        assert!(store.peek_snapshot(path_a).is_none());
+        assert!(store.has_snapshot(path_b));
+        let inner = store.lock_inner();
+        assert_eq!(inner.total_bytes, 50);
+        assert_eq!(inner.order.len(), 1);
     }
 }

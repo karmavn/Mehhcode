@@ -7,7 +7,7 @@ on:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 permissions:
   contents: read
@@ -21,10 +21,11 @@ jobs:
   ci:
     name: Check, Clippy & Test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest, macos-latest]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,17 +39,20 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Cargo check
-        run: cargo check --workspace --all-targets
+        run: cargo check --locked --workspace --all-targets
 
       - name: Cargo clippy
-        run: cargo clippy --workspace --all-targets
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Cargo clippy (workspace production unwrap/panic guard)
+        run: cargo clippy --locked --workspace --no-deps --lib --bins -- -D clippy::unwrap_used -D clippy::panic
 
       - name: Cargo test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Build Windows release binary
         if: matrix.os == 'windows-latest'
-        run: cargo build --release -p mehh-cli --bin mehh
+        run: cargo build --release --locked -p mehh-cli --bin mehh
 
       - name: Upload mehh.exe artifact
         if: matrix.os == 'windows-latest'
@@ -58,3 +62,16 @@ jobs:
           path: target/release/mehh.exe
           retention-days: 14
           if-no-files-found: error
+
+  deny:
+    name: Cargo Deny (Advisories, Licenses, Sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check advisories, licenses, bans, and sources
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories licenses bans sources

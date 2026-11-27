@@ -6,9 +6,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use mehh_agent::{AgentTool, AgentToolResult, AgentToolUpdateCallback, ToolExecutionMode};
 use mehh_ai::http_safety::{
-    check_url_host_policy, is_eligible_for_remote_extract, normalize_and_validate_http_url,
-    DnsPolicy,
+    check_url_host_policy, is_eligible_for_remote_extract, is_private_or_local_ip,
+    normalize_and_validate_http_url, DnsPolicy,
 };
+#[cfg(test)]
+use mehh_ai::http_safety::url_contains_potential_secret;
 use reqwest::Url;
 use serde_json::{json, Map, Value};
 use tokio::time::Instant;
@@ -18,10 +20,10 @@ use super::html_markdown::{
     html_to_markdown, html_to_text, looks_like_empty_spa_shell, strip_markdown_to_text,
 };
 use super::mcp_rpc::{read_bounded_body, send_cancellable_request};
-use super::output::format_fetch_content;
+use super::output::format_fetch_content_async;
 use super::router::ProgressFn;
 use super::types::{ProviderError, WebProviderChoice};
-use super::WebRuntime;
+use super::{LazyWebRuntime, WebRuntime, WebRuntimeHandle};
 
 pub const MAX_FETCH_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_REDIRECTS: usize = 10;
@@ -82,27 +84,43 @@ enum Stage1Outcome {
     EmptySpaShell {
         content_type: String,
         rendered: String,
+        remote_extract_allowed: bool,
     },
     BlockedHttp {
         status: u16,
         detail: String,
+        remote_extract_allowed: bool,
     },
     TerminalError(String),
+}
+
+enum Stage2Error {
+    Cancelled,
+    PolicyBlocked(String),
+    Failed(String),
 }
 
 /// Built-in web fetch tool using local-first HTTP fetch and keyless extract fallback.
 #[derive(Clone)]
 pub struct WebFetchTool {
-    runtime: Result<Arc<WebRuntime>, String>,
+    runtime: WebRuntimeHandle,
 }
 
 impl WebFetchTool {
     pub fn new(runtime: Result<Arc<WebRuntime>, String>) -> Self {
-        Self { runtime }
+        Self {
+            runtime: WebRuntimeHandle::Eager(runtime),
+        }
     }
 
     pub fn from_runtime(runtime: Arc<WebRuntime>) -> Self {
         Self::new(Ok(runtime))
+    }
+
+    pub fn lazy(runtime: Arc<LazyWebRuntime>) -> Self {
+        Self {
+            runtime: WebRuntimeHandle::Lazy(runtime),
+        }
     }
 }
 
@@ -117,7 +135,7 @@ impl AgentTool for WebFetchTool {
     }
 
     fn description(&self) -> &str {
-        "Fetch content from an HTTP or HTTPS URL and return it as markdown (default), plain text, or HTML. This tool is read-only. Very large responses are truncated inline with the full text saved to a temporary file readable via read."
+        "Fetch and read live content from an HTTP or HTTPS URL as markdown (default), plain text, or HTML. Use this whenever the user provides a URL or you need full page content from a web_search result. This tool is read-only. Very large responses are truncated inline with the full text saved to a temporary file readable via read."
     }
 
     fn parameters(&self) -> Value {
@@ -160,7 +178,7 @@ impl AgentTool for WebFetchTool {
         if cancel.is_cancelled() {
             return Err("Web fetch aborted".to_string());
         }
-        let runtime = self.runtime.as_ref().map_err(Clone::clone)?;
+        let runtime = self.runtime.resolve()?;
         if !runtime.config.enabled {
             return Err("Web fetch is disabled in settings".to_string());
         }
@@ -169,15 +187,31 @@ impl AgentTool for WebFetchTool {
             .get("url")
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required 'url' parameter".to_string())?;
-        let format = FetchFormat::from_param(params.get("format").and_then(|v| v.as_str()))?;
-        let timeout_secs = match params.get("timeout").and_then(|v| v.as_u64()) {
-            Some(t) if (1..=120).contains(&t) => t,
-            Some(t) => {
-                return Err(format!(
-                    "Invalid timeout {t}: expected integer seconds between 1 and 120"
-                ));
+        let format_raw = match params.get("format") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(s)) => Some(s.as_str()),
+            Some(_) => {
+                return Err(
+                    "Invalid format parameter: expected 'markdown', 'text', or 'html'".to_string(),
+                );
             }
-            None => runtime.config.effective_timeout_seconds(),
+        };
+        let format = FetchFormat::from_param(format_raw)?;
+        let timeout_secs = match params.get("timeout") {
+            None | Some(Value::Null) => runtime.config.effective_timeout_seconds(),
+            Some(v) => match v.as_u64() {
+                Some(t) if (1..=120).contains(&t) => t,
+                Some(t) => {
+                    return Err(format!(
+                        "Invalid timeout {t}: expected integer seconds between 1 and 120"
+                    ));
+                }
+                None => {
+                    return Err(
+                        "Invalid timeout: expected integer seconds between 1 and 120".to_string(),
+                    );
+                }
+            },
         };
 
         let url = normalize_and_validate_http_url(raw_url)?;
@@ -197,8 +231,9 @@ impl AgentTool for WebFetchTool {
             Stage1Outcome::EmptySpaShell {
                 content_type,
                 rendered,
+                remote_extract_allowed,
             } => {
-                if can_use_remote_fallback(runtime, &url, format) {
+                if remote_extract_allowed && can_use_remote_fallback(runtime, &url, format) {
                     match run_stage2_extract(
                         runtime,
                         &url,
@@ -212,14 +247,20 @@ impl AgentTool for WebFetchTool {
                         Ok((provider_id, extracted)) => {
                             (provider_id, "text/markdown".to_string(), extracted)
                         }
-                        Err(_) => ("local".to_string(), content_type, rendered),
+                        Err(Stage2Error::Cancelled) => return Err("Web fetch aborted".to_string()),
+                        Err(Stage2Error::PolicyBlocked(err)) => return Err(err),
+                        Err(Stage2Error::Failed(_)) => ("local".to_string(), content_type, rendered),
                     }
                 } else {
                     ("local".to_string(), content_type, rendered)
                 }
             }
-            Stage1Outcome::BlockedHttp { status, detail } => {
-                if can_use_remote_fallback(runtime, &url, format) {
+            Stage1Outcome::BlockedHttp {
+                status,
+                detail,
+                remote_extract_allowed,
+            } => {
+                if remote_extract_allowed && can_use_remote_fallback(runtime, &url, format) {
                     match run_stage2_extract(
                         runtime,
                         &url,
@@ -233,7 +274,9 @@ impl AgentTool for WebFetchTool {
                         Ok((provider_id, extracted)) => {
                             (provider_id, "text/markdown".to_string(), extracted)
                         }
-                        Err(fallback_err) => {
+                        Err(Stage2Error::Cancelled) => return Err("Web fetch aborted".to_string()),
+                        Err(Stage2Error::PolicyBlocked(err)) => return Err(err),
+                        Err(Stage2Error::Failed(fallback_err)) => {
                             return Err(format!(
                                 "Unable to fetch {url}: {detail}; remote fallback failed ({fallback_err})"
                             ));
@@ -247,7 +290,8 @@ impl AgentTool for WebFetchTool {
             }
         };
 
-        let formatted = format_fetch_content(&content, format.spill_extension(&content_type))?;
+        let ext = format.spill_extension(&content_type).to_string();
+        let formatted = format_fetch_content_async(content, ext).await?;
         Ok(AgentToolResult {
             content: vec![mehh_ai::ToolResultContentBlock::Text(mehh_ai::TextContent {
                 text: formatted.text,
@@ -264,6 +308,15 @@ impl AgentTool for WebFetchTool {
     }
 }
 
+fn is_hop_remote_extract_eligible(runtime: &WebRuntime, url: &Url) -> bool {
+    #[cfg(test)]
+    if runtime.config.allow_remote_extract_for_loopback_tests {
+        return !url_contains_potential_secret(url);
+    }
+    let _ = runtime;
+    is_eligible_for_remote_extract(url).is_ok()
+}
+
 fn can_use_remote_fallback(runtime: &WebRuntime, url: &Url, format: FetchFormat) -> bool {
     if !runtime.config.fetch_fallback
         || runtime.config.provider == WebProviderChoice::Disabled
@@ -271,11 +324,7 @@ fn can_use_remote_fallback(runtime: &WebRuntime, url: &Url, format: FetchFormat)
     {
         return false;
     }
-    #[cfg(test)]
-    if runtime.config.allow_remote_extract_for_loopback_tests {
-        return !mehh_ai::http_safety::url_contains_potential_secret(url);
-    }
-    is_eligible_for_remote_extract(url).is_ok()
+    is_hop_remote_extract_eligible(runtime, url)
 }
 
 async fn check_local_hop_policy(runtime: &WebRuntime, target: &Url) -> Result<(), String> {
@@ -293,11 +342,12 @@ async fn execute_with_manual_redirects(
     user_agent: &str,
     deadline: Instant,
     cancel: &CancellationToken,
-) -> Result<(Url, reqwest::Response), Stage1Outcome> {
+) -> Result<(Url, reqwest::Response, bool), Stage1Outcome> {
     let mut current = start_url.clone();
     if let Err(err) = check_local_hop_policy(runtime, &current).await {
         return Err(Stage1Outcome::TerminalError(err));
     }
+    let mut remote_extract_allowed = is_hop_remote_extract_eligible(runtime, &current);
 
     for hop in 0..=MAX_REDIRECTS {
         let req = runtime
@@ -319,34 +369,55 @@ async fn execute_with_manual_redirects(
             }
         };
 
-        let status = resp.status().as_u16();
-        let location = resp
-            .headers()
-            .get(reqwest::header::LOCATION)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-
-        if matches!(status, 301 | 302 | 303 | 307 | 308) {
-            if let Some(loc) = location {
-                if hop >= MAX_REDIRECTS {
-                    return Err(Stage1Outcome::TerminalError(format!(
-                        "Too many redirects (more than {MAX_REDIRECTS})"
-                    )));
+        if let Some(addr) = resp.remote_addr() {
+            let allow_loopback_test = {
+                #[cfg(test)]
+                {
+                    runtime.config.allow_remote_extract_for_loopback_tests
                 }
-                let joined = current
-                    .join(&loc)
-                    .map_err(|e| Stage1Outcome::TerminalError(format!("Invalid redirect URL: {e}")))?;
-                let next = normalize_and_validate_http_url(joined.as_str())
-                    .map_err(Stage1Outcome::TerminalError)?;
-                if let Err(err) = check_local_hop_policy(runtime, &next).await {
-                    return Err(Stage1Outcome::TerminalError(err));
+                #[cfg(not(test))]
+                {
+                    false
                 }
-                current = next;
-                continue;
+            };
+            if !allow_loopback_test && is_private_or_local_ip(addr.ip()) {
+                remote_extract_allowed = false;
             }
         }
 
-        return Ok((current, resp));
+        let status = resp.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            let Some(loc) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+            else {
+                return Err(Stage1Outcome::TerminalError(format!(
+                    "HTTP {status} redirect from {current} is missing a valid Location header"
+                )));
+            };
+            if hop >= MAX_REDIRECTS {
+                return Err(Stage1Outcome::TerminalError(format!(
+                    "Too many redirects (more than {MAX_REDIRECTS})"
+                )));
+            }
+            let joined = current
+                .join(&loc)
+                .map_err(|e| Stage1Outcome::TerminalError(format!("Invalid redirect URL: {e}")))?;
+            let next = normalize_and_validate_http_url(joined.as_str())
+                .map_err(Stage1Outcome::TerminalError)?;
+            if let Err(err) = check_local_hop_policy(runtime, &next).await {
+                return Err(Stage1Outcome::TerminalError(err));
+            }
+            remote_extract_allowed &= is_hop_remote_extract_eligible(runtime, &next);
+            current = next;
+            continue;
+        }
+
+        return Ok((current, resp, remote_extract_allowed));
     }
 
     Err(Stage1Outcome::TerminalError(format!(
@@ -361,19 +432,20 @@ async fn run_stage1_local(
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Stage1Outcome {
-    let (mut final_url, mut response) = match execute_with_manual_redirects(
-        runtime,
-        url,
-        format,
-        DEFAULT_BROWSER_UA,
-        deadline,
-        cancel,
-    )
-    .await
-    {
-        Ok(ok) => ok,
-        Err(outcome) => return outcome,
-    };
+    let (mut final_url, mut response, mut remote_extract_allowed) =
+        match execute_with_manual_redirects(
+            runtime,
+            url,
+            format,
+            DEFAULT_BROWSER_UA,
+            deadline,
+            cancel,
+        )
+        .await
+        {
+            Ok(ok) => ok,
+            Err(outcome) => return outcome,
+        };
 
     let mut status = response.status().as_u16();
     let is_cf_challenge = status == 403
@@ -394,9 +466,10 @@ async fn run_stage1_local(
         )
         .await
         {
-            Ok((retry_url, retry_resp)) => {
+            Ok((retry_url, retry_resp, retry_remote_allowed)) => {
                 final_url = retry_url;
                 response = retry_resp;
+                remote_extract_allowed &= retry_remote_allowed;
                 status = response.status().as_u16();
             }
             Err(outcome) => return outcome,
@@ -413,6 +486,7 @@ async fn run_stage1_local(
             return Stage1Outcome::BlockedHttp {
                 status,
                 detail: format!("HTTP {status} {reason}"),
+                remote_extract_allowed,
             };
         }
         return Stage1Outcome::TerminalError(format!(
@@ -470,16 +544,30 @@ async fn run_stage1_local(
         };
     }
 
-    let converted = match format {
-        FetchFormat::Markdown => html_to_markdown(&raw_text, Some(&final_url)),
-        FetchFormat::Text => html_to_text(&raw_text),
-        FetchFormat::Html => unreachable!(),
+    let base_url = final_url.clone();
+    let conversion = tokio::task::spawn_blocking(move || {
+        let converted = match format {
+            FetchFormat::Markdown => html_to_markdown(&raw_text, Some(&base_url)),
+            FetchFormat::Text => html_to_text(&raw_text),
+            FetchFormat::Html => unreachable!(),
+        };
+        let is_empty_spa = looks_like_empty_spa_shell(&raw_text, &converted);
+        (converted, is_empty_spa)
+    })
+    .await;
+
+    let (converted, is_empty_spa) = match conversion {
+        Ok(pair) => pair,
+        Err(e) => {
+            return Stage1Outcome::TerminalError(format!("HTML conversion task failed: {e}"));
+        }
     };
 
-    if looks_like_empty_spa_shell(&raw_text, &converted) {
+    if is_empty_spa {
         return Stage1Outcome::EmptySpaShell {
             content_type,
             rendered: converted,
+            remote_extract_allowed,
         };
     }
 
@@ -496,10 +584,16 @@ async fn run_stage2_extract(
     deadline: Instant,
     cancel: &CancellationToken,
     on_update: Option<&AgentToolUpdateCallback>,
-) -> Result<(String, String), String> {
-    let remaining = deadline
-        .saturating_duration_since(Instant::now())
-        .max(Duration::from_secs(1));
+) -> Result<(String, String), Stage2Error> {
+    if cancel.is_cancelled() {
+        return Err(Stage2Error::Cancelled);
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(Stage2Error::Failed(
+            "Request timed out before remote fallback".to_string(),
+        ));
+    }
     let progress_cb: Option<Box<ProgressFn>> = on_update.cloned().map(|cb| {
         let f: Box<ProgressFn> = Box::new(move |msg: &str| {
             cb(AgentToolResult::text(msg.to_string()));
@@ -517,14 +611,21 @@ async fn run_stage2_extract(
             progress_cb.as_deref(),
         )
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| match e {
+            ProviderError::Cancelled => Stage2Error::Cancelled,
+            other => Stage2Error::Failed(other.to_string()),
+        })?;
 
     if let Some(ref final_u) = extracted.page.final_url {
         let parsed_final = normalize_and_validate_http_url(final_u)
-            .map_err(|e| format!("Invalid post-redirect URL from extractor: {e}"))?;
-        check_url_host_policy(DnsPolicy::PublicOnly, &parsed_final)?;
+            .map_err(|e| Stage2Error::PolicyBlocked(format!("Invalid post-redirect URL from extractor: {e}")))?;
+        check_url_host_policy(DnsPolicy::PublicOnly, &parsed_final)
+            .map_err(Stage2Error::PolicyBlocked)?;
         if let Some(ref checker) = runtime.config.url_policy_checker {
-            checker.check_url(parsed_final.as_str()).await?;
+            checker
+                .check_url(parsed_final.as_str())
+                .await
+                .map_err(Stage2Error::PolicyBlocked)?;
         }
     }
 
@@ -557,14 +658,13 @@ fn is_textual_mime(mime: &str) -> bool {
 }
 
 fn looks_like_binary_bytes(bytes: &[u8]) -> bool {
-    let sample = &bytes[..bytes.len().min(512)];
-    if sample.contains(&0) {
+    if bytes.contains(&0) {
         return true;
     }
-    sample.starts_with(b"%PDF-")
-        || sample.starts_with(b"\x89PNG\r\n\x1a\n")
-        || sample.starts_with(b"\xff\xd8\xff")
-        || sample.starts_with(b"PK\x03\x04")
+    bytes.starts_with(b"%PDF-")
+        || bytes.starts_with(b"\x89PNG\r\n\x1a\n")
+        || bytes.starts_with(b"\xff\xd8\xff")
+        || bytes.starts_with(b"PK\x03\x04")
 }
 
 fn looks_like_html_document(text: &str) -> bool {
@@ -751,17 +851,30 @@ mod tests {
         assert!(e1.contains("Too many redirects"));
 
         // 2. PublicOnly blocks localhost/private upfront and blocks redirect to metadata IP
-        let (addr2, _) = spawn_one_shot_server(vec![http_resp(
-            "302 Found",
-            "Location: http://169.254.169.254/latest/meta-data\r\n",
-            b"",
-        )])
+        //    without invoking Stage 2 remote fallback.
+        let (addr2, _) = spawn_one_shot_server(vec![
+            http_resp(
+                "302 Found",
+                "Location: http://169.254.169.254/latest/meta-data\r\n",
+                b"",
+            ),
+            http_resp(
+                "302 Found",
+                "Location: //169.254.169.254/latest/meta-data\r\n",
+                b"",
+            ),
+        ])
         .await;
-        let tool_meta = WebFetchTool::from_runtime(Arc::new(WebRuntime::for_tests(WebConfig {
+        let (spy_addr, spy_reqs) = spawn_one_shot_server(vec![]).await;
+        let mut meta_cfg = WebConfig {
             allow_private_urls: true,
             fetch_fallback: true,
+            provider: WebProviderChoice::Fixed(ProviderId::Keenable),
+            allow_remote_extract_for_loopback_tests: true,
             ..Default::default()
-        })));
+        };
+        meta_cfg.endpoints.keenable_base = format!("http://{spy_addr}");
+        let tool_meta = WebFetchTool::from_runtime(Arc::new(WebRuntime::for_tests(meta_cfg)));
         let mut p2 = Map::new();
         p2.insert("url".into(), json!(format!("http://{addr2}/start")));
         let e2 = tool_meta
@@ -770,21 +883,43 @@ mod tests {
             .unwrap_err();
         assert!(e2.contains("Blocked private or restricted IP"));
 
-        // 3. Policy checker blocks redirect hop
+        let mut p2b = Map::new();
+        p2b.insert("url".into(), json!(format!("http://{addr2}/proto-rel")));
+        let e2b = tool_meta
+            .execute("r2b", p2b, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(e2b.contains("Blocked private or restricted IP"));
+        assert!(spy_reqs.lock().unwrap().is_empty());
+
+        // PublicOnly also rejects protocol-relative redirect resolved to 127.0.0.1.
+        let public_rt = WebRuntime::for_tests(WebConfig {
+            allow_private_urls: false,
+            ..Default::default()
+        });
+        let joined_loopback = Url::parse("https://example.com/start")
+            .unwrap()
+            .join("//127.0.0.1:9/admin")
+            .unwrap();
+        assert!(check_local_hop_policy(&public_rt, &joined_loopback).await.is_err());
+
+        // 3. Policy checker blocks redirect hop without invoking Stage 2
         let (addr3, _) = spawn_one_shot_server(vec![http_resp(
             "302 Found",
             "Location: /blocked-secret-admin\r\n",
             b"",
         )])
         .await;
-        let tool_pol = WebFetchTool::from_runtime(Arc::new(WebRuntime::for_tests(
-            WebConfig {
-                allow_private_urls: true,
-                fetch_fallback: true,
-                ..Default::default()
-            }
-            .with_url_policy_checker(Arc::new(DenyUrlChecker("blocked-secret-admin".into()))),
-        )));
+        let mut pol_cfg = WebConfig {
+            allow_private_urls: true,
+            fetch_fallback: true,
+            provider: WebProviderChoice::Fixed(ProviderId::Keenable),
+            allow_remote_extract_for_loopback_tests: true,
+            ..Default::default()
+        }
+        .with_url_policy_checker(Arc::new(DenyUrlChecker("blocked-secret-admin".into())));
+        pol_cfg.endpoints.keenable_base = format!("http://{spy_addr}");
+        let tool_pol = WebFetchTool::from_runtime(Arc::new(WebRuntime::for_tests(pol_cfg)));
         let mut p3 = Map::new();
         p3.insert("url".into(), json!(format!("http://{addr3}/start")));
         let e3 = tool_pol
@@ -792,6 +927,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e3.contains("Denied by policy"));
+        assert!(spy_reqs.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -929,5 +1065,150 @@ mod tests {
                 "expected rejection for {path}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_stage2_blocks_post_redirect_secret_and_propagates_cancel_on_spa() {
+        let (local_addr, _) = spawn_one_shot_server(vec![
+            http_resp("302 Found", "Location: /auth?token=SECRET_XYZ\r\n", b""),
+            http_resp("403 Forbidden", "Content-Type: text/html\r\n", b"WAF"),
+            http_resp(
+                "200 OK",
+                "Content-Type: text/html\r\n",
+                b"<html><body><div id=\"root\"></div><script></script></body></html>",
+            ),
+        ])
+        .await;
+
+        let ext_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let ext_addr = ext_listener.local_addr().unwrap();
+        let ext_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let ext_hits_bg = ext_hits.clone();
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut accepted_tx = Some(accepted_tx);
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = ext_listener.accept().await {
+                ext_hits_bg.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Some(tx) = accepted_tx.take() {
+                    let _ = tx.send(());
+                }
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+        });
+
+        let mut cfg = WebConfig {
+            allow_private_urls: true,
+            fetch_fallback: true,
+            provider: WebProviderChoice::Fixed(ProviderId::Keenable),
+            allow_remote_extract_for_loopback_tests: true,
+            ..Default::default()
+        };
+        cfg.endpoints.keenable_base = format!("http://{ext_addr}");
+        let tool = WebFetchTool::from_runtime(Arc::new(WebRuntime::for_tests(cfg)));
+
+        // Redirect onto ?token=SECRET_XYZ must NOT invoke Stage 2 remote fallback.
+        let mut p1 = Map::new();
+        p1.insert("url".into(), json!(format!("http://{local_addr}/clean")));
+        assert!(tool
+            .execute("sec_redir", p1, CancellationToken::new(), None)
+            .await
+            .is_err());
+        assert_eq!(ext_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Cancellation during Stage 2 on EmptySpaShell must return Err, not Ok.
+        let cancel = CancellationToken::new();
+        let c_bg = cancel.clone();
+        tokio::spawn(async move {
+            let _ = accepted_rx.await;
+            c_bg.cancel();
+        });
+        let mut p2 = Map::new();
+        p2.insert("url".into(), json!(format!("http://{local_addr}/spa")));
+        let err = tool
+            .execute("spa_cancel", p2, cancel, None)
+            .await
+            .expect_err("cancelled Stage 2 on SPA must fail instead of returning empty shell");
+        assert_eq!(ext_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(err.to_ascii_lowercase().contains("abort"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_redirect_missing_location_and_invalid_param_types() {
+        let (addr, _) = spawn_one_shot_server(vec![http_resp(
+            "302 Found",
+            "Content-Type: text/plain\r\n",
+            b"redirecting without location",
+        )])
+        .await;
+        let tool = WebFetchTool::from_runtime(Arc::new(WebRuntime::for_tests(WebConfig {
+            allow_private_urls: true,
+            fetch_fallback: false,
+            ..Default::default()
+        })));
+
+        let mut p1 = Map::new();
+        p1.insert("url".into(), json!(format!("http://{addr}/noloc")));
+        assert!(tool
+            .execute("noloc", p1, CancellationToken::new(), None)
+            .await
+            .is_err());
+
+        let mut p2 = Map::new();
+        p2.insert("url".into(), json!(format!("http://{addr}/x")));
+        p2.insert("timeout".into(), json!(-5));
+        assert!(tool
+            .execute("bad_t", p2, CancellationToken::new(), None)
+            .await
+            .is_err());
+
+        let mut p3 = Map::new();
+        p3.insert("url".into(), json!(format!("http://{addr}/x")));
+        p3.insert("format".into(), json!(123));
+        assert!(tool
+            .execute("bad_f", p3, CancellationToken::new(), None)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stage2_policy_blocked_on_spa_returns_error() {
+        let (local_addr, _) = spawn_one_shot_server(vec![http_resp(
+            "200 OK",
+            "Content-Type: text/html\r\n",
+            b"<html><body><div id=\"root\"></div><script></script></body></html>",
+        )])
+        .await;
+        let (ext_addr, _) = spawn_one_shot_server(vec![http_resp(
+            "200 OK",
+            "Content-Type: application/json\r\n",
+            json!({ "url": "http://127.0.0.1:9/ssrf", "title": "Bad", "content": "leak" })
+                .to_string()
+                .as_bytes(),
+        )])
+        .await;
+
+        let mut cfg = WebConfig {
+            allow_private_urls: true,
+            fetch_fallback: true,
+            provider: WebProviderChoice::Fixed(ProviderId::Keenable),
+            allow_remote_extract_for_loopback_tests: true,
+            ..Default::default()
+        };
+        cfg.endpoints.keenable_base = format!("http://{ext_addr}");
+        let tool = WebFetchTool::from_runtime(Arc::new(WebRuntime::for_tests(cfg)));
+
+        let mut params = Map::new();
+        params.insert("url".into(), json!(format!("http://{local_addr}/spa")));
+        let err = tool
+            .execute("spa_policy", params, CancellationToken::new(), None)
+            .await
+            .expect_err("Stage 2 policy block on SPA shell must fail closed");
+        let lower = err.to_ascii_lowercase();
+        assert!(
+            lower.contains("policy") || lower.contains("private") || lower.contains("loopback") || lower.contains("restricted"),
+            "got: {err}"
+        );
     }
 }

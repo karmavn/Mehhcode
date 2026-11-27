@@ -38,11 +38,23 @@ impl Default for RetryPolicy {
 }
 
 impl RetryPolicy {
-    /// Computes exponential backoff duration for the zero-based retry attempt.
+    /// Computes exponential backoff duration for the zero-based retry attempt
+    /// with bounded +/-20% jitter to avoid thundering-herd retries.
     pub fn backoff_for_attempt(&self, attempt: u32) -> Duration {
         let mult = 1u64.checked_shl(attempt.min(10)).unwrap_or(1024);
-        let delay = self.initial_backoff.saturating_mul(mult as u32);
-        delay.min(self.max_backoff)
+        let base = self.initial_backoff.saturating_mul(mult as u32).min(self.max_backoff);
+        let base_ms = base.as_millis() as u64;
+        if base_ms <= 5 {
+            return base;
+        }
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .subsec_nanos() as u64;
+        // Map into [80%, 120%] of base_ms without exceeding max_backoff.
+        let pct = 80 + (nanos % 41);
+        let jittered = Duration::from_millis((base_ms.saturating_mul(pct)) / 100);
+        jittered.min(self.max_backoff)
     }
 }
 
@@ -54,12 +66,22 @@ pub enum RetryFailure {
     HttpStatus { status: StatusCode, body: String },
 }
 
-/// Builds a default HTTP client configured with connection timeout.
+static DEFAULT_HTTP_CLIENT: std::sync::LazyLock<reqwest::Client> =
+    std::sync::LazyLock::new(|| {
+        reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .dns_resolver(std::sync::Arc::new(
+                crate::http_safety::SafeDnsResolver::new(crate::http_safety::DnsPolicy::AllowPrivate),
+            ))
+            .connect_timeout(Duration::from_secs(15))
+            .build()
+            .expect("failed to build default HTTP client")
+    });
+
+/// Returns a shared pooled HTTP client configured with redirects disabled,
+/// connect-time SSRF DNS protection, and a connection timeout.
 pub fn default_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(15))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+    DEFAULT_HTTP_CLIENT.clone()
 }
 
 /// Returns true if an HTTP status code represents a transient error worth retrying.
@@ -205,6 +227,19 @@ pub async fn send_with_retry<F>(
 where
     F: Fn() -> reqwest::RequestBuilder,
 {
+    send_with_retry_with_secrets(build_request, policy, cancel, &[]).await
+}
+
+/// Executes an HTTP request with retry and redacts `secrets` from transport/HTTP errors.
+pub async fn send_with_retry_with_secrets<F>(
+    build_request: F,
+    policy: &RetryPolicy,
+    cancel: &CancellationToken,
+    secrets: &[&str],
+) -> Result<reqwest::Response, RetryFailure>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
     let mut attempt: u32 = 0;
 
     loop {
@@ -237,8 +272,15 @@ where
                     continue;
                 }
 
-                let body =
-                    crate::oauth::redact_error_body(&read_error_body_bytes_capped(resp).await, &[]);
+                let raw_body = tokio::select! {
+                    _ = cancel.cancelled() => return Err(RetryFailure::Cancelled),
+                    text = read_error_body_bytes_capped(resp) => text,
+                };
+                let body = crate::oauth::redact_error_body_with_limit(
+                    &raw_body,
+                    secrets,
+                    MAX_ERROR_BODY_CHARS,
+                );
                 return Err(RetryFailure::HttpStatus { status, body });
             }
             Ok(Err(err)) => {
@@ -253,7 +295,12 @@ where
                     }
                     continue;
                 }
-                return Err(RetryFailure::Transport(err.to_string()));
+                let sanitized = crate::oauth::redact_error_body_with_limit(
+                    &err.without_url().to_string(),
+                    secrets,
+                    MAX_ERROR_BODY_CHARS,
+                );
+                return Err(RetryFailure::Transport(sanitized));
             }
             Err(_) => {
                 if attempt < policy.max_retries {
@@ -424,7 +471,7 @@ mod tests {
 
     #[test]
     fn test_truncate_error_body_multibyte_safe() {
-        let body = "错误🎉".repeat(3000);
+        let body = "\u{9519}\u{8BEF}\u{1F389}".repeat(3000);
         let truncated = truncate_error_body(&body, 100);
         assert!(truncated.ends_with("...[truncated]"));
     }
@@ -558,6 +605,132 @@ mod tests {
         assert!(
             err_msg.contains("[REDACTED]"),
             "expected redaction marker: {err_msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_preserves_overflow_phrase_beyond_512_chars() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 2048];
+                let _ = socket.read(&mut buf).await;
+                let padding = "x".repeat(700);
+                let body = format!("{padding} context_length_exceeded");
+                let resp = format!(
+                    "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let client = default_http_client();
+        let url = format!("http://{addr}/test");
+        let policy = RetryPolicy {
+            max_retries: 0,
+            initial_backoff: Duration::from_millis(5),
+            max_backoff: Duration::from_millis(5),
+        };
+        let cancel = CancellationToken::new();
+        let failure = send_with_retry(|| client.get(&url), &policy, &cancel)
+            .await
+            .unwrap_err();
+        match failure {
+            RetryFailure::HttpStatus { body, .. } => {
+                assert!(body.contains("context_length_exceeded"), "{body}");
+            }
+            other => panic!("expected HttpStatus, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn default_http_client_disables_redirects_and_blocks_metadata() {
+        let target_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_addr = target_listener.local_addr().unwrap();
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let target_hits_srv = Arc::clone(&target_hits);
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = target_listener.accept().await {
+                target_hits_srv.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let redirect_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let redirect_addr = redirect_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = redirect_listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let resp = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{target_addr}/steal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let client = default_http_client();
+        let resp = client
+            .get(format!("http://{redirect_addr}/start"))
+            .header("x-api-key", "sk-secret-do-not-forward")
+            .send()
+            .await
+            .expect("302 response should be returned without following redirect");
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(
+            target_hits.load(Ordering::SeqCst),
+            0,
+            "default_http_client must not follow redirects"
+        );
+
+        let metadata_res = client
+            .get("http://metadata.google.internal/computeMetadata/v1/")
+            .send()
+            .await;
+        assert!(
+            metadata_res.is_err(),
+            "default_http_client must block cloud metadata endpoints via SafeDnsResolver"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_http_client_reuses_keep_alive_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let accepts_srv = Arc::clone(&accepts);
+
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            accepts_srv.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            for _ in 0..2 {
+                let n = socket.read(&mut buf).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                let resp = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok";
+                socket.write_all(resp.as_bytes()).await.unwrap();
+            }
+        });
+
+        let url = format!("http://{addr}/ping");
+        let r1 = default_http_client().get(&url).send().await.unwrap();
+        assert_eq!(r1.text().await.unwrap(), "ok");
+        let r2 = default_http_client().get(&url).send().await.unwrap();
+        assert_eq!(r2.text().await.unwrap(), "ok");
+
+        server.await.unwrap();
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "separate default_http_client() handles must share one keep-alive pool"
         );
     }
 }

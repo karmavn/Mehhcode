@@ -25,16 +25,27 @@ impl Text {
 
 impl Component for Text {
     fn render(&self, width: usize) -> Vec<String> {
+        if width == 0 {
+            return Vec::new();
+        }
         let pad_x = self.padding_x;
         let inner_width = width.saturating_sub(pad_x * 2);
+        if inner_width == 0 {
+            return Vec::new();
+        }
         let wrapped = wrap_text_with_ansi(&self.content, inner_width);
         if pad_x == 0 {
             wrapped
         } else {
-            let pad_str = " ".repeat(pad_x);
             wrapped
                 .into_iter()
-                .map(|line| format!("{pad_str}{line}{pad_str}"))
+                .map(|line| {
+                    let mut out = String::with_capacity(line.len() + pad_x * 2);
+                    out.extend(std::iter::repeat_n(' ', pad_x));
+                    out.push_str(&line);
+                    out.extend(std::iter::repeat_n(' ', pad_x));
+                    out
+                })
                 .collect()
         }
     }
@@ -135,54 +146,81 @@ impl Component for BorderedBox {
 
         let (tl, h, tr, v, bl, br) = self.style.chars();
         let inner_width = width - 2;
-        let mut lines = Vec::new();
+        let child_lines = self.child.render(inner_width);
+        let mut lines = Vec::with_capacity(child_lines.len() + 2);
+        let mut h_fill = String::with_capacity(inner_width * h.len_utf8());
+        h_fill.extend(std::iter::repeat_n(h, inner_width));
+        let mut v_buf = [0u8; 4];
+        let v_str = v.encode_utf8(&mut v_buf);
+        let left = paint(&self.border_color, v_str);
+        let right = paint(&self.border_color, v_str);
 
         // Top line with optional title
         let top_line = if let Some(ref title) = self.title {
-            let title_clean = crate::ansi::strip_ansi(title);
-            let title_w = crate::ansi::visible_width(&title_clean);
-            if title_w + 4 <= inner_width {
-                let right_pad = inner_width - title_w - 3;
-                let painted_title = if self.title_color.is_empty() {
-                    title.clone()
-                } else {
-                    format!("{}{}\x1b[0m{}", self.title_color, title, self.border_color)
-                };
-                paint(
-                    &self.border_color,
-                    &format!("{tl}{h} {painted_title} {}{tr}", h.to_string().repeat(right_pad)),
-                )
+            let title_w = crate::ansi::visible_width(title);
+            let fitted = if title_w + 4 <= inner_width {
+                Some((std::borrow::Cow::Borrowed(title.as_str()), title_w))
+            } else if inner_width >= 6 {
+                let truncated =
+                    truncate_to_width(title, inner_width.saturating_sub(4), "…", false);
+                let trunc_w = crate::ansi::visible_width(&truncated);
+                Some((std::borrow::Cow::Owned(truncated), trunc_w))
             } else {
-                paint(
-                    &self.border_color,
-                    &format!("{tl}{}{tr}", h.to_string().repeat(inner_width)),
-                )
+                None
+            };
+            if let Some((display_title, display_w)) = fitted {
+                let right_pad = inner_width - display_w - 3;
+                let mut top_inner = String::with_capacity(inner_width + 16);
+                top_inner.push(tl);
+                top_inner.push(h);
+                top_inner.push(' ');
+                if !self.title_color.is_empty() {
+                    top_inner.push_str(&self.title_color);
+                    top_inner.push_str(&display_title);
+                    top_inner.push_str("\x1b[0m");
+                    top_inner.push_str(&self.border_color);
+                } else {
+                    top_inner.push_str(&display_title);
+                }
+                top_inner.push(' ');
+                top_inner.extend(std::iter::repeat_n(h, right_pad));
+                top_inner.push(tr);
+                paint(&self.border_color, &top_inner)
+            } else {
+                paint(&self.border_color, &format!("{tl}{h_fill}{tr}"))
             }
         } else {
-            paint(
-                &self.border_color,
-                &format!("{tl}{}{tr}", h.to_string().repeat(inner_width)),
-            )
+            paint(&self.border_color, &format!("{tl}{h_fill}{tr}"))
         };
         lines.push(top_line);
 
         // Child lines with vertical borders. Paint only the border glyphs:
         // wrapping the whole line would tint plain child text (e.g. the prompt
         // input) with the border color, which is nearly invisible in dark themes.
-        let child_lines = self.child.render(inner_width);
         for line in child_lines {
             let line_w = crate::ansi::visible_width(&line);
-            let pad = inner_width.saturating_sub(line_w);
-            let left = paint(&self.border_color, &v.to_string());
-            let right = paint(&self.border_color, &format!("{}{v}", " ".repeat(pad)));
-            lines.push(format!("{left}{line}{right}"));
+            let (fitted, fitted_w) = if line_w > inner_width {
+                let has_cursor = line.contains(crate::tui::CURSOR_MARKER);
+                let mut truncated = truncate_to_width(&line, inner_width, "", false);
+                if has_cursor && !truncated.contains(crate::tui::CURSOR_MARKER) {
+                    truncated.push_str(crate::tui::CURSOR_MARKER);
+                }
+                let w = crate::ansi::visible_width(&truncated);
+                (truncated, w)
+            } else {
+                (line, line_w)
+            };
+            let pad = inner_width.saturating_sub(fitted_w);
+            let mut row = String::with_capacity(left.len() + fitted.len() + pad + right.len());
+            row.push_str(&left);
+            row.push_str(&fitted);
+            row.extend(std::iter::repeat_n(' ', pad));
+            row.push_str(&right);
+            lines.push(row);
         }
 
         // Bottom line
-        lines.push(paint(
-            &self.border_color,
-            &format!("{bl}{}{br}", h.to_string().repeat(inner_width)),
-        ));
+        lines.push(paint(&self.border_color, &format!("{bl}{h_fill}{br}")));
 
         lines
     }
@@ -293,12 +331,16 @@ pub struct SelectList {
 
 impl SelectList {
     pub fn new(items: Vec<SelectItem>, max_visible: usize) -> Self {
+        Self::new_with_theme(items, max_visible, Theme::default())
+    }
+
+    pub fn new_with_theme(items: Vec<SelectItem>, max_visible: usize, theme: Theme) -> Self {
         Self {
             items,
             filter: String::new(),
             selected: 0,
             max_visible: max_visible.max(1),
-            theme: Theme::default(),
+            theme,
         }
     }
 
@@ -383,95 +425,137 @@ impl SelectList {
     /// Returns `(start, end, filtered_indices)` for the currently visible viewport rows.
     pub fn visible_range(&self) -> (usize, usize, Vec<usize>) {
         let filtered = self.filtered_indices();
-        let total = filtered.len();
-        if total == 0 {
-            return (0, 0, filtered);
-        }
-        let selected = self.selected.min(total.saturating_sub(1));
-        let max_vis = self.max_visible.min(total);
-        let start = (selected as isize - (max_vis as isize / 2))
-            .clamp(0, (total as isize - max_vis as isize).max(0)) as usize;
-        let end = (start + max_vis).min(total);
+        let (start, end) = Self::visible_bounds(self.selected, self.max_visible, filtered.len());
         (start, end, filtered)
     }
-}
 
-impl Component for SelectList {
-    fn render(&self, width: usize) -> Vec<String> {
-        let (start, end, filtered) = self.visible_range();
+    fn visible_bounds(selected: usize, max_visible: usize, total: usize) -> (usize, usize) {
+        if total == 0 {
+            return (0, 0);
+        }
+        let clamped_sel = selected.min(total.saturating_sub(1));
+        let max_vis = max_visible.max(1).min(total);
+        let start = (clamped_sel as isize - (max_vis as isize / 2))
+            .clamp(0, (total as isize - max_vis as isize).max(0)) as usize;
+        let end = (start + max_vis).min(total);
+        (start, end)
+    }
+
+    /// Renders pre-filtered rows using the provided `theme` and `max_visible` cap without cloning the list.
+    pub fn render_with_filtered(
+        &self,
+        width: usize,
+        theme: &Theme,
+        max_visible: usize,
+        filtered: &[usize],
+    ) -> (Vec<String>, usize, usize) {
+        let (start, end) = Self::visible_bounds(self.selected, max_visible, filtered.len());
         if filtered.is_empty() {
             if self.filter.trim().is_empty() {
-                return vec![truncate_to_width(
-                    &format!("  {}", self.theme.fg(&self.theme.dim, "No matching items")),
-                    width,
-                    "...",
-                    false,
-                )];
+                return (
+                    vec![truncate_to_width(
+                        &format!("  {}", theme.fg(&theme.dim, "No matching items")),
+                        width,
+                        "...",
+                        false,
+                    )],
+                    0,
+                    0,
+                );
             }
+            let clean_filter = crate::ansi::sanitize_terminal_text(self.filter.trim(), false);
             let msg = format!(
-                "No match for '{}' · Backspace or Esc to clear",
-                self.filter.trim()
+                "No match for '{clean_filter}' · Backspace or Esc to clear"
             );
-            return wrap_text_with_ansi(&msg, width.saturating_sub(4).max(10))
+            let lines = wrap_text_with_ansi(&msg, width.saturating_sub(4).max(10))
                 .into_iter()
                 .map(|w| {
                     truncate_to_width(
-                        &format!("  {}", self.theme.fg(&self.theme.dim, &w)),
+                        &format!("  {}", theme.fg(&theme.dim, &w)),
                         width,
                         "...",
                         false,
                     )
                 })
                 .collect();
+            return (lines, 0, 0);
         }
 
         let selected = self.selected.min(filtered.len().saturating_sub(1));
 
         let max_label_width = filtered
             .iter()
-            .map(|&idx| crate::ansi::visible_width(&self.items[idx].label))
+            .map(|&idx| {
+                let clean = crate::ansi::sanitize_terminal_text_cow(&self.items[idx].label, false);
+                crate::ansi::visible_width(&clean)
+            })
             .max()
             .unwrap_or(12)
             .clamp(10, 36);
 
-        let mut lines = Vec::new();
+        let mut lines = Vec::with_capacity(end.saturating_sub(start));
+        let reset = "\x1b[0m";
+        let bg = theme.selected_bg.as_str();
         for (vis_idx, &item_idx) in filtered[start..end].iter().enumerate() {
             let actual_idx = start + vis_idx;
             let item = &self.items[item_idx];
             let is_selected = actual_idx == selected;
 
-            let label_len = crate::ansi::visible_width(&item.label);
-            let label_pad = " ".repeat(max_label_width.saturating_sub(label_len));
-            let desc = item.description.as_deref().unwrap_or("");
-            let desc_len = crate::ansi::visible_width(desc);
-            let used = 2 + label_len + label_pad.len() + 2 + desc_len;
-            let tail_pad = " ".repeat(width.saturating_sub(used));
-            let reset = "\x1b[0m";
-            let bg = self.theme.selected_bg.as_str();
-            let rebg = bg;
-            let label_color = item.label_color.as_deref().unwrap_or(&self.theme.text);
+            let clean_label = crate::ansi::sanitize_terminal_text_cow(&item.label, false);
+            let label_len = crate::ansi::visible_width(&clean_label);
+            let label_pad_len = max_label_width.saturating_sub(label_len);
+            let clean_desc = crate::ansi::sanitize_terminal_text_cow(
+                item.description.as_deref().unwrap_or(""),
+                false,
+            );
+            let desc_len = crate::ansi::visible_width(&clean_desc);
+            let used = 2 + label_len + label_pad_len + 2 + desc_len;
+            let tail_pad_len = width.saturating_sub(used);
+            let label_color = item.label_color.as_deref().unwrap_or(&theme.text);
 
-            let line = if is_selected {
-                format!(
-                    "{bg}{accent}▎ {reset}{rebg}\x1b[1m{label_color}{label}{label_pad}  {reset}{rebg}{dim}{desc}{tail_pad}{reset}",
-                    accent = self.theme.accent,
-                    label_color = label_color,
-                    label = item.label,
-                    dim = self.theme.dim,
-                )
+            let mut line = String::with_capacity(width + 64);
+            if is_selected {
+                line.push_str(bg);
+                line.push_str(&theme.accent);
+                line.push_str("▎ ");
+                line.push_str(reset);
+                line.push_str(bg);
+                line.push_str("\x1b[1m");
+                line.push_str(label_color);
+                line.push_str(&clean_label);
+                line.extend(std::iter::repeat_n(' ', label_pad_len));
+                line.push_str("  ");
+                line.push_str(reset);
+                line.push_str(bg);
+                line.push_str(&theme.dim);
+                line.push_str(&clean_desc);
+                line.extend(std::iter::repeat_n(' ', tail_pad_len));
+                line.push_str(reset);
             } else {
-                format!(
-                    "  {label_color}{label}{label_pad}  {reset}{dim}{desc}{tail_pad}{reset}",
-                    label_color = label_color,
-                    label = item.label,
-                    dim = self.theme.dim,
-                )
-            };
+                line.push_str("  ");
+                line.push_str(label_color);
+                line.push_str(&clean_label);
+                line.extend(std::iter::repeat_n(' ', label_pad_len));
+                line.push_str("  ");
+                line.push_str(reset);
+                line.push_str(&theme.dim);
+                line.push_str(&clean_desc);
+                line.extend(std::iter::repeat_n(' ', tail_pad_len));
+                line.push_str(reset);
+            }
 
             lines.push(truncate_to_width(&line, width, "...", false));
         }
 
-        lines
+        (lines, start, end)
+    }
+}
+
+impl Component for SelectList {
+    fn render(&self, width: usize) -> Vec<String> {
+        let filtered = self.filtered_indices();
+        self.render_with_filtered(width, &self.theme, self.max_visible, &filtered)
+            .0
     }
 
     fn handle_key(&mut self, key: &str) -> bool {
@@ -525,6 +609,21 @@ mod tests {
         assert!(joined.contains("\x1b[38;2;1;2;3m"));
         assert!(joined.contains("\x1b[38;2;4;5;6m"));
         assert!(lines.iter().all(|l| crate::ansi::visible_width(l) == 20), "{lines:?}");
+    }
+
+    #[test]
+    fn bordered_box_truncates_long_title_instead_of_dropping_it() {
+        let boxed = BorderedBox::new(Box::new(Text::new("body")))
+            .with_title("VeryLongSectionTitle");
+        // width = 14 => inner_width = 12 (>= 6); max title width = 8 ("VeryLon…")
+        let lines = boxed.render(14);
+        assert_eq!(crate::ansi::visible_width(&lines[0]), 14, "{lines:?}");
+        assert!(lines[0].contains("VeryLon\u{2026}"), "{lines:?}");
+
+        // width = 7 => inner_width = 5 (< 6); drops title cleanly without panic or overflow
+        let narrow = boxed.render(7);
+        assert_eq!(crate::ansi::visible_width(&narrow[0]), 7, "{narrow:?}");
+        assert!(!narrow[0].contains("Very"), "{narrow:?}");
     }
 
     #[test]
@@ -629,5 +728,85 @@ mod tests {
         let (fstart, fend, ffiltered) = list.visible_range();
         assert_eq!((fstart, fend), (0, 1));
         assert_eq!(ffiltered, vec![6]);
+    }
+
+    #[test]
+    fn select_list_sanitizes_ansi_osc_and_bidi_in_label_and_description() {
+        let item = SelectItem::new("id1", "\x1b]0;pwn\x07\x1b[31mModel\u{202E}X\x1b[0m")
+            .with_description("\x1b]52;c;AAAA\x07desc\u{2066}hidden\u{2069}");
+        let list = SelectList::new(vec![item], 4);
+        let lines = list.render(50);
+        assert_eq!(lines.len(), 1);
+        assert!(!lines[0].contains("\x1b]0;"), "OSC title must be stripped: {:?}", lines[0]);
+        assert!(!lines[0].contains("\x1b]52;"), "OSC 52 must be stripped: {:?}", lines[0]);
+        assert!(!lines[0].contains('\u{202E}'), "Bidi override must be stripped: {:?}", lines[0]);
+        assert!(!lines[0].contains('\u{2066}'), "Bidi isolate must be stripped: {:?}", lines[0]);
+        let plain = crate::ansi::strip_ansi(&lines[0]);
+        assert!(plain.contains("ModelX"), "{plain:?}");
+        assert!(plain.contains("deschidden"), "{plain:?}");
+    }
+
+    #[test]
+    fn select_list_empty_filter_sanitizes_escape_and_bidi_in_no_match_message() {
+        let mut list = SelectList::new(vec![SelectItem::new("id1", "Alpha")], 4);
+        list.set_filter("\x1b]0;pwn\x07\x1b[31mbad\u{202E}");
+        let lines = list.render(60);
+        let joined = lines.join("\n");
+        assert!(!joined.contains("\x1b]0;"), "OSC leaked: {joined:?}");
+        assert!(!joined.contains("\x1b[31m"), "CSI leaked: {joined:?}");
+        assert!(!joined.contains('\u{202E}'), "Bidi leaked: {joined:?}");
+        let plain = crate::ansi::strip_ansi(&joined);
+        assert!(plain.contains("No match for 'bad'"), "{plain:?}");
+    }
+
+    #[test]
+    fn text_render_handles_zero_width_and_zero_inner_width() {
+        assert!(Text::new("hello").render(0).is_empty());
+        let lines = Text::new("line1\nline2").with_padding(2).render(4);
+        for l in &lines {
+            assert!(!l.contains('\n'), "raw newline leaked: {l:?}");
+            assert!(crate::ansi::visible_width(l) <= 4, "overflow: {l:?}");
+        }
+    }
+
+    #[test]
+    fn bordered_box_truncates_overflow_preserving_cursor_and_pads_before_border_color() {
+        struct FixedLines(Vec<String>);
+        impl Component for FixedLines {
+            fn render(&self, _width: usize) -> Vec<String> {
+                self.0.clone()
+            }
+        }
+
+        let boxed = BorderedBox::new(Box::new(FixedLines(vec![format!(
+            "abcdef{}",
+            crate::tui::CURSOR_MARKER
+        )])));
+        let lines = boxed.render(7); // inner_width = 5
+        assert_eq!(crate::ansi::visible_width(&lines[1]), 7, "{lines:?}");
+        assert!(
+            lines[1].contains(crate::tui::CURSOR_MARKER),
+            "cursor marker dropped during truncation: {:?}",
+            lines[1]
+        );
+
+        let boxed_cursor = BorderedBox::new(Box::new(FixedLines(vec![format!(
+            "> hi{}",
+            crate::tui::CURSOR_MARKER
+        )])))
+        .with_border_color("\x1b[38;2;1;2;3m");
+        let rendered = boxed_cursor.render(20);
+        let mut term = crate::tui::MockTerminal::new(20, 5);
+        let mut tui = crate::tui::TuiRenderer::new();
+        tui.render_frame(&mut term, rendered, false).unwrap();
+        let out = term.full_output();
+        assert!(
+            out.contains("> hi\x1b[7m \x1b[27m"),
+            "fake cursor must sit on uncolored pad space before border_color: {out:?}"
+        );
+        assert!(
+            !out.contains("\x1b[7m│\x1b[27m"),
+            "fake cursor must not invert right border: {out:?}"
+        );
     }
 }

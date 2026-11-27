@@ -16,3 +16,7 @@ mehh-coding-agent.workspace = true
 tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

@@ -21,3 +21,6 @@ regex = { workspace = true }
 globset = { workspace = true }
 ignore = { workspace = true }
 similar = { workspace = true }
+
+[lints]
+workspace = true

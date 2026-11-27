@@ -2,7 +2,6 @@
 //! Provides conversational transcript, live markdown streaming, slash commands,
 //! editor with history and autocomplete, and async agent loop turns.
 
-use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -20,9 +19,9 @@ use mehh_ai::{
 };
 use mehh_tui::{
     normalize_crossterm_key, truncate_to_width, wrap_text_with_ansi, BorderStyle, BorderedBox,
-    Component, CrosstermTerminal, Editor, EditorOutput, Keybindings, Loader, MarkdownView,
-    SelectItem, SelectList, SettingItem, SettingsList, Terminal, Text, Theme, TuiAction,
-    TuiRenderer, WheelScrollAccelerator,
+    Component, CrosstermTerminal, Editor, EditorOutput, Keybindings, Loader, SelectItem,
+    SelectList, SettingItem, SettingsList, Terminal, Text, Theme, TuiAction, TuiRenderer,
+    WheelScrollAccelerator,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -45,7 +44,7 @@ pub use state::{
 };
 use state::{anchored_scroll_offset, scroll_down_anchored, scroll_up_anchored, slice_transcript_segments};
 pub use commands::{builtin_slash_commands, copy_toggle, format_hotkeys, handle_slash_command, perform_login, perform_login_with_prompt, perform_logout, persist_settings, rebuild_transcript_items, refresh_session_api_key, theme_source_exists, thinking_level_label};
-use commands::{ToolApprovalDecision, apply_interactive_model_switch, apply_setting_cycle_dir, apply_theme_choice, connected_providers_with_session, cycle_session_thinking, effective_permission_mode, effective_settings_snapshot, load_interactive_registry, open_connect_provider_selector, open_model_selector, open_session_switcher, parse_thinking_level_str, permission_mode_description, permission_rule_status_message, refresh_connected_state, refresh_settings_selector_with_status, set_session_thinking_level, settings_selected_id, sync_mcp_tools, sync_theme_preview, thinking_level_description, tool_approval_decision, update_autocomplete_with_context, update_selector_filter};
+use commands::{ToolApprovalDecision, apply_interactive_model_switch, apply_setting_cycle_dir, apply_theme_choice, connected_providers_with_session, cycle_session_thinking, disconnect_provider, effective_permission_mode, effective_settings_snapshot, load_interactive_registry, open_connect_for_provider, open_connect_provider_selector, open_model_selector, open_session_switcher, parse_thinking_level_str, permission_mode_description, permission_rule_status_message, refresh_connected_state, refresh_settings_selector_with_status, set_session_thinking_level, settings_selected_id, sync_mcp_tools, sync_theme_preview, thinking_level_description, tool_approval_decision, update_autocomplete_with_context, update_selector_filter};
 #[cfg(test)]
 use commands::{apply_setting_cycle, build_settings_list, refresh_settings_selector, settings_selector_items, split_system_prompt, update_autocomplete_with_cwd};
 pub use render::render_interactive_frame;
@@ -55,4 +54,4 @@ use render::{cap_preview_lines, compact_count, compact_path, ctx_bar, diff_visib
 pub use events::{apply_agent_event, run_interactive_mode};
 pub(crate) use events::AgentSignal;
 #[cfg(test)]
-use events::{SignalOutcome, apply_agent_signal, drain_agent_signals, expand_prompt_with_files, handle_agent_signal_async, handle_connect_input_paste, handle_mouse_event, handle_non_approval_selector_key, start_turn};
+use events::{SignalOutcome, apply_agent_signal, drain_agent_signals, expand_prompt_with_files, handle_agent_signal_async, handle_connect_input_paste, handle_interactive_paste, handle_mouse_event, handle_non_approval_selector_key, start_turn};

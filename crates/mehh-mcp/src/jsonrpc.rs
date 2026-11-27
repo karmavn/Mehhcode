@@ -153,26 +153,58 @@ impl<'de> Deserialize<'de> for JsonRpcMessage {
     where
         D: Deserializer<'de>,
     {
-        let val = serde_json::Value::deserialize(deserializer)?;
-        if let Some(obj) = val.as_object() {
-            if obj.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
-                return Err(serde::de::Error::custom("Invalid JSON-RPC version: expected '2.0'"));
-            }
-            let id_value = obj.get("id");
-            let has_id = id_value.is_some_and(|v| !v.is_null());
-            let has_method = obj.contains_key("method");
-            if has_method {
+        let mut val = serde_json::Value::deserialize(deserializer)?;
+        if let Some(obj) = val.as_object_mut() {
+            let Some(jsonrpc) = obj.remove("jsonrpc").and_then(|v| match v {
+                serde_json::Value::String(s) if s == "2.0" => Some(s),
+                _ => None,
+            }) else {
+                return Err(serde::de::Error::custom(
+                    "Invalid JSON-RPC version: expected '2.0'",
+                ));
+            };
+            let id_opt = obj.remove("id");
+            let has_id = id_opt.as_ref().is_some_and(|v| !v.is_null());
+            if let Some(method_val) = obj.remove("method") {
+                let method: String =
+                    serde_json::from_value(method_val).map_err(serde::de::Error::custom)?;
+                let params = match obj.remove("params") {
+                    Some(serde_json::Value::Null) | None => None,
+                    Some(p) => Some(p),
+                };
                 if has_id {
-                    let req: JsonRpcRequest = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
-                    return Ok(JsonRpcMessage::Request(req));
+                    return Ok(JsonRpcMessage::Request(JsonRpcRequest {
+                        jsonrpc,
+                        id: id_opt.unwrap_or(serde_json::Value::Null),
+                        method,
+                        params,
+                    }));
                 } else {
-                    let notif: JsonRpcNotification = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
-                    return Ok(JsonRpcMessage::Notification(notif));
+                    return Ok(JsonRpcMessage::Notification(JsonRpcNotification {
+                        jsonrpc,
+                        method,
+                        params,
+                    }));
                 }
-            } else if id_value.is_some() {
+            } else if let Some(id) = id_opt {
                 // A null id is only valid on a response (e.g. a parse-error reply), never on a request.
-                let resp: JsonRpcResponse = serde_json::from_value(val).map_err(serde::de::Error::custom)?;
-                return Ok(JsonRpcMessage::Response(resp));
+                let result = match obj.remove("result") {
+                    Some(serde_json::Value::Null) | None => None,
+                    Some(r) => Some(r),
+                };
+                let error = match obj.remove("error") {
+                    Some(serde_json::Value::Null) | None => None,
+                    Some(e) => Some(
+                        serde_json::from_value::<JsonRpcError>(e)
+                            .map_err(serde::de::Error::custom)?,
+                    ),
+                };
+                return Ok(JsonRpcMessage::Response(JsonRpcResponse {
+                    jsonrpc,
+                    id,
+                    result,
+                    error,
+                }));
             }
         }
         Err(serde::de::Error::custom("Invalid JSON-RPC 2.0 message"))

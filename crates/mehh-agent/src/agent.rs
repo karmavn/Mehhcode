@@ -350,6 +350,12 @@ impl Agent {
 
         let config = self.build_loop_config();
         let on_event = self.build_on_event();
+        let mut guard = StreamingStateGuard {
+            state: self.state.clone(),
+            cancel: config.cancel.clone(),
+            initial_len: self.messages.len(),
+            completed: false,
+        };
 
         let new_messages = run_agent_loop(
             messages,
@@ -359,14 +365,10 @@ impl Agent {
         )
         .await;
 
-        {
-            let mut st = mehh_ai::write_recover(&self.state);
-            st.is_streaming = false;
-            st.streaming_message = None;
-            st.pending_tool_calls.clear();
-        }
+        guard.completed = true;
+        drop(guard);
 
-        self.messages.extend(new_messages.clone());
+        self.messages.extend(new_messages.iter().cloned());
         new_messages
     }
 
@@ -425,10 +427,35 @@ impl Agent {
                     _ => {}
                 }
             }
-            for listener in &listeners {
-                listener(event.clone());
+            if let Some((last, rest)) = listeners.split_last() {
+                for listener in rest {
+                    listener(event.clone());
+                }
+                last(event);
             }
         }))
+    }
+}
+
+struct StreamingStateGuard {
+    state: Arc<std::sync::RwLock<AgentState>>,
+    cancel: CancellationToken,
+    initial_len: usize,
+    completed: bool,
+}
+
+impl Drop for StreamingStateGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.cancel.cancel();
+        }
+        let mut st = mehh_ai::write_recover(&self.state);
+        if !self.completed {
+            st.messages.truncate(self.initial_len);
+        }
+        st.is_streaming = false;
+        st.streaming_message = None;
+        st.pending_tool_calls.clear();
     }
 }
 
@@ -1031,5 +1058,77 @@ mod tests {
 
         let _ = agent.prompt_text("hi").await;
         assert_eq!(received.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn dropping_mid_flight_prompt_resets_streaming_state_and_cancels() {
+        let started = Arc::new(tokio::sync::Notify::new());
+
+        struct HangingTool {
+            started: Arc<tokio::sync::Notify>,
+        }
+        #[async_trait::async_trait]
+        impl AgentTool for HangingTool {
+            fn name(&self) -> &str {
+                "hang"
+            }
+            fn description(&self) -> &str {
+                "Waits until cancelled"
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object", "properties": {} })
+            }
+            async fn execute(
+                &self,
+                _tool_call_id: &str,
+                _params: serde_json::Map<String, serde_json::Value>,
+                cancel: CancellationToken,
+                _on_update: Option<AgentToolUpdateCallback>,
+            ) -> Result<AgentToolResult, String> {
+                self.started.notify_one();
+                cancel.cancelled().await;
+                Err("cancelled".to_string())
+            }
+        }
+
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_tool_call_message(vec![faux_tool_call(
+            "call-hang",
+            "hang",
+            serde_json::json!({}),
+        )]));
+
+        let mut agent = Agent::new(faux_model(), provider).with_tools(vec![Arc::new(HangingTool {
+            started: started.clone(),
+        })]);
+
+        let saw_tool_start = Arc::new(AtomicBool::new(false));
+        let saw_tool_start_clone = saw_tool_start.clone();
+        agent.subscribe(move |ev| {
+            if matches!(ev, AgentEvent::ToolExecutionStart { tool_call_id, .. } if tool_call_id == "call-hang") {
+                saw_tool_start_clone.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let cancel_handle = agent.cancellation_token();
+        {
+            let mut prompt_fut = Box::pin(agent.prompt_text("start"));
+            tokio::select! {
+                _ = &mut prompt_fut => panic!("hanging tool prompt should not finish before drop"),
+                _ = started.notified() => {}
+            }
+        }
+
+        assert!(saw_tool_start.load(Ordering::SeqCst));
+        assert!(cancel_handle.is_cancelled());
+        let st = agent.state();
+        assert!(!st.is_streaming, "is_streaming must reset on drop");
+        assert!(st.streaming_message.is_none(), "streaming_message must clear on drop");
+        assert!(st.pending_tool_calls.is_empty(), "pending_tool_calls must clear on drop");
+        assert_eq!(
+            st.messages.len(),
+            agent.messages().len(),
+            "state.messages must stay synchronized with agent.messages on drop"
+        );
     }
 }

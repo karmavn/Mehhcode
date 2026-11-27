@@ -46,16 +46,49 @@ fn score_positions(text_chars: &[char], positions: &[usize]) -> f64 {
     score
 }
 
-fn match_query(normalized_query: &str, text_lower: &str) -> FuzzyMatch {
-    if normalized_query.is_empty() {
+fn score_contiguous(text_chars: &[char], start: usize, q_len: usize) -> f64 {
+    let mut score = 0.0;
+    let mut last_match_index: isize = -1;
+    let mut consecutive_matches: usize = 0;
+
+    for k in 0..q_len {
+        let i = start + k;
+        if last_match_index == i as isize - 1 {
+            consecutive_matches += 1;
+            score -= (consecutive_matches as f64) * 5.0;
+        } else {
+            consecutive_matches = 0;
+        }
+
+        if i == 0
+            || matches!(
+                text_chars[i - 1],
+                ' ' | '\t' | '\n' | '\r' | '-' | '_' | '.' | '/' | ':'
+            )
+        {
+            score -= 10.0;
+        }
+
+        score += (i as f64) * 0.1;
+        last_match_index = i as isize;
+    }
+
+    score
+}
+
+fn match_prepared_chars(
+    normalized_query: &str,
+    query_chars: &[char],
+    text_lower: &str,
+    text_chars: &[char],
+    positions: &mut Vec<usize>,
+) -> FuzzyMatch {
+    if query_chars.is_empty() {
         return FuzzyMatch {
             matches: true,
             score: 0.0,
         };
     }
-
-    let query_chars: Vec<char> = normalized_query.chars().collect();
-    let text_chars: Vec<char> = text_lower.chars().collect();
 
     if query_chars.len() > text_chars.len() {
         return FuzzyMatch {
@@ -65,18 +98,15 @@ fn match_query(normalized_query: &str, text_lower: &str) -> FuzzyMatch {
     }
 
     // Greedy alignment: each query character at its first occurrence after the previous one.
-    let mut positions = Vec::with_capacity(query_chars.len());
+    positions.clear();
     let mut last_match_index: isize = -1;
 
-    for &qc in &query_chars {
+    for &qc in query_chars {
         let start_idx = (last_match_index + 1) as usize;
-        let mut found = None;
-        for (offset, &tc) in text_chars[start_idx..].iter().enumerate() {
-            if tc == qc {
-                found = Some(start_idx + offset);
-                break;
-            }
-        }
+        let found = text_chars[start_idx..]
+            .iter()
+            .position(|&tc| tc == qc)
+            .map(|offset| start_idx + offset);
 
         match found {
             Some(idx) => {
@@ -92,22 +122,16 @@ fn match_query(normalized_query: &str, text_lower: &str) -> FuzzyMatch {
         }
     }
 
-    let mut score = score_positions(&text_chars, &positions);
+    let mut score = score_positions(text_chars, positions);
 
     // The greedy alignment can scatter the query over an earlier, unrelated part of the text.
     // Also score every contiguous occurrence and keep the best alignment.
-    if !query_chars.is_empty() && text_chars.len() >= query_chars.len() {
-        let q_len = query_chars.len();
-        for (start, window) in text_chars.windows(q_len).enumerate() {
-            if window == query_chars.as_slice() {
-                let mut contig_positions = Vec::with_capacity(q_len);
-                for k in 0..q_len {
-                    contig_positions.push(start + k);
-                }
-                let contig_score = score_positions(&text_chars, &contig_positions);
-                if contig_score < score {
-                    score = contig_score;
-                }
+    let q_len = query_chars.len();
+    for (start, window) in text_chars.windows(q_len).enumerate() {
+        if window == query_chars {
+            let contig_score = score_contiguous(text_chars, start, q_len);
+            if contig_score < score {
+                score = contig_score;
             }
         }
     }
@@ -119,6 +143,70 @@ fn match_query(normalized_query: &str, text_lower: &str) -> FuzzyMatch {
     FuzzyMatch {
         matches: true,
         score,
+    }
+}
+
+struct PreparedToken {
+    lower: String,
+    chars: Vec<char>,
+    swapped: Option<(String, Vec<char>)>,
+}
+
+impl PreparedToken {
+    fn new(token: &str) -> Self {
+        let lower = token.to_lowercase();
+        let chars: Vec<char> = lower.chars().collect();
+        let swapped = if let Some((letters, digits)) = split_letters_digits(&lower) {
+            let s = format!("{digits}{letters}");
+            let sc: Vec<char> = s.chars().collect();
+            Some((s, sc))
+        } else if let Some((digits, letters)) = split_digits_letters(&lower) {
+            let s = format!("{letters}{digits}");
+            let sc: Vec<char> = s.chars().collect();
+            Some((s, sc))
+        } else {
+            None
+        };
+        Self {
+            lower,
+            chars,
+            swapped,
+        }
+    }
+
+    fn match_prepared(
+        &self,
+        text_lower: &str,
+        text_chars: &[char],
+        positions: &mut Vec<usize>,
+    ) -> FuzzyMatch {
+        let primary = match_prepared_chars(
+            &self.lower,
+            &self.chars,
+            text_lower,
+            text_chars,
+            positions,
+        );
+        if primary.matches {
+            return primary;
+        }
+        let Some((ref swapped_lower, ref swapped_chars)) = self.swapped else {
+            return primary;
+        };
+        let swapped_match = match_prepared_chars(
+            swapped_lower,
+            swapped_chars,
+            text_lower,
+            text_chars,
+            positions,
+        );
+        if !swapped_match.matches {
+            return primary;
+        }
+        FuzzyMatch {
+            matches: true,
+            score: swapped_match.score + 5.0,
+        }
     }
 }
 
@@ -165,36 +253,17 @@ fn split_digits_letters(s: &str) -> Option<(&str, &str)> {
 /// Matches if all characters in `query` appear in order in `text`.
 /// Lower score = better match.
 pub fn fuzzy_match(query: &str, text: &str) -> FuzzyMatch {
-    let query_lower = query.to_lowercase();
+    let token = PreparedToken::new(query);
+    if token.chars.is_empty() {
+        return FuzzyMatch {
+            matches: true,
+            score: 0.0,
+        };
+    }
     let text_lower = text.to_lowercase();
-
-    let primary_match = match_query(&query_lower, &text_lower);
-    if primary_match.matches {
-        return primary_match;
-    }
-
-    let swapped_query = if let Some((letters, digits)) = split_letters_digits(&query_lower) {
-        Some(format!("{}{}", digits, letters))
-    } else if let Some((digits, letters)) = split_digits_letters(&query_lower) {
-        Some(format!("{}{}", letters, digits))
-    } else {
-        None
-    };
-
-    let swapped_query = match swapped_query {
-        Some(q) => q,
-        None => return primary_match,
-    };
-
-    let swapped_match = match_query(&swapped_query, &text_lower);
-    if !swapped_match.matches {
-        return primary_match;
-    }
-
-    FuzzyMatch {
-        matches: true,
-        score: swapped_match.score + 5.0,
-    }
+    let text_chars: Vec<char> = text_lower.chars().collect();
+    let mut positions = Vec::with_capacity(token.chars.len());
+    token.match_prepared(&text_lower, &text_chars, &mut positions)
 }
 
 /// Filter and sort items by fuzzy match quality, returning matched item indices and references.
@@ -209,25 +278,31 @@ pub fn fuzzy_filter_indexed<'a, T, S: AsRef<str>>(
         return items.iter().enumerate().collect();
     }
 
-    let tokens: Vec<&str> = query_trimmed
+    let prepared_tokens: Vec<PreparedToken> = query_trimmed
         .split(|c: char| c.is_whitespace() || c == '/')
         .filter(|t| !t.is_empty())
+        .map(PreparedToken::new)
         .collect();
 
-    if tokens.is_empty() {
+    if prepared_tokens.is_empty() {
         return items.iter().enumerate().collect();
     }
 
     let mut results: Vec<(usize, &'a T, f64)> = Vec::new();
+    let mut text_chars: Vec<char> = Vec::new();
+    let mut positions: Vec<usize> = Vec::new();
 
     for (idx, item) in items.iter().enumerate() {
         let text = get_text(item);
-        let text_ref = text.as_ref();
+        let text_lower = text.as_ref().to_lowercase();
+        text_chars.clear();
+        text_chars.extend(text_lower.chars());
+
         let mut total_score = 0.0;
         let mut all_match = true;
 
-        for &token in &tokens {
-            let m = fuzzy_match(token, text_ref);
+        for token in &prepared_tokens {
+            let m = token.match_prepared(&text_lower, &text_chars, &mut positions);
             if m.matches {
                 total_score += m.score;
             } else {

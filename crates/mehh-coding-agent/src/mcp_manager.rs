@@ -8,12 +8,15 @@ use std::time::Duration;
 use anyhow::Context;
 use mehh_agent::AgentTool;
 use mehh_mcp::{
-    create_mcp_agent_tools, create_mcp_agent_tools_with_shared_names,
-    load_mcp_configs_with_trust, ListMcpResourceTemplatesTool,
-    ListMcpResourcesTool, McpAuthEntry, McpAuthStore, McpClient, McpRoot, McpServerConfig,
-    McpServerRegistry, McpToolInfo, McpTransport, OAuthTokens, ReadMcpResourceTool, StdioTransport,
-    StoredMcpBearerProvider, StreamableHttpTransport,
+    create_mcp_agent_tools_with_shared_names_and_timeout, load_mcp_configs_with_trust,
+    ListMcpResourceTemplatesTool, ListMcpResourcesTool, McpAuthEntry, McpAuthStore, McpClient,
+    McpRoot, McpServerConfig, McpServerRegistry, McpToolInfo, McpTransport, OAuthTokens,
+    ReadMcpResourceTool, StdioTransport, StoredMcpBearerProvider, StreamableHttpTransport,
 };
+
+const MAX_OAUTH_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_OAUTH_ERROR_BYTES: usize = 16 * 1024;
+const OAUTH_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Connection status summary for an MCP server.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,14 +26,61 @@ pub struct McpConnectionSummary {
     pub error: Option<String>,
 }
 
-/// Converts a local filesystem path to a standard `file://` URI.
+/// Report returned by [`McpManager::refresh_server_tools_report`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpRefreshReport {
+    pub changed: bool,
+    pub errors: Vec<String>,
+}
+
+fn is_method_not_found_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string();
+    msg.starts_with("MCP error -32601:") || msg.starts_with("MCP error -32601 ")
+}
+
+async fn list_tools_if_supported(client: &McpClient) -> anyhow::Result<Vec<McpToolInfo>> {
+    let supports_tools = client
+        .server_capabilities()
+        .await
+        .and_then(|caps| caps.get("tools").cloned())
+        .is_some_and(|v| !v.is_null());
+    if !supports_tools {
+        return Ok(Vec::new());
+    }
+    match client.list_tools().await {
+        Ok(tools) => Ok(tools),
+        Err(err) if is_method_not_found_error(&err) => Ok(Vec::new()),
+        Err(err) => Err(err),
+    }
+}
+
+fn redact_token_error_body(raw: &str, secrets: &[&str]) -> String {
+    let mut s = raw.to_string();
+    for secret in secrets {
+        if !secret.is_empty() {
+            s = s.replace(secret, "[REDACTED]");
+        }
+    }
+    s.chars().take(512).collect()
+}
+
+/// Converts a local filesystem path (including Windows verbatim `\\?\` and UNC paths)
+/// to a standard `file://` URI.
 pub fn cwd_to_root_uri(cwd: &Path) -> String {
     let abs = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let path_str = abs.to_string_lossy().replace('\\', "/");
-    // Strip the Windows extended-length (\\?\) prefix before percent-encoding.
-    // Otherwise '?' becomes %3F and the drive-letter ':' becomes %3A, so the
-    // prefix trim becomes a no-op and the drive-letter special case never fires.
-    let path_str = path_str.trim_start_matches("//?/");
+    let raw = abs.to_string_lossy();
+    let stripped = crate::settings::strip_windows_verbatim_prefix(&raw);
+    let path_str = stripped.replace('\\', "/");
+
+    if let Some(unc_rest) = path_str.strip_prefix("//") {
+        let encoded = unc_rest
+            .split('/')
+            .map(mehh_ai::percent_encode)
+            .collect::<Vec<_>>()
+            .join("/");
+        return format!("file://{encoded}");
+    }
+
     let encoded = path_str
         .split('/')
         .enumerate()
@@ -48,6 +98,49 @@ pub fn cwd_to_root_uri(cwd: &Path) -> String {
     } else {
         format!("file:///{encoded}")
     }
+}
+
+fn build_oauth_authorize_url(
+    authorization_endpoint: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    challenge: &str,
+    state: &str,
+) -> anyhow::Result<String> {
+    let mut url = reqwest::Url::parse(authorization_endpoint)
+        .with_context(|| format!("Invalid OAuth authorization endpoint '{authorization_endpoint}'"))?;
+    url.query_pairs_mut()
+        .append_pair("response_type", "code")
+        .append_pair("client_id", client_id)
+        .append_pair("redirect_uri", redirect_uri)
+        .append_pair("code_challenge", challenge)
+        .append_pair("code_challenge_method", "S256")
+        .append_pair("state", state);
+    Ok(url.into())
+}
+
+async fn read_bounded_oauth_json_bytes(
+    mut resp: reqwest::Response,
+    max_bytes: usize,
+) -> anyhow::Result<Vec<u8>> {
+    if let Some(len) = resp.content_length() {
+        if len > max_bytes as u64 {
+            anyhow::bail!(
+                "OAuth token response Content-Length ({len} bytes) exceeds limit of {max_bytes} bytes"
+            );
+        }
+    }
+    let mut buf = Vec::new();
+    while let Some(chunk) = tokio::time::timeout(OAUTH_BODY_READ_TIMEOUT, resp.chunk())
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out reading OAuth token response body"))??
+    {
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            anyhow::bail!("OAuth token response body exceeded limit of {max_bytes} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
 }
 
 /// Manages MCP client connections, active MCP tools, resource meta-tools, and OAuth storage.
@@ -169,11 +262,17 @@ impl McpManager {
                             dirty.store(true, std::sync::atomic::Ordering::SeqCst);
                         }),
                     );
-                    let adapted = create_mcp_agent_tools_with_shared_names(
+                    let timeout = mgr
+                        .configs
+                        .get(&name)
+                        .and_then(|c| c.effective_timeout_ms())
+                        .map(Duration::from_millis);
+                    let adapted = create_mcp_agent_tools_with_shared_names_and_timeout(
                         &name,
                         tool_infos,
                         client.clone(),
                         &mut used_names,
+                        timeout,
                     );
                     let tool_count = adapted.len();
                     mgr.server_tools.insert(name.clone(), adapted);
@@ -207,7 +306,7 @@ impl McpManager {
     fn names_used_by_other_servers(&self, except: Option<&str>) -> HashSet<String> {
         self.server_tools
             .iter()
-            .filter(|(name, _)| except.map_or(true, |ex| name.as_str() != ex))
+            .filter(|(name, _)| except != Some(name.as_str()))
             .flat_map(|(_, tools)| tools.iter().map(|tool| tool.name().to_string()))
             .collect()
     }
@@ -244,6 +343,10 @@ impl McpManager {
                     .await
                     .is_some_and(|e| e.tokens.is_some());
 
+            let mut http_transport = StreamableHttpTransport::new(url.clone(), cfg.headers.clone());
+            if let Some(ms) = cfg.effective_timeout_ms() {
+                http_transport = http_transport.with_request_timeout(Duration::from_millis(ms));
+            }
             if needs_oauth {
                 let bearer_provider = Arc::new(StoredMcpBearerProvider::new(
                     auth_store.clone(),
@@ -251,15 +354,9 @@ impl McpManager {
                     url,
                     cfg.oauth_token_endpoint.clone(),
                 )?);
-                let http_transport = StreamableHttpTransport::new(url.clone(), cfg.headers.clone())
-                    .with_auth_provider(bearer_provider);
-                Ok(Arc::new(http_transport))
-            } else {
-                Ok(Arc::new(StreamableHttpTransport::new(
-                    url.clone(),
-                    cfg.headers.clone(),
-                )))
+                http_transport = http_transport.with_auth_provider(bearer_provider);
             }
+            Ok(Arc::new(http_transport))
         } else {
             anyhow::bail!("Neither command nor url specified for MCP server '{name}'")
         }
@@ -288,8 +385,11 @@ impl McpManager {
             .unwrap_or_else(|| Duration::from_secs(15));
 
         let connect_and_list = async {
-            let client = Arc::new(McpClient::connect_with_roots(transport, roots).await?);
-            let tool_infos = client.list_tools().await?;
+            let client = Arc::new(
+                McpClient::connect_with_roots_and_timeout(transport, roots, timeout_duration)
+                    .await?,
+            );
+            let tool_infos = list_tools_if_supported(&client).await?;
             Ok::<_, anyhow::Error>((client, tool_infos))
         };
 
@@ -330,16 +430,32 @@ impl McpManager {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Fetches the latest tools from all connected MCP clients and updates active tools.
-    pub async fn refresh_server_tools(&mut self) -> anyhow::Result<bool> {
+    /// Fetches the latest tools from all connected MCP clients and returns a structured report.
+    pub async fn refresh_server_tools_report(&mut self) -> McpRefreshReport {
         let mut changed = false;
+        let mut errors = Vec::new();
         for (name, client) in &self.clients {
-            if let Ok(new_tools) = client.list_tools().await {
-                let mut used = self.names_used_by_other_servers(Some(name));
-                let adapted =
-                    create_mcp_agent_tools_with_shared_names(name, new_tools, client.clone(), &mut used);
-                self.server_tools.insert(name.clone(), adapted);
-                changed = true;
+            match list_tools_if_supported(client).await {
+                Ok(new_tools) => {
+                    let mut used = self.names_used_by_other_servers(Some(name));
+                    let timeout = self
+                        .configs
+                        .get(name)
+                        .and_then(|c| c.effective_timeout_ms())
+                        .map(Duration::from_millis);
+                    let adapted = create_mcp_agent_tools_with_shared_names_and_timeout(
+                        name,
+                        new_tools,
+                        client.clone(),
+                        &mut used,
+                        timeout,
+                    );
+                    self.server_tools.insert(name.clone(), adapted);
+                    changed = true;
+                }
+                Err(err) => {
+                    errors.push(format!("{name}: {err:#}"));
+                }
             }
         }
         if changed {
@@ -350,7 +466,19 @@ impl McpManager {
                 }
             }
         }
-        Ok(changed)
+        McpRefreshReport { changed, errors }
+    }
+
+    /// Fetches the latest tools from all connected MCP clients and updates active tools.
+    pub async fn refresh_server_tools(&mut self) -> anyhow::Result<bool> {
+        let report = self.refresh_server_tools_report().await;
+        if !report.errors.is_empty() {
+            anyhow::bail!(
+                "Failed to refresh tools for MCP server(s): {}",
+                report.errors.join("; ")
+            );
+        }
+        Ok(report.changed)
     }
 
     /// Returns the shared persistent authentication store.
@@ -402,11 +530,13 @@ impl McpManager {
                         }),
                     );
                     let mut used = self.names_used_by_other_servers(Some(name));
-                    let adapted = create_mcp_agent_tools_with_shared_names(
+                    let timeout = cfg.effective_timeout_ms().map(Duration::from_millis);
+                    let adapted = create_mcp_agent_tools_with_shared_names_and_timeout(
                         name,
                         tool_infos,
                         client.clone(),
                         &mut used,
+                        timeout,
                     );
                     let tool_count = adapted.len();
                     self.server_tools.insert(name.to_string(), adapted);
@@ -437,8 +567,15 @@ impl McpManager {
         let names = self.configured_server_names();
         let mut results = Vec::new();
         for name in names {
-            if let Ok(summary) = self.reconnect_server(&name).await {
-                results.push(summary);
+            match self.reconnect_server(&name).await {
+                Ok(summary) => results.push(summary),
+                Err(err) => {
+                    results.push(McpConnectionSummary {
+                        server: name,
+                        tool_count: 0,
+                        error: Some(err.to_string()),
+                    });
+                }
             }
         }
         results
@@ -483,22 +620,8 @@ impl McpManager {
 
         let redirect_uri = format!("http://127.0.0.1:{port}/callback");
 
-        let existing_entry = auth_store.get(name, url).await;
-        let (client_id, client_secret) = if let Some(ref entry) = existing_entry {
-            if let Some(ref cid) = entry.client_id {
-                (cid.clone(), entry.client_secret.clone())
-            } else if meta.registration_endpoint.is_some() {
-                mehh_mcp::oauth::register_dynamic_client(
-                    &http_client,
-                    &meta,
-                    &redirect_uri,
-                    "mehh-agent",
-                )
-                .await?
-            } else {
-                ("dynamic_client".to_string(), None)
-            }
-        } else if meta.registration_endpoint.is_some() {
+        let existing_entry = auth_store.try_get(name, url).await?;
+        let (client_id, client_secret) = if meta.registration_endpoint.is_some() {
             mehh_mcp::oauth::register_dynamic_client(
                 &http_client,
                 &meta,
@@ -506,6 +629,11 @@ impl McpManager {
                 "mehh-agent",
             )
             .await?
+        } else if let Some(cid) = existing_entry.as_ref().and_then(|e| e.client_id.as_ref()) {
+            (
+                cid.clone(),
+                existing_entry.as_ref().and_then(|e| e.client_secret.clone()),
+            )
         } else {
             ("dynamic_client".to_string(), None)
         };
@@ -513,14 +641,13 @@ impl McpManager {
         let (verifier, challenge) = mehh_mcp::oauth::generate_mcp_pkce();
         let state = uuid::Uuid::new_v4().to_string();
 
-        let auth_url = format!(
-            "{}?response_type=code&client_id={}&redirect_uri={}&code_challenge={}&code_challenge_method=S256&state={}",
-            meta.authorization_endpoint,
-            mehh_ai::percent_encode(&client_id),
-            mehh_ai::percent_encode(&redirect_uri),
-            mehh_ai::percent_encode(&challenge),
-            mehh_ai::percent_encode(&state),
-        );
+        let auth_url = build_oauth_authorize_url(
+            &meta.authorization_endpoint,
+            &client_id,
+            &redirect_uri,
+            &challenge,
+            &state,
+        )?;
 
         on_url(&auth_url);
 
@@ -541,16 +668,28 @@ impl McpManager {
         mehh_mcp::oauth::validate_oauth_request_url(&meta.token_endpoint).await?;
         let token_resp = http_client
             .post(&meta.token_endpoint)
+            .header("Accept", "application/json")
             .form(&form_params)
             .send()
             .await
-            .context("Failed to POST token request to authorization server")?
-            .error_for_status()
-            .context("Token endpoint returned error status")?;
+            .context("Failed to POST token request to authorization server")?;
 
-        let tokens: OAuthTokens = token_resp
-            .json()
-            .await
+        let status = token_resp.status();
+        if !status.is_success() {
+            let err_bytes = read_bounded_oauth_json_bytes(token_resp, MAX_OAUTH_ERROR_BYTES)
+                .await
+                .unwrap_or_default();
+            let err_body = String::from_utf8_lossy(&err_bytes);
+            let mut secrets: Vec<&str> = vec![auth_code.as_str(), verifier.as_str()];
+            if let Some(ref secret) = client_secret {
+                secrets.push(secret.as_str());
+            }
+            let safe_body = redact_token_error_body(&err_body, &secrets);
+            anyhow::bail!("Token endpoint returned error status ({status}): {safe_body}");
+        }
+
+        let body_bytes = read_bounded_oauth_json_bytes(token_resp, MAX_OAUTH_RESPONSE_BYTES).await?;
+        let tokens: OAuthTokens = serde_json::from_slice(&body_bytes)
             .context("Failed to parse token response JSON")?;
 
         // tokens_expire_at is Unix SECONDS, not milliseconds: it is compared
@@ -597,6 +736,7 @@ impl McpManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mehh_mcp::create_mcp_agent_tools;
 
     #[tokio::test]
     async fn test_mcp_manager_empty_configs() {
@@ -834,5 +974,496 @@ mod tests {
             .any(|t| t.name() == "mcp__mock__new_tool"));
 
         mgr.close_all().await;
+    }
+
+    #[test]
+    fn cwd_to_root_uri_handles_unc_and_verbatim_unc_paths() {
+        assert_eq!(
+            cwd_to_root_uri(Path::new(r"\\?\UNC\fileserver\share\my repo")),
+            "file://fileserver/share/my%20repo"
+        );
+        assert_eq!(
+            cwd_to_root_uri(Path::new(r"\\?\unc\fileserver\share\proj")),
+            "file://fileserver/share/proj"
+        );
+        assert_eq!(
+            cwd_to_root_uri(Path::new(r"\\fileserver\share\proj")),
+            "file://fileserver/share/proj"
+        );
+    }
+
+    #[test]
+    fn build_oauth_authorize_url_preserves_existing_query_and_encodes_params() {
+        let url = build_oauth_authorize_url(
+            "https://auth.example.com/authorize?tenant=acme",
+            "client&id=1",
+            "http://127.0.0.1:8080/callback",
+            "chal+1",
+            "st=1",
+        )
+        .unwrap();
+        let parsed = reqwest::Url::parse(&url).unwrap();
+        let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+        assert_eq!(pairs.get("tenant").map(String::as_str), Some("acme"));
+        assert_eq!(pairs.get("client_id").map(String::as_str), Some("client&id=1"));
+        assert_eq!(pairs.get("response_type").map(String::as_str), Some("code"));
+        assert_eq!(pairs.get("state").map(String::as_str), Some("st=1"));
+    }
+
+    #[tokio::test]
+    async fn read_bounded_oauth_json_bytes_rejects_oversized_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 512];
+            let _ = sock.read(&mut buf).await;
+            let body = vec![b'a'; 2048];
+            let header = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(header.as_bytes()).await;
+            let _ = sock.write_all(&body).await;
+        });
+
+        let resp = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{port}/token"))
+            .send()
+            .await
+            .unwrap();
+        let err = read_bounded_oauth_json_bytes(resp, 1024).await.unwrap_err();
+        assert!(err.to_string().contains("exceeds limit"));
+        let _ = server.await;
+    }
+
+    #[tokio::test]
+    async fn i19_resource_only_server_without_tools_capability_or_32601_connects_and_refreshes_cleanly() {
+        use mehh_mcp::jsonrpc::{JsonRpcMessage, JsonRpcResponse};
+        use mehh_mcp::transport::{InMemoryTransport, McpTransport};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // 1. Server without "tools" capability must skip tools/list altogether.
+        let (c_tr1, s_tr1) = InMemoryTransport::pair();
+        let tools_list_called = Arc::new(AtomicBool::new(false));
+        let called_flag = tools_list_called.clone();
+        let srv1 = tokio::spawn(async move {
+            while let Some(Ok(msg)) = s_tr1.recv().await {
+                if let JsonRpcMessage::Request(req) = msg {
+                    let resp = if req.method == "initialize" {
+                        JsonRpcResponse::success(
+                            req.id,
+                            serde_json::json!({
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": { "resources": {} },
+                                "serverInfo": { "name": "res-only", "version": "1.0" }
+                            }),
+                        )
+                    } else if req.method == "tools/list" {
+                        called_flag.store(true, Ordering::SeqCst);
+                        JsonRpcResponse::error(req.id, -32601, "Method not found", None)
+                    } else {
+                        JsonRpcResponse::success(req.id, serde_json::json!({}))
+                    };
+                    let _ = s_tr1.send(JsonRpcMessage::Response(resp)).await;
+                }
+            }
+        });
+
+        let client1 = Arc::new(McpClient::connect(Arc::new(c_tr1)).await.unwrap());
+
+        // 2. Server advertising "tools" capability that returns -32601 must yield empty tool list.
+        let (c_tr2, s_tr2) = InMemoryTransport::pair();
+        let srv2 = tokio::spawn(async move {
+            while let Some(Ok(msg)) = s_tr2.recv().await {
+                if let JsonRpcMessage::Request(req) = msg {
+                    let resp = if req.method == "initialize" {
+                        JsonRpcResponse::success(
+                            req.id,
+                            serde_json::json!({
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "partial-srv", "version": "1.0" }
+                            }),
+                        )
+                    } else if req.method == "tools/list" {
+                        JsonRpcResponse::error(req.id, -32601, "Method not found", None)
+                    } else {
+                        JsonRpcResponse::success(req.id, serde_json::json!({}))
+                    };
+                    let _ = s_tr2.send(JsonRpcMessage::Response(resp)).await;
+                }
+            }
+        });
+        let client2 = Arc::new(McpClient::connect(Arc::new(c_tr2)).await.unwrap());
+
+        let mut mgr = McpManager::default();
+        mgr.clients.push(("res_only".to_string(), client1.clone()));
+        mgr.clients.push(("partial".to_string(), client2.clone()));
+        mgr.refresh_server_tools()
+            .await
+            .expect("refresh_server_tools must succeed for resource-only and -32601 servers");
+        assert!(
+            !tools_list_called.load(Ordering::SeqCst),
+            "tools/list must be skipped when capabilities lack tools"
+        );
+
+        mgr.close_all().await;
+        srv1.abort();
+        srv2.abort();
+    }
+
+    #[tokio::test]
+    async fn i21_complete_oauth_flow_fails_closed_on_corrupt_store_reregisters_dcr_and_reads_error_body() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // 1. Corrupt auth store fails closed via try_get.
+        let dir = crate::TempTestDir::new("i21_oauth");
+        let store_path = dir.path().join("mcp-auth.json");
+        let store = McpAuthStore::try_with_path(store_path.clone()).unwrap();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        // Seed store with an old client_id tied to a previous port, and verify DCR re-registers!
+        store
+            .set(
+                "srv",
+                &base_url,
+                McpAuthEntry {
+                    server_url: base_url.clone(),
+                    client_id: Some("stale_old_port_client_id".to_string()),
+                    client_secret: Some("old_secret".to_string()),
+                    tokens: None,
+                    tokens_expire_at: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let seen_dcr_redirect = Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_token_accept = Arc::new(std::sync::Mutex::new(None::<String>));
+        let seen_token_client_id = Arc::new(std::sync::Mutex::new(None::<String>));
+        let dcr_cb = seen_dcr_redirect.clone();
+        let accept_cb = seen_token_accept.clone();
+        let cid_cb = seen_token_client_id.clone();
+
+        let base_url_srv = base_url.clone();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let dcr_cb = dcr_cb.clone();
+                let accept_cb = accept_cb.clone();
+                let cid_cb = cid_cb.clone();
+                let base_url = base_url_srv.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let first_line = req.lines().next().unwrap_or("");
+                    let path = first_line.split_whitespace().nth(1).unwrap_or("");
+
+                    let (status, body) = if path.contains("/.well-known/oauth-authorization-server") {
+                        let meta = serde_json::json!({
+                            "authorization_endpoint": format!("{base_url}/authorize"),
+                            "token_endpoint": format!("{base_url}/token"),
+                            "registration_endpoint": format!("{base_url}/register"),
+                        });
+                        ("200 OK", meta.to_string())
+                    } else if path == "/register" {
+                        let (_, body_part) = req.split_once("\r\n\r\n").unwrap_or(("", ""));
+                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(body_part) {
+                            *dcr_cb.lock().unwrap() = v
+                                .get("redirect_uris")
+                                .and_then(|u| u.get(0))
+                                .and_then(|s| s.as_str())
+                                .map(str::to_string);
+                        }
+                        (
+                            "200 OK",
+                            serde_json::json!({
+                                "client_id": "fresh_dcr_client_id",
+                                "client_secret": "fresh_dcr_secret"
+                            })
+                            .to_string(),
+                        )
+                    } else if path == "/token" {
+                        for line in req.lines() {
+                            if let Some((k, v)) = line.split_once(':') {
+                                if k.eq_ignore_ascii_case("accept") {
+                                    *accept_cb.lock().unwrap() = Some(v.trim().to_string());
+                                }
+                            }
+                        }
+                        let (_, body_part) = req.split_once("\r\n\r\n").unwrap_or(("", ""));
+                        for pair in body_part.split('&') {
+                            if let Some((k, v)) = pair.split_once('=') {
+                                if k == "client_id" {
+                                    *cid_cb.lock().unwrap() = Some(v.to_string());
+                                }
+                            }
+                        }
+                        (
+                            "400 Bad Request",
+                            r#"{"error":"invalid_grant","error_description":"code expired","client_secret":"fresh_dcr_secret"}"#.to_string(),
+                        )
+                    } else {
+                        ("404 Not Found", "{}".to_string())
+                    };
+
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let flow_res = McpManager::complete_server_oauth_flow(
+            "srv",
+            &format!("http://127.0.0.1:{port}"),
+            &store,
+            |auth_url| {
+                let parsed = reqwest::Url::parse(auth_url).unwrap();
+                let pairs: HashMap<String, String> = parsed.query_pairs().into_owned().collect();
+                let redir = pairs.get("redirect_uri").unwrap().clone();
+                let state = pairs.get("state").unwrap().clone();
+                tokio::spawn(async move {
+                    let cb_url = format!("{redir}?code=test_code&state={state}");
+                    let _ = reqwest::get(cb_url).await;
+                });
+            },
+        )
+        .await;
+
+        let err = flow_res.expect_err("400 from token endpoint must fail");
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains("invalid_grant") && err_msg.contains("code expired"),
+            "token endpoint error body must be surfaced, got: {err_msg}"
+        );
+        assert!(
+            !err_msg.contains("fresh_dcr_secret"),
+            "client_secret must be redacted from error, got: {err_msg}"
+        );
+        assert_eq!(
+            seen_token_client_id.lock().unwrap().as_deref(),
+            Some("fresh_dcr_client_id"),
+            "must register fresh DCR client_id for new ephemeral redirect_uri"
+        );
+        assert!(
+            seen_dcr_redirect.lock().unwrap().is_some(),
+            "DCR endpoint must be called with redirect_uri"
+        );
+        assert_eq!(
+            seen_token_accept.lock().unwrap().as_deref(),
+            Some("application/json"),
+            "token POST must send Accept: application/json"
+        );
+
+        // Corrupt the store on disk -> try_get must fail closed after metadata/bind.
+        std::fs::write(&store_path, b"{not valid json").unwrap();
+        let corrupt_err = McpManager::complete_server_oauth_flow(
+            "srv",
+            &format!("http://127.0.0.1:{port}"),
+            &store,
+            |_| {},
+        )
+        .await
+        .expect_err("corrupt auth store must fail closed via try_get");
+        assert!(
+            format!("{corrupt_err:#}").contains("mcp-auth.json"),
+            "expected auth store parse failure, got: {corrupt_err:#}"
+        );
+
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn c9_mcp_manager_wires_effective_timeout_ms_into_http_and_tool_calls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req_str = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let (_, body) = req_str.split_once("\r\n\r\n").unwrap_or(("", ""));
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(body.trim()).unwrap_or_default();
+                    let method = parsed.get("method").and_then(|m| m.as_str()).unwrap_or("");
+                    let id = parsed.get("id").cloned();
+
+                    let resp_body = match method {
+                        "initialize" => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "http-srv", "version": "1.0" }
+                            }
+                        })
+                        .to_string(),
+                        "notifications/initialized" => {
+                            let _ = sock
+                                .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .await;
+                            return;
+                        }
+                        "tools/list" => serde_json::json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "tools": [{
+                                    "name": "slow_tool",
+                                    "inputSchema": { "type": "object" }
+                                }]
+                            }
+                        })
+                        .to_string(),
+                        "tools/call" => {
+                            // Delay longer than configured 120ms timeout.
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                            return;
+                        }
+                        _ => String::new(),
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                        resp_body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let dir = crate::TempTestDir::new("c9_mgr");
+        let store = Arc::new(
+            McpAuthStore::try_with_path(dir.path().join("mcp-auth.json")).unwrap(),
+        );
+        let mut configs = HashMap::new();
+        configs.insert(
+            "http_srv".to_string(),
+            McpServerConfig {
+                url: Some(format!("http://127.0.0.1:{port}/mcp")),
+                timeout_ms: Some(120),
+                ..Default::default()
+            },
+        );
+        let mgr = McpManager::connect_with_configs(dir.path(), configs, store).await;
+        assert_eq!(mgr.summaries()[0].error, None);
+
+        let tool = mgr
+            .tools()
+            .iter()
+            .find(|t| t.name() == "mcp__http_srv__slow_tool")
+            .expect("tool must be registered");
+        let start = std::time::Instant::now();
+        let err = tool
+            .execute(
+                "c1",
+                serde_json::Map::new(),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(
+            err.contains("Timed out") || err.contains("timed out"),
+            "expected configured 120ms timeout error, got: {err}"
+        );
+
+        mgr.close_all().await;
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn i22_refresh_server_tools_report_collects_errors_and_updates_healthy_servers() {
+        use mehh_mcp::jsonrpc::{JsonRpcMessage, JsonRpcResponse};
+        use mehh_mcp::transport::{InMemoryTransport, McpTransport};
+
+        let (ok_c, ok_s) = InMemoryTransport::pair();
+        let ok_srv = tokio::spawn(async move {
+            while let Some(Ok(msg)) = ok_s.recv().await {
+                if let JsonRpcMessage::Request(req) = msg {
+                    let resp = if req.method == "initialize" {
+                        JsonRpcResponse::success(
+                            req.id,
+                            serde_json::json!({
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "ok-srv", "version": "1.0" }
+                            }),
+                        )
+                    } else {
+                        JsonRpcResponse::success(
+                            req.id,
+                            serde_json::json!({
+                                "tools": [{
+                                    "name": "ping",
+                                    "inputSchema": { "type": "object" }
+                                }]
+                            }),
+                        )
+                    };
+                    let _ = ok_s.send(JsonRpcMessage::Response(resp)).await;
+                }
+            }
+        });
+
+        let (bad_c, bad_s) = InMemoryTransport::pair();
+        let bad_srv = tokio::spawn(async move {
+            while let Some(Ok(msg)) = bad_s.recv().await {
+                if let JsonRpcMessage::Request(req) = msg {
+                    let resp = if req.method == "initialize" {
+                        JsonRpcResponse::success(
+                            req.id,
+                            serde_json::json!({
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "bad-srv", "version": "1.0" }
+                            }),
+                        )
+                    } else {
+                        JsonRpcResponse::error(req.id, -32603, "internal failure", None)
+                    };
+                    let _ = bad_s.send(JsonRpcMessage::Response(resp)).await;
+                }
+            }
+        });
+
+        let ok_client = Arc::new(McpClient::connect(Arc::new(ok_c)).await.unwrap());
+        let bad_client = Arc::new(McpClient::connect(Arc::new(bad_c)).await.unwrap());
+
+        let mut mgr = McpManager::default();
+        mgr.clients.push(("ok_srv".to_string(), ok_client));
+        mgr.clients.push(("bad_srv".to_string(), bad_client));
+
+        let report = mgr.refresh_server_tools_report().await;
+        assert!(report.changed);
+        assert_eq!(report.errors.len(), 1);
+        assert!(report.errors[0].contains("bad_srv"));
+        assert!(mgr.tools().iter().any(|t| t.name() == "mcp__ok_srv__ping"));
+
+        let err = mgr.refresh_server_tools().await.unwrap_err();
+        assert!(err.to_string().contains("bad_srv"));
+
+        mgr.close_all().await;
+        ok_srv.abort();
+        bad_srv.abort();
     }
 }

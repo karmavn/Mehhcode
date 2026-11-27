@@ -127,13 +127,37 @@ fn read_mcp_config_file(path: &Path) -> anyhow::Result<Option<McpConfigFile>> {
     Ok(Some(parsed))
 }
 
+fn non_empty_env_os_from<F>(name: &str, mut get_var: F) -> Option<std::ffi::OsString>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    get_var(name).filter(|v| !v.to_string_lossy().trim().is_empty())
+}
+
+fn resolve_home_dir_with<F>(mut get_var: F, windows_precedence: bool) -> Option<PathBuf>
+where
+    F: FnMut(&str) -> Option<std::ffi::OsString>,
+{
+    let home = if windows_precedence {
+        non_empty_env_os_from("USERPROFILE", &mut get_var)
+            .or_else(|| non_empty_env_os_from("HOME", &mut get_var))
+            .or_else(|| {
+                let drive = non_empty_env_os_from("HOMEDRIVE", &mut get_var)?;
+                let path = non_empty_env_os_from("HOMEPATH", &mut get_var)?;
+                let mut combined = drive;
+                combined.push(path);
+                Some(combined)
+            })
+    } else {
+        non_empty_env_os_from("HOME", &mut get_var)
+            .or_else(|| non_empty_env_os_from("USERPROFILE", &mut get_var))
+    };
+    home.map(PathBuf::from)
+}
+
 /// Returns the path to the global user MCP configuration: `~/.mehh/agent/mcp.json`.
 pub fn global_mcp_config_path() -> Option<PathBuf> {
-    #[cfg(windows)]
-    let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
-    #[cfg(not(windows))]
-    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"));
-    let home = home.filter(|h| !h.is_empty()).map(PathBuf::from)?;
+    let home = resolve_home_dir_with(|k| std::env::var_os(k), cfg!(windows))?;
     Some(home.join(".mehh").join("agent").join("mcp.json"))
 }
 
@@ -303,5 +327,55 @@ mod tests {
         let snake_ms: McpServerConfig =
             serde_json::from_value(serde_json::json!({ "timeout_ms": 250 })).unwrap();
         assert_eq!(snake_ms.effective_timeout_ms(), Some(250));
+    }
+
+    #[test]
+    fn resolve_home_dir_filters_empty_values_per_variable() {
+        let vars = |entries: &[(&str, &str)]| {
+            let map: HashMap<String, String> = entries
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect();
+            move |name: &str| map.get(name).map(std::ffi::OsString::from)
+        };
+
+        // Empty USERPROFILE on Windows falls back to HOME.
+        let win_home = resolve_home_dir_with(
+            vars(&[("USERPROFILE", "   "), ("HOME", "/home/fallback")]),
+            true,
+        );
+        assert_eq!(win_home, Some(PathBuf::from("/home/fallback")));
+
+        // Empty USERPROFILE and HOME on Windows falls back to HOMEDRIVE + HOMEPATH.
+        let win_drive = resolve_home_dir_with(
+            vars(&[
+                ("USERPROFILE", ""),
+                ("HOME", ""),
+                ("HOMEDRIVE", "C:"),
+                ("HOMEPATH", "\\Users\\alice"),
+            ]),
+            true,
+        );
+        assert_eq!(win_drive, Some(PathBuf::from("C:\\Users\\alice")));
+
+        // Partial HOMEDRIVE without non-empty HOMEPATH returns None.
+        let win_partial = resolve_home_dir_with(
+            vars(&[("HOMEDRIVE", "C:"), ("HOMEPATH", "")]),
+            true,
+        );
+        assert_eq!(win_partial, None);
+
+        // Empty HOME on Unix falls back to USERPROFILE, and HOME wins when both are set.
+        let unix_fallback = resolve_home_dir_with(
+            vars(&[("HOME", ""), ("USERPROFILE", "/users/alice")]),
+            false,
+        );
+        assert_eq!(unix_fallback, Some(PathBuf::from("/users/alice")));
+
+        let unix_precedence = resolve_home_dir_with(
+            vars(&[("HOME", "/home/alice"), ("USERPROFILE", "/users/alice")]),
+            false,
+        );
+        assert_eq!(unix_precedence, Some(PathBuf::from("/home/alice")));
     }
 }

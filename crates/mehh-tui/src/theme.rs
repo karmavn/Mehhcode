@@ -80,7 +80,28 @@ pub fn hex_to_bg_ansi(hex: &str) -> Option<String> {
     Some(format!("\x1b[48;2;{r};{g};{b}m"))
 }
 
-/// Resolve a color value string: converts hex colors to ANSI SGR escapes, or preserves raw ANSI escapes.
+fn is_valid_sgr(s: &str) -> bool {
+    if !s.starts_with("\x1b[") || !s.ends_with('m') {
+        return false;
+    }
+    let mut rest = s;
+    while !rest.is_empty() {
+        let Some(after_esc) = rest.strip_prefix("\x1b[") else {
+            return false;
+        };
+        let Some(m_idx) = after_esc.find('m') else {
+            return false;
+        };
+        let params = &after_esc[..m_idx];
+        if !params.bytes().all(|b| b.is_ascii_digit() || b == b';') {
+            return false;
+        }
+        rest = &after_esc[m_idx + 1..];
+    }
+    true
+}
+
+/// Resolve a color value string: converts hex colors to ANSI SGR escapes, or preserves valid SGR escapes.
 fn resolve_color_value(val: &str, is_bg: bool) -> String {
     let trimmed = val.trim();
     if trimmed.is_empty() {
@@ -109,8 +130,9 @@ fn resolve_color_value(val: &str, is_bg: bool) -> String {
         "cyan" => (if is_bg { "\x1b[46m" } else { "\x1b[36m" }).to_string(),
         "white" => (if is_bg { "\x1b[47m" } else { "\x1b[37m" }).to_string(),
         "gray" | "grey" | "muted" => (if is_bg { "\x1b[100m" } else { "\x1b[90m" }).to_string(),
-        // Raw ANSI escapes or unchanged fallback
-        _ => trimmed.to_string(),
+        // Valid raw SGR escapes only; reject unrecognized strings and non-SGR sequences
+        _ if is_valid_sgr(trimmed) => trimmed.to_string(),
+        _ => String::new(),
     }
 }
 
@@ -186,42 +208,82 @@ impl Theme {
         }
     }
 
+    fn is_explicit_path(name_or_path: &str) -> bool {
+        name_or_path.contains('/')
+            || name_or_path.contains('\\')
+            || name_or_path.starts_with('.')
+            || name_or_path.to_ascii_lowercase().ends_with(".json")
+            || Path::new(name_or_path).is_absolute()
+    }
+
+    /// Try to load a theme by built-in preset name, `~/.mehh/agent/themes/<name>.json`,
+    /// or an explicit file path. Distinguishes missing named presets from IO/parse errors
+    /// on explicit paths or existing theme files, and strips any leading UTF-8 BOM.
+    pub fn try_load(name_or_path: &str) -> Result<Theme, String> {
+        let name_str = name_or_path.trim();
+        if name_str.is_empty() {
+            return Err("Theme name or path is empty".to_string());
+        }
+
+        let mut theme = Self::from_name(name_str);
+        let direct_path = Path::new(name_str);
+        let explicit = Self::is_explicit_path(name_str);
+
+        let file_path = if explicit {
+            direct_path.to_path_buf()
+        } else {
+            match Self::theme_file_path(name_str) {
+                Some(p) => p,
+                None => {
+                    return if matches!(name_str.to_ascii_lowercase().as_str(), "dark" | "light") {
+                        Ok(theme)
+                    } else {
+                        Err(format!("Theme '{name_str}' not found"))
+                    };
+                }
+            }
+        };
+
+        let content = match std::fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(e) if !explicit && e.kind() == std::io::ErrorKind::NotFound => {
+                return if matches!(name_str.to_ascii_lowercase().as_str(), "dark" | "light") {
+                    Ok(theme)
+                } else {
+                    Err(format!("Theme '{name_str}' not found"))
+                };
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Failed to read theme '{}': {e}",
+                    file_path.display()
+                ));
+            }
+        };
+
+        let clean = content.strip_prefix('\u{feff}').unwrap_or(&content);
+        let val: serde_json::Value = serde_json::from_str(clean)
+            .map_err(|e| format!("Failed to parse theme '{}': {e}", file_path.display()))?;
+        if !val.is_object() {
+            return Err(format!(
+                "Invalid theme '{}': expected JSON object",
+                file_path.display()
+            ));
+        }
+
+        Self::apply_json_value(&mut theme, &val);
+        Ok(theme)
+    }
+
     /// Load a theme by name: checks `~/.mehh/agent/themes/<name>.json` (or a direct path),
-    /// supporting `#rrggbb` hex colors converted to `\x1b[38;2;r;g;bm` or raw ANSI escapes,
+    /// supporting `#rrggbb` hex colors converted to `\x1b[38;2;r;g;bm` or valid SGR escapes,
     /// falling back to `Theme::from_name(...)` / `Theme::dark()`.
     pub fn load(name: Option<&str>) -> Self {
         let name_str = match name {
             Some(n) if !n.trim().is_empty() => n.trim(),
             _ => return Self::dark(),
         };
-
-        let mut theme = Self::from_name(name_str);
-
-        // Check direct path or ~/.mehh/agent/themes/<name>.json
-        let direct_path = Path::new(name_str);
-        let path = if direct_path.exists() {
-            Some(direct_path.to_path_buf())
-        } else {
-            Self::theme_file_path(name_str)
-        };
-
-        let file_path = match path {
-            Some(p) if p.exists() => p,
-            _ => return theme,
-        };
-
-        let content = match std::fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(_) => return theme,
-        };
-
-        let val: serde_json::Value = match serde_json::from_str(&content) {
-            Ok(v) => v,
-            Err(_) => return theme,
-        };
-
-        Self::apply_json_value(&mut theme, &val);
-        theme
+        Self::try_load(name_str).unwrap_or_else(|_| Self::from_name(name_str))
     }
 
     fn theme_file_path(name: &str) -> Option<PathBuf> {
@@ -249,7 +311,10 @@ impl Theme {
         };
 
         if let Some(n) = obj.get("name").and_then(|v| v.as_str()) {
-            theme.name = n.to_string();
+            let clean_name = crate::ansi::sanitize_terminal_text(n, false);
+            if !clean_name.trim().is_empty() {
+                theme.name = clean_name;
+            }
         }
 
         let vars = obj.get("vars").and_then(|v| v.as_object());
@@ -386,5 +451,111 @@ mod tests {
         assert_eq!(t.dim, "\x1b[38;2;18;52;86m");
         assert_eq!(t.surface_elevated, Theme::dark().surface_elevated);
         let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn theme_load_strips_utf8_bom() {
+        let tmp = std::env::temp_dir().join(format!("mehh-theme-bom-{}.json", std::process::id()));
+        std::fs::write(&tmp, "\u{feff}{\"name\":\"bommed\",\"accent\":\"#112233\"}").unwrap();
+        let t = Theme::load(Some(tmp.to_str().unwrap()));
+        assert_eq!(t.name, "bommed");
+        assert_eq!(t.accent, "\x1b[38;2;17;34;51m");
+        let _ = std::fs::remove_file(tmp);
+    }
+
+    #[test]
+    fn try_load_distinguishes_presets_from_explicit_path_and_parse_errors() {
+        // Built-in named presets succeed without an explicit file unless overridden on disk
+        assert!(Theme::try_load("dark").is_ok());
+        assert!(Theme::try_load("light").is_ok());
+
+        // Missing explicit path returns Err
+        let missing = std::env::temp_dir().join(format!("mehh-missing-theme-{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        let err = Theme::try_load(missing.to_str().unwrap()).unwrap_err();
+        assert!(err.contains("Failed to read theme"), "{err}");
+
+        // Invalid JSON at explicit path returns Err
+        let bad_json = std::env::temp_dir().join(format!("mehh-bad-theme-{}.json", std::process::id()));
+        std::fs::write(&bad_json, "{not valid json").unwrap();
+        let parse_err = Theme::try_load(bad_json.to_str().unwrap()).unwrap_err();
+        assert!(parse_err.contains("Failed to parse theme"), "{parse_err}");
+        let _ = std::fs::remove_file(bad_json);
+
+        // Unknown non-path name returns Err
+        assert!(Theme::try_load("definitely_missing_preset_98765").is_err());
+    }
+
+    #[test]
+    fn resolve_color_value_rejects_non_sgr_and_arbitrary_strings() {
+        assert_eq!(resolve_color_value("\x1b[38;2;10;20;30m", false), "\x1b[38;2;10;20;30m");
+        assert_eq!(resolve_color_value("\x1b[1m\x1b[35m", false), "\x1b[1m\x1b[35m");
+        assert_eq!(resolve_color_value("\x1b[2J", false), "");
+        assert_eq!(resolve_color_value("\x1b]0;pwned\x07", false), "");
+        assert_eq!(resolve_color_value("arbitrary-text", false), "");
+    }
+
+    #[test]
+    fn try_load_ignores_bare_cwd_file_but_allows_explicit_relative_path() {
+        static CWD_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        struct CwdGuard {
+            orig: PathBuf,
+            dir: PathBuf,
+        }
+        impl Drop for CwdGuard {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.orig);
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        let _lock = CWD_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+        let orig = std::env::current_dir().unwrap();
+        let dir = std::env::temp_dir().join(format!("mehh-theme-cwd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("dark"),
+            r##"{"name":"shadowed","accent":"#112233"}"##,
+        )
+        .unwrap();
+
+        let _guard = CwdGuard {
+            orig,
+            dir: dir.clone(),
+        };
+        std::env::set_current_dir(&dir).unwrap();
+
+        let bare = Theme::try_load("dark").expect("bare dark preset should load");
+        assert_ne!(bare.name, "shadowed");
+        assert_ne!(bare.accent, "\x1b[38;2;17;34;51m");
+
+        let explicit = Theme::try_load("./dark").expect("explicit ./dark path should load");
+        assert_eq!(explicit.name, "shadowed");
+        assert_eq!(explicit.accent, "\x1b[38;2;17;34;51m");
+    }
+
+    #[test]
+    fn try_load_sanitizes_theme_name_control_and_escape_sequences() {
+        let p1 = std::env::temp_dir().join(format!("mehh-theme-name-1-{}.json", std::process::id()));
+        std::fs::write(
+            &p1,
+            "{\"name\":\"Evil\\u001b]0;pwn\\u0007\\u001b[31mTheme\\u202e\",\"accent\":\"#112233\"}",
+        )
+        .unwrap();
+        let t1 = Theme::try_load(p1.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&p1);
+        assert_eq!(t1.name, "EvilTheme");
+
+        let p2 = std::env::temp_dir().join(format!("mehh-theme-name-2-{}.json", std::process::id()));
+        std::fs::write(
+            &p2,
+            "{\"name\":\"\\u001b]0;only-osc\\u0007\",\"accent\":\"#112233\"}",
+        )
+        .unwrap();
+        let t2 = Theme::try_load(p2.to_str().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&p2);
+        assert!(!t2.name.trim().is_empty());
+        assert!(!t2.name.contains("only-osc"));
     }
 }

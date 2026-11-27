@@ -24,7 +24,10 @@ jobs:
         with:
           script: |
             const hook = process.env.DISCORD_WEBHOOK;
-            if (!hook) { core.setFailed('Missing DISCORD_WEBHOOK secret'); return; }
+            if (!hook) {
+              core.notice('Skipping Discord notification: DISCORD_WEBHOOK secret is not configured');
+              return;
+            }
             const ev = context.eventName;
             const p = context.payload;
             const repo = p.repository ? p.repository.full_name : (context.repo.owner + '/' + context.repo.repo);
@@ -35,7 +38,7 @@ jobs:
             if (ev === 'push') {
               const commits = p.commits || [];
               color = 0x2ECC71;
-              title = '📦 Push vao ' + repo;
+              title = '[PUSH] Push vao ' + repo;
               description = (p.pusher && p.pusher.name ? p.pusher.name : 'ai') + ' day ' + commits.length + ' commit toi ' + cut(p.ref, 80);
               fields = commits.slice(0, 5).map(c => ({
                 name: String(c.id || '').slice(0, 7),
@@ -44,19 +47,19 @@ jobs:
             } else if (ev === 'pull_request') {
               const pr = p.pull_request || {};
               color = 0x3498DB;
-              title = '🔀 Pull request ' + p.action + ': ' + cut(pr.title, 80);
+              title = '[PR] Pull request ' + p.action + ': ' + cut(pr.title, 80);
               description = '[#' + pr.number + '](' + pr.html_url + ') boi ' + (pr.user ? pr.user.login : '?') + ' trong ' + repo;
               if (pr.body) fields.push({ name: 'Mo ta', value: cut(pr.body, 300) });
             } else if (ev === 'issues') {
               const i = p.issue || {};
               color = 0xF1C40F;
-              title = '🐛 Issue ' + p.action + ': ' + cut(i.title, 80);
+              title = '[ISSUE] Issue ' + p.action + ': ' + cut(i.title, 80);
               description = '[#' + i.number + '](' + i.html_url + ') boi ' + (i.user ? i.user.login : '?') + ' trong ' + repo;
               if (i.body) fields.push({ name: 'Noi dung', value: cut(i.body, 300) });
             } else if (ev === 'release') {
               const rel = p.release || {};
               color = 0xE91E63;
-              title = '🚀 Release ' + cut(rel.tag_name, 40) + ' - ' + cut(rel.name, 60);
+              title = '[RELEASE] Release ' + cut(rel.tag_name, 40) + ' - ' + cut(rel.name, 60);
               description = '[Xem ban phat hanh](' + rel.html_url + ')';
             } else {
               title = 'GitHub event: ' + ev;

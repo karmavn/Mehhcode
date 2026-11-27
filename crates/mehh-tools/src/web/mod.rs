@@ -3,19 +3,21 @@
 pub mod fetch_tool;
 pub mod html_markdown;
 pub mod mcp_rpc;
+pub mod native;
 pub mod output;
 pub mod providers;
 pub mod router;
 pub mod search_tool;
 pub mod types;
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use mehh_ai::http_safety::{build_safe_http_client, DnsPolicy};
 
 pub use fetch_tool::WebFetchTool;
+pub use native::NativeEndpoints;
 pub use providers::WebEndpoints;
 pub use router::WebRouter;
 pub use search_tool::WebSearchTool;
@@ -97,21 +99,72 @@ pub struct WebRuntime {
     pub router: WebRouter,
 }
 
+/// Deferred initializer for [`WebRuntime`] so CLI startup pays zero HTTP/TLS setup unless a web tool runs.
+pub struct LazyWebRuntime {
+    config: WebConfig,
+    cell: OnceLock<Result<Arc<WebRuntime>, String>>,
+}
+
+impl LazyWebRuntime {
+    pub fn new(config: WebConfig) -> Self {
+        Self {
+            config,
+            cell: OnceLock::new(),
+        }
+    }
+
+    pub fn get(&self) -> Result<&Arc<WebRuntime>, String> {
+        self.cell
+            .get_or_init(|| {
+                WebRuntime::try_new(self.config.clone())
+                    .map(Arc::new)
+                    .map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum WebRuntimeHandle {
+    Eager(Result<Arc<WebRuntime>, String>),
+    Lazy(Arc<LazyWebRuntime>),
+}
+
+impl WebRuntimeHandle {
+    pub(crate) fn resolve(&self) -> Result<&Arc<WebRuntime>, String> {
+        match self {
+            Self::Eager(res) => res.as_ref().map_err(Clone::clone),
+            Self::Lazy(lazy) => lazy.get(),
+        }
+    }
+}
+
 impl WebRuntime {
     /// Builds hardened HTTP clients and shared router; fails closed if client setup fails.
     pub fn try_new(config: WebConfig) -> anyhow::Result<Self> {
-        let timeout = Duration::from_secs(config.effective_timeout_seconds());
+        let local_policy = config.local_dns_policy();
         let local_client = build_safe_http_client(
-            config.local_dns_policy(),
+            local_policy,
             Duration::from_secs(15),
-            Some(timeout),
+            None,
         )?;
-        let router_client = build_safe_http_client(
+        let router_client = if local_policy == DnsPolicy::PublicOnly {
+            local_client.clone()
+        } else {
+            build_safe_http_client(
+                DnsPolicy::PublicOnly,
+                Duration::from_secs(15),
+                None,
+            )?
+        };
+        let router = WebRouter::with_native_config(
+            config.endpoints.clone(),
+            router_client.clone(),
+            router_client,
             DnsPolicy::PublicOnly,
-            Duration::from_secs(15),
-            Some(Duration::from_secs(30)),
-        )?;
-        let router = WebRouter::new(config.endpoints.clone(), router_client);
+            config.url_policy_checker.clone(),
+        );
         Ok(Self {
             config,
             local_fetch_client: local_client,
@@ -121,24 +174,81 @@ impl WebRuntime {
 
     #[cfg(test)]
     pub(crate) fn for_tests(config: WebConfig) -> Self {
-        let timeout = Duration::from_secs(config.effective_timeout_seconds());
         let local_client = build_safe_http_client(
             config.local_dns_policy(),
             Duration::from_secs(5),
-            Some(timeout),
+            None,
         )
         .unwrap();
         let router_client = build_safe_http_client(
             DnsPolicy::AllowPrivate,
             Duration::from_secs(5),
-            Some(Duration::from_secs(5)),
+            None,
         )
         .unwrap();
-        let router = WebRouter::new(config.endpoints.clone(), router_client);
+        let router = WebRouter::with_native_config(
+            config.endpoints.clone(),
+            router_client.clone(),
+            router_client,
+            DnsPolicy::AllowPrivate,
+            config.url_policy_checker.clone(),
+        );
         Self {
             config,
             local_fetch_client: local_client,
             router,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn test_try_new_router_blocks_loopback_even_when_allow_private_urls_is_true() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicBool::new(false));
+        let accepted_clone = accepted.clone();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                accepted_clone.store(true, Ordering::SeqCst);
+                let mut buf = [0u8; 1024];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n").await;
+            }
+        });
+
+        let mut cfg = WebConfig {
+            provider: WebProviderChoice::Fixed(ProviderId::Mehh),
+            allow_private_urls: true,
+            ..Default::default()
+        };
+        let port = addr.port();
+        let loopback = format!("http://localhost:{port}/");
+        cfg.endpoints.native.ddg_html = loopback.clone();
+        cfg.endpoints.native.bing_html = loopback.clone();
+        cfg.endpoints.native.wikipedia_api = loopback;
+
+        let runtime = WebRuntime::try_new(cfg).unwrap();
+        let cancel = CancellationToken::new();
+        let err = runtime
+            .router
+            .search(
+                WebProviderChoice::Fixed(ProviderId::Mehh),
+                "what is ssrf",
+                Duration::from_secs(3),
+                &cancel,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(err.should_failover());
+        assert!(!accepted.load(Ordering::SeqCst));
     }
 }

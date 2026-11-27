@@ -3,205 +3,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use clap::Parser;
 use mehh_ai::{
-    catalog, faux, LlmProvider, Model, ModelCost, ThinkingLevel,
+    catalog, Model, ModelCost, ThinkingLevel,
 };
-use mehh_coding_agent::auth::resolve_api_key_async;
 use mehh_coding_agent::models_config::ModelRegistry;
-use mehh_coding_agent::trust::{resolve_project_trust_with_override, TrustOverride};
 use mehh_coding_agent::{
     process_file_arguments, ProcessedPromptArgs, list_sessions, perform_login, perform_logout, rpc, run_interactive_mode, run_print_mode_content,
-    AgentSession, McpManager, OutputMode, SessionManager, SessionSummary, Settings,
-    SettingsManager,
+    AgentSession, OutputMode, SessionManager, SessionSummary, Settings,
 };
+pub use mehh_cli::{parse_cli_mode, should_run_interactive, CliArgs, CliMode};
 
-#[derive(clap::Parser, Debug, Clone, PartialEq, Eq)]
-#[command(name = "mehh", version, about = "mehh coding agent CLI")]
-pub struct CliArgs {
-    pub prompt: Vec<String>,
-
-    #[arg(short = 'p', long = "print")]
-    pub print: bool,
-
-    #[arg(short = 'c', long = "continue")]
-    pub continue_session: bool,
-
-    #[arg(
-        short = 'r',
-        long = "resume",
-        num_args = 0..=1,
-        require_equals = true,
-        value_name = "SESSION"
-    )]
-    pub resume: Option<Option<String>>,
-
-    #[arg(long = "login", value_name = "PROVIDER")]
-    pub login: Option<String>,
-
-    #[arg(long = "logout", value_name = "PROVIDER")]
-    pub logout: Option<String>,
-
-    #[arg(long = "mode", default_value = "text")]
-    pub mode: String,
-
-    #[arg(long = "permission-mode", value_name = "MODE")]
-    pub permission_mode: Option<String>,
-
-    #[arg(long = "worker-model", value_name = "MODEL")]
-    pub worker_model: Option<String>,
-
-    #[arg(long = "lead-turns", value_name = "TURNS")]
-    pub lead_turns: Option<usize>,
-
-    #[arg(short = 'm', long = "model")]
-    pub model: Option<String>,
-
-    #[arg(long = "provider")]
-    pub provider: Option<String>,
-
-    #[arg(long = "api-key")]
-    pub api_key: Option<String>,
-
-    #[arg(long = "thinking")]
-    pub thinking: Option<String>,
-
-    #[arg(long = "system-prompt")]
-    pub system_prompt: Option<String>,
-
-    #[arg(long = "append-system-prompt")]
-    pub append_system_prompt: Option<String>,
-
-    #[arg(long = "session")]
-    pub session: Option<PathBuf>,
-
-    #[arg(long = "no-session")]
-    pub no_session: bool,
-
-    #[arg(long = "no-tools")]
-    pub no_tools: bool,
-
-    #[arg(long = "no-mcp")]
-    pub no_mcp: bool,
-
-    #[arg(long = "codemode")]
-    pub codemode: bool,
-
-    #[arg(long = "list-models")]
-    pub list_models: bool,
-
-    #[arg(long = "trust")]
-    pub trust: bool,
-
-    #[arg(long = "name", value_name = "NAME")]
-    pub name: Option<String>,
-
-    #[arg(long = "session-id", value_name = "ID")]
-    pub session_id: Option<String>,
-
-    #[arg(long = "session-dir", value_name = "PATH")]
-    pub session_dir: Option<PathBuf>,
-
-    #[arg(long = "fork", value_name = "ENTRY_ID")]
-    pub fork: Option<String>,
-
-    #[arg(long = "models", value_name = "MODELS")]
-    pub models: Option<String>,
-
-    #[arg(long = "tools", value_name = "TOOLS")]
-    pub tools: Option<String>,
-
-    #[arg(long = "exclude-tools", value_name = "TOOLS")]
-    pub exclude_tools: Option<String>,
-
-    #[arg(long = "no-builtin-tools")]
-    pub no_builtin_tools: bool,
-
-    #[arg(long = "export", value_name = "SESSION_FILE")]
-    pub export: Option<PathBuf>,
-
-    #[arg(long = "skills")]
-    pub skills: bool,
-
-    #[arg(long = "no-skills")]
-    pub no_skills: bool,
-
-    #[arg(long = "prompt-templates")]
-    pub prompt_templates: bool,
-
-    #[arg(long = "no-prompt-templates")]
-    pub no_prompt_templates: bool,
-
-    #[arg(long = "use-theme", value_name = "THEME")]
-    pub use_theme: Option<String>,
-
-    #[arg(long = "no-themes")]
-    pub no_themes: bool,
-
-    #[arg(long = "no-context-files")]
-    pub no_context_files: bool,
-
-    #[arg(short = 'v', long = "verbose")]
-    pub verbose: bool,
-
-    #[arg(long = "approve")]
-    pub approve: bool,
-
-    #[arg(long = "no-approve")]
-    pub no_approve: bool,
-}
-
-impl CliArgs {
-    pub fn validate(&self) -> anyhow::Result<()> {
-        if (self.approve || self.trust) && self.no_approve {
-            anyhow::bail!("Cannot specify both --approve/--trust and --no-approve");
-        }
-        if self.no_session
-            && (self.continue_session || self.resume.is_some() || self.session.is_some())
-        {
-            anyhow::bail!(
-                "Cannot specify --no-session with session resumption or session file flags"
-            );
-        }
-        if self.continue_session && self.session.is_some() {
-            anyhow::bail!("Cannot specify both -c/--continue and --session");
-        }
-        if self.continue_session && self.resume.is_some() {
-            anyhow::bail!("Cannot specify both -c/--continue and -r/--resume");
-        }
-        if self.session_dir.is_some()
-            && (self.no_session
-                || self.session.is_some()
-                || self.continue_session
-                || self.resume.is_some())
-        {
-            anyhow::bail!(
-                "--session-dir cannot be combined with --no-session, --session, -c/--continue, or -r/--resume"
-            );
-        }
-        if self.skills && self.no_skills {
-            anyhow::bail!("Cannot specify both --skills and --no-skills");
-        }
-        if self.prompt_templates && self.no_prompt_templates {
-            anyhow::bail!("Cannot specify both --prompt-templates and --no-prompt-templates");
-        }
-        if self.use_theme.is_some() && self.no_themes {
-            anyhow::bail!("Cannot specify both --use-theme and --no-themes");
-        }
-        Ok(())
-    }
-
-    pub fn trust_override(&self) -> TrustOverride {
-        if self.no_approve {
-            TrustOverride::NoApprove
-        } else if self.trust {
-            // --approve only controls tool approvals. Letting it also trust the
-            // repo would enable project MCP servers, skills and instructions
-            // without the user ever making a trust decision.
-            TrustOverride::Approve
-        } else {
-            TrustOverride::None
-        }
-    }
-}
+mod bootstrap;
 
 /// `todo` and `subagent` are added by main.rs after tool selection, so they
 /// must never reach `select_coding_tools` (which only knows built-in tools).
@@ -254,20 +65,7 @@ pub fn configure_cli_subagent(
     let child_include = parsed_include.as_deref().filter(|v| !v.is_empty());
 
     let mut child_tools: Vec<Arc<dyn mehh_agent::AgentTool>> = Vec::new();
-    if !args.no_tools && !args.no_builtin_tools {
-        let web_cfg = agent_session
-            .settings
-            .to_web_config()
-            .with_url_policy_checker(agent_session.inspection_manager.clone());
-        child_tools.extend(mehh_tools::select_coding_tools_with_web(
-            cwd.to_path_buf(),
-            child_include,
-            &exclude,
-            web_cfg,
-        )?);
-    }
-    let mut seen: std::collections::HashSet<String> =
-        child_tools.iter().map(|t| t.name().to_string()).collect();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for tool in agent_session
         .tools()
         .iter()
@@ -275,6 +73,26 @@ pub fn configure_cli_subagent(
     {
         if seen.insert(tool.name().to_string()) {
             child_tools.push(tool.clone());
+        }
+    }
+    if !args.no_tools
+        && !args.no_builtin_tools
+        && args.tools.is_some()
+        && child_include.is_none()
+    {
+        let web_cfg = agent_session
+            .settings
+            .to_web_config()
+            .with_url_policy_checker(agent_session.inspection_manager.clone());
+        for tool in mehh_tools::select_coding_tools_with_web(
+            cwd.to_path_buf(),
+            None,
+            &exclude,
+            web_cfg,
+        )? {
+            if seen.insert(tool.name().to_string()) {
+                child_tools.push(tool);
+            }
         }
     }
     agent_session.set_subagent_with_child_tools(child_tools);
@@ -288,36 +106,6 @@ pub fn handle_export(
     cwd: &Path,
 ) -> anyhow::Result<()> {
     mehh_coding_agent::session::export_session(input_file, output_file, cwd)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CliMode {
-    Text,
-    Json,
-    Rpc,
-    Interactive,
-}
-
-pub fn parse_cli_mode(s: &str) -> anyhow::Result<CliMode> {
-    match s.trim().to_ascii_lowercase().as_str() {
-        "text" => Ok(CliMode::Text),
-        "json" => Ok(CliMode::Json),
-        "rpc" => Ok(CliMode::Rpc),
-        "interactive" | "tui" => Ok(CliMode::Interactive),
-        other => anyhow::bail!(
-            "Invalid mode '{}'. Allowed: text, json, rpc, interactive",
-            other
-        ),
-    }
-}
-
-pub fn should_run_interactive(
-    args: &CliArgs,
-    cli_mode: CliMode,
-    stdin_is_terminal: bool,
-) -> bool {
-    cli_mode == CliMode::Interactive
-        || (cli_mode == CliMode::Text && !args.print && args.prompt.is_empty() && stdin_is_terminal)
 }
 
 pub fn parse_thinking_level(s: &str) -> anyhow::Result<ThinkingLevel> {
@@ -376,10 +164,21 @@ pub fn select_cli_model_and_provider<'a>(
 ) -> (Option<&'a str>, Option<&'a str>) {
     if let Some(m) = args_model {
         (Some(m), args_provider)
+    } else if let Some(p) = args_provider {
+        let model = if settings
+            .default_provider
+            .as_deref()
+            .is_some_and(|dp| dp.eq_ignore_ascii_case(p))
+        {
+            settings.default_model.as_deref()
+        } else {
+            None
+        };
+        (model, Some(p))
     } else {
         (
             settings.default_model.as_deref(),
-            args_provider.or(settings.default_provider.as_deref()),
+            settings.default_provider.as_deref(),
         )
     }
 }
@@ -695,11 +494,10 @@ pub fn resolve_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<Ses
     } else if let Some(path) = args.session.as_deref() {
         create_session_manager(false, Some(path), cwd)?
     } else if args.continue_session {
-        let sessions = list_sessions(cwd)?;
-        let latest = sessions.first().ok_or_else(|| {
+        let latest = mehh_coding_agent::latest_session_path(cwd)?.ok_or_else(|| {
             anyhow::anyhow!("No previous session found for {}", cwd.display())
         })?;
-        create_session_manager(false, Some(&latest.path), cwd)?
+        create_session_manager(false, Some(&latest), cwd)?
     } else if let Some(spec) = args.resume.as_ref() {
         let sessions = list_sessions(cwd)?;
         let path = match spec {
@@ -708,16 +506,27 @@ pub fn resolve_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<Ses
         };
         create_session_manager(false, Some(&path), cwd)?
     } else if let Some(id) = args.session_id.as_deref() {
-        // --session-id works on its own, not only together with --session-dir.
-        if let Some(dir) = args.session_dir.as_deref() {
-            let ts = mehh_ai::now_ms();
-            let path = dir.join(format!("{ts}_{id}.jsonl"));
-            SessionManager::open_file(path, cwd)?
-        } else {
-            let mut mgr = create_session_manager(false, None, cwd)?;
-            mgr.set_session_name(Some(id.to_string()))?;
-            mgr
+        let trimmed_id = id.trim();
+        if trimmed_id.is_empty() {
+            anyhow::bail!("--session-id cannot be empty");
         }
+        let dir = match args.session_dir.as_deref() {
+            Some(d) => d.to_path_buf(),
+            None => mehh_coding_agent::session_dir_for_cwd(cwd)?,
+        };
+        let safe_id: String = trimmed_id
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        let ts = mehh_ai::now_ms();
+        let path = dir.join(format!("{ts}_{safe_id}.jsonl"));
+        SessionManager::create_file_with_id(path, cwd, trimmed_id)?
     } else if let Some(dir) = args.session_dir.as_deref() {
         let ts = mehh_ai::now_ms();
         let path = dir.join(format!("{ts}_default.jsonl"));
@@ -735,8 +544,7 @@ pub fn resolve_session_manager(args: &CliArgs, cwd: &Path) -> anyhow::Result<Ses
     Ok(sm)
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args = CliArgs::parse();
     args.validate()?;
 
@@ -750,7 +558,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Credential management short-circuits before a session or trust check is created.
     if let Some(provider) = args.login.as_deref() {
-        let message = perform_login(provider, args.api_key.as_deref(), None).await?;
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?;
+        let message = rt.block_on(perform_login(provider, args.api_key.as_deref(), None))?;
         println!("{message}");
         return Ok(());
     }
@@ -771,302 +582,110 @@ async fn main() -> anyhow::Result<()> {
         return handle_export(export_input, export_output, &cwd);
     }
 
-    let model_registry = match ModelRegistry::load_with_discovered(None, None) {
-        Ok(reg) => reg,
-        Err(disc_err) => {
-            let base = ModelRegistry::load_default()?;
-            eprintln!("Warning: could not load discovered models cache: {disc_err}");
-            base
-        }
-    };
-    if args.list_models {
-        for m in model_registry.models() {
-            println!(
-                "{}/{} - {} ({} tokens)",
-                m.provider, m.id, m.name, m.context_window
-            );
-        }
-        return Ok(());
-    }
-
-    let is_interactive = should_run_interactive(&args, cli_mode, io::stdin().is_terminal());
-    let trusted = resolve_project_trust_with_override(&cwd, args.trust_override(), is_interactive)?;
-    let mut settings = SettingsManager::try_load_with_trust(&cwd, trusted)?;
-    if let Some(ref m) = args.permission_mode {
-        let mode = m
-            .parse::<mehh_coding_agent::PermissionMode>()
-            .map_err(|e| anyhow::anyhow!(e))?;
-        settings.permission_mode = Some(mode);
-    } else if args.approve && !args.no_approve {
-        // Keep --approve useful: it now auto-approves tools without granting
-        // trust to project-local configuration.
-        settings.permission_mode = Some(mehh_coding_agent::PermissionMode::Auto);
-    } else if cli_mode == CliMode::Rpc && settings.permission_mode.is_none() {
-        // RPC has no approval channel. SmartApprove (the type default) would
-        // block every mutating command with "approval required but not
-        // granted". Only fill in the default when the user has not explicitly
-        // chosen a mode in settings; never downgrade Chat/Approve to Auto.
-        settings.permission_mode = Some(mehh_coding_agent::PermissionMode::Auto);
-    }
-    if let Some(ref wm) = args.worker_model {
-        settings.worker_model = Some(wm.clone());
-    }
-    if let Some(lt) = args.lead_turns {
-        settings.lead_turns = Some(lt);
-    }
-
-    let (model, provider): (Model, Arc<dyn LlmProvider>) = {
-        let is_faux = args
+    let is_faux_fast = !args.list_models
+        && args.models.is_none()
+        && (args
             .provider
             .as_deref()
-            .map(|p| p.eq_ignore_ascii_case("faux"))
-            .unwrap_or(false)
+            .is_some_and(|p| p.eq_ignore_ascii_case("faux"))
             || args
                 .model
                 .as_deref()
-                .map(|m| m.eq_ignore_ascii_case("faux") || m.eq_ignore_ascii_case("faux-1"))
-                .unwrap_or(false);
-
-        if is_faux {
-            let model = faux::faux_model();
-            let faux_prov = faux::FauxProvider::new();
-            faux_prov.add_response(faux::faux_assistant_message(
-                "Hello from mehh Rust faux provider!",
-            ));
-            (model, Arc::new(faux_prov))
-        } else {
-            let connected = match mehh_coding_agent::list_connected_providers(None, &model_registry)
-            {
-                Ok(list) => list,
-                Err(e) => {
-                    eprintln!("Warning: could not inspect auth credentials: {e}");
-                    Vec::new()
-                }
-            };
-            let model = select_startup_model(&model_registry, &args, &settings, &connected)
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Failed to resolve model (model: {:?}, provider: {:?})",
-                        args.model,
-                        args.provider
-                    )
-                })?;
-
-            let provider = AgentSession::default_provider_for_model(&model);
-            (model, provider)
-        }
-    };
-
-    let session_mgr = resolve_session_manager(&args, &cwd)?;
-
-    let mut agent_session = AgentSession::new_with_trust(
-        cwd.clone(),
-        model.clone(),
-        provider.clone(),
-        session_mgr,
-        settings,
-        trusted,
-    );
-
-    if args.no_context_files {
-        agent_session.set_no_context_files(true);
-    }
-    if args.verbose {
-        eprintln!(
-            "model={} provider={} api={} base_url={}",
-            model.id, model.provider, model.api, model.base_url
-        );
-    }
-    if args.skills && agent_session.skills.is_empty() {
-        eprintln!("note: --skills is enabled by default; no project skills were found");
-    }
-    if args.prompt_templates && agent_session.prompt_templates.is_empty() {
-        eprintln!("note: --prompt-templates is enabled by default; no templates were found");
-    }
-
-    // Subagent tools are built after MCP connection so child agents see MCP tools.
-    let exclude_contains = |name: &str| {
-        args.exclude_tools
-            .as_deref()
-            .unwrap_or("")
-            .split(',')
-            .any(|s| s.trim() == name)
-    };
-    let include_subagent = if args.no_tools || args.no_builtin_tools || exclude_contains("subagent") {
-        false
+                .is_some_and(|m| m.eq_ignore_ascii_case("faux") || m.eq_ignore_ascii_case("faux-1")));
+    let model_registry = if is_faux_fast {
+        ModelRegistry::builtin_only()
     } else {
-        match args.tools.as_deref() {
-            Some(inc) => inc.split(',').any(|s| s.trim() == "subagent"),
-            None => true,
+        match ModelRegistry::load_with_discovered(None, None) {
+            Ok(reg) => reg,
+            Err(disc_err) => {
+                let base = ModelRegistry::load_default()?;
+                eprintln!("Warning: could not load discovered models cache: {disc_err}");
+                base
+            }
         }
     };
-    if args.no_tools || args.no_builtin_tools || args.tools.is_some() || args.exclude_tools.is_some() {
-        let web_cfg = agent_session
-            .settings
-            .to_web_config()
-            .with_url_policy_checker(agent_session.inspection_manager.clone());
-        let mut cli_tools = resolve_cli_tools_with_web(&args, cwd.clone(), web_cfg)?;
-        let should_include_todo = if args.no_tools || args.no_builtin_tools || exclude_contains("todo") {
-            false
-        } else if let Some(ref inc) = args.tools {
-            inc.split(',').any(|s| s.trim() == "todo")
-        } else {
-            true
-        };
-        if should_include_todo {
-            cli_tools.push(Arc::new(mehh_coding_agent::todo::TodoTool::new(agent_session.todo_state.clone())));
+    if args.list_models {
+        let stdout = io::stdout();
+        let mut out = io::BufWriter::new(stdout.lock());
+        for m in model_registry.models() {
+            writeln!(
+                out,
+                "{}/{} - {} ({} tokens)",
+                m.provider, m.id, m.name, m.context_window
+            )?;
         }
-
-        agent_session.set_tools(cli_tools);
+        out.flush()?;
+        return Ok(());
     }
 
-    if let Some(ref models_str) = args.models {
-        let mut resolved = Vec::new();
-        for token in models_str.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
-            // IDs may contain multiple slashes (e.g. openrouter/anthropic/claude-sonnet-4.5).
-            let model_opt = if let Some((provider, id)) = token.split_once('/') {
-                model_registry
-                    .resolve_exact(provider, id)
-                    .or_else(|| model_registry.resolve(token, None))
-            } else {
-                model_registry.resolve(token, None)
-            };
-            match model_opt {
-                Some(m) => resolved.push(m),
-                None => eprintln!("warning: unknown model '{token}' in --models; skipped"),
-            }
-        }
-        agent_session.set_scoped_models(resolved);
-    }
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(run_async_cli(
+        args,
+        cli_mode,
+        cli_thinking,
+        cwd,
+        model_registry,
+    ))
+}
 
-    if args.no_skills {
-        agent_session.skills.clear();
-        agent_session.rebuild_system_prompt();
-    }
-    if args.no_prompt_templates {
-        agent_session.prompt_templates.clear();
-    }
-
-    if args.no_themes {
-        agent_session.settings.theme = Some("dark".to_string());
-    } else if let Some(ref th) = args.use_theme {
-        agent_session.settings.theme = Some(th.clone());
-    }
-
-    // Resolve the key asynchronously so expired OAuth tokens are refreshed first.
-    let has_explicit_api_key = args
-        .api_key
-        .as_deref()
-        .is_some_and(|k| !k.trim().is_empty());
-    // Key refresh (which may perform HTTP) and MCP startup are independent.
-    // join! (not try_join!) so a failing key refresh cannot drop an MCP
-    // connect future that may already have spawned child processes.
-    let (api_key_resolved, mcp_resolved) = tokio::join!(
-        resolve_api_key_async(&model.provider, args.api_key.as_deref(), None::<&Path>),
-        async {
-            if !args.no_tools && !args.no_mcp {
-                McpManager::connect_from_configs_with_trust(&cwd, trusted)
-                    .await
-                    .map(Some)
-            } else {
-                Ok(None)
-            }
-        }
+async fn run_async_cli(
+    args: CliArgs,
+    cli_mode: CliMode,
+    cli_thinking: Option<ThinkingLevel>,
+    cwd: PathBuf,
+    model_registry: ModelRegistry,
+) -> anyhow::Result<()> {
+    let is_interactive = should_run_interactive(
+        &args,
+        cli_mode,
+        io::stdin().is_terminal(),
+        io::stdout().is_terminal(),
     );
-    let mcp_manager = mcp_resolved?;
-    let api_key_base = match api_key_resolved {
-        Ok(key) => key,
-        Err(err) => {
-            // join! already let MCP finish connecting; close its child processes
-            // before propagating the credential error.
-            if let Some(ref mgr) = mcp_manager {
-                mgr.close_all().await;
-            }
-            return Err(err);
-        }
-    };
-    let api_key = api_key_base.or_else(|| {
-        model_registry
-            .provider_api_key(&model.provider)
-            .map(str::to_string)
-    });
-    if has_explicit_api_key {
-        agent_session.set_explicit_api_key(api_key);
-    } else {
-        agent_session.set_api_key(api_key);
-    }
-    apply_cli_thinking_override(&mut agent_session, cli_thinking);
-    agent_session.sync_thinking_for_model(true);
+    let mut boot = bootstrap::bootstrap_session(
+        &args,
+        cli_mode,
+        cli_thinking,
+        cwd,
+        &model_registry,
+        is_interactive,
+    )
+    .await?;
 
-    let mut mcp_manager = mcp_manager;
-    let mcp_tools = if let Some(ref mgr) = mcp_manager {
-        if !is_interactive {
-            for summary in mgr.summaries() {
-                if let Some(ref err) = summary.error {
-                    eprintln!(
-                        "Warning: MCP server '{}' failed to connect: {}",
-                        summary.server, err
-                    );
-                }
-            }
-        }
-        mgr.tools().to_vec()
-    } else {
-        Vec::new()
-    };
-
-    if !args.no_tools {
-        agent_session.enable_mcp_and_codemode(mcp_tools, args.codemode);
-    }
-
-    if include_subagent {
-        configure_cli_subagent(&args, &cwd, &mut agent_session)?;
-    }
-
-    agent_session.set_custom_system_prompt(
-        args.system_prompt.clone(),
-        args.append_system_prompt.clone(),
-    );
-
-    if is_interactive {
-        let summaries = mcp_manager
+    let run_res = if boot.is_interactive {
+        let summaries = boot
+            .mcp_manager
             .as_ref()
             .map(|mgr| mgr.summaries().to_vec())
             .unwrap_or_default();
-        let res = run_interactive_mode(
-            &mut agent_session,
+        Box::pin(run_interactive_mode(
+            &mut boot.session,
             &summaries,
-            mcp_manager.as_mut(),
+            boot.mcp_manager.as_mut(),
             args.codemode,
-        )
-        .await;
-        if let Some(mgr) = &mcp_manager {
-            let _ = mgr.close_all().await;
-        }
-        return res;
-    }
-
-    let run_res = match cli_mode {
-        CliMode::Rpc => {
-            rpc::run_rpc_mode(
-                &mut agent_session,
-                tokio::io::BufReader::new(tokio::io::stdin()),
-                tokio::io::stdout(),
-            )
-            .await
-        }
-        CliMode::Text | CliMode::Interactive => {
-            run_print_flow(&mut agent_session, &args, OutputMode::Text).await
-        }
-        CliMode::Json => {
-            run_print_flow(&mut agent_session, &args, OutputMode::Json).await
+        ))
+        .await
+    } else {
+        match boot.cli_mode {
+            CliMode::Rpc => {
+                rpc::run_rpc_mode(
+                    &mut boot.session,
+                    tokio::io::BufReader::new(tokio::io::stdin()),
+                    tokio::io::stdout(),
+                )
+                .await
+            }
+            CliMode::Text | CliMode::Interactive => {
+                run_print_flow(&mut boot.session, &args, OutputMode::Text).await
+            }
+            CliMode::Json => {
+                run_print_flow(&mut boot.session, &args, OutputMode::Json).await
+            }
         }
     };
 
-    if let Some(mgr) = &mcp_manager {
-        let _ = mgr.close_all().await;
-    }
-
+    bootstrap::close_mcp(boot.mcp_manager.as_ref()).await;
     run_res
 }
 
@@ -1087,11 +706,7 @@ async fn run_print_flow(
     // example `git diff | mehh -p "review"` must include both pieces.
     let mut piped = String::new();
     if !io::stdin().is_terminal() {
-        piped = mehh_cli::read_piped_stdin_for_prompt(
-            tokio::io::BufReader::new(tokio::io::stdin()),
-            &args.prompt,
-        )
-        .await?;
+        piped = mehh_cli::read_piped_stdin_for_prompt(io::stdin(), &args.prompt).await?;
     }
     let user_content = mehh_cli::build_print_user_content(processed, &piped)?;
 
@@ -1102,6 +717,7 @@ async fn run_print_flow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mehh_ai::faux;
 
     fn make_temp_dir(prefix: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1327,14 +943,15 @@ mod tests {
 
     #[test]
     fn test_should_run_interactive_default_text_mode_with_tty() {
-        // When mode is text, no prompt, print is false, and stdin is a terminal -> true
+        // When mode is text, no prompt, print is false, and stdin+stdout are terminals -> true
         let args = CliArgs::try_parse_from(["mehh"]).unwrap();
         assert_eq!(args.mode, "text");
         assert!(args.prompt.is_empty());
         assert!(!args.print);
 
         let cli_mode = parse_cli_mode(&args.mode).unwrap();
-        assert!(should_run_interactive(&args, cli_mode, true));
+        assert!(should_run_interactive(&args, cli_mode, true, true));
+        assert!(!should_run_interactive(&args, cli_mode, true, false));
     }
 
     #[test]
@@ -1342,7 +959,8 @@ mod tests {
         // When mode is text and no prompt, but stdin is NOT a terminal (piped) -> false
         let args = CliArgs::try_parse_from(["mehh"]).unwrap();
         let cli_mode = parse_cli_mode(&args.mode).unwrap();
-        assert!(!should_run_interactive(&args, cli_mode, false));
+        assert!(!should_run_interactive(&args, cli_mode, false, true));
+        assert!(!should_run_interactive(&args, cli_mode, false, false));
     }
 
     #[test]
@@ -1350,8 +968,9 @@ mod tests {
         // When prompt is supplied in text mode, even on TTY -> false
         let args = CliArgs::try_parse_from(["mehh", "do something"]).unwrap();
         let cli_mode = parse_cli_mode(&args.mode).unwrap();
-        assert!(!should_run_interactive(&args, cli_mode, true));
-        assert!(!should_run_interactive(&args, cli_mode, false));
+        assert!(!should_run_interactive(&args, cli_mode, true, true));
+        assert!(!should_run_interactive(&args, cli_mode, false, true));
+        assert!(!should_run_interactive(&args, cli_mode, true, false));
     }
 
     #[test]
@@ -1359,26 +978,32 @@ mod tests {
         // When print flag -p is set in text mode, even on TTY with no prompt -> false
         let args = CliArgs::try_parse_from(["mehh", "-p"]).unwrap();
         let cli_mode = parse_cli_mode(&args.mode).unwrap();
-        assert!(!should_run_interactive(&args, cli_mode, true));
-        assert!(!should_run_interactive(&args, cli_mode, false));
+        assert!(!should_run_interactive(&args, cli_mode, true, true));
+        assert!(!should_run_interactive(&args, cli_mode, false, true));
+        assert!(!should_run_interactive(&args, cli_mode, true, false));
     }
 
     #[test]
     fn test_should_run_interactive_explicit_interactive_mode() {
-        // Explicit interactive mode is always true regardless of TTY, prompt, or print
+        // Explicit interactive mode requires stdout to be a terminal so redirected stdout
+        // does not enter TUI raw mode.
         let args1 = CliArgs::try_parse_from(["mehh", "--mode", "interactive"]).unwrap();
-        assert!(should_run_interactive(&args1, CliMode::Interactive, true));
-        assert!(should_run_interactive(&args1, CliMode::Interactive, false));
+        assert!(should_run_interactive(&args1, CliMode::Interactive, true, true));
+        assert!(should_run_interactive(&args1, CliMode::Interactive, false, true));
+        assert!(!should_run_interactive(&args1, CliMode::Interactive, true, false));
+        assert!(!should_run_interactive(&args1, CliMode::Interactive, false, false));
 
         let args2 = CliArgs::try_parse_from(["mehh", "--mode", "interactive", "-p", "some prompt"]).unwrap();
-        assert!(should_run_interactive(&args2, CliMode::Interactive, true));
-        assert!(should_run_interactive(&args2, CliMode::Interactive, false));
+        assert!(should_run_interactive(&args2, CliMode::Interactive, true, true));
+        assert!(should_run_interactive(&args2, CliMode::Interactive, false, true));
+        assert!(!should_run_interactive(&args2, CliMode::Interactive, true, false));
 
         let args3 = CliArgs::try_parse_from(["mehh", "--mode", "tui"]).unwrap();
         let mode3 = parse_cli_mode(&args3.mode).unwrap();
         assert_eq!(mode3, CliMode::Interactive);
-        assert!(should_run_interactive(&args3, mode3, true));
-        assert!(should_run_interactive(&args3, mode3, false));
+        assert!(should_run_interactive(&args3, mode3, true, true));
+        assert!(should_run_interactive(&args3, mode3, false, true));
+        assert!(!should_run_interactive(&args3, mode3, true, false));
     }
 
     #[test]
@@ -1387,15 +1012,17 @@ mod tests {
         let args_json = CliArgs::try_parse_from(["mehh", "--mode", "json"]).unwrap();
         let mode_json = parse_cli_mode(&args_json.mode).unwrap();
         assert_eq!(mode_json, CliMode::Json);
-        assert!(!should_run_interactive(&args_json, mode_json, true));
-        assert!(!should_run_interactive(&args_json, mode_json, false));
+        assert!(!should_run_interactive(&args_json, mode_json, true, true));
+        assert!(!should_run_interactive(&args_json, mode_json, false, true));
+        assert!(!should_run_interactive(&args_json, mode_json, true, false));
 
         // Rpc mode never runs interactive mode
         let args_rpc = CliArgs::try_parse_from(["mehh", "--mode", "rpc"]).unwrap();
         let mode_rpc = parse_cli_mode(&args_rpc.mode).unwrap();
         assert_eq!(mode_rpc, CliMode::Rpc);
-        assert!(!should_run_interactive(&args_rpc, mode_rpc, true));
-        assert!(!should_run_interactive(&args_rpc, mode_rpc, false));
+        assert!(!should_run_interactive(&args_rpc, mode_rpc, true, true));
+        assert!(!should_run_interactive(&args_rpc, mode_rpc, false, true));
+        assert!(!should_run_interactive(&args_rpc, mode_rpc, true, false));
     }
 
     #[test]
@@ -1710,14 +1337,14 @@ mod tests {
 
     #[test]
     fn test_resolve_session_manager_continue_without_sessions_fails() {
-        let dir = make_temp_dir("mehh_cli_continue");
+        let _lock = crate::bootstrap::tests::ENV_LOCK.blocking_lock();
+        let env = crate::bootstrap::tests::TempEnv::new("cli_continue", None);
         let args = CliArgs::try_parse_from(["mehh", "-c"]).unwrap();
-        let err = match resolve_session_manager(&args, &dir) {
+        let err = match resolve_session_manager(&args, &env.cwd) {
             Ok(_) => panic!("expected --continue to fail without a previous session"),
             Err(e) => e,
         };
         assert!(err.to_string().contains("No previous session"));
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2091,6 +1718,126 @@ mod tests {
             "subagent tool must be attached"
         );
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn configure_cli_subagent_shares_parent_tool_instances_and_supports_subagent_only() {
+        let temp_dir = make_temp_dir("mehh_subagent_share");
+        let args = CliArgs::try_parse_from(["mehh"]).unwrap();
+        let cli_tools = resolve_cli_tools(&args, temp_dir.clone()).unwrap();
+        let mut session = AgentSession::new(
+            temp_dir.clone(),
+            faux::faux_model(),
+            Arc::new(faux::FauxProvider::new()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+        );
+        session.set_tools(cli_tools);
+
+        configure_cli_subagent(&args, &temp_dir, &mut session).unwrap();
+        let child_tools = session.subagent_child_tools().unwrap();
+        for tool_name in ["web_search", "web_fetch", "undo_edit"] {
+            let parent_tool = session.tools().iter().find(|t| t.name() == tool_name).unwrap();
+            let child_tool = child_tools.iter().find(|t| t.name() == tool_name).unwrap();
+            assert!(
+                Arc::ptr_eq(parent_tool, child_tool),
+                "subagent must reuse parent's Arc<{tool_name}> (shared WebRuntime/EditUndoStore)"
+            );
+        }
+
+        // `--tools subagent` still populates built-in tools for child subagents
+        let sub_only_args = CliArgs::try_parse_from(["mehh", "--tools", "subagent"]).unwrap();
+        let sub_only_parent_tools = resolve_cli_tools(&sub_only_args, temp_dir.clone()).unwrap();
+        assert!(sub_only_parent_tools.is_empty());
+        let mut sub_only_session = AgentSession::new(
+            temp_dir.clone(),
+            faux::faux_model(),
+            Arc::new(faux::FauxProvider::new()),
+            SessionManager::in_memory(&temp_dir),
+            Settings::default(),
+        );
+        sub_only_session.set_tools(sub_only_parent_tools);
+        configure_cli_subagent(&sub_only_args, &temp_dir, &mut sub_only_session).unwrap();
+        let sub_only_children = sub_only_session.subagent_child_tools().unwrap();
+        assert!(sub_only_children.iter().any(|t| t.name() == "read"));
+        assert!(sub_only_children.iter().any(|t| t.name() == "web_search"));
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn i24_provider_without_model_does_not_inherit_mismatched_default_model() {
+        let settings = Settings {
+            default_provider: Some("anthropic".to_string()),
+            default_model: Some("claude-sonnet-4-5".to_string()),
+            ..Settings::default()
+        };
+
+        // Explicit --provider openai without --model must NOT inherit anthropic's default_model
+        let (model_arg, prov_arg) =
+            select_cli_model_and_provider(None, Some("openai"), &settings);
+        assert_eq!(model_arg, None);
+        assert_eq!(prov_arg, Some("openai"));
+
+        // Matching --provider (case-insensitive) preserves settings.default_model
+        let (model_same, prov_same) =
+            select_cli_model_and_provider(None, Some("Anthropic"), &settings);
+        assert_eq!(model_same, Some("claude-sonnet-4-5"));
+        assert_eq!(prov_same, Some("Anthropic"));
+
+        // Neither flag specified uses both defaults
+        let (model_def, prov_def) = select_cli_model_and_provider(None, None, &settings);
+        assert_eq!(model_def, Some("claude-sonnet-4-5"));
+        assert_eq!(prov_def, Some("anthropic"));
+    }
+
+    #[test]
+    fn i25_session_id_creates_session_with_exact_header_id_and_preserves_name() {
+        let _lock = crate::bootstrap::tests::ENV_LOCK.blocking_lock();
+        let env = crate::bootstrap::tests::TempEnv::new("cli_session_id", None);
+        let dir = &env.cwd;
+        let sess_dir = dir.join("sessions");
+        std::fs::create_dir_all(&sess_dir).unwrap();
+
+        let args = CliArgs::try_parse_from([
+            "mehh",
+            "--session-id",
+            "custom-run-42",
+            "--name",
+            "Human Label",
+            "--session-dir",
+            sess_dir.to_str().unwrap(),
+        ])
+        .unwrap();
+        let sm = resolve_session_manager(&args, dir).unwrap();
+        assert_eq!(sm.session_id(), "custom-run-42");
+        assert_eq!(sm.session_name().as_deref(), Some("Human Label"));
+
+        // Without --session-dir, --session-id still creates a file in session_dir_for_cwd(cwd)
+        // with header.id == "custom-run-standalone" so list_sessions / -r resolves it.
+        let cwd_dir = dir.join("project_cwd");
+        std::fs::create_dir_all(&cwd_dir).unwrap();
+        let args_standalone = CliArgs::try_parse_from([
+            "mehh",
+            "--session-id",
+            "custom-run-standalone",
+            "--name",
+            "Standalone Name",
+        ])
+        .unwrap();
+        let sm_standalone = resolve_session_manager(&args_standalone, &cwd_dir).unwrap();
+        let created_path = sm_standalone
+            .file_path()
+            .expect("standalone --session-id must be file-backed")
+            .to_path_buf();
+        assert_eq!(sm_standalone.session_id(), "custom-run-standalone");
+        assert_eq!(sm_standalone.session_name().as_deref(), Some("Standalone Name"));
+        let found = list_sessions(&cwd_dir).unwrap();
+        assert!(
+            found.iter().any(|s| s.id == "custom-run-standalone"),
+            "list_sessions(cwd) must find standalone --session-id session: {found:?}"
+        );
+        let _ = std::fs::remove_file(created_path);
     }
 }
 

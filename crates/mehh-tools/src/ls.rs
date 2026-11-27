@@ -92,6 +92,8 @@ impl AgentTool for LsTool {
             .max(1) as usize;
 
         let dir_path = self.resolve_path(&path_str)?;
+        let explicit_protected =
+            context::path_targets_protected_credential(&path_str, &dir_path);
         let cancel_clone = cancel.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -123,9 +125,18 @@ impl AgentTool for LsTool {
                 };
 
                 let name = entry.file_name().to_string_lossy().to_string();
-                // metadata() follows symlinks, so a symlinked directory gets
-                // the '/' suffix instead of being shown as a plain file.
-                let is_dir = entry.metadata().map(|m| m.is_dir()).unwrap_or(false);
+                if !explicit_protected && context::is_protected_credential_name(&name) {
+                    continue;
+                }
+                // Use DirEntry::file_type() directly (no extra stat syscall), and only
+                // follow symlinks with std::fs::metadata so symlinked dirs still get '/'.
+                let is_dir = match entry.file_type() {
+                    Ok(ft) if ft.is_symlink() => std::fs::metadata(entry.path())
+                        .map(|m| m.is_dir())
+                        .unwrap_or(false),
+                    Ok(ft) => ft.is_dir(),
+                    Err(_) => false,
+                };
 
                 if is_dir {
                     entries.push(format!("{}/", name));
@@ -138,14 +149,26 @@ impl AgentTool for LsTool {
                 return Ok(AgentToolResult::text("(empty directory)"));
             }
 
-            entries.sort_by_cached_key(|a| a.to_lowercase());
+            entries.sort_by(|a, b| {
+                if a.is_ascii() && b.is_ascii() {
+                    for (&ba, &bb) in a.as_bytes().iter().zip(b.as_bytes()) {
+                        let cmp = ba.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
+                        if cmp != std::cmp::Ordering::Equal {
+                            return cmp;
+                        }
+                    }
+                    a.len().cmp(&b.len())
+                } else {
+                    a.to_lowercase().cmp(&b.to_lowercase())
+                }
+            });
 
             let limit_reached = entries.len() > limit;
             if limit_reached {
                 entries.truncate(limit);
             }
 
-            let mut output_lines = Vec::new();
+            let mut output = String::new();
             let mut total_bytes = 0usize;
             let mut byte_cap_reached = false;
             for entry in entries {
@@ -154,11 +177,12 @@ impl AgentTool for LsTool {
                     byte_cap_reached = true;
                     break;
                 }
+                if total_bytes > 0 {
+                    output.push('\n');
+                }
+                output.push_str(&entry);
                 total_bytes += add_bytes;
-                output_lines.push(entry);
             }
-
-            let mut output = output_lines.join("\n");
             if byte_cap_reached {
                 output.push_str(&format!(
                     "\n\n[Output truncated at {} byte limit]",
@@ -181,5 +205,83 @@ impl AgentTool for LsTool {
         })
         .await
         .map_err(|e| format!("Ls task failed: {e}"))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_ls_skips_protected_credentials_unless_explicitly_targeted() {
+        let dir = crate::TempTestDir::new("ls_protected");
+        std::fs::create_dir_all(dir.path().join(".mehh")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".ssh")).unwrap();
+        std::fs::write(dir.path().join(".mehh/secret.txt"), "x").unwrap();
+        std::fs::write(dir.path().join(".env"), "A=1").unwrap();
+        std::fs::write(dir.path().join(".env.local"), "A=2").unwrap();
+        std::fs::write(dir.path().join("auth.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("mcp-auth.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("trust.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "ok").unwrap();
+
+        let tool = LsTool::new(dir.path().to_path_buf());
+        let res = tool
+            .execute("tc1", serde_json::Map::new(), CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt = match &res.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt.contains("visible.txt"));
+        for hidden in [".mehh", ".ssh", ".env", "auth.json", "mcp-auth.json", "trust.json"] {
+            assert!(!txt.contains(hidden), "must not leak {hidden}: {txt}");
+        }
+
+        let explicit = json!({ "path": ".mehh" }).as_object().unwrap().clone();
+        let res2 = tool
+            .execute("tc2", explicit, CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt2 = match &res2.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt2.contains("secret.txt"), "got: {txt2}");
+    }
+
+    #[tokio::test]
+    async fn test_ls_marks_symlinked_dir_with_trailing_slash() {
+        let dir = crate::TempTestDir::new("ls_symlink_dir");
+        let target_dir = dir.path().join("real_dir");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let link = dir.path().join("dir_link");
+
+        #[cfg(unix)]
+        let link_res = std::os::unix::fs::symlink(&target_dir, &link);
+        #[cfg(windows)]
+        let link_res = std::os::windows::fs::symlink_dir(&target_dir, &link);
+        #[cfg(not(any(unix, windows)))]
+        let link_res: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ));
+
+        if let Err(e) = link_res {
+            eprintln!("skipping ls symlink dir test: {e}");
+            return;
+        }
+
+        let tool = LsTool::new(dir.path().to_path_buf());
+        let res = tool
+            .execute("tc", serde_json::Map::new(), CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let txt = match &res.content[0] {
+            mehh_ai::ToolResultContentBlock::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        assert!(txt.contains("dir_link/"), "expected trailing slash on symlinked dir: {txt}");
     }
 }

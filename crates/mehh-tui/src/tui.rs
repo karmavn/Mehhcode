@@ -1,3 +1,5 @@
+use std::fmt::Write as _;
+
 use crate::ansi::{ansi_code_len, slice_by_column, visible_width};
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -153,16 +155,14 @@ pub fn composite_tui_line(
         String::new()
     };
 
-    let mut res = String::new();
+    let mut res = String::with_capacity(
+        before.len() + before_pad + 4 + overlay_slice.len() + overlay_pad + 4 + after.len(),
+    );
     res.push_str(&before);
-    if before_pad > 0 {
-        res.push_str(&" ".repeat(before_pad));
-    }
+    res.extend(std::iter::repeat_n(' ', before_pad));
     res.push_str("\x1b[0m");
     res.push_str(&overlay_slice);
-    if overlay_pad > 0 {
-        res.push_str(&" ".repeat(overlay_pad));
-    }
+    res.extend(std::iter::repeat_n(' ', overlay_pad));
     res.push_str("\x1b[0m");
     res.push_str(&after);
 
@@ -179,6 +179,8 @@ pub fn composite_tui_line(
 pub struct TuiRenderer {
     pub previous_lines: Vec<String>,
     pub previous_width: usize,
+    pub previous_height: usize,
+    frame_buf: String,
 }
 
 impl TuiRenderer {
@@ -186,12 +188,15 @@ impl TuiRenderer {
         Self {
             previous_lines: Vec::new(),
             previous_width: 0,
+            previous_height: 0,
+            frame_buf: String::new(),
         }
     }
 
     pub fn reset(&mut self) {
         self.previous_lines.clear();
         self.previous_width = 0;
+        self.previous_height = 0;
     }
 
     pub fn render_frame(
@@ -200,9 +205,11 @@ impl TuiRenderer {
         mut lines: Vec<String>,
         show_hardware_cursor: bool,
     ) -> std::io::Result<()> {
-        let (cols, _rows) = terminal.size();
+        let (cols, rows) = terminal.size();
         let width = cols as usize;
+        let height = rows as usize;
         let width_changed = self.previous_width != 0 && self.previous_width != width;
+        let height_changed = self.previous_height != 0 && self.previous_height != height;
 
         // Extract CURSOR_MARKER position
         let mut cursor_pos: Option<(usize, usize)> = None;
@@ -212,7 +219,7 @@ impl TuiRenderer {
                 let col = visible_width(&line[..pos]);
                 cursor_pos = Some((row_idx, col));
                 cursor_byte = Some((row_idx, pos));
-                *line = line.replacen(CURSOR_MARKER, "", 1);
+                line.replace_range(pos..pos + CURSOR_MARKER.len(), "");
                 break;
             }
         }
@@ -234,34 +241,49 @@ impl TuiRenderer {
                     let style = &line[byte_pos..style_end];
                     let rest = &line[style_end..];
                     let grapheme = rest.graphemes(true).next().unwrap_or("");
-                    let before = format!("{}{}", &line[..byte_pos], style);
                     let after = &rest[grapheme.len()..];
                     let cursor_char = if grapheme.is_empty() { " " } else { grapheme };
-                    *line = format!("{before}\x1b[7m{cursor_char}\x1b[27m{after}");
+                    let mut rebuilt = String::with_capacity(line.len() + 12);
+                    rebuilt.push_str(&line[..byte_pos]);
+                    rebuilt.push_str(style);
+                    rebuilt.push_str("\x1b[7m");
+                    rebuilt.push_str(cursor_char);
+                    rebuilt.push_str("\x1b[27m");
+                    rebuilt.push_str(after);
+                    *line = rebuilt;
                 }
             }
         }
 
         let is_first = self.previous_lines.is_empty();
-        let full_redraw = is_first || width_changed;
+        let full_redraw = is_first || width_changed || height_changed;
+        let has_shrunk = self.previous_lines.len() > lines.len();
 
-        let mut out = String::new();
+        let mut out = std::mem::take(&mut self.frame_buf);
+        out.clear();
+        let needed = if full_redraw {
+            lines.len().saturating_mul(64) + 32
+        } else {
+            512
+        };
+        if out.capacity() < needed {
+            out.reserve(needed - out.capacity());
+        }
         out.push_str("\x1b[?2026h"); // Synchronized output begin
+        let mut wrote_diff = full_redraw || has_shrunk;
 
         if full_redraw {
-            out.push_str("\x1b[H");
-            out.push('\r');
+            out.push_str("\x1b[H\r");
             for (i, line) in lines.iter().enumerate() {
-                out.push_str("\x1b[2K");
+                out.push_str("\x1b[0m\x1b[2K");
                 out.push_str(line);
+                out.push_str("\x1b[0m");
                 if i + 1 < lines.len() {
                     out.push_str("\r\n");
                 }
             }
-            if self.previous_lines.len() > lines.len() {
-                out.push_str(&format!("\x1b[{};1H\x1b[J", lines.len() + 1));
-            } else {
-                out.push_str("\x1b[J");
+            if lines.len() < rows as usize {
+                let _ = write!(out, "\x1b[0m\x1b[{};1H\x1b[J", lines.len() + 1);
             }
         } else {
             let max_len = lines.len().max(self.previous_lines.len());
@@ -270,12 +292,13 @@ impl TuiRenderer {
                 let new_l = lines.get(i).map(|s| s.as_str()).unwrap_or("");
                 if old_l != new_l {
                     if let Some(line) = lines.get(i) {
-                        out.push_str(&format!("\x1b[{};1H\x1b[2K{line}", i + 1));
+                        let _ = write!(out, "\x1b[0m\x1b[{};1H\x1b[2K{line}\x1b[0m", i + 1);
+                        wrote_diff = true;
                     }
                 }
             }
-            if self.previous_lines.len() > lines.len() {
-                out.push_str(&format!("\x1b[{};1H\x1b[J", lines.len() + 1));
+            if has_shrunk && lines.len() < rows as usize {
+                let _ = write!(out, "\x1b[0m\x1b[{};1H\x1b[J", lines.len() + 1);
             }
         }
 
@@ -283,17 +306,30 @@ impl TuiRenderer {
         if show_hardware_cursor {
             if let Some((target_row, target_col)) = cursor_pos {
                 let target_row = target_row.min(lines.len().saturating_sub(1));
-                out.push_str(&format!("\x1b[{};{}H", target_row + 1, target_col + 1));
+                let _ = write!(out, "\x1b[{};{}H\x1b[?25h", target_row + 1, target_col + 1);
+                wrote_diff = true;
+            } else if wrote_diff {
+                out.push_str("\x1b[?25h");
             }
+        }
+
+        if !wrote_diff {
+            self.frame_buf = out;
+            self.previous_lines = lines;
+            self.previous_width = width;
+            self.previous_height = height;
+            return Ok(());
         }
 
         out.push_str("\x1b[?2026l"); // Synchronized output end
 
-        terminal.write(&out)?;
-        terminal.flush()?;
+        let write_res = terminal.write(&out).and_then(|()| terminal.flush());
+        self.frame_buf = out;
+        write_res?;
 
         self.previous_lines = lines;
         self.previous_width = width;
+        self.previous_height = height;
 
         Ok(())
     }
@@ -426,16 +462,101 @@ mod tests {
     fn fake_cursor_preserves_wide_character_after_marker() {
         let mut term = MockTerminal::new(40, 3);
         let mut renderer = TuiRenderer::new();
-        let line = format!("> {CURSOR_MARKER}世界👨‍👩‍👧‍👦!");
+        let line = format!(
+            "> {CURSOR_MARKER}\u{4E16}\u{754C}\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}\u{200D}\u{1F466}!"
+        );
         renderer.render_frame(&mut term, vec![line], false).unwrap();
         let out = term.full_output();
-        assert!(out.contains('世'), "wide character dropped: {out:?}");
-        assert!(out.contains('界'), "wide character dropped: {out:?}");
+        assert!(out.contains('\u{4E16}'), "wide character dropped: {out:?}");
+        assert!(out.contains('\u{754C}'), "wide character dropped: {out:?}");
         assert!(
-            out.contains('👨') && out.contains('👩') && out.contains('👧') && out.contains('👦'),
+            out.contains('\u{1F468}')
+                && out.contains('\u{1F469}')
+                && out.contains('\u{1F467}')
+                && out.contains('\u{1F466}'),
             "emoji sequence dropped: {out:?}"
         );
         assert!(out.contains('!'), "trailing character dropped: {out:?}");
+    }
+
+    #[test]
+    fn full_redraw_at_exact_terminal_height_does_not_emit_erase_to_end_of_display() {
+        let mut term = MockTerminal::new(40, 3);
+        let mut renderer = TuiRenderer::new();
+        let frame = vec![
+            "line 1".to_string(),
+            "line 2".to_string(),
+            "/help".to_string(),
+        ];
+        renderer.render_frame(&mut term, frame, false).unwrap();
+        let out = term.full_output();
+        assert!(
+            !out.contains("\x1b[J"),
+            "full redraw with lines.len() == rows must not emit \\x1b[J: {out:?}"
+        );
+        assert!(out.contains("/help"), "{out:?}");
+    }
+
+    #[test]
+    fn unchanged_frame_skips_terminal_write() {
+        let mut term = MockTerminal::new(40, 3);
+        let mut renderer = TuiRenderer::new();
+        let frame = vec!["a".into(), "b".into()];
+        renderer.render_frame(&mut term, frame.clone(), false).unwrap();
+        term.clear_output();
+        renderer.render_frame(&mut term, frame, false).unwrap();
+        assert!(term.output.is_empty(), "identical frame must skip terminal I/O");
+    }
+
+    #[test]
+    fn render_frame_resets_sgr_before_erase_and_at_line_ends() {
+        let mut term = MockTerminal::new(40, 5);
+        let mut renderer = TuiRenderer::new();
+        renderer
+            .render_frame(&mut term, vec!["\x1b[41ma".into(), "b".into()], false)
+            .unwrap();
+        let out = term.full_output();
+        assert!(out.contains("\x1b[0m\x1b[2K\x1b[41ma\x1b[0m"), "{out:?}");
+        assert!(out.contains("\x1b[0m\x1b[2Kb\x1b[0m"), "{out:?}");
+        assert!(out.contains("\x1b[0m\x1b[3;1H\x1b[J"), "{out:?}");
+
+        term.clear_output();
+        renderer
+            .render_frame(&mut term, vec!["\x1b[41ma".into(), "B".into()], false)
+            .unwrap();
+        let diff = term.full_output();
+        assert!(diff.contains("\x1b[0m\x1b[2;1H\x1b[2KB\x1b[0m"), "{diff:?}");
+    }
+
+    #[test]
+    fn render_frame_forces_full_redraw_when_height_changes() {
+        let mut term = MockTerminal::new(40, 6);
+        let mut renderer = TuiRenderer::new();
+        let frame = vec!["line 1".into(), "line 2".into()];
+        renderer.render_frame(&mut term, frame.clone(), false).unwrap();
+        term.clear_output();
+
+        term.rows = 4;
+        renderer.render_frame(&mut term, frame, false).unwrap();
+        let out = term.full_output();
+        assert!(
+            out.contains("\x1b[H"),
+            "height change must trigger full redraw: {out:?}"
+        );
+    }
+
+    #[test]
+    fn render_frame_emits_show_cursor_when_enabled() {
+        let mut term = MockTerminal::new(40, 4);
+        let mut renderer = TuiRenderer::new();
+        renderer
+            .render_frame(&mut term, vec![format!("hi{CURSOR_MARKER}")], true)
+            .unwrap();
+        let out = term.full_output();
+        assert!(
+            out.contains("\x1b[?25h"),
+            "hardware cursor mode must emit DECTCEM show cursor: {out:?}"
+        );
     }
 }
 

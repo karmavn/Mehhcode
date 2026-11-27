@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use mehh_coding_agent::permissions::PermissionStore;
 use mehh_coding_agent::tool_inspection::{
     ApprovalHandler, InspectionVerdict, PermissionMode, ToolInspectionContext,
     ToolInspectionManager,
@@ -48,9 +49,10 @@ fn edit_ctx(cwd: &std::path::Path, id: &str, origin: Option<String>) -> ToolInsp
 #[tokio::test]
 async fn test_concurrent_approvals_are_serialized() {
     let cwd = std::env::current_dir().unwrap();
-    let mgr = Arc::new(ToolInspectionManager::new(
+    let mgr = Arc::new(ToolInspectionManager::new_with_store(
         PermissionMode::Approve,
         cwd.clone(),
+        PermissionStore::default(),
     ));
     let active = Arc::new(AtomicUsize::new(0));
     let peak = Arc::new(AtomicUsize::new(0));
@@ -83,7 +85,11 @@ async fn test_concurrent_approvals_are_serialized() {
 #[tokio::test]
 async fn test_approval_reason_carries_subagent_origin() {
     let cwd = std::env::current_dir().unwrap();
-    let mgr = ToolInspectionManager::new(PermissionMode::Approve, cwd.clone());
+    let mgr = ToolInspectionManager::new_with_store(
+        PermissionMode::Approve,
+        cwd.clone(),
+        PermissionStore::default(),
+    );
     let reasons = Arc::new(std::sync::Mutex::new(Vec::new()));
     let handler = RecordingHandler {
         active: Arc::new(AtomicUsize::new(0)),
@@ -102,7 +108,11 @@ async fn test_approval_reason_carries_subagent_origin() {
 #[tokio::test]
 async fn test_repetition_breaker_is_scoped_per_origin() {
     let cwd = std::env::current_dir().unwrap();
-    let mgr = ToolInspectionManager::new(PermissionMode::Auto, cwd.clone());
+    let mgr = ToolInspectionManager::new_with_store(
+        PermissionMode::Auto,
+        cwd.clone(),
+        PermissionStore::default(),
+    );
     let mut args = serde_json::Map::new();
     args.insert("path".to_string(), json!("src/lib.rs"));
 

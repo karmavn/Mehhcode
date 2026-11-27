@@ -15,6 +15,18 @@ pub const CODEMODE_MAX_IMAGES: usize = 4;
 pub const CODEMODE_MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_STORE_TOTAL_BYTES: usize = 1024 * 1024;
 const MAX_STORE_VALUE_BYTES: usize = 256 * 1024;
+const MAX_STORE_KEY_BYTES: usize = 1024;
+
+pub(crate) fn decoded_base64_len(data: &str) -> usize {
+    let padding = data
+        .as_bytes()
+        .iter()
+        .rev()
+        .take(2)
+        .filter(|&&b| b == b'=')
+        .count();
+    ((data.len() / 4) * 3).saturating_sub(padding)
+}
 
 #[derive(Debug, Clone)]
 pub struct CodemodeConfig {
@@ -75,6 +87,46 @@ impl From<mehh_ai::Model> for ModelSummary {
         }
     }
 }
+
+impl From<&mehh_ai::Model> for ModelSummary {
+    fn from(m: &mehh_ai::Model) -> Self {
+        Self {
+            id: m.id.clone(),
+            name: m.name.clone(),
+            provider: m.provider.clone(),
+            api: m.api.clone(),
+            context_window: m.context_window,
+            reasoning: m.reasoning,
+        }
+    }
+}
+
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_byte_len(value: &serde_json::Value) -> Option<usize> {
+    let mut writer = CountingWriter(0);
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.0)
+}
+
+static BUILTIN_MODELS_SUMMARY_JSON: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let models: Vec<ModelSummary> = mehh_ai::catalog::builtin_models_slice()
+        .iter()
+        .map(ModelSummary::from)
+        .collect();
+    serde_json::to_string(&models).unwrap_or_else(|_| "[]".to_string())
+});
 
 fn webp_signature_valid(data: &str) -> bool {
     if data.len() < 16 {
@@ -143,10 +195,44 @@ pub type SandboxToolExecutor = Arc<
 >;
 
 #[derive(Debug, Clone, Serialize)]
-struct ResolvedToolMeta {
-    name: String,
-    js_name: String,
-    description: String,
+pub(crate) struct ResolvedToolMeta {
+    pub(crate) name: String,
+    pub(crate) js_name: String,
+    pub(crate) description: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct PreparedToolMeta {
+    pub(crate) defs: Arc<[ToolDefinition]>,
+    pub(crate) resolved: Arc<[ResolvedToolMeta]>,
+    pub(crate) meta_json: Arc<str>,
+}
+
+pub(crate) fn resolve_tool_meta(defs: Arc<[ToolDefinition]>) -> PreparedToolMeta {
+    let mut used_js_names = std::collections::HashSet::with_capacity(defs.len());
+    let resolved: Vec<ResolvedToolMeta> = defs
+        .iter()
+        .map(|t| {
+            let base = to_identifier(&t.name);
+            let mut js_name = base.clone();
+            let mut suffix = 2;
+            while !used_js_names.insert(js_name.clone()) {
+                js_name = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            ResolvedToolMeta {
+                name: t.name.clone(),
+                js_name,
+                description: t.description.clone(),
+            }
+        })
+        .collect();
+    let json = serde_json::to_string(&resolved).unwrap_or_else(|_| "[]".to_string());
+    PreparedToolMeta {
+        defs,
+        resolved: Arc::from(resolved),
+        meta_json: Arc::from(json),
+    }
 }
 
 pub fn to_identifier(name: &str) -> String {
@@ -511,19 +597,51 @@ pub async fn run_codemode(
     config: &CodemodeConfig,
     cancel: CancellationToken,
 ) -> CodemodeResult {
+    run_codemode_shared(
+        code,
+        Arc::from(tool_defs),
+        executor,
+        kv_store,
+        config,
+        cancel,
+    )
+    .await
+}
+
+pub async fn run_codemode_shared(
+    code: &str,
+    tool_defs: Arc<[ToolDefinition]>,
+    executor: SandboxToolExecutor,
+    kv_store: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    config: &CodemodeConfig,
+    cancel: CancellationToken,
+) -> CodemodeResult {
+    let prepared = resolve_tool_meta(tool_defs);
+    run_codemode_with_meta(code, prepared, executor, kv_store, config, cancel).await
+}
+
+pub(crate) async fn run_codemode_with_meta(
+    code: &str,
+    prepared: PreparedToolMeta,
+    executor: SandboxToolExecutor,
+    kv_store: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    config: &CodemodeConfig,
+    cancel: CancellationToken,
+) -> CodemodeResult {
     let code = code.to_string();
-    let tool_defs = tool_defs.to_vec();
     let config = config.clone();
     let handle = tokio::runtime::Handle::current();
+    let run_cancel = cancel.child_token();
+    let _cancel_guard = CancelOnDrop(run_cancel.clone());
 
     tokio::task::spawn_blocking(move || {
         run_codemode_blocking(
             &code,
-            &tool_defs,
+            prepared,
             executor,
             kv_store,
             &config,
-            cancel,
+            run_cancel,
             handle,
         )
     })
@@ -538,13 +656,14 @@ pub async fn run_codemode(
 
 fn run_codemode_blocking(
     code: &str,
-    tool_defs: &[ToolDefinition],
+    prepared: PreparedToolMeta,
     executor: SandboxToolExecutor,
     kv_store: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     config: &CodemodeConfig,
     cancel: CancellationToken,
     handle: tokio::runtime::Handle,
 ) -> CodemodeResult {
+    let tool_defs = Arc::clone(&prepared.defs);
     let rt = match rquickjs::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -575,6 +694,52 @@ fn run_codemode_blocking(
             || Instant::now() > deadline
             || cancel_check.is_cancelled()
     })));
+
+    // Pre-validate user source in a bare QuickJS context with zero host
+    // bindings or prelude. QuickJS's AsyncFunction constructor parses via a
+    // synthesized wrapper where a balanced `})()` sequence could run before
+    // `toString` verification; validating first in an unprivileged context
+    // guarantees any escape attempt has zero capabilities.
+    let code_json = serde_json::to_string(code).unwrap_or_else(|_| "\"\"".to_string());
+    {
+        let precheck_ctx = match rquickjs::Context::full(&rt) {
+            Ok(c) => c,
+            Err(e) => {
+                return CodemodeResult {
+                    ok: false,
+                    value: None,
+                    error: Some(format!("Failed to create QuickJS context: {e}")),
+                    items: Vec::new(),
+                };
+            }
+        };
+        let precheck_err = precheck_ctx.with(|ctx| -> Option<String> {
+            let check_code = format!(
+                "((__src) => {{ const pristineToString = Function.prototype.toString; const AsyncFunction = Object.getPrototypeOf(async function() {{}}).constructor; const __f = AsyncFunction(__src); const __expected = \"async function anonymous(\\n) {{\\n\" + __src + \"\\n}}\"; if (pristineToString.call(__f) !== __expected) {{ throw new Error(\"Invalid async wrapper source\"); }} }})({code_json})"
+            );
+            match ctx.eval::<(), _>(check_code.as_str()) {
+                Ok(()) => None,
+                Err(err) => {
+                    if Instant::now() > deadline {
+                        return Some("Execution timed out".to_string());
+                    }
+                    if cancel.is_cancelled() {
+                        return Some("Execution was cancelled".to_string());
+                    }
+                    let exc = ctx.catch();
+                    Some(format_js_error(&ctx, exc, err))
+                }
+            }
+        });
+        if let Some(err_msg) = precheck_err {
+            return CodemodeResult {
+                ok: false,
+                value: None,
+                error: Some(err_msg),
+                items: Vec::new(),
+            };
+        }
+    }
 
     let context = match rquickjs::Context::full(&rt) {
         Ok(c) => c,
@@ -748,31 +913,38 @@ fn run_codemode_blocking(
 
         // 4. __host_image
         let items_image = items.clone();
-        let total_chars_image = total_chars.clone();
         let total_items_image = total_items.clone();
         let image_count = Arc::new(AtomicUsize::new(0));
+        let total_image_bytes = Arc::new(AtomicUsize::new(0));
         let host_image = match rquickjs::Function::new(
             ctx.clone(),
             move |data: String, mime: String| -> String {
                 if let Err(err) = validate_image_payload(&data, &mime) {
                     return err;
                 }
-                if data.len() > CODEMODE_MAX_IMAGE_BYTES {
+                let decoded_len = decoded_base64_len(&data);
+                if decoded_len > CODEMODE_MAX_IMAGE_BYTES {
                     return format!(
                         "Output image exceeds the {} MiB limit",
                         CODEMODE_MAX_IMAGE_BYTES / (1024 * 1024)
                     );
                 }
-                let next_image = image_count.fetch_add(1, Ordering::Relaxed) + 1;
-                if next_image > CODEMODE_MAX_IMAGES {
+                let current_images = image_count.load(Ordering::Relaxed);
+                if current_images >= CODEMODE_MAX_IMAGES {
                     return format!("Too many output images (maximum {CODEMODE_MAX_IMAGES})");
                 }
-                let new_chars = total_chars_image.load(Ordering::Relaxed) + data.len();
+                let new_image_bytes = total_image_bytes
+                    .load(Ordering::Relaxed)
+                    .saturating_add(decoded_len);
+                if new_image_bytes > CODEMODE_MAX_IMAGES * CODEMODE_MAX_IMAGE_BYTES {
+                    return "script output exceeded image output limit".to_string();
+                }
                 let new_items = total_items_image.load(Ordering::Relaxed) + 1;
-                if new_chars > max_chars || new_items > max_items {
+                if new_items > max_items {
                     return "script output exceeded output limit".to_string();
                 }
-                total_chars_image.store(new_chars, Ordering::Relaxed);
+                image_count.store(current_images + 1, Ordering::Relaxed);
+                total_image_bytes.store(new_image_bytes, Ordering::Relaxed);
                 total_items_image.store(new_items, Ordering::Relaxed);
                 lock_or_recover(&items_image).push(CodemodeOutputItem::Image {
                     data,
@@ -801,13 +973,45 @@ fn run_codemode_blocking(
         }
 
         // 5. __host_store
+        struct StoreAccounting {
+            key_sizes: HashMap<String, usize>,
+            total_bytes: usize,
+        }
         let kv_store_set = kv_store.clone();
+        let cancel_store = cancel.clone();
+        let store_accounting: Arc<Mutex<Option<StoreAccounting>>> = Arc::new(Mutex::new(None));
         let host_store = match rquickjs::Function::new(
             ctx.clone(),
             move |key: String, val_json: String| -> String {
+                if cancel_store.is_cancelled() {
+                    return "Execution was cancelled".to_string();
+                }
+                if Instant::now() > deadline {
+                    return "Execution timed out".to_string();
+                }
+                if key.len() > MAX_STORE_KEY_BYTES {
+                    return format!("store() key exceeds {MAX_STORE_KEY_BYTES} byte limit");
+                }
                 let mut map = lock_or_recover(&kv_store_set);
+                let mut accounting_guard = lock_or_recover(&store_accounting);
+                let accounting = accounting_guard.get_or_insert_with(|| {
+                    let mut key_sizes = HashMap::with_capacity(map.len());
+                    let mut total_bytes = 0usize;
+                    for (k, v) in map.iter() {
+                        let sz = k.len() + json_byte_len(v).unwrap_or(0);
+                        key_sizes.insert(k.clone(), sz);
+                        total_bytes = total_bytes.saturating_add(sz);
+                    }
+                    StoreAccounting {
+                        key_sizes,
+                        total_bytes,
+                    }
+                });
                 if val_json == "__UNDEFINED__" {
                     map.remove(&key);
+                    if let Some(old) = accounting.key_sizes.remove(&key) {
+                        accounting.total_bytes = accounting.total_bytes.saturating_sub(old);
+                    }
                     return String::new();
                 }
                 if val_json.len() > MAX_STORE_VALUE_BYTES {
@@ -817,19 +1021,19 @@ fn run_codemode_blocking(
                     Ok(v) => v,
                     Err(e) => return format!("store('{key}') invalid JSON: {e}"),
                 };
-                let canonical = serde_json::to_string(&val).unwrap_or_else(|_| val_json.clone());
-                let new_bytes = key.len() + canonical.len();
-                // Recompute from the shared map on every write. A per-run
-                // counter drifts when the KV store outlives a single script.
-                let total_others: usize = map
-                    .iter()
-                    .filter(|(k, _)| k.as_str() != key)
-                    .map(|(k, v)| k.len() + serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
-                    .sum();
-                if total_others.saturating_add(new_bytes) > MAX_STORE_TOTAL_BYTES {
+                let canonical_len = json_byte_len(&val).unwrap_or(val_json.len());
+                let new_bytes = key.len() + canonical_len;
+                let old_bytes = accounting.key_sizes.get(&key).copied().unwrap_or(0);
+                let projected = accounting
+                    .total_bytes
+                    .saturating_sub(old_bytes)
+                    .saturating_add(new_bytes);
+                if projected > MAX_STORE_TOTAL_BYTES {
                     return "store is full: stored values would exceed 1MB limit".to_string();
                 }
-                map.insert(key, val);
+                map.insert(key.clone(), val);
+                accounting.key_sizes.insert(key, new_bytes);
+                accounting.total_bytes = projected;
                 String::new()
             },
         ) {
@@ -912,29 +1116,10 @@ fn run_codemode_blocking(
             };
         }
 
-        // Resolve deduplicated JS identifiers once. The prelude, search,
-        // describe and namespace helpers must all use the same table.
-        let resolved_tools: Arc<[ResolvedToolMeta]> = {
-            let mut used_js_names = std::collections::HashSet::new();
-            tool_defs
-                .iter()
-                .map(|t| {
-                    let base = to_identifier(&t.name);
-                    let mut js_name = base.clone();
-                    let mut suffix = 2;
-                    while !used_js_names.insert(js_name.clone()) {
-                        js_name = format!("{base}_{suffix}");
-                        suffix += 1;
-                    }
-                    ResolvedToolMeta {
-                        name: t.name.clone(),
-                        js_name,
-                        description: t.description.clone(),
-                    }
-                })
-                .collect()
-        };
-        let shared_tool_defs: Arc<[ToolDefinition]> = Arc::from(tool_defs);
+        // Reuse pre-resolved deduplicated JS identifiers and JSON metadata.
+        let resolved_tools = Arc::clone(&prepared.resolved);
+        let tools_meta_json = Arc::clone(&prepared.meta_json);
+        let shared_tool_defs = tool_defs;
 
         // 8. __host_search_tools
         let tool_defs_search = Arc::clone(&shared_tool_defs);
@@ -1152,16 +1337,9 @@ fn run_codemode_blocking(
         }
 
         // 11. __host_models_list
-        let host_models_list = match rquickjs::Function::new(
-            ctx.clone(),
-            move || -> String {
-                let models: Vec<ModelSummary> = mehh_ai::catalog::builtin_models()
-                    .into_iter()
-                    .map(ModelSummary::from)
-                    .collect();
-                serde_json::to_string(&models).unwrap_or_else(|_| "[]".to_string())
-            },
-        ) {
+        let host_models_list = match rquickjs::Function::new(ctx.clone(), move || -> String {
+            BUILTIN_MODELS_SUMMARY_JSON.clone()
+        }) {
             Ok(f) => f,
             Err(e) => {
                 return CodemodeResult {
@@ -1220,9 +1398,8 @@ fn run_codemode_blocking(
             move |provider_json: String| -> String {
                 let provider_filter: Option<String> =
                     serde_json::from_str(&provider_json).unwrap_or(None);
-                let all = mehh_ai::catalog::builtin_models();
-                let filtered: Vec<ModelSummary> = all
-                    .into_iter()
+                let filtered: Vec<ModelSummary> = mehh_ai::catalog::builtin_models_slice()
+                    .iter()
                     .filter(|m| {
                         if let Some(ref p) = provider_filter {
                             m.provider.eq_ignore_ascii_case(p) || m.api.eq_ignore_ascii_case(p)
@@ -1254,9 +1431,7 @@ fn run_codemode_blocking(
             };
         }
 
-        // Setup prelude with the deduplicated table built above.
-        let tools_meta_json =
-            serde_json::to_string(&resolved_tools[..]).unwrap_or_else(|_| "[]".to_string());
+        // Setup prelude with the precomputed deduplicated metadata table.
         let prelude_code = format!("(({PRELUDE_JS}))({tools_meta_json});");
         if let Err(e) = ctx.eval::<(), _>(prelude_code.as_str()) {
             let exc = ctx.catch();
@@ -1276,7 +1451,6 @@ fn run_codemode_blocking(
         // function instead of throwing. Capture a pristine toString first, then
         // verify the constructed function's source is exactly the expected
         // wrapper with our body before invoking it.
-        let code_json = serde_json::to_string(code).unwrap_or_else(|_| "\"\"".to_string());
         let wrapped_code = format!(
             "((__src) => {{ const pristineToString = Function.prototype.toString; const AsyncFunction = Object.getPrototypeOf(async function() {{}}).constructor; const __f = AsyncFunction(__src); const __expected = \"async function anonymous(\\n) {{\\n\" + __src + \"\\n}}\"; if (pristineToString.call(__f) !== __expected) {{ throw new Error(\"Invalid async wrapper source\"); }} return __f(); }})({code_json})"
         );
@@ -1364,32 +1538,15 @@ fn run_codemode_blocking(
                         None => rquickjs::Value::new_undefined(ctx.clone()),
                     };
 
-                    let parsed_value = if val.is_undefined() {
-                        None
-                    } else {
-                        match ctx.json_stringify(&val) {
-                            Ok(Some(s)) => {
-                                let json_str = s.to_string().unwrap_or_default();
-                                serde_json::from_str::<serde_json::Value>(&json_str).ok()
-                            }
-                            Ok(None) => None,
-                            Err(_) => {
-                                return CodemodeResult {
-                                    ok: false,
-                                    value: None,
-                                    error: Some("Return value is not JSON-serializable".to_string()),
-                                    items: std::mem::take(&mut *lock_or_recover(&items)),
-                                };
-                            }
-                        }
-                    };
-
-                    CodemodeResult {
-                        ok: true,
-                        value: parsed_value,
-                        error: None,
-                        items: std::mem::take(&mut *lock_or_recover(&items)),
-                    }
+                    finalize_codemode_value(
+                        &ctx,
+                        &val,
+                        deadline,
+                        &cancel,
+                        &exited,
+                        config.max_output_chars,
+                        &items,
+                    )
                 }
                 rquickjs::promise::PromiseState::Rejected => {
                     let _ = promise.result::<rquickjs::Value>();
@@ -1411,9 +1568,27 @@ fn run_codemode_blocking(
                     }
                 }
                 rquickjs::promise::PromiseState::Pending => {
-                    // An uncatchable exit raised inside a promise job leaves the
-                    // async function's promise pending: QuickJS does not settle
-                    // it when the interrupt prevents the resume from returning.
+                    // An uncatchable internal error (OOM, stack overflow) or exit
+                    // raised inside a promise job can leave the promise pending
+                    // with a pending exception on the context.
+                    let exc = ctx.catch();
+                    if !exc.is_null() && !exc.is_undefined() {
+                        let err_msg = format_js_error(&ctx, exc, rquickjs::Error::Exception);
+                        if is_clean_exit(&exited, &err_msg) {
+                            return CodemodeResult {
+                                ok: true,
+                                value: None,
+                                error: None,
+                                items: std::mem::take(&mut *lock_or_recover(&items)),
+                            };
+                        }
+                        return CodemodeResult {
+                            ok: false,
+                            value: None,
+                            error: Some(err_msg),
+                            items: std::mem::take(&mut *lock_or_recover(&items)),
+                        };
+                    }
                     if exited.load(Ordering::SeqCst) {
                         return CodemodeResult {
                             ok: true,
@@ -1436,55 +1611,360 @@ fn run_codemode_blocking(
         } else {
             // A plain value can only appear if QuickJS fails to construct the
             // async function; still apply the same deadline/cancel/exit checks.
-            if Instant::now() > deadline {
-                return CodemodeResult {
-                    ok: false,
-                    value: None,
-                    error: Some("Execution timed out".to_string()),
-                    items: std::mem::take(&mut *lock_or_recover(&items)),
-                };
-            }
-            if cancel.is_cancelled() {
-                return CodemodeResult {
-                    ok: false,
-                    value: None,
-                    error: Some("Execution was cancelled".to_string()),
-                    items: std::mem::take(&mut *lock_or_recover(&items)),
-                };
-            }
-            if exited.load(Ordering::SeqCst) {
-                return CodemodeResult {
-                    ok: true,
-                    value: None,
-                    error: None,
-                    items: std::mem::take(&mut *lock_or_recover(&items)),
-                };
-            }
-            let parsed_value = if eval_val.is_undefined() {
-                None
-            } else {
-                match ctx.json_stringify(&eval_val) {
-                    Ok(Some(s)) => {
-                        let json_str = s.to_string().unwrap_or_default();
-                        serde_json::from_str::<serde_json::Value>(&json_str).ok()
-                    }
-                    Ok(None) => None,
-                    Err(_) => {
+            finalize_codemode_value(
+                &ctx,
+                &eval_val,
+                deadline,
+                &cancel,
+                &exited,
+                config.max_output_chars,
+                &items,
+            )
+        }
+    })
+}
+
+fn finalize_codemode_value<'js>(
+    ctx: &rquickjs::Ctx<'js>,
+    val: &rquickjs::Value<'js>,
+    deadline: Instant,
+    cancel: &CancellationToken,
+    exited: &AtomicBool,
+    max_output_chars: usize,
+    items: &Mutex<Vec<CodemodeOutputItem>>,
+) -> CodemodeResult {
+    if Instant::now() > deadline {
+        return CodemodeResult {
+            ok: false,
+            value: None,
+            error: Some("Execution timed out".to_string()),
+            items: std::mem::take(&mut *lock_or_recover(items)),
+        };
+    }
+    if cancel.is_cancelled() {
+        return CodemodeResult {
+            ok: false,
+            value: None,
+            error: Some("Execution was cancelled".to_string()),
+            items: std::mem::take(&mut *lock_or_recover(items)),
+        };
+    }
+    if exited.load(Ordering::SeqCst) {
+        return CodemodeResult {
+            ok: true,
+            value: None,
+            error: None,
+            items: std::mem::take(&mut *lock_or_recover(items)),
+        };
+    }
+    let parsed_value = if val.is_undefined() {
+        None
+    } else {
+        match ctx.json_stringify(val) {
+            Ok(Some(s)) => {
+                if Instant::now() > deadline {
+                    return CodemodeResult {
+                        ok: false,
+                        value: None,
+                        error: Some("Execution timed out".to_string()),
+                        items: std::mem::take(&mut *lock_or_recover(items)),
+                    };
+                }
+                if cancel.is_cancelled() {
+                    return CodemodeResult {
+                        ok: false,
+                        value: None,
+                        error: Some("Execution was cancelled".to_string()),
+                        items: std::mem::take(&mut *lock_or_recover(items)),
+                    };
+                }
+                let json_str = match s.to_string() {
+                    Ok(s) => s,
+                    Err(e) => {
                         return CodemodeResult {
                             ok: false,
                             value: None,
-                            error: Some("Return value is not JSON-serializable".to_string()),
-                            items: std::mem::take(&mut *lock_or_recover(&items)),
+                            error: Some(format!("Return value is not valid UTF-8: {e}")),
+                            items: std::mem::take(&mut *lock_or_recover(items)),
+                        };
+                    }
+                };
+                if json_str.len() > max_output_chars {
+                    return CodemodeResult {
+                        ok: false,
+                        value: None,
+                        error: Some(format!(
+                            "Return value exceeds maximum output size ({} > {} bytes)",
+                            json_str.len(),
+                            max_output_chars
+                        )),
+                        items: std::mem::take(&mut *lock_or_recover(items)),
+                    };
+                }
+                match serde_json::from_str::<serde_json::Value>(&json_str) {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        return CodemodeResult {
+                            ok: false,
+                            value: None,
+                            error: Some(format!("Return value is not valid JSON: {e}")),
+                            items: std::mem::take(&mut *lock_or_recover(items)),
                         };
                     }
                 }
-            };
-            CodemodeResult {
-                ok: true,
-                value: parsed_value,
-                error: None,
-                items: std::mem::take(&mut *lock_or_recover(&items)),
+            }
+            Ok(None) => None,
+            Err(e) => {
+                if Instant::now() > deadline {
+                    return CodemodeResult {
+                        ok: false,
+                        value: None,
+                        error: Some("Execution timed out".to_string()),
+                        items: std::mem::take(&mut *lock_or_recover(items)),
+                    };
+                }
+                if cancel.is_cancelled() {
+                    return CodemodeResult {
+                        ok: false,
+                        value: None,
+                        error: Some("Execution was cancelled".to_string()),
+                        items: std::mem::take(&mut *lock_or_recover(items)),
+                    };
+                }
+                let exc = ctx.catch();
+                let detail = if !exc.is_null() && !exc.is_undefined() {
+                    format_js_error(ctx, exc, e)
+                } else {
+                    e.to_string()
+                };
+                return CodemodeResult {
+                    ok: false,
+                    value: None,
+                    error: Some(format!("Return value is not JSON-serializable: {detail}")),
+                    items: std::mem::take(&mut *lock_or_recover(items)),
+                };
             }
         }
-    })
+    };
+    CodemodeResult {
+        ok: true,
+        value: parsed_value,
+        error: None,
+        items: std::mem::take(&mut *lock_or_recover(items)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_png_base64(decoded_bytes: usize) -> String {
+        let mut raw = vec![0u8; decoded_bytes.max(8)];
+        raw[..8].copy_from_slice(b"\x89PNG\r\n\x1a\n");
+        BASE64.encode(&raw)
+    }
+
+    fn noop_executor() -> SandboxToolExecutor {
+        Arc::new(|_name, _args, _cancel| Box::pin(async { Ok(serde_json::json!("ok")) }))
+    }
+
+    #[tokio::test]
+    async fn test_large_image_above_256kib_succeeds_under_default_config() {
+        // ~1.53 MiB decoded -> ~2.03 MiB base64 (> 256 KiB default max_output_chars and
+        // > 2 MiB raw base64 chars, but < 2 MiB decoded CODEMODE_MAX_IMAGE_BYTES).
+        let b64 = make_png_base64(1_600_000);
+        assert!(b64.len() > CODEMODE_MAX_IMAGE_BYTES);
+        let code = format!(r#"image("data:image/png;base64,{b64}"); return "ok";"#);
+        let res = run_codemode(
+            &code,
+            &[],
+            noop_executor(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &CodemodeConfig::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(res.ok, "expected >256 KiB image to succeed, got: {:?}", res.error);
+        assert_eq!(res.items.len(), 1);
+        assert!(matches!(res.items[0], CodemodeOutputItem::Image { .. }));
+
+        // Exceeding decoded CODEMODE_MAX_IMAGE_BYTES must still be rejected.
+        let oversized_b64 = make_png_base64(CODEMODE_MAX_IMAGE_BYTES + 3);
+        let oversized_code = format!(r#"image("data:image/png;base64,{oversized_b64}");"#);
+        let oversized_res = run_codemode(
+            &oversized_code,
+            &[],
+            noop_executor(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &CodemodeConfig::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!oversized_res.ok);
+    }
+
+    #[tokio::test]
+    async fn test_rejected_image_does_not_burn_quota() {
+        let valid_b64 = make_png_base64(64);
+        let oversized_b64 = make_png_base64(CODEMODE_MAX_IMAGE_BYTES + 3);
+        let code = format!(
+            r#"
+            for (let i = 0; i < 5; i++) {{
+                try {{ image("data:image/png;base64,{oversized_b64}"); }} catch (e) {{}}
+            }}
+            for (let i = 0; i < {CODEMODE_MAX_IMAGES}; i++) {{
+                image("data:image/png;base64,{valid_b64}");
+            }}
+            return "ok";
+            "#
+        );
+        let res = run_codemode(
+            &code,
+            &[],
+            noop_executor(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &CodemodeConfig::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(res.ok, "rejected images must not burn quota, got: {:?}", res.error);
+        assert_eq!(res.items.len(), CODEMODE_MAX_IMAGES);
+    }
+
+    #[tokio::test]
+    async fn test_dropping_run_codemode_future_cancels_immediately() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel::<()>();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let cancelled_tx = Arc::new(Mutex::new(Some(cancelled_tx)));
+
+        let executor: SandboxToolExecutor = Arc::new(move |_name, _args, cancel| {
+            let started_tx = started_tx.clone();
+            let cancelled_tx = cancelled_tx.clone();
+            Box::pin(async move {
+                if let Some(tx) = lock_or_recover(&started_tx).take() {
+                    let _ = tx.send(());
+                }
+                cancel.cancelled().await;
+                if let Some(tx) = lock_or_recover(&cancelled_tx).take() {
+                    let _ = tx.send(());
+                }
+                Err("cancelled".to_string())
+            })
+        });
+
+        let tool_def = ToolDefinition {
+            name: "slow".to_string(),
+            description: "Slow tool".to_string(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        };
+        let kv = Arc::new(Mutex::new(HashMap::new()));
+        let config = CodemodeConfig {
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+
+        {
+            let tool_defs = [tool_def];
+            let mut fut = Box::pin(run_codemode(
+                r#"await tools.slow({});"#,
+                &tool_defs,
+                executor,
+                kv,
+                &config,
+                CancellationToken::new(),
+            ));
+            tokio::select! {
+                _ = &mut fut => panic!("run_codemode should still be awaiting slow tool"),
+                _ = started_rx => {}
+            }
+        }
+
+        tokio::time::timeout(Duration::from_secs(2), cancelled_rx)
+            .await
+            .expect("nested tool cancellation did not fire promptly after future drop")
+            .expect("cancelled_tx dropped unexpectedly");
+    }
+
+    #[tokio::test]
+    async fn test_post_await_stack_overflow_and_oom_report_real_error() {
+        let tool_def = ToolDefinition {
+            name: "echo".to_string(),
+            description: "Echo".to_string(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+        };
+
+        // 1. Stack overflow after await
+        let stack_res = run_codemode(
+            r#"await tools.echo({}); function f() { return f(); } f();"#,
+            std::slice::from_ref(&tool_def),
+            noop_executor(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &CodemodeConfig::default(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!stack_res.ok);
+        let stack_err = stack_res.error.unwrap_or_default();
+        assert!(
+            !stack_err.contains("promise that can never settle"),
+            "stack overflow after await must not masquerade as unsettled promise: {stack_err}"
+        );
+        assert!(
+            stack_err.to_lowercase().contains("stack")
+                || stack_err.contains("InternalError"),
+            "expected stack overflow error, got: {stack_err}"
+        );
+
+        // 2. OOM after await
+        let oom_config = CodemodeConfig {
+            memory_limit_bytes: 2 * 1024 * 1024,
+            timeout: Duration::from_secs(10),
+            ..Default::default()
+        };
+        let oom_res = run_codemode(
+            r#"await tools.echo({}); const a = []; while (true) { a.push("x".repeat(65536)); }"#,
+            std::slice::from_ref(&tool_def),
+            noop_executor(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &oom_config,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!oom_res.ok);
+        let oom_err = oom_res.error.unwrap_or_default();
+        assert!(
+            !oom_err.contains("promise that can never settle"),
+            "OOM after await must not masquerade as unsettled promise: {oom_err}"
+        );
+        assert!(
+            oom_err.to_lowercase().contains("memory")
+                || oom_err.contains("InternalError"),
+            "expected OOM error, got: {oom_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_oversized_return_value_is_rejected() {
+        let config = CodemodeConfig {
+            max_output_chars: 1024,
+            ..Default::default()
+        };
+        let res = run_codemode(
+            r#"return "a".repeat(2048);"#,
+            &[],
+            noop_executor(),
+            Arc::new(Mutex::new(HashMap::new())),
+            &config,
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(!res.ok, "oversized return value must fail");
+        assert_eq!(res.value, None);
+        let err = res.error.unwrap_or_default();
+        assert!(
+            err.contains("exceeds maximum output size"),
+            "unexpected error message: {err}"
+        );
+    }
 }

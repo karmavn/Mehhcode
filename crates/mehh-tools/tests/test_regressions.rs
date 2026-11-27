@@ -467,9 +467,79 @@ async fn undo_creation_refuses_symlink_swap_to_unrelated_file() {
         "undo must not delete the unrelated file Q"
     );
     assert!(
-        store.has_snapshot(&link),
+        store.has_snapshot(&original_target),
         "a refused undo must keep the snapshot for a later retry"
     );
+}
+
+#[tokio::test]
+async fn undo_refuses_symlink_swap_to_other_file_with_existing_snapshot() {
+    let dir = TempDir::new("undo_symlink_swap_existing_q");
+    let original_target = dir.path().join("original.txt");
+    let link = dir.path().join("P.txt");
+    let other_file = dir.path().join("Q.txt");
+    std::fs::write(&other_file, "q_original").unwrap();
+
+    if let Err(e) = make_symlink(Path::new("original.txt"), &link) {
+        eprintln!("skipping undo symlink-swap test: cannot create symlinks ({e})");
+        return;
+    }
+
+    let store = Arc::new(EditUndoStore::new());
+    let edit = EditTool::new(dir.path().to_path_buf()).with_undo_store(store.clone());
+    let edit_q_params = json!({
+        "path": "Q.txt",
+        "oldText": "q_original",
+        "newText": "q_edited"
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    edit.execute("edit_q", edit_q_params, CancellationToken::new(), None)
+        .await
+        .expect("edit Q");
+    assert_eq!(std::fs::read_to_string(&other_file).unwrap(), "q_edited");
+
+    let write = WriteTool::new(dir.path().to_path_buf()).with_undo_store(store.clone());
+    let write_params = json!({ "path": "P.txt", "content": "p_created" })
+        .as_object()
+        .unwrap()
+        .clone();
+    write
+        .execute("write_p", write_params, CancellationToken::new(), None)
+        .await
+        .expect("write through dangling symlink");
+    assert_eq!(std::fs::read_to_string(&original_target).unwrap(), "p_created");
+
+    // Swap P.txt to point to Q.txt, which ALSO has an undo snapshot.
+    std::fs::remove_file(&link).unwrap();
+    if let Err(e) = make_symlink(Path::new("Q.txt"), &link) {
+        eprintln!("skipping undo symlink-swap test: cannot recreate symlink ({e})");
+        return;
+    }
+
+    let undo = UndoEditTool::new(dir.path().to_path_buf(), store.clone());
+    let mut undo_params = serde_json::Map::new();
+    undo_params.insert("path".to_string(), json!("P.txt"));
+    undo_params.insert(
+        mehh_agent::INSPECTED_TARGET_ARG.to_string(),
+        json!(original_target.to_string_lossy()),
+    );
+    let err = undo
+        .execute("undo", undo_params, CancellationToken::new(), None)
+        .await
+        .expect_err("undo must refuse after the target changed");
+    assert!(
+        err.contains("changed since it was inspected"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&other_file).unwrap(),
+        "q_edited",
+        "undo must not revert Q.txt when P.txt was swapped to point at Q.txt"
+    );
+    assert!(store.has_snapshot(&original_target));
+    assert!(store.has_snapshot(&other_file));
 }
 
 #[tokio::test]

@@ -6,8 +6,9 @@ use futures::StreamExt;
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256};
 
+use crate::oauth::redact_error_body_with_limit;
 use crate::retry::{
-    default_http_client, retry_failure_event, send_with_retry, RetryPolicy,
+    default_http_client, retry_failure_event, send_with_retry_with_secrets, RetryPolicy,
     DEFAULT_STREAM_CHUNK_TIMEOUT,
 };
 use crate::stream::{create_event_stream, AssistantEventSender, AssistantEventStream, LlmProvider};
@@ -58,35 +59,32 @@ fn parse_url_parts(url: &str) -> (String, String, String) {
     (host_port.to_string(), path, query)
 }
 
-/// Pure-Rust AWS SigV4 request signer.
-/// Generates required headers including Authorization, Host, x-amz-date, and x-amz-content-sha256.
-#[allow(clippy::too_many_arguments)]
-pub fn sign_aws_sigv4(
-    method: &str,
-    url: &str,
-    region: &str,
-    service: &str,
-    access_key: &str,
-    secret_key: &str,
-    session_token: Option<&str>,
-    payload: &[u8],
-    amz_date: &str,
-) -> Vec<(String, String)> {
-    let (host, path, canonical_query) = parse_url_parts(url);
-    let date_stamp = if amz_date.len() >= 8 {
-        &amz_date[..8]
-    } else {
-        amz_date
-    };
+struct SigV4Request<'a> {
+    method: &'a str,
+    url: &'a str,
+    region: &'a str,
+    service: &'a str,
+    access_key: &'a str,
+    secret_key: &'a str,
+    session_token: Option<&'a str>,
+    payload_hash: &'a str,
+    amz_date: &'a str,
+}
 
-    let payload_hash = sha256_hex(payload);
+fn sign_aws_sigv4_with_hash(req: SigV4Request<'_>) -> Vec<(String, String)> {
+    let (host, path, canonical_query) = parse_url_parts(req.url);
+    let date_stamp = if req.amz_date.is_ascii() {
+        req.amz_date.get(..8).unwrap_or(req.amz_date)
+    } else {
+        ""
+    };
 
     let mut signed_headers_map = vec![
         ("host", host.clone()),
-        ("x-amz-content-sha256", payload_hash.clone()),
-        ("x-amz-date", amz_date.to_string()),
+        ("x-amz-content-sha256", req.payload_hash.to_string()),
+        ("x-amz-date", req.amz_date.to_string()),
     ];
-    if let Some(token) = session_token {
+    if let Some(token) = req.session_token {
         signed_headers_map.push(("x-amz-security-token", token.to_string()));
     }
     signed_headers_map.sort_by(|a, b| a.0.cmp(b.0));
@@ -107,46 +105,75 @@ pub fn sign_aws_sigv4(
     let canonical_path = path.replace('%', "%25");
     let canonical_request = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
-        method.to_uppercase(),
+        req.method.to_uppercase(),
         canonical_path,
         canonical_query,
         canonical_headers,
         signed_headers_names,
-        payload_hash,
+        req.payload_hash,
     );
     let canonical_request_hash = sha256_hex(canonical_request.as_bytes());
 
-    let credential_scope = format!("{date_stamp}/{region}/{service}/aws4_request");
+    let credential_scope = format!("{date_stamp}/{}/{}/aws4_request", req.region, req.service);
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{}\n{}\n{}",
-        amz_date,
+        req.amz_date,
         credential_scope,
         canonical_request_hash,
     );
 
-    let k_secret = format!("AWS4{secret_key}");
+    let k_secret = format!("AWS4{}", req.secret_key);
     let k_date = hmac_sha256(k_secret.as_bytes(), date_stamp.as_bytes());
-    let k_region = hmac_sha256(&k_date, region.as_bytes());
-    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    let k_region = hmac_sha256(&k_date, req.region.as_bytes());
+    let k_service = hmac_sha256(&k_region, req.service.as_bytes());
     let k_signing = hmac_sha256(&k_service, b"aws4_request");
     // SigV4 signs by hex-encoding the raw HMAC digest. Hashing it a second
     // time with SHA-256 produces an invalid signature (403 InvalidSignature).
     let signature = hex_encode(&hmac_sha256(&k_signing, string_to_sign.as_bytes()));
 
     let auth_header = format!(
-        "AWS4-HMAC-SHA256 Credential={access_key}/{credential_scope}, SignedHeaders={signed_headers_names}, Signature={signature}"
+        "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers_names}, Signature={signature}",
+        req.access_key,
     );
 
     let mut out = vec![
         ("authorization".to_string(), auth_header),
         ("host".to_string(), host),
-        ("x-amz-date".to_string(), amz_date.to_string()),
-        ("x-amz-content-sha256".to_string(), payload_hash),
+        ("x-amz-date".to_string(), req.amz_date.to_string()),
+        ("x-amz-content-sha256".to_string(), req.payload_hash.to_string()),
     ];
-    if let Some(token) = session_token {
+    if let Some(token) = req.session_token {
         out.push(("x-amz-security-token".to_string(), token.to_string()));
     }
     out
+}
+
+/// Pure-Rust AWS SigV4 request signer.
+/// Generates required headers including Authorization, Host, x-amz-date, and x-amz-content-sha256.
+#[allow(clippy::too_many_arguments)]
+pub fn sign_aws_sigv4(
+    method: &str,
+    url: &str,
+    region: &str,
+    service: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    payload: &[u8],
+    amz_date: &str,
+) -> Vec<(String, String)> {
+    let payload_hash = sha256_hex(payload);
+    sign_aws_sigv4_with_hash(SigV4Request {
+        method,
+        url,
+        region,
+        service,
+        access_key,
+        secret_key,
+        session_token,
+        payload_hash: &payload_hash,
+        amz_date,
+    })
 }
 
 /// A parsed EventStream frame.
@@ -154,6 +181,13 @@ pub fn sign_aws_sigv4(
 pub struct EventStreamMessage {
     pub headers: HashMap<String, String>,
     pub payload: Vec<u8>,
+}
+
+fn read_be_bytes<const N: usize>(bytes: &[u8], label: &str) -> Result<[u8; N], anyhow::Error> {
+    bytes
+        .get(..N)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| anyhow::anyhow!("{label}"))
 }
 
 fn decode_eventstream_headers(mut bytes: &[u8]) -> Result<HashMap<String, String>, anyhow::Error> {
@@ -188,34 +222,24 @@ fn decode_eventstream_headers(mut bytes: &[u8]) -> Result<HashMap<String, String
                 bytes = &bytes[1..];
             }
             3 => {
-                if bytes.len() < 2 {
-                    anyhow::bail!("Header short underflow");
-                }
-                let val = i16::from_be_bytes(bytes[..2].try_into().unwrap());
+                let val = i16::from_be_bytes(read_be_bytes::<2>(bytes, "Header short underflow")?);
                 headers.insert(name, val.to_string());
                 bytes = &bytes[2..];
             }
             4 => {
-                if bytes.len() < 4 {
-                    anyhow::bail!("Header int underflow");
-                }
-                let val = i32::from_be_bytes(bytes[..4].try_into().unwrap());
+                let val = i32::from_be_bytes(read_be_bytes::<4>(bytes, "Header int underflow")?);
                 headers.insert(name, val.to_string());
                 bytes = &bytes[4..];
             }
             5 => {
-                if bytes.len() < 8 {
-                    anyhow::bail!("Header long underflow");
-                }
-                let val = i64::from_be_bytes(bytes[..8].try_into().unwrap());
+                let val = i64::from_be_bytes(read_be_bytes::<8>(bytes, "Header long underflow")?);
                 headers.insert(name, val.to_string());
                 bytes = &bytes[8..];
             }
             6 => {
-                if bytes.len() < 2 {
-                    anyhow::bail!("Header bytes length underflow");
-                }
-                let len = u16::from_be_bytes(bytes[..2].try_into().unwrap()) as usize;
+                let len =
+                    u16::from_be_bytes(read_be_bytes::<2>(bytes, "Header bytes length underflow")?)
+                        as usize;
                 bytes = &bytes[2..];
                 if bytes.len() < len {
                     anyhow::bail!("Header byte array underflow");
@@ -223,10 +247,10 @@ fn decode_eventstream_headers(mut bytes: &[u8]) -> Result<HashMap<String, String
                 bytes = &bytes[len..];
             }
             7 => {
-                if bytes.len() < 2 {
-                    anyhow::bail!("Header string length underflow");
-                }
-                let len = u16::from_be_bytes(bytes[..2].try_into().unwrap()) as usize;
+                let len = u16::from_be_bytes(read_be_bytes::<2>(
+                    bytes,
+                    "Header string length underflow",
+                )?) as usize;
                 bytes = &bytes[2..];
                 if bytes.len() < len {
                     anyhow::bail!("Header string value underflow");
@@ -236,10 +260,8 @@ fn decode_eventstream_headers(mut bytes: &[u8]) -> Result<HashMap<String, String
                 bytes = &bytes[len..];
             }
             8 => {
-                if bytes.len() < 8 {
-                    anyhow::bail!("Header timestamp underflow");
-                }
-                let val = i64::from_be_bytes(bytes[..8].try_into().unwrap());
+                let val =
+                    i64::from_be_bytes(read_be_bytes::<8>(bytes, "Header timestamp underflow")?);
                 headers.insert(name, val.to_string());
                 bytes = &bytes[8..];
             }
@@ -295,7 +317,9 @@ pub struct EventStreamParser {
 impl EventStreamParser {
     /// Creates a new empty EventStream parser.
     pub fn new() -> Self {
-        Self { buffer: Vec::new() }
+        Self {
+            buffer: Vec::with_capacity(4096),
+        }
     }
 
     /// Returns true when trailing incomplete bytes remain in the frame buffer.
@@ -318,9 +342,18 @@ impl EventStreamParser {
         let result = (|| {
             while self.buffer.len() - offset >= 12 {
                 let frame = &self.buffer[offset..];
-                let total_len = u32::from_be_bytes(frame[0..4].try_into().unwrap()) as usize;
-                let headers_len = u32::from_be_bytes(frame[4..8].try_into().unwrap()) as usize;
-                let prelude_crc = u32::from_be_bytes(frame[8..12].try_into().unwrap());
+                let total_len = u32::from_be_bytes(read_be_bytes::<4>(
+                    &frame[0..4],
+                    "EventStream prelude underflow",
+                )?) as usize;
+                let headers_len = u32::from_be_bytes(read_be_bytes::<4>(
+                    &frame[4..8],
+                    "EventStream prelude underflow",
+                )?) as usize;
+                let prelude_crc = u32::from_be_bytes(read_be_bytes::<4>(
+                    &frame[8..12],
+                    "EventStream prelude underflow",
+                )?);
 
                 if !(16..=MAX_EVENTSTREAM_BUFFER_BYTES).contains(&total_len)
                     || headers_len > total_len - 16
@@ -341,8 +374,10 @@ impl EventStreamParser {
                     break;
                 }
 
-                let message_crc =
-                    u32::from_be_bytes(frame[total_len - 4..total_len].try_into().unwrap());
+                let message_crc = u32::from_be_bytes(read_be_bytes::<4>(
+                    &frame[total_len - 4..total_len],
+                    "EventStream message CRC underflow",
+                )?);
                 let calculated_message_crc = crc32fast::hash(&frame[0..total_len - 4]);
                 if calculated_message_crc != message_crc {
                     anyhow::bail!(
@@ -420,15 +455,29 @@ fn supports_prompt_caching(model: &Model) -> bool {
 }
 
 fn normalize_bedrock_tool_call_id(id: &str) -> String {
-    let sanitized: String = id
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '_' || c == '-' { c } else { '_' })
-        .collect();
-    if sanitized.len() > 64 {
-        sanitized[..64].to_string()
-    } else {
-        sanitized
+    crate::transform_messages::sanitize_and_cap_tool_call_id(id, 64)
+}
+
+fn push_bedrock_message(
+    messages: &mut Vec<serde_json::Value>,
+    role: &str,
+    parts: Vec<serde_json::Value>,
+) {
+    if parts.is_empty() {
+        return;
     }
+    if let Some(last) = messages.last_mut() {
+        if last.get("role").and_then(|r| r.as_str()) == Some(role) {
+            if let Some(existing) = last.get_mut("content").and_then(|c| c.as_array_mut()) {
+                existing.extend(parts);
+                return;
+            }
+        }
+    }
+    messages.push(serde_json::json!({
+        "role": role,
+        "content": parts,
+    }));
 }
 
 /// Builds the JSON request payload for Amazon Bedrock ConverseStream API.
@@ -438,18 +487,18 @@ pub fn build_bedrock_request(
     options: &StreamOptions,
 ) -> serde_json::Value {
     use crate::transform_messages::{split_error_tool_result_images, transform_messages};
-    use crate::unicode::sanitize_surrogates;
+    use crate::unicode::sanitize_surrogates_cow;
 
     let mut system_texts = Vec::new();
     if let Some(sys) = &context.system_prompt {
         if !sys.is_empty() {
-            system_texts.push(sanitize_surrogates(sys));
+            system_texts.push(sanitize_surrogates_cow(sys));
         }
     }
     for msg in &context.messages {
         if let Message::System(sys) = msg {
             if !sys.content.is_empty() {
-                system_texts.push(sanitize_surrogates(&sys.content));
+                system_texts.push(sanitize_surrogates_cow(&sys.content));
             }
         }
     }
@@ -472,11 +521,11 @@ pub fn build_bedrock_request(
             }
             Message::User(u) => {
                 let content_parts: Vec<serde_json::Value> = match &u.content {
-                    UserContent::Text(text) => vec![serde_json::json!({ "text": sanitize_surrogates(text) })],
+                    UserContent::Text(text) => vec![serde_json::json!({ "text": sanitize_surrogates_cow(text) })],
                     UserContent::Blocks(blocks) => blocks
                         .iter()
                         .map(|b| match b {
-                            UserContentBlock::Text(tc) => serde_json::json!({ "text": sanitize_surrogates(&tc.text) }),
+                            UserContentBlock::Text(tc) => serde_json::json!({ "text": sanitize_surrogates_cow(&tc.text) }),
                             UserContentBlock::Image(img) => {
                                 let format = match img.mime_type.as_str() {
                                     "image/png" => "png",
@@ -498,21 +547,7 @@ pub fn build_bedrock_request(
                 // A steering user can follow a ToolResult, which is also emitted
                 // as role=user. Converse requires alternating roles, so merge
                 // the parts into the existing user message instead.
-                if let Some(last) = messages.last_mut() {
-                    if last.get("role").and_then(|r| r.as_str()) == Some("user") {
-                        if let Some(existing) =
-                            last.get_mut("content").and_then(|c| c.as_array_mut())
-                        {
-                            existing.extend(content_parts);
-                            i += 1;
-                            continue;
-                        }
-                    }
-                }
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": content_parts,
-                }));
+                push_bedrock_message(&mut messages, "user", content_parts);
                 i += 1;
             }
             Message::Assistant(a) => {
@@ -521,18 +556,26 @@ pub fn build_bedrock_request(
                     match block {
                         AssistantContentBlock::Text(tc) => {
                             if !tc.text.is_empty() {
-                                content_parts.push(serde_json::json!({ "text": sanitize_surrogates(&tc.text) }));
+                                content_parts.push(serde_json::json!({ "text": sanitize_surrogates_cow(&tc.text) }));
                             }
                         }
                         AssistantContentBlock::Thinking(th) => {
-                            let mut reasoning_text = serde_json::Map::new();
-                            reasoning_text.insert("text".to_string(), serde_json::json!(sanitize_surrogates(&th.thinking)));
-                            if let Some(sig) = &th.thinking_signature {
-                                reasoning_text.insert("signature".to_string(), serde_json::json!(sig));
+                            if th.redacted == Some(true) {
+                                if let Some(sig) = &th.thinking_signature {
+                                    content_parts.push(serde_json::json!({
+                                        "reasoningContent": { "redactedContent": sig }
+                                    }));
+                                }
+                            } else {
+                                let mut reasoning_text = serde_json::Map::new();
+                                reasoning_text.insert("text".to_string(), serde_json::json!(sanitize_surrogates_cow(&th.thinking)));
+                                if let Some(sig) = &th.thinking_signature {
+                                    reasoning_text.insert("signature".to_string(), serde_json::json!(sig));
+                                }
+                                content_parts.push(serde_json::json!({
+                                    "reasoningContent": { "reasoningText": reasoning_text }
+                                }));
                             }
-                            content_parts.push(serde_json::json!({
-                                "reasoningContent": { "reasoningText": reasoning_text }
-                            }));
                         }
                         AssistantContentBlock::ToolCall(tc) => {
                             content_parts.push(serde_json::json!({
@@ -545,10 +588,7 @@ pub fn build_bedrock_request(
                         }
                     }
                 }
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": content_parts,
-                }));
+                push_bedrock_message(&mut messages, "assistant", content_parts);
                 i += 1;
             }
             Message::ToolResult(_) => {
@@ -571,7 +611,7 @@ pub fn build_bedrock_request(
                         for b in content_blocks {
                             match b {
                                 ToolResultContentBlock::Text(tc) => {
-                                    contents.push(serde_json::json!({ "text": sanitize_surrogates(&tc.text) }));
+                                    contents.push(serde_json::json!({ "text": sanitize_surrogates_cow(&tc.text) }));
                                 }
                                 ToolResultContentBlock::Image(img) => {
                                     let format = match img.mime_type.as_str() {
@@ -601,7 +641,7 @@ pub fn build_bedrock_request(
                             }
                         }));
                         if let Some(s) = split {
-                            error_images.push(serde_json::json!({ "text": sanitize_surrogates(&s.caption) }));
+                            error_images.push(serde_json::json!({ "text": sanitize_surrogates_cow(&s.caption) }));
                             for img in s.images {
                                 let format = match img.mime_type.as_str() {
                                     "image/png" => "png",
@@ -627,10 +667,7 @@ pub fn build_bedrock_request(
 
                 let mut combined_content = tool_results;
                 combined_content.extend(error_images);
-                messages.push(serde_json::json!({
-                    "role": "user",
-                    "content": combined_content,
-                }));
+                push_bedrock_message(&mut messages, "user", combined_content);
             }
         }
     }
@@ -639,7 +676,7 @@ pub fn build_bedrock_request(
     let caching_enabled = resolved_cache_retention != CacheRetention::None
         && supports_prompt_caching(model);
     let cache_point = if resolved_cache_retention == CacheRetention::Long {
-        serde_json::json!({ "type": "default", "ttl": "ONE_HOUR" })
+        serde_json::json!({ "type": "default", "ttl": "1h" })
     } else {
         serde_json::json!({ "type": "default" })
     };
@@ -668,17 +705,18 @@ pub fn build_bedrock_request(
         );
     }
 
-    let thinking_enabled = model.reasoning && options.reasoning != Some(ThinkingLevel::Off);
+    let thinking_enabled =
+        is_claude && model.reasoning && options.reasoning.is_some_and(|r| r != ThinkingLevel::Off);
     let max_tokens = options.max_tokens.unwrap_or(model.max_tokens);
 
     let mut inference_config = serde_json::Map::new();
     // Claude on Bedrock rejects temperature != 1 when extended thinking is on.
     if let Some(temp) = options.temperature {
-        if !thinking_enabled || !is_claude {
+        if !thinking_enabled {
             inference_config.insert("temperature".to_string(), serde_json::json!(temp));
         }
     }
-    if options.max_tokens.is_some() {
+    if options.max_tokens.is_some() || thinking_enabled {
         inference_config.insert("maxTokens".to_string(), serde_json::json!(max_tokens));
     }
     if !inference_config.is_empty() {
@@ -727,8 +765,7 @@ pub fn build_bedrock_request(
         };
         // Bedrock caps budget_tokens at 32768 and requires it below maxTokens.
         let budget = budget
-            .min(32768)
-            .max(MIN_ANSWER_TOKENS)
+            .clamp(MIN_ANSWER_TOKENS, 32768)
             .min(max_tokens - 1);
         req_map.insert(
             "additionalModelRequestFields".to_string(),
@@ -761,6 +798,7 @@ pub struct BedrockStreamState {
     done: bool,
     pub received_terminal: bool,
     open_blocks: HashMap<usize, BedrockOpenBlock>,
+    secrets: Vec<String>,
 }
 
 impl BedrockStreamState {
@@ -773,19 +811,31 @@ impl BedrockStreamState {
             done: false,
             received_terminal: false,
             open_blocks: HashMap::new(),
+            secrets: Vec::new(),
         }
+    }
+
+    /// Configures active request secrets to redact from any error messages.
+    pub fn set_secrets(&mut self, secrets: Vec<String>) {
+        self.secrets = secrets;
+    }
+
+    fn redact_error(&self, msg: &str) -> String {
+        let refs: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
+        redact_error_body_with_limit(msg, &refs, 4096)
     }
 
     /// Marks the stream as aborted so `finish_into` emits an aborted terminal event.
     pub fn mark_aborted(&mut self, msg: &str) {
         self.output.stop_reason = StopReason::Aborted;
-        self.output.error_message = Some(msg.to_string());
+        self.output.error_message = Some(self.redact_error(msg));
     }
 
     /// Marks the stream as failed so `finish_into` emits an error terminal event.
     pub fn mark_error(&mut self, msg: impl Into<String>) {
         self.output.stop_reason = StopReason::Error;
-        self.output.error_message = Some(msg.into());
+        let raw = msg.into();
+        self.output.error_message = Some(self.redact_error(&raw));
     }
 
     /// Processes a single decoded JSON payload from an EventStream frame and sends events.
@@ -803,6 +853,9 @@ impl BedrockStreamState {
         json: &serde_json::Value,
         events: &mut Vec<AssistantMessageEvent>,
     ) {
+        if self.done {
+            return;
+        }
         if !self.started {
             self.started = true;
             events.push(AssistantMessageEvent::Start {
@@ -815,9 +868,9 @@ impl BedrockStreamState {
             for (k, v) in obj {
                 if (k.ends_with("Exception") || k.ends_with("exception") || k == "error") && v.is_object() {
                     self.received_terminal = true;
-                    self.output.stop_reason = StopReason::Error;
                     let msg = v.get("message").and_then(|m| m.as_str()).unwrap_or(k.as_str());
-                    self.output.error_message = Some(format!("{k}: {msg}"));
+                    self.mark_error(format!("{k}: {msg}"));
+                    self.finish_into(events);
                     return;
                 }
             }
@@ -921,18 +974,28 @@ impl BedrockStreamState {
                             th.thinking_signature = Some(sig.to_string());
                         }
                     }
+                    if let Some(redacted_data) = rc.get("redactedContent").and_then(|v| v.as_str()) {
+                        if let Some(AssistantContentBlock::Thinking(th)) = self.output.content.get_mut(content_index) {
+                            th.redacted = Some(true);
+                            th.thinking_signature = Some(redacted_data.to_string());
+                            if th.thinking.is_empty() {
+                                th.thinking = "[Reasoning redacted]".to_string();
+                            }
+                        }
+                    }
                 } else if let Some(tu) = delta.get("toolUse") {
                     if let Some(input_delta) = tu.get("input").and_then(|v| v.as_str()) {
                         if let Some(BedrockOpenBlock::ToolCall { content_index, stream }) = self.open_blocks.get_mut(&block_idx) {
                             let c_idx = *content_index;
-                            let args = stream.append(input_delta);
-                            if let Some(AssistantContentBlock::ToolCall(tc)) = self.output.content.get_mut(c_idx) {
-                                tc.arguments = args;
+                            if let Some(args) = stream.append_if_changed(input_delta) {
+                                if let Some(AssistantContentBlock::ToolCall(tc)) = self.output.content.get_mut(c_idx) {
+                                    tc.arguments = args.clone();
+                                }
                             }
                             events.push(AssistantMessageEvent::ToolCallDelta {
                                 content_index: c_idx,
                                 delta: input_delta.to_string(),
-                                partial: self.output.metadata_clone_with_block(c_idx),
+                                partial: self.output.clone(),
                             });
                         }
                     }
@@ -991,34 +1054,49 @@ impl BedrockStreamState {
         // 4. messageStop
         if let Some(ms) = json.get("messageStop") {
             self.received_terminal = true;
-            if let Some(reason) = ms.get("stopReason").and_then(|v| v.as_str()) {
-                self.output.stop_reason = match reason {
-                    "end_turn" | "stop_sequence" => StopReason::Stop,
-                    "tool_use" => StopReason::ToolUse,
-                    "max_tokens" => StopReason::Length,
-                    "content_filtered" => StopReason::Error,
-                    _ => StopReason::Stop,
-                };
+            if !matches!(
+                self.output.stop_reason,
+                StopReason::Error | StopReason::Aborted
+            ) {
+                if let Some(reason) = ms.get("stopReason").and_then(|v| v.as_str()) {
+                    self.output.stop_reason = match reason {
+                        "end_turn" | "stop_sequence" => StopReason::Stop,
+                        "tool_use" => StopReason::ToolUse,
+                        "max_tokens" => StopReason::Length,
+                        "content_filtered" => {
+                            if self.output.error_message.is_none() {
+                                self.output.error_message =
+                                    Some("Response blocked by Bedrock content filter".to_string());
+                            }
+                            StopReason::Error
+                        }
+                        _ => StopReason::Stop,
+                    };
+                }
             }
         }
 
         // 5. metadata
         if let Some(meta) = json.get("metadata") {
-            if let Some(usage) = meta.get("usage") {
+            if let Some(usage) = meta.get("usage").filter(|u| u.is_object()) {
                 let input = usage.get("inputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 let output = usage.get("outputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 let total = usage.get("totalTokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 let cache_read = usage.get("cacheReadInputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
                 let cache_write = usage.get("cacheWriteInputTokens").and_then(|v| v.as_u64()).unwrap_or(0);
 
-                self.output.usage.input = input.saturating_sub(cache_read);
+                // Bedrock `inputTokens` already excludes cached tokens.
+                self.output.usage.input = input;
                 self.output.usage.output = output;
                 self.output.usage.cache_read = cache_read;
                 self.output.usage.cache_write = cache_write;
                 self.output.usage.total_tokens = if total > 0 {
                     total
                 } else {
-                    input.saturating_add(output)
+                    input
+                        .saturating_add(output)
+                        .saturating_add(cache_read)
+                        .saturating_add(cache_write)
                 };
                 self.output.usage.calculate_cost(&self.model.cost);
             }
@@ -1113,6 +1191,186 @@ impl BedrockStreamState {
     }
 }
 
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn extract_bedrock_region_from_base_url(base_url: &str) -> Option<String> {
+    let parsed = reqwest::Url::parse(base_url.trim()).ok()?;
+    let host = parsed.host_str()?;
+    let region = host
+        .strip_prefix("bedrock-runtime.")?
+        .strip_suffix(".amazonaws.com")?;
+    if region.is_empty() || region.contains('.') {
+        return None;
+    }
+    Some(region.to_string())
+}
+
+fn insert_custom_headers(
+    header_map: &mut reqwest::header::HeaderMap,
+    headers: Option<&HashMap<String, String>>,
+) -> Result<(), String> {
+    if let Some(map) = headers {
+        for (k, v) in map {
+            let name = reqwest::header::HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| format!("Invalid header name '{k}': {e}"))?;
+            let value = reqwest::header::HeaderValue::from_str(v)
+                .map_err(|e| format!("Invalid header value for '{k}': {e}"))?;
+            header_map.insert(name, value);
+        }
+    }
+    Ok(())
+}
+
+/// Dispatches a decoded Bedrock EventStream frame into `BedrockStreamState`.
+/// Returns `true` when a fatal frame error/exception requires immediate stream termination.
+pub fn process_eventstream_message_into(
+    ev: &EventStreamMessage,
+    state: &mut BedrockStreamState,
+    batch: &mut Vec<AssistantMessageEvent>,
+) -> bool {
+    let msg_type = ev.headers.get(":message-type").map(|s| s.as_str());
+    if msg_type == Some("exception") || msg_type == Some("error") {
+        let exc = ev
+            .headers
+            .get(":exception-type")
+            .or_else(|| ev.headers.get(":error-code"))
+            .cloned()
+            .unwrap_or_else(|| "Bedrock exception".to_string());
+        let detail = if let Some(msg) = ev.headers.get(":error-message") {
+            msg.clone()
+        } else {
+            String::from_utf8_lossy(&ev.payload).to_string()
+        };
+        state.mark_error(format!("{exc}: {detail}"));
+        state.finish_into(batch);
+        return true;
+    }
+
+    match serde_json::from_slice::<serde_json::Value>(&ev.payload) {
+        Ok(json) => {
+            let wrapped = match ev.headers.get(":event-type").map(|s| s.as_str()) {
+                Some(event_type) if !event_type.is_empty() => match &json {
+                    serde_json::Value::Object(map) if !map.contains_key(event_type) => {
+                        serde_json::json!({ event_type: json })
+                    }
+                    _ => json,
+                },
+                _ => json,
+            };
+            state.process_event_into(&wrapped, batch);
+            state.done
+                && matches!(
+                    state.output.stop_reason,
+                    StopReason::Error | StopReason::Aborted
+                )
+        }
+        Err(e) => {
+            if msg_type == Some("event") {
+                state.mark_error(format!("Invalid JSON in Bedrock event frame: {e}"));
+                state.finish_into(batch);
+                true
+            } else {
+                false
+            }
+        }
+    }
+}
+
+fn validate_bedrock_endpoint(model_base_url: &str, region: &str) -> Result<String, String> {
+    if region.is_empty()
+        || !region
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+    {
+        return Err(format!("Invalid AWS Bedrock region: '{region}'"));
+    }
+    let base_url = if model_base_url.trim().is_empty() {
+        format!("https://bedrock-runtime.{region}.amazonaws.com")
+    } else {
+        model_base_url.trim().trim_end_matches('/').to_string()
+    };
+    let parsed = reqwest::Url::parse(&base_url)
+        .map_err(|e| format!("Invalid AWS Bedrock base URL '{base_url}': {e}"))?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(format!(
+            "Invalid AWS Bedrock base URL '{base_url}': must use http or https with a host"
+        ));
+    }
+    Ok(parsed.as_str().trim_end_matches('/').to_string())
+}
+
+fn resolve_bedrock_region_and_base_url(model_base_url: &str) -> Result<(String, String), String> {
+    let region = extract_bedrock_region_from_base_url(model_base_url)
+        .or_else(|| non_empty_env("AWS_REGION"))
+        .or_else(|| non_empty_env("AWS_DEFAULT_REGION"))
+        .unwrap_or_else(|| "us-east-1".to_string());
+    let base_url = validate_bedrock_endpoint(model_base_url, &region)?;
+    Ok((region, base_url))
+}
+
+struct SigV4HeaderParams<'a> {
+    url: &'a str,
+    region: &'a str,
+    access_key: &'a str,
+    secret_key: &'a str,
+    session_token: Option<&'a str>,
+    payload_hash: &'a str,
+    amz_date: &'a str,
+}
+
+fn build_sigv4_headers_with_hash(
+    p: SigV4HeaderParams<'_>,
+) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>, String> {
+    let sig_headers = sign_aws_sigv4_with_hash(SigV4Request {
+        method: "POST",
+        url: p.url,
+        region: p.region,
+        service: "bedrock",
+        access_key: p.access_key,
+        secret_key: p.secret_key,
+        session_token: p.session_token,
+        payload_hash: p.payload_hash,
+        amz_date: p.amz_date,
+    });
+    let mut out = Vec::with_capacity(sig_headers.len());
+    for (name, val) in sig_headers {
+        let h_name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|e| format!("Invalid SigV4 header name '{name}': {e}"))?;
+        let h_val = reqwest::header::HeaderValue::from_str(&val)
+            .map_err(|e| format!("Invalid SigV4 header value for '{name}': {e}"))?;
+        out.push((h_name, h_val));
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn build_sigv4_headers(
+    url: &str,
+    region: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+    body_bytes: &[u8],
+    amz_date: &str,
+) -> Result<Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)>, String> {
+    let payload_hash = sha256_hex(body_bytes);
+    build_sigv4_headers_with_hash(SigV4HeaderParams {
+        url,
+        region,
+        access_key,
+        secret_key,
+        session_token,
+        payload_hash: &payload_hash,
+        amz_date,
+    })
+}
+
 /// Provider for Amazon Bedrock ConverseStream API.
 pub struct BedrockProvider {
     client: reqwest::Client,
@@ -1150,85 +1408,192 @@ impl LlmProvider for BedrockProvider {
         let (sender, stream) = create_event_stream();
         let client = self.client.clone();
         let model = model.clone();
-        let context = context.clone();
         let options = options.clone();
+        let body_bytes = serde_json::to_vec(&build_bedrock_request(&model, context, &options))
+            .unwrap_or_default();
 
         tokio::spawn(async move {
-            let body_json = build_bedrock_request(&model, &context, &options);
-            let body_bytes = serde_json::to_vec(&body_json).unwrap_or_default();
 
-            let region = std::env::var("AWS_REGION")
-                .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
-                .unwrap_or_else(|_| "us-east-1".to_string());
-
-            let base_url = if model.base_url.is_empty() {
-                format!("https://bedrock-runtime.{region}.amazonaws.com")
-            } else {
-                model.base_url.trim_end_matches('/').to_string()
+            let (region, base_url) = match resolve_bedrock_region_and_base_url(&model.base_url) {
+                Ok(pair) => pair,
+                Err(e) => {
+                    let mut err_msg = AssistantMessage::empty_for_model(&model);
+                    err_msg.stop_reason = StopReason::Error;
+                    err_msg.error_message = Some(e);
+                    let _ = sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: err_msg,
+                        })
+                        .await;
+                    return;
+                }
             };
 
-            // Bedrock model IDs commonly contain ':' (e.g. "...-v1:0"), which
-            // must be percent-encoded in the path. The signer double-encodes it.
-            let encoded_model_id = model.id.replace(':', "%3A");
+            // Bedrock model IDs can contain ':' or '/' (e.g. "...-v1:0" or inference profile ARNs),
+            // which must be percent-encoded in the path. The signer double-encodes '%'.
+            let encoded_model_id = crate::oauth::percent_encode(&model.id);
             let url = format!("{base_url}/model/{encoded_model_id}/converse-stream");
 
-            let resp = match send_with_retry(
-                || {
-                    let mut req = client.post(&url);
-                    req = req.header("content-type", "application/json");
-                    req = req.header("accept", "application/vnd.amazon.eventstream");
-
-                    // Check if bearer token is provided
-                    if let Ok(bearer) = std::env::var("AWS_BEARER_TOKEN_BEDROCK") {
-                        req = req.header("authorization", format!("Bearer {bearer}"));
-                    } else {
-                        // Perform AWS SigV4 signing fresh on each retry attempt
-                        let access_key = std::env::var("AWS_ACCESS_KEY_ID")
-                            .or_else(|_| {
-                                options.api_key.clone().ok_or(std::env::VarError::NotPresent)
+            let bearer = non_empty_env("AWS_BEARER_TOKEN_BEDROCK");
+            let sigv4_creds = if bearer.is_none() {
+                let access_key = non_empty_env("AWS_ACCESS_KEY_ID").or_else(|| {
+                    options
+                        .api_key
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                });
+                let secret_key = non_empty_env("AWS_SECRET_ACCESS_KEY");
+                let session_token = non_empty_env("AWS_SESSION_TOKEN");
+                match (access_key, secret_key) {
+                    (Some(ak), Some(sk)) => Some((ak, sk, session_token)),
+                    _ => {
+                        let mut err_msg = AssistantMessage::empty_for_model(&model);
+                        err_msg.stop_reason = StopReason::Error;
+                        err_msg.error_message = Some(
+                            "AWS Bedrock credentials missing: set AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY (or AWS_BEARER_TOKEN_BEDROCK)"
+                                .to_string(),
+                        );
+                        let _ = sender
+                            .send(AssistantMessageEvent::Error {
+                                reason: StopReason::Error,
+                                error: err_msg,
                             })
-                            .unwrap_or_default();
-                        let secret_key =
-                            std::env::var("AWS_SECRET_ACCESS_KEY").unwrap_or_default();
-                        let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
+                            .await;
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
 
+            let mut secrets_owned: Vec<String> = Vec::new();
+            if let Some(ref b) = bearer {
+                secrets_owned.push(b.clone());
+            }
+            if let Some((ref ak, ref sk, ref st)) = sigv4_creds {
+                secrets_owned.push(ak.clone());
+                secrets_owned.push(sk.clone());
+                if let Some(ref token) = st {
+                    secrets_owned.push(token.clone());
+                }
+            }
+            let secret_refs: Vec<&str> = secrets_owned.iter().map(String::as_str).collect();
+
+            let mut base_headers = reqwest::header::HeaderMap::new();
+            base_headers.insert(
+                reqwest::header::CONTENT_TYPE,
+                reqwest::header::HeaderValue::from_static("application/json"),
+            );
+            base_headers.insert(
+                reqwest::header::ACCEPT,
+                reqwest::header::HeaderValue::from_static("application/vnd.amazon.eventstream"),
+            );
+            if let Err(e) = insert_custom_headers(&mut base_headers, model.headers.as_ref())
+                .and_then(|_| insert_custom_headers(&mut base_headers, options.headers.as_ref()))
+            {
+                let mut err_msg = AssistantMessage::empty_for_model(&model);
+                err_msg.stop_reason = StopReason::Error;
+                err_msg.error_message =
+                    Some(redact_error_body_with_limit(&e, &secret_refs, 4096));
+                let _ = sender
+                    .send(AssistantMessageEvent::Error {
+                        reason: StopReason::Error,
+                        error: err_msg,
+                    })
+                    .await;
+                return;
+            }
+            if let Some(ref b) = bearer {
+                match reqwest::header::HeaderValue::from_str(&format!("Bearer {b}")) {
+                    Ok(val) => {
+                        base_headers.insert(reqwest::header::AUTHORIZATION, val);
+                    }
+                    Err(e) => {
+                        let mut err_msg = AssistantMessage::empty_for_model(&model);
+                        err_msg.stop_reason = StopReason::Error;
+                        err_msg.error_message = Some(redact_error_body_with_limit(
+                            &format!("Invalid bearer token header: {e}"),
+                            &secret_refs,
+                            4096,
+                        ));
+                        let _ = sender
+                            .send(AssistantMessageEvent::Error {
+                                reason: StopReason::Error,
+                                error: err_msg,
+                            })
+                            .await;
+                        return;
+                    }
+                }
+            }
+
+            let payload_hash = sha256_hex(&body_bytes);
+            if let Some((ref access_key, ref secret_key, ref session_token)) = sigv4_creds {
+                let now = SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let amz_date = format_iso8601_basic(now);
+                if let Err(e) = build_sigv4_headers_with_hash(SigV4HeaderParams {
+                    url: &url,
+                    region: &region,
+                    access_key,
+                    secret_key,
+                    session_token: session_token.as_deref(),
+                    payload_hash: &payload_hash,
+                    amz_date: &amz_date,
+                }) {
+                    let mut err_msg = AssistantMessage::empty_for_model(&model);
+                    err_msg.stop_reason = StopReason::Error;
+                    err_msg.error_message =
+                        Some(redact_error_body_with_limit(&e, &secret_refs, 4096));
+                    let _ = sender
+                        .send(AssistantMessageEvent::Error {
+                            reason: StopReason::Error,
+                            error: err_msg,
+                        })
+                        .await;
+                    return;
+                }
+            }
+
+            let resp = match send_with_retry_with_secrets(
+                || {
+                    let mut headers = base_headers.clone();
+                    if let Some((ref access_key, ref secret_key, ref session_token)) = sigv4_creds {
+                        // Perform AWS SigV4 signing fresh on each retry attempt;
+                        // insert after user headers so signed headers cannot be overwritten.
                         let now = SystemTime::now()
                             .duration_since(SystemTime::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_secs();
                         let amz_date = format_iso8601_basic(now);
 
-                        let sig_headers = sign_aws_sigv4(
-                            "POST",
-                            &url,
-                            &region,
-                            "bedrock",
-                            &access_key,
-                            &secret_key,
-                            session_token.as_deref(),
-                            &body_bytes,
-                            &amz_date,
-                        );
-
-                        for (name, val) in sig_headers {
-                            req = req.header(name, val);
+                        if let Ok(sig_headers) = build_sigv4_headers_with_hash(SigV4HeaderParams {
+                            url: &url,
+                            region: &region,
+                            access_key,
+                            secret_key,
+                            session_token: session_token.as_deref(),
+                            payload_hash: &payload_hash,
+                            amz_date: &amz_date,
+                        }) {
+                            for (h_name, h_val) in sig_headers {
+                                headers.insert(h_name, h_val);
+                            }
                         }
                     }
-
-                    if let Some(headers) = &model.headers {
-                        for (k, v) in headers {
-                            req = req.header(k, v);
-                        }
-                    }
-                    if let Some(headers) = &options.headers {
-                        for (k, v) in headers {
-                            req = req.header(k, v);
-                        }
-                    }
-                    req.body(body_bytes.clone())
+                    client
+                        .post(&url)
+                        .headers(headers)
+                        .body(body_bytes.clone())
                 },
                 &RetryPolicy::default(),
                 &cancel,
+                &secret_refs,
             )
             .await
             {
@@ -1242,6 +1607,7 @@ impl LlmProvider for BedrockProvider {
             let mut byte_stream = resp.bytes_stream();
             let mut parser = EventStreamParser::new();
             let mut state = BedrockStreamState::new(&model);
+            state.set_secrets(secrets_owned.clone());
 
             loop {
                 tokio::select! {
@@ -1259,36 +1625,14 @@ impl LlmProvider for BedrockProvider {
                                     Ok(events) => {
                                         let mut batch = Vec::new();
                                         for ev in events {
-                                            let msg_type = ev.headers.get(":message-type").map(|s| s.as_str());
-                                            if msg_type == Some("exception") || msg_type == Some("error") {
-                                                let exc = ev
-                                                    .headers
-                                                    .get(":exception-type")
-                                                    .or_else(|| ev.headers.get(":error-code"))
-                                                    .cloned()
-                                                    .unwrap_or_else(|| "Bedrock exception".to_string());
-                                                let detail = if let Some(msg) = ev.headers.get(":error-message") {
-                                                    msg.clone()
-                                                } else {
-                                                    String::from_utf8_lossy(&ev.payload).to_string()
-                                                };
-                                                state.mark_error(format!("{exc}: {detail}"));
-                                                state.finish_into(&mut batch);
+                                            if process_eventstream_message_into(&ev, &mut state, &mut batch) {
                                                 sender.send_batch(batch).await;
                                                 return;
                                             }
-                                            if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&ev.payload) {
-                                                state.process_event_into(&json, &mut batch);
-                                                if state.output.stop_reason == StopReason::Error
-                                                    || state.output.stop_reason == StopReason::Aborted
-                                                {
-                                                    state.finish_into(&mut batch);
-                                                    sender.send_batch(batch).await;
-                                                    return;
-                                                }
-                                            }
                                         }
-                                        sender.send_batch(batch).await;
+                                        if !sender.send_batch(batch).await {
+                                            return;
+                                        }
                                     }
                                     Err(e) => {
                                         state.mark_error(e.to_string());
@@ -1300,7 +1644,11 @@ impl LlmProvider for BedrockProvider {
                                 }
                             }
                             Ok(Some(Err(e))) => {
-                                state.mark_error(e.to_string());
+                                state.mark_error(redact_error_body_with_limit(
+                                    &e.without_url().to_string(),
+                                    &secret_refs,
+                                    4096,
+                                ));
                                 let mut batch = Vec::new();
                                 state.finish_into(&mut batch);
                                 sender.send_batch(batch).await;
@@ -1689,7 +2037,7 @@ mod tests {
             serde_json::json!({ "type": "default" })
         );
 
-        // 2. Long cache retention adds ttl: ONE_HOUR
+        // 2. Long cache retention adds ttl: 1h
         let long_opts = StreamOptions {
             cache_retention: Some(CacheRetention::Long),
             ..Default::default()
@@ -1698,13 +2046,13 @@ mod tests {
         let sys_long = req_long["system"].as_array().expect("system array");
         assert_eq!(
             sys_long[1]["cachePoint"],
-            serde_json::json!({ "type": "default", "ttl": "ONE_HOUR" })
+            serde_json::json!({ "type": "default", "ttl": "1h" })
         );
         let msgs_long = req_long["messages"].as_array().expect("messages array");
         let user_content_long = msgs_long[0]["content"].as_array().expect("content array");
         assert_eq!(
             user_content_long[1]["cachePoint"],
-            serde_json::json!({ "type": "default", "ttl": "ONE_HOUR" })
+            serde_json::json!({ "type": "default", "ttl": "1h" })
         );
 
         // 3. When cache_retention == Some(CacheRetention::None): cachePoint is omitted
@@ -2049,5 +2397,418 @@ mod tests {
         );
         let result = state.finish(&sender);
         assert_eq!(result.usage.total_tokens, u64::MAX);
+    }
+
+    #[test]
+    fn bedrock_end_to_end_eventstream_dispatch_and_usage_and_content_filtered() {
+        let model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            name: "Claude 3.7 Sonnet (Bedrock)".to_string(),
+            api: "bedrock-converse-stream".to_string(),
+            provider: "amazon-bedrock".to_string(),
+            base_url: "https://bedrock-runtime.eu-west-1.amazonaws.com".to_string(),
+            reasoning: true,
+            input: vec!["text".to_string()],
+            cost: ModelCost::default(),
+            context_window: 200_000,
+            max_tokens: 8192,
+            headers: None,
+            ..Default::default()
+        };
+
+        // Pipe encode_eventstream_frame -> EventStreamParser -> :event-type dispatch -> BedrockStreamState
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&encode_eventstream_frame(
+            &[(":message-type", "event"), (":event-type", "messageStart")],
+            br#"{"role":"assistant"}"#,
+        ));
+        wire.extend_from_slice(&encode_eventstream_frame(
+            &[(":message-type", "event"), (":event-type", "contentBlockDelta")],
+            br#"{"contentBlockIndex":0,"delta":{"reasoningContent":{"redactedContent":"cmVkYWN0ZWQ="}}}"#,
+        ));
+        wire.extend_from_slice(&encode_eventstream_frame(
+            &[(":message-type", "event"), (":event-type", "contentBlockStop")],
+            br#"{"contentBlockIndex":0}"#,
+        ));
+        wire.extend_from_slice(&encode_eventstream_frame(
+            &[(":message-type", "event"), (":event-type", "contentBlockDelta")],
+            br#"{"contentBlockIndex":1,"delta":{"text":"Hello"}}"#,
+        ));
+        wire.extend_from_slice(&encode_eventstream_frame(
+            &[(":message-type", "event"), (":event-type", "contentBlockStop")],
+            br#"{"contentBlockIndex":1}"#,
+        ));
+        wire.extend_from_slice(&encode_eventstream_frame(
+            &[(":message-type", "event"), (":event-type", "messageStop")],
+            br#"{"stopReason":"content_filtered"}"#,
+        ));
+        wire.extend_from_slice(&encode_eventstream_frame(
+            &[(":message-type", "event"), (":event-type", "metadata")],
+            br#"{"usage":{"inputTokens":120,"outputTokens":30,"cacheReadInputTokens":40,"cacheWriteInputTokens":10}}"#,
+        ));
+
+        let mut parser = EventStreamParser::new();
+        let frames = parser.feed(&wire).expect("parse eventstream");
+        let mut state = BedrockStreamState::new(&model);
+        let mut batch = Vec::new();
+        for ev in &frames {
+            let fatal = process_eventstream_message_into(ev, &mut state, &mut batch);
+            assert!(!fatal, "content_filtered messageStop must not abort before trailing metadata frame");
+        }
+        let final_msg = state.finish_into(&mut batch);
+
+        assert_eq!(final_msg.stop_reason, StopReason::Error);
+        // Bedrock inputTokens is already exclusive of cacheReadInputTokens.
+        assert_eq!(final_msg.usage.input, 120);
+        assert_eq!(final_msg.usage.output, 30);
+        assert_eq!(final_msg.usage.cache_read, 40);
+        assert_eq!(final_msg.usage.cache_write, 10);
+        assert_eq!(final_msg.usage.total_tokens, 200);
+
+        match &final_msg.content[0] {
+            AssistantContentBlock::Thinking(th) => {
+                assert_eq!(th.redacted, Some(true));
+                assert_eq!(th.thinking_signature.as_deref(), Some("cmVkYWN0ZWQ="));
+            }
+            other => panic!("Expected redacted thinking block, got {other:?}"),
+        }
+        match &final_msg.content[1] {
+            AssistantContentBlock::Text(tc) => assert_eq!(tc.text, "Hello"),
+            other => panic!("Expected text block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bedrock_invalid_json_on_event_frame_is_stream_error() {
+        let model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            ..Default::default()
+        };
+        let frame = encode_eventstream_frame(
+            &[(":message-type", "event"), (":event-type", "contentBlockDelta")],
+            b"{not valid json",
+        );
+        let mut parser = EventStreamParser::new();
+        let frames = parser.feed(&frame).expect("valid framing");
+        let mut state = BedrockStreamState::new(&model);
+        let mut batch = Vec::new();
+        let fatal = process_eventstream_message_into(&frames[0], &mut state, &mut batch);
+        assert!(fatal);
+        assert!(matches!(
+            batch.last(),
+            Some(AssistantMessageEvent::Error {
+                reason: StopReason::Error,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn bedrock_replays_redacted_thinking_skips_empty_assistant_and_gates_thinking() {
+        let mut model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            name: "Anthropic Claude 3.7 Sonnet".to_string(),
+            api: "bedrock-converse-stream".to_string(),
+            provider: "amazon-bedrock".to_string(),
+            reasoning: true,
+            max_tokens: 8192,
+            ..Default::default()
+        };
+
+        let context = Context {
+            system_prompt: None,
+            messages: vec![
+                Message::User(UserMessage {
+                    content: UserContent::Text("First".to_string()),
+                    timestamp: 1,
+                }),
+                // Empty assistant turn -> skipped, consecutive user turns merged.
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContentBlock::Text(TextContent {
+                        text: "".to_string(),
+                        text_signature: None,
+                    })],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: 2,
+                }),
+                Message::User(UserMessage {
+                    content: UserContent::Text("Second".to_string()),
+                    timestamp: 3,
+                }),
+                Message::Assistant(AssistantMessage {
+                    content: vec![AssistantContentBlock::Thinking(ThinkingContent {
+                        thinking: "[Reasoning redacted]".to_string(),
+                        thinking_signature: Some("opaque_redacted_sig".to_string()),
+                        redacted: Some(true),
+                    })],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    response_id: None,
+                    usage: Usage::default(),
+                    stop_reason: StopReason::Stop,
+                    error_message: None,
+                    timestamp: 4,
+                }),
+            ],
+            tools: None,
+        };
+
+        // When options.reasoning is None, Anthropic thinking must NOT be enabled.
+        let req_none = build_bedrock_request(&model, &context, &StreamOptions::default());
+        assert!(req_none.get("additionalModelRequestFields").is_none());
+
+        // When thinking is enabled and options.max_tokens is None, inferenceConfig.maxTokens must be set.
+        let opts_on = StreamOptions {
+            reasoning: Some(ThinkingLevel::Low),
+            cache_retention: Some(CacheRetention::None),
+            ..Default::default()
+        };
+        let req_on = build_bedrock_request(&model, &context, &opts_on);
+        assert_eq!(req_on["inferenceConfig"]["maxTokens"], 8192);
+        assert!(req_on.get("additionalModelRequestFields").is_some());
+
+        let msgs = req_on["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0]["role"], "user");
+        assert_eq!(msgs[0]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(
+            msgs[1]["content"][0],
+            serde_json::json!({
+                "reasoningContent": { "redactedContent": "opaque_redacted_sig" }
+            })
+        );
+
+        // Non-Claude reasoning model must NOT get Anthropic thinking fields.
+        model.id = "deepseek.r1-v1:0".to_string();
+        model.name = "DeepSeek R1".to_string();
+        let req_non_claude = build_bedrock_request(&model, &context, &opts_on);
+        assert!(req_non_claude.get("additionalModelRequestFields").is_none());
+    }
+
+    #[test]
+    fn bedrock_multi_block_tool_call_delta_and_sigv4_non_ascii_and_region() {
+        let model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            ..Default::default()
+        };
+        let mut state = BedrockStreamState::new(&model);
+        let mut events = Vec::new();
+        state.process_event_into(
+            &serde_json::json!({
+                "contentBlockDelta": {
+                    "contentBlockIndex": 0,
+                    "delta": { "text": "Working" }
+                }
+            }),
+            &mut events,
+        );
+        state.process_event_into(
+            &serde_json::json!({
+                "contentBlockStop": { "contentBlockIndex": 0 }
+            }),
+            &mut events,
+        );
+        state.process_event_into(
+            &serde_json::json!({
+                "contentBlockStart": {
+                    "contentBlockIndex": 1,
+                    "start": { "toolUse": { "toolUseId": "tu_1", "name": "ping" } }
+                }
+            }),
+            &mut events,
+        );
+        state.process_event_into(
+            &serde_json::json!({
+                "contentBlockDelta": {
+                    "contentBlockIndex": 1,
+                    "delta": { "toolUse": { "input": "{\"ok\":true}" } }
+                }
+            }),
+            &mut events,
+        );
+        let delta = events
+            .iter()
+            .find_map(|ev| match ev {
+                AssistantMessageEvent::ToolCallDelta {
+                    content_index,
+                    partial,
+                    ..
+                } => Some((*content_index, partial)),
+                _ => None,
+            })
+            .expect("ToolCallDelta emitted");
+        assert_eq!(delta.0, 1);
+        assert_eq!(delta.1.content.len(), 2);
+
+        // Non-ASCII amz_date must not panic.
+        let _ = sign_aws_sigv4(
+            "POST",
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/converse-stream",
+            "us-east-1",
+            "bedrock",
+            "AKIA",
+            "secret",
+            None,
+            b"{}",
+            "2025\u{1F980}0101T000000Z",
+        );
+
+        assert_eq!(
+            extract_bedrock_region_from_base_url("https://bedrock-runtime.ap-northeast-1.amazonaws.com/"),
+            Some("ap-northeast-1".to_string())
+        );
+        assert_eq!(
+            extract_bedrock_region_from_base_url("https://custom-proxy.example.com"),
+            None
+        );
+    }
+
+    #[test]
+    fn in_band_json_exception_terminates_stream_and_blocks_subsequent_message_stop() {
+        let model = Model {
+            id: "anthropic.claude-3-7-sonnet-20250219-v1:0".to_string(),
+            ..Default::default()
+        };
+        let mut state = BedrockStreamState::new(&model);
+        let mut events = Vec::new();
+        let exc_frame = EventStreamMessage {
+            headers: [(":message-type".to_string(), "event".to_string())]
+                .into_iter()
+                .collect(),
+            payload: br#"{"throttlingException":{"message":"Too many requests"}}"#.to_vec(),
+        };
+        let fatal = process_eventstream_message_into(&exc_frame, &mut state, &mut events);
+        assert!(fatal, "in-band JSON exception must terminate the stream");
+        assert!(state.done);
+        assert_eq!(state.output.stop_reason, StopReason::Error);
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, AssistantMessageEvent::Error { reason: StopReason::Error, .. })));
+
+        // A trailing messageStop frame must not overwrite StopReason::Error or emit Done.
+        let stop_frame = EventStreamMessage {
+            headers: [
+                (":message-type".to_string(), "event".to_string()),
+                (":event-type".to_string(), "messageStop".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            payload: br#"{"stopReason":"end_turn"}"#.to_vec(),
+        };
+        let prev_len = events.len();
+        let _ = process_eventstream_message_into(&stop_frame, &mut state, &mut events);
+        assert_eq!(events.len(), prev_len, "no events may be emitted after terminal Error");
+        assert_eq!(state.output.stop_reason, StopReason::Error);
+    }
+
+    #[test]
+    fn validate_bedrock_endpoint_and_sigv4_headers_fail_closed() {
+        assert!(validate_bedrock_endpoint("", "us-east-1").is_ok());
+        assert!(validate_bedrock_endpoint("", "us-east-1.attacker.com").is_err());
+        assert!(validate_bedrock_endpoint("", "").is_err());
+        assert!(validate_bedrock_endpoint("file:///etc/passwd", "us-east-1").is_err());
+        assert!(validate_bedrock_endpoint("https://custom.example.com", "us-east-1").is_ok());
+        assert_eq!(
+            validate_bedrock_endpoint(
+                "HTTPS://bedrock-runtime.us-east-1.amazonaws.com/",
+                "us-east-1"
+            )
+            .expect("uppercase scheme normalized"),
+            "https://bedrock-runtime.us-east-1.amazonaws.com"
+        );
+
+        let err = build_sigv4_headers(
+            "https://bedrock-runtime.us-east-1.amazonaws.com/model/test/converse-stream",
+            "us-east-1",
+            "AKIA\r\ninjected",
+            "secret",
+            None,
+            b"{}",
+            "20250101T000000Z",
+        )
+        .unwrap_err();
+        assert!(err.contains("Invalid SigV4 header"), "{err}");
+    }
+
+    #[test]
+    fn builtin_bedrock_models_honor_aws_region_env_and_fallback_to_us_east_1() {
+        static BEDROCK_ENV_MUTEX: std::sync::LazyLock<std::sync::Mutex<()>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+        struct EnvGuard(&'static str, Option<std::ffi::OsString>);
+        impl EnvGuard {
+            fn set(key: &'static str, val: Option<&str>) -> Self {
+                let prev = std::env::var_os(key);
+                unsafe {
+                    match val {
+                        Some(v) => std::env::set_var(key, v),
+                        None => std::env::remove_var(key),
+                    }
+                }
+                Self(key, prev)
+            }
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    match &self.1 {
+                        Some(v) => std::env::set_var(self.0, v),
+                        None => std::env::remove_var(self.0),
+                    }
+                }
+            }
+        }
+
+        let _lock = BEDROCK_ENV_MUTEX.lock().unwrap();
+        let _g1 = EnvGuard::set("AWS_REGION", Some("eu-west-1"));
+        let _g2 = EnvGuard::set("AWS_DEFAULT_REGION", Some("ap-south-1"));
+
+        for id in [
+            "anthropic.claude-3-7-sonnet-20250219-v1:0",
+            "us.anthropic.claude-sonnet-4-20250514-v1:0",
+        ] {
+            let model = crate::catalog::resolve_model("amazon-bedrock", Some(id))
+                .expect("built-in bedrock model");
+            assert!(
+                model.base_url.trim().is_empty(),
+                "built-in bedrock model '{id}' must not hardcode base_url: {}",
+                model.base_url
+            );
+            let (region, base_url) = resolve_bedrock_region_and_base_url(&model.base_url).unwrap();
+            assert_eq!(region, "eu-west-1");
+            assert_eq!(
+                base_url,
+                "https://bedrock-runtime.eu-west-1.amazonaws.com"
+            );
+        }
+
+        // Unset both env vars -> falls back to us-east-1.
+        unsafe {
+            std::env::remove_var("AWS_REGION");
+            std::env::remove_var("AWS_DEFAULT_REGION");
+        }
+        let (region, base_url) = resolve_bedrock_region_and_base_url("").unwrap();
+        assert_eq!(region, "us-east-1");
+        assert_eq!(
+            base_url,
+            "https://bedrock-runtime.us-east-1.amazonaws.com"
+        );
+
+        // Explicit custom model.base_url still wins over AWS_REGION.
+        unsafe {
+            std::env::set_var("AWS_REGION", "eu-west-1");
+        }
+        let custom_url = "https://bedrock-runtime.ap-northeast-1.amazonaws.com";
+        let (custom_region, resolved_custom_url) =
+            resolve_bedrock_region_and_base_url(custom_url).unwrap();
+        assert_eq!(custom_region, "ap-northeast-1");
+        assert_eq!(resolved_custom_url, custom_url);
     }
 }

@@ -645,19 +645,37 @@ mod tests {
         );
     }
 
-    // 13. A `})()` sequence cannot escape the async wrapper.
+    // 13. A `})()` sequence cannot escape the async wrapper or invoke host capabilities.
     #[tokio::test]
     async fn test_wrapper_escape_is_syntax_error() {
+        let echo = Arc::new(MockEchoTool);
+        let def = tool_to_definition(echo.as_ref());
+        let tool_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tool_calls_clone = Arc::clone(&tool_calls);
+        let executor: SandboxToolExecutor = Arc::new(move |_name, _args, _cancel| {
+            tool_calls_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async { Ok(serde_json::Value::String("ok".to_string())) })
+        });
+        let kv = Arc::new(Mutex::new(HashMap::new()));
         let result = run_codemode(
-            r#"})(); (async () => { return 7; })(); (async () => {"#,
-            &[],
-            dummy_executor(),
-            Arc::new(Mutex::new(HashMap::new())),
+            r#"})(); try { store("pwned", 1); } catch (e) {} try { __host_call_tool("echo", "{}"); } catch (e) {} (async () => { return 7; })(); (async () => {"#,
+            std::slice::from_ref(&def),
+            executor,
+            Arc::clone(&kv),
             &CodemodeConfig::default(),
             CancellationToken::new(),
         )
         .await;
         assert!(!result.ok, "escaped wrapper must not execute");
+        assert!(
+            kv.lock().unwrap().is_empty(),
+            "escaped payload must not access store()"
+        );
+        assert_eq!(
+            tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "escaped payload must not invoke host tools"
+        );
     }
 
     // 14. exit() after an await must still be a clean exit, not a pending-promise error.

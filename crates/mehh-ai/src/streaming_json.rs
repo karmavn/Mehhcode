@@ -26,13 +26,12 @@ pub fn repair_json(json: &str) -> String {
         }
 
         if ch == '\\' {
-            match chars.peek().map(|&(_, c)| c) {
+            match chars.peek().copied() {
                 None => {
                     repaired.push_str("\\\\");
                     continue;
                 }
-                Some('u') => {
-                    let next_byte_idx = chars.peek().unwrap().0;
+                Some((next_byte_idx, 'u')) => {
                     let remaining = &json[next_byte_idx..];
                     if remaining.len() >= 5
                         && remaining.as_bytes()[1..5].iter().all(|b| b.is_ascii_hexdigit())
@@ -47,7 +46,9 @@ pub fn repair_json(json: &str) -> String {
                     repaired.push_str("\\\\");
                     continue;
                 }
-                Some(next_ch) if matches!(next_ch, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => {
+                Some((_, next_ch))
+                    if matches!(next_ch, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') =>
+                {
                     repaired.push('\\');
                     repaired.push(next_ch);
                     chars.next();
@@ -162,6 +163,7 @@ struct OpenString {
 const CREDIT_PER_APPEND: usize = 256;
 const CREDIT_PER_CHARACTER: usize = 8;
 const MAX_PENDING_SCALAR_LENGTH: usize = 64;
+const MAX_NESTING_DEPTH: usize = 128;
 
 fn simple_escape(ch: char) -> Option<&'static str> {
     match ch {
@@ -263,6 +265,7 @@ pub struct StreamingJsonParser {
     credit: usize,
     dirty: bool,
     snapshot_cache: Option<Value>,
+    snapshot_rev: u64,
 }
 
 impl StreamingJsonParser {
@@ -279,26 +282,52 @@ impl StreamingJsonParser {
             } else if !self.scalar.is_empty() {
                 index = self.read_scalar(text, index);
             } else {
-                let ch = text[index..].chars().next().unwrap();
+                let Some(ch) = text[index..].chars().next() else {
+                    break;
+                };
                 index += ch.len_utf8();
                 self.structural(ch);
             }
         }
     }
 
-    pub fn snapshot(&mut self) -> Option<Value> {
+    fn refresh_snapshot(&mut self) -> bool {
         if !self.dirty {
-            return self.snapshot_cache.clone();
+            return false;
         }
         let pending = self.pending_scalar();
-        let cost = self.path_cost + if pending.is_some() { 1 } else { 0 };
+        let open_text_cost = self
+            .open_string
+            .as_ref()
+            .map_or(0, |open| open.text.len() / 256);
+        let cost = self.path_cost + open_text_cost + if pending.is_some() { 1 } else { 0 };
         if cost > self.credit {
-            return self.snapshot_cache.clone();
+            return false;
         }
         self.credit -= cost;
         self.dirty = false;
-        self.snapshot_cache = self.copy_open_path(pending);
+        let next = self.copy_open_path(pending);
+        if next != self.snapshot_cache {
+            self.snapshot_cache = next;
+            self.snapshot_rev = self.snapshot_rev.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn snapshot(&mut self) -> Option<Value> {
+        self.refresh_snapshot();
         self.snapshot_cache.clone()
+    }
+
+    pub(crate) fn snapshot_if_changed(&mut self, last_rev: &mut u64) -> Option<Option<&Value>> {
+        self.refresh_snapshot();
+        if self.snapshot_rev == *last_rev {
+            return None;
+        }
+        *last_rev = self.snapshot_rev;
+        Some(self.snapshot_cache.as_ref())
     }
 
     fn read_string(&mut self, text: &str, start: usize) -> usize {
@@ -307,7 +336,11 @@ impl StreamingJsonParser {
         for (offset, ch) in text[start..].char_indices() {
             let abs_index = start + offset;
 
-            if !self.open_string.as_ref().unwrap().escape.is_empty() {
+            if self
+                .open_string
+                .as_ref()
+                .is_some_and(|open| !open.escape.is_empty())
+            {
                 if self.continue_escape(ch) {
                     run_start = abs_index + ch.len_utf8();
                     continue;
@@ -327,7 +360,9 @@ impl StreamingJsonParser {
                 if abs_index > run_start {
                     self.append_string(&text[run_start..abs_index]);
                 }
-                self.open_string.as_mut().unwrap().escape.push('\\');
+                if let Some(open) = self.open_string.as_mut() {
+                    open.escape.push('\\');
+                }
                 run_start = abs_index + 1;
             }
         }
@@ -340,30 +375,43 @@ impl StreamingJsonParser {
     }
 
     fn continue_escape(&mut self, ch: char) -> bool {
-        let escape_state = self.open_string.as_ref().unwrap().escape.clone();
+        let Some(escape_state) = self.open_string.as_ref().map(|o| o.escape.clone()) else {
+            return false;
+        };
         if escape_state == "\\" {
             if let Some(decoded) = simple_escape(ch) {
-                self.open_string.as_mut().unwrap().escape.clear();
+                if let Some(open) = self.open_string.as_mut() {
+                    open.escape.clear();
+                }
                 self.append_string(decoded);
                 return true;
             }
             if ch == 'u' {
-                self.open_string.as_mut().unwrap().escape.push('u');
+                if let Some(open) = self.open_string.as_mut() {
+                    open.escape.push('u');
+                }
                 return true;
             }
-            self.open_string.as_mut().unwrap().escape.clear();
+            if let Some(open) = self.open_string.as_mut() {
+                open.escape.clear();
+            }
             self.append_string("\\");
             return false;
         }
 
         if ch.is_ascii_hexdigit() {
-            let open = self.open_string.as_mut().unwrap();
-            open.escape.push(ch);
-            if open.escape.len() < 6 {
-                return true;
-            }
-            let hex_str = open.escape[2..6].to_string();
-            open.escape.clear();
+            let hex_str = {
+                let Some(open) = self.open_string.as_mut() else {
+                    return false;
+                };
+                open.escape.push(ch);
+                if open.escape.len() < 6 {
+                    return true;
+                }
+                let hex = open.escape[2..6].to_string();
+                open.escape.clear();
+                hex
+            };
 
             if let Ok(code) = u32::from_str_radix(&hex_str, 16) {
                 if let Some(c) = char::from_u32(code) {
@@ -371,9 +419,14 @@ impl StreamingJsonParser {
                     let s = c.encode_utf8(&mut buf).to_string();
                     self.append_string(&s);
                 } else if (0xd800..=0xdbff).contains(&code) {
-                    self.open_string.as_mut().unwrap().pending_surrogate = Some(code as u16);
+                    if let Some(open) = self.open_string.as_mut() {
+                        open.pending_surrogate = Some(code as u16);
+                    }
                 } else if (0xdc00..=0xdfff).contains(&code) {
-                    let high = self.open_string.as_mut().unwrap().pending_surrogate.take();
+                    let high = self
+                        .open_string
+                        .as_mut()
+                        .and_then(|open| open.pending_surrogate.take());
                     if let Some(h) = high {
                         let combined = 0x10000 + (((h as u32) - 0xd800) << 10) + (code - 0xdc00);
                         if let Some(c) = char::from_u32(combined) {
@@ -387,24 +440,61 @@ impl StreamingJsonParser {
             return true;
         }
 
-        let literal = std::mem::take(&mut self.open_string.as_mut().unwrap().escape);
+        let literal = self
+            .open_string
+            .as_mut()
+            .map(|open| std::mem::take(&mut open.escape))
+            .unwrap_or_default();
         self.append_string(&literal);
         false
     }
 
     fn append_string(&mut self, text: &str) {
-        let (target, slot, open_text) = {
-            let open = self.open_string.as_mut().unwrap();
+        {
+            let Some(open) = self.open_string.as_mut() else {
+                return;
+            };
+            open.pending_surrogate = None;
             open.text.push_str(text);
-            (open.target, open.slot.clone(), open.text.clone())
+            if open.target != StringTarget::Value {
+                return;
+            }
+        }
+        let Some(slot) = self.open_string.as_ref().and_then(|o| o.slot.as_ref()) else {
+            return;
         };
-        if target == StringTarget::Value {
-            self.place(slot, Value::String(open_text));
+        self.dirty = true;
+        match slot {
+            Slot::Root => {
+                if let Some(Value::String(s)) = self.root.as_mut() {
+                    s.push_str(text);
+                }
+            }
+            Slot::Element(index) => {
+                if let Some(frame) = self.stack.last_mut() {
+                    if let Container::Array(elements) = &mut frame.container {
+                        if let Some(Value::String(s)) = elements.get_mut(*index) {
+                            s.push_str(text);
+                        }
+                    }
+                }
+            }
+            Slot::Member(key) => {
+                if let Some(frame) = self.stack.last_mut() {
+                    if let Container::Object(members) = &mut frame.container {
+                        if let Some(Value::String(s)) = members.get_mut(key) {
+                            s.push_str(text);
+                        }
+                    }
+                }
+            }
         }
     }
 
     fn end_string(&mut self) {
-        let open = self.open_string.take().unwrap();
+        let Some(open) = self.open_string.take() else {
+            return;
+        };
         if open.target == StringTarget::Key {
             if let Some(frame) = self.stack.last_mut() {
                 frame.key = Some(open.text);
@@ -499,8 +589,8 @@ impl StreamingJsonParser {
         match &frame.container {
             Container::Array(elements) => Some(Slot::Element(elements.len())),
             Container::Object(_) => {
-                if (frame.phase == Phase::Value || frame.phase == Phase::Colon) && frame.key.is_some() {
-                    Some(Slot::Member(frame.key.clone().unwrap()))
+                if frame.phase == Phase::Value || frame.phase == Phase::Colon {
+                    frame.key.clone().map(Slot::Member)
                 } else {
                     None
                 }
@@ -536,6 +626,10 @@ impl StreamingJsonParser {
     }
 
     fn open_container(&mut self, container: Container) {
+        if self.stack.len() >= MAX_NESTING_DEPTH {
+            self.done = true;
+            return;
+        }
         let slot = self.value_slot();
         let is_array = matches!(container, Container::Array(_));
         self.stack.push(Frame {
@@ -562,13 +656,13 @@ impl StreamingJsonParser {
     }
 
     fn value_ended(&mut self) {
-        if self.stack.is_empty() {
+        let Some(frame) = self.stack.last_mut() else {
             if self.root.is_some() {
                 self.done = true;
             }
             return;
-        }
-        self.stack.last_mut().unwrap().phase = Phase::Comma;
+        };
+        frame.phase = Phase::Comma;
     }
 
     fn place(&mut self, slot: Option<Slot>, value: Value) {
@@ -649,7 +743,7 @@ impl StreamingJsonParser {
 pub struct ToolCallArgumentsStream {
     text: String,
     parser: StreamingJsonParser,
-    snapshot: Option<Value>,
+    snapshot_rev: u64,
     arguments: Map<String, Value>,
 }
 
@@ -663,25 +757,35 @@ impl ToolCallArgumentsStream {
     }
 
     pub fn append(&mut self, delta: &str) -> Map<String, Value> {
+        let _ = self.append_if_changed(delta);
+        self.arguments.clone()
+    }
+
+    pub fn append_if_changed(&mut self, delta: &str) -> Option<&Map<String, Value>> {
         self.text.push_str(delta);
         self.parser.append(delta);
-        self.update_partial()
+        self.update_partial_if_changed()
     }
 
     pub fn replace(&mut self, text: &str) -> Map<String, Value> {
+        let _ = self.replace_if_changed(text);
+        self.arguments.clone()
+    }
+
+    pub fn replace_if_changed(&mut self, text: &str) -> Option<&Map<String, Value>> {
         if text.starts_with(&self.text) {
             let delta = &text[self.text.len()..];
             if delta.is_empty() {
-                self.partial()
+                None
             } else {
-                self.append(delta)
+                self.append_if_changed(delta)
             }
         } else {
             self.text.clear();
             self.parser = StreamingJsonParser::new();
-            self.snapshot = None;
+            self.snapshot_rev = 0;
             self.arguments.clear();
-            self.append(text)
+            self.append_if_changed(text)
         }
     }
 
@@ -689,21 +793,13 @@ impl ToolCallArgumentsStream {
         parse_tool_call_arguments(Some(&self.text))
     }
 
-    fn partial(&self) -> Map<String, Value> {
-        self.arguments.clone()
-    }
-
-    fn update_partial(&mut self) -> Map<String, Value> {
-        let snapshot = self.parser.snapshot();
-        if snapshot == self.snapshot {
-            return self.arguments.clone();
-        }
-        self.snapshot = snapshot.clone();
+    fn update_partial_if_changed(&mut self) -> Option<&Map<String, Value>> {
+        let snapshot = self.parser.snapshot_if_changed(&mut self.snapshot_rev)?;
         self.arguments = match snapshot {
-            Some(Value::Object(map)) => map,
+            Some(Value::Object(map)) => map.clone(),
             _ => Map::new(),
         };
-        self.arguments.clone()
+        Some(&self.arguments)
     }
 }
 
@@ -837,5 +933,43 @@ mod tests {
         let (final_args, err) = stream.finish();
         assert!(err.is_none());
         assert_eq!(final_args.get("b").and_then(|v| v.as_i64()), Some(2));
+    }
+
+    #[test]
+    fn streaming_parser_caps_deep_nesting_without_stack_overflow() {
+        let mut parser = StreamingJsonParser::new();
+        let deep = format!("{}1{}", "[".repeat(500), "]".repeat(500));
+        parser.append(&deep);
+        assert!(parser.done);
+        let snap = parser.snapshot();
+        assert!(snap.is_some());
+        drop(snap);
+        drop(parser);
+
+        let mut obj_parser = StreamingJsonParser::new();
+        let deep_obj = format!("{}{}", r#"{"a":"#.repeat(500), "}".repeat(500));
+        obj_parser.append(&deep_obj);
+        assert!(obj_parser.done);
+        let _ = obj_parser.snapshot();
+    }
+
+    #[test]
+    fn streaming_parser_clears_pending_surrogate_on_intervening_content() {
+        for (input, expected) in [
+            (r#""\ud800hello\udc00""#, "hello"),
+            (r#""\ud800\n\udc00""#, "\n"),
+            (r#""\ud800\u0041\udc00""#, "A"),
+            (r#""\ud800\x\udc00""#, "\\x"),
+            (r#""\ud800\u12z\udc00""#, "\\u12z"),
+            (r#""\ud83d\ude00""#, "\u{1f600}"),
+        ] {
+            let mut parser = StreamingJsonParser::new();
+            parser.append(input);
+            assert_eq!(
+                parser.snapshot(),
+                Some(Value::String(expected.to_string())),
+                "failed for input {input}"
+            );
+        }
     }
 }

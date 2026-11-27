@@ -37,31 +37,46 @@ fn sanitize_output_ext(raw: &str) -> String {
     }
 }
 
-fn cleanup_old_mcp_outputs(dir: &Path) {
+fn cleanup_old_mcp_outputs_with_cutoff(dir: &Path, cutoff: SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let Ok(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(24 * 3600)).ok_or(()) else {
-        return;
-    };
     for entry in entries.flatten() {
-        if let Ok(meta) = entry.metadata() {
-            if meta.is_file() && meta.modified().is_ok_and(|m| m < cutoff) {
-                let _ = std::fs::remove_file(entry.path());
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if !name_str.starts_with("mcp-output-") {
+            continue;
+        }
+        let path = entry.path();
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_file() && meta.modified().is_ok_and(|m| m < cutoff) {
+                let _ = std::fs::remove_file(&path);
             }
         }
+    }
+}
+
+fn cleanup_old_mcp_outputs(dir: &Path) {
+    if let Some(cutoff) = SystemTime::now().checked_sub(Duration::from_secs(24 * 3600)) {
+        cleanup_old_mcp_outputs_with_cutoff(dir, cutoff);
     }
 }
 
 fn mcp_output_base_dir() -> PathBuf {
     #[cfg(windows)]
     let home = std::env::var_os("USERPROFILE")
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()));
+        .filter(|v| !v.to_string_lossy().trim().is_empty())
+        .or_else(|| {
+            std::env::var_os("HOME").filter(|v| !v.to_string_lossy().trim().is_empty())
+        });
     #[cfg(not(windows))]
     let home = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()));
+        .filter(|v| !v.to_string_lossy().trim().is_empty())
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").filter(|v| !v.to_string_lossy().trim().is_empty())
+        });
     if let Some(h) = home {
         PathBuf::from(h).join(".mehh").join("tmp").join("mcp")
     } else {
@@ -69,40 +84,93 @@ fn mcp_output_base_dir() -> PathBuf {
     }
 }
 
-pub fn save_mcp_output_file(data: &[u8], ext: &str) -> anyhow::Result<PathBuf> {
-    let base_dir = mcp_output_base_dir();
-    std::fs::create_dir_all(&base_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&base_dir, std::fs::Permissions::from_mode(0o700))?;
+fn save_mcp_output_file_in_dir(
+    base_dir: &Path,
+    data: &[u8],
+    ext: &str,
+) -> anyhow::Result<PathBuf> {
+    if data.len() > MCP_DISK_WRITE_MAX_BYTES {
+        anyhow::bail!(
+            "MCP output size ({} bytes) exceeds {} byte disk write limit",
+            data.len(),
+            MCP_DISK_WRITE_MAX_BYTES
+        );
+    }
+
+    if let Ok(meta) = std::fs::symlink_metadata(base_dir) {
+        if meta.file_type().is_symlink() {
+            anyhow::bail!(
+                "Refusing to write MCP output into symlinked directory '{}'",
+                base_dir.display()
+            );
+        }
+    }
+    std::fs::create_dir_all(base_dir)?;
+    let dir_meta = std::fs::symlink_metadata(base_dir)?;
+    if dir_meta.file_type().is_symlink() || !dir_meta.is_dir() {
+        anyhow::bail!(
+            "MCP output target directory '{}' is not a real directory",
+            base_dir.display()
+        );
     }
 
     let clean_ext = sanitize_output_ext(ext);
-
     let filename = format!("mcp-output-{}{clean_ext}", uuid::Uuid::new_v4());
     let file_path = base_dir.join(filename);
 
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true).mode(0o600);
-        let mut file = opts.open(&file_path)?;
-        use std::io::Write;
-        file.write_all(data)?;
+        opts.mode(0o600);
     }
-
-    #[cfg(not(unix))]
+    let mut file = opts.open(&file_path)?;
+    #[cfg(unix)]
     {
-        let mut opts = std::fs::OpenOptions::new();
-        opts.write(true).create_new(true);
-        let mut file = opts.open(&file_path)?;
-        use std::io::Write;
-        file.write_all(data)?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let file_meta = file.metadata()?;
+        if dir_meta.uid() != file_meta.uid() {
+            drop(file);
+            let _ = std::fs::remove_file(&file_path);
+            anyhow::bail!(
+                "Refusing MCP output directory '{}' owned by another user",
+                base_dir.display()
+            );
+        }
+        std::fs::set_permissions(base_dir, std::fs::Permissions::from_mode(0o700))?;
     }
+    use std::io::Write;
+    if let Err(e) = file.write_all(data).and_then(|()| file.flush()) {
+        drop(file);
+        let _ = std::fs::remove_file(&file_path);
+        return Err(e.into());
+    }
+    drop(file);
+
+    cleanup_old_mcp_outputs(base_dir);
 
     Ok(file_path)
+}
+
+pub fn save_mcp_output_file(data: &[u8], ext: &str) -> anyhow::Result<PathBuf> {
+    save_mcp_output_file_in_dir(&mcp_output_base_dir(), data, ext)
+}
+
+async fn decode_base64_maybe_blocking(blob: &str) -> anyhow::Result<Vec<u8>> {
+    const BLOCKING_THRESHOLD_BYTES: usize = 64 * 1024;
+    if blob.len() > BLOCKING_THRESHOLD_BYTES {
+        let owned = blob.to_string();
+        tokio::task::spawn_blocking(move || {
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, owned)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("base64 decode task failed: {e}"))?
+        .map_err(|e| anyhow::anyhow!("{e}"))
+    } else {
+        base64::Engine::decode(&base64::engine::general_purpose::STANDARD, blob)
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
 }
 
 fn is_text_mime_type(mime: &str) -> bool {
@@ -116,36 +184,123 @@ fn is_text_mime_type(mime: &str) -> bool {
 pub const MAX_TOOL_NAME_LENGTH: usize = 64;
 pub const MAX_TOOL_DESCRIPTION_BYTES: usize = 4096;
 pub const MAX_TOOL_SCHEMA_BYTES: usize = 64 * 1024;
+pub const MAX_PROGRESS_MESSAGE_BYTES: usize = 512;
 pub const MCP_OUTPUT_MAX_BYTES: usize = 20 * 1024; // 20KB model-facing limit
 pub const MCP_RESOURCE_MAX_BYTES: usize = 100 * 1024; // 100KB cap for resources/images
+pub const MCP_DISK_WRITE_MAX_BYTES: usize = 10 * 1024 * 1024; // 10MB cap for binary/output disk writes
 
 /// Async wrapper so filesystem work never blocks a Tokio worker thread.
 pub async fn save_mcp_output_file_async(data: Vec<u8>, ext: String) -> anyhow::Result<PathBuf> {
     tokio::task::spawn_blocking(move || {
-        cleanup_old_mcp_outputs(&mcp_output_base_dir());
-        save_mcp_output_file(&data, &ext)
+        let base_dir = mcp_output_base_dir();
+        save_mcp_output_file_in_dir(&base_dir, &data, &ext)
     })
     .await
     .context("MCP output save task panicked")?
 }
 
-/// Sanitizes untrusted control characters and caps length on a UTF-8 char boundary.
-pub fn sanitize_mcp_text(raw: &str, max_bytes: usize) -> String {
-    let cleaned: String = raw
-        .chars()
-        .filter(|&c| {
-            let code = c as u32;
-            c == '\n' || c == '\t' || (code >= 0x20 && code != 0x7f && !(0x80..=0x9f).contains(&code))
-        })
-        .collect();
-    if cleaned.len() <= max_bytes {
-        return cleaned;
+fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
+fn strip_ansi_control_and_bidi(raw: &str, preserve_newlines_tabs: bool) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            match chars.peek().copied() {
+                // CSI sequence: ESC [ <params/intermediates> <final byte 0x40..=0x7E>
+                Some('[') => {
+                    chars.next();
+                    while let Some(&nc) = chars.peek() {
+                        chars.next();
+                        if ('@'..='~').contains(&nc) {
+                            break;
+                        }
+                    }
+                }
+                // OSC / DCS / SOS / PM / APC: terminated by BEL, ST (ESC \), or C1 ST (0x9C)
+                Some(']' | 'P' | 'X' | '^' | '_') => {
+                    chars.next();
+                    while let Some(nc) = chars.next() {
+                        if nc == '\x07' || nc == '\u{009C}' {
+                            break;
+                        }
+                        if nc == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // Other 2-byte ESC sequence
+                Some(nc) if (' '..='~').contains(&nc) => {
+                    chars.next();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        // C1 CSI (0x9B)
+        if c == '\u{009B}' {
+            while let Some(&nc) = chars.peek() {
+                chars.next();
+                if ('@'..='~').contains(&nc) {
+                    break;
+                }
+            }
+            continue;
+        }
+        // C1 OSC (0x9D)
+        if c == '\u{009D}' {
+            while let Some(nc) = chars.next() {
+                if nc == '\x07' || nc == '\u{009C}' {
+                    break;
+                }
+                if nc == '\x1b' && chars.peek() == Some(&'\\') {
+                    chars.next();
+                    break;
+                }
+            }
+            continue;
+        }
+        if is_bidi_control(c) {
+            continue;
+        }
+        let code = c as u32;
+        if (preserve_newlines_tabs && (c == '\n' || c == '\t'))
+            || (code >= 0x20 && code != 0x7f && !(0x80..=0x9f).contains(&code))
+        {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn truncate_utf8_with_ellipsis(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
     }
     let mut end = max_bytes.saturating_sub(3);
-    while end > 0 && !cleaned.is_char_boundary(end) {
+    while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}...", &cleaned[..end])
+    format!("{}...", &text[..end])
+}
+
+/// Sanitizes untrusted ANSI/CSI/OSC sequences, bidi overrides, and control characters,
+/// capping length on a UTF-8 char boundary.
+pub fn sanitize_mcp_text(raw: &str, max_bytes: usize) -> String {
+    let cleaned = strip_ansi_control_and_bidi(raw, true);
+    truncate_utf8_with_ellipsis(cleaned, max_bytes)
+}
+
+/// Sanitizes single-line progress notification messages from untrusted MCP servers.
+pub fn sanitize_progress_message(raw: &str) -> String {
+    let cleaned = strip_ansi_control_and_bidi(raw, false);
+    truncate_utf8_with_ellipsis(cleaned, MAX_PROGRESS_MESSAGE_BYTES)
 }
 
 fn sanitize_schema_value(val: &mut serde_json::Value) {
@@ -184,9 +339,28 @@ fn strip_schema_descriptions(val: &mut serde_json::Value) {
     }
 }
 
+struct CountingWriter(usize);
+
+impl std::io::Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len());
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn json_byte_len(value: &serde_json::Value) -> Option<usize> {
+    let mut writer = CountingWriter(0);
+    serde_json::to_writer(&mut writer, value).ok()?;
+    Some(writer.0)
+}
+
 fn schema_too_big(schema: &serde_json::Value) -> bool {
-    serde_json::to_vec(schema)
-        .map(|bytes| bytes.len() > MAX_TOOL_SCHEMA_BYTES)
+    json_byte_len(schema)
+        .map(|len| len > MAX_TOOL_SCHEMA_BYTES)
         .unwrap_or(true)
 }
 
@@ -202,30 +376,56 @@ fn sanitize_input_schema(mut schema: serde_json::Value) -> serde_json::Value {
         return schema;
     }
     // Keep type, required and property names so the model can still call the
-    // tool instead of guessing against an empty `{}` schema.
+    // tool instead of guessing against an empty `{}` schema, while strictly
+    // enforcing `MAX_TOOL_SCHEMA_BYTES`.
     let mut minimal = serde_json::Map::new();
-    if let Some(kind) = schema.get("type") {
+    if let Some(kind) = schema.get("type").filter(|v| v.is_string()) {
         minimal.insert("type".to_string(), kind.clone());
-    }
-    if let Some(serde_json::Value::Object(props)) = schema.get("properties") {
-        let mut kept = serde_json::Map::new();
-        for (name, prop) in props {
-            let mut slim = serde_json::Map::new();
-            if let Some(kind) = prop.get("type") {
-                slim.insert("type".to_string(), kind.clone());
-            }
-            kept.insert(name.clone(), serde_json::Value::Object(slim));
-        }
-        minimal.insert("properties".to_string(), serde_json::Value::Object(kept));
-    }
-    if let Some(required) = schema.get("required") {
-        minimal.insert("required".to_string(), required.clone());
     }
     minimal.insert(
         "description".to_string(),
         serde_json::json!("[schema truncated: original exceeded size limit]"),
     );
-    serde_json::Value::Object(minimal)
+    if let Some(serde_json::Value::Object(props)) = schema.get("properties") {
+        let mut kept = serde_json::Map::new();
+        const MAX_FALLBACK_PROPERTIES: usize = 256;
+        let mut approx_bytes = 256usize;
+        for (name, prop) in props.iter().take(MAX_FALLBACK_PROPERTIES) {
+            let mut slim = serde_json::Map::new();
+            if let Some(kind) = prop.get("type").filter(|v| v.is_string()) {
+                slim.insert("type".to_string(), kind.clone());
+            }
+            let entry_cost = name.len().saturating_add(32);
+            if approx_bytes.saturating_add(entry_cost) > MAX_TOOL_SCHEMA_BYTES / 2 {
+                break;
+            }
+            approx_bytes = approx_bytes.saturating_add(entry_cost);
+            kept.insert(name.clone(), serde_json::Value::Object(slim));
+        }
+        minimal.insert("properties".to_string(), serde_json::Value::Object(kept));
+    }
+    if let Some(serde_json::Value::Array(req)) = schema.get("required") {
+        let kept_props = minimal.get("properties").and_then(|p| p.as_object());
+        let filtered_req: Vec<serde_json::Value> = req
+            .iter()
+            .filter(|v| {
+                v.as_str()
+                    .is_some_and(|s| kept_props.is_some_and(|kp| kp.contains_key(s)))
+            })
+            .cloned()
+            .collect();
+        if !filtered_req.is_empty() {
+            minimal.insert("required".to_string(), serde_json::Value::Array(filtered_req));
+        }
+    }
+    let fallback = serde_json::Value::Object(minimal);
+    if !schema_too_big(&fallback) {
+        return fallback;
+    }
+    serde_json::json!({
+        "type": "object",
+        "description": "[schema truncated: original exceeded size limit]"
+    })
 }
 
 /// Sanitizes and formats an MCP tool into `mcp__<server>__<tool>`.
@@ -285,16 +485,31 @@ pub fn create_mcp_agent_tools_with_shared_names(
     client: Arc<McpClient>,
     used_names: &mut HashSet<String>,
 ) -> Vec<Arc<dyn AgentTool>> {
+    create_mcp_agent_tools_with_shared_names_and_timeout(
+        server_name,
+        tools,
+        client,
+        used_names,
+        None,
+    )
+}
+
+/// Builds collision-free `McpAgentTool` adapters with an explicit tool invocation timeout.
+pub fn create_mcp_agent_tools_with_shared_names_and_timeout(
+    server_name: &str,
+    tools: Vec<McpToolInfo>,
+    client: Arc<McpClient>,
+    used_names: &mut HashSet<String>,
+    timeout: Option<Duration>,
+) -> Vec<Arc<dyn AgentTool>> {
     tools
         .into_iter()
         .map(|info| {
             let unique_name = resolve_unique_mcp_tool_name(server_name, &info.name, used_names);
-            Arc::new(McpAgentTool::with_resolved_name(
-                server_name,
-                info,
-                client.clone(),
-                unique_name,
-            )) as Arc<dyn AgentTool>
+            Arc::new(
+                McpAgentTool::with_resolved_name(server_name, info, client.clone(), unique_name)
+                    .with_timeout(timeout),
+            ) as Arc<dyn AgentTool>
         })
         .collect()
 }
@@ -367,11 +582,11 @@ fn truncate_details_inner(value: &mut serde_json::Value) {
 
 fn truncate_details(value: &mut serde_json::Value) {
     truncate_details_inner(value);
-    if let Ok(bytes) = serde_json::to_vec(value) {
-        if bytes.len() > MCP_OUTPUT_MAX_BYTES * 2 {
+    if let Some(len) = json_byte_len(value) {
+        if len > MCP_OUTPUT_MAX_BYTES * 2 {
             *value = serde_json::json!({
                 "truncated": true,
-                "originalBytes": bytes.len()
+                "originalBytes": len
             });
         }
     }
@@ -426,13 +641,12 @@ pub async fn convert_mcp_result_with_saver(
             }
             McpContentBlock::Resource { resource } => {
                 if let Some(text) = resource.get("text").and_then(|t| t.as_str()) {
-                    let display = truncate_middle(text, MCP_RESOURCE_MAX_BYTES)
-                        .unwrap_or_else(|| text.to_string());
-                    text_parts.push(display);
-                } else if let (Some(blob), Some(mime)) = (
-                    resource.get("blob").and_then(|b| b.as_str()),
-                    resource.get("mimeType").and_then(|m| m.as_str()),
-                ) {
+                    text_parts.push(text.to_string());
+                } else if let Some(blob) = resource.get("blob").and_then(|b| b.as_str()) {
+                    let mime = resource
+                        .get("mimeType")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("application/octet-stream");
                     if mime.starts_with("image/") {
                         push_capped_image(
                             blob.to_string(),
@@ -442,44 +656,62 @@ pub async fn convert_mcp_result_with_saver(
                             &mut total_image_bytes,
                         );
                     } else {
-                        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, blob) {
-                            Ok(data) => {
-                                if is_text_mime_type(mime) {
-                                    if let Ok(text) = String::from_utf8(data) {
-                                        text_parts.push(text);
+                        let raw_uri = resource.get("uri").and_then(|u| u.as_str()).unwrap_or("");
+                        let safe_uri = sanitize_mcp_text(raw_uri, 512);
+                        let max_b64_len = MCP_DISK_WRITE_MAX_BYTES.div_ceil(3).saturating_mul(4);
+                        if blob.len() > max_b64_len {
+                            text_parts.push(format!(
+                                "[Binary resource {safe_uri} omitted: encoded size {} bytes exceeds {} byte cap]",
+                                blob.len(),
+                                MCP_DISK_WRITE_MAX_BYTES
+                            ));
+                        } else {
+                            match decode_base64_maybe_blocking(blob).await {
+                                Ok(data) => {
+                                    if data.len() > MCP_DISK_WRITE_MAX_BYTES {
+                                        text_parts.push(format!(
+                                            "[Binary resource {safe_uri} omitted: {} bytes exceeds {} byte cap]",
+                                            data.len(),
+                                            MCP_DISK_WRITE_MAX_BYTES
+                                        ));
+                                    } else if is_text_mime_type(mime) {
+                                        if let Ok(text) = String::from_utf8(data) {
+                                            text_parts.push(text);
+                                        } else {
+                                            text_parts.push("[resource omitted]".to_string());
+                                        }
                                     } else {
-                                        text_parts.push("[resource omitted]".to_string());
-                                    }
-                                } else {
-                                    let uri = resource.get("uri").and_then(|u| u.as_str()).unwrap_or("");
-                                    let ext = if uri.contains('.') {
-                                        let clean = uri.split('?').next().unwrap_or(uri);
-                                        std::path::Path::new(clean)
+                                        let clean = raw_uri.split(['?', '#']).next().unwrap_or(raw_uri);
+                                        let raw_ext = std::path::Path::new(clean)
                                             .extension()
                                             .and_then(|s| s.to_str())
-                                            .map(|e| format!(".{e}"))
-                                            .unwrap_or_else(|| ".bin".to_string())
-                                    } else {
-                                        ".bin".to_string()
-                                    };
-                                    let save_res = if let Some(ref s) = saver {
-                                        s(data, ext).await
-                                    } else {
-                                        save_mcp_output_file_async(data, ext).await
-                                    };
-                                    match save_res {
-                                        Ok(p) => {
-                                            text_parts.push(format!("[Binary resource {uri} saved to {}]", p.display()));
-                                        }
-                                        Err(e) => {
-                                            text_parts.push(format!("[Binary resource {uri} could not be saved: {e}]"));
+                                            .unwrap_or("");
+                                        let ext = sanitize_output_ext(raw_ext);
+                                        let save_res = if let Some(ref s) = saver {
+                                            s(data, ext).await
+                                        } else {
+                                            save_mcp_output_file_async(data, ext).await
+                                        };
+                                        match save_res {
+                                            Ok(p) => {
+                                                text_parts.push(format!(
+                                                    "[Binary resource {safe_uri} saved to {}]",
+                                                    p.display()
+                                                ));
+                                            }
+                                            Err(e) => {
+                                                text_parts.push(format!(
+                                                    "[Binary resource {safe_uri} could not be saved: {e}]"
+                                                ));
+                                            }
                                         }
                                     }
                                 }
-                            }
-                            Err(e) => {
-                                let uri = resource.get("uri").and_then(|u| u.as_str()).unwrap_or("");
-                                text_parts.push(format!("[Binary resource {uri} failed to decode base64: {e}]"));
+                                Err(e) => {
+                                    text_parts.push(format!(
+                                        "[Binary resource {safe_uri} failed to decode base64: {e}]"
+                                    ));
+                                }
                             }
                         }
                     }
@@ -504,10 +736,12 @@ pub async fn convert_mcp_result_with_saver(
     let mut blocks = Vec::new();
 
     if let Some(truncated) = truncate_middle(&combined_text, MCP_OUTPUT_MAX_BYTES) {
-        let save_res = if let Some(ref s) = saver {
-            s(combined_text.as_bytes().to_vec(), ".txt".to_string()).await.ok()
+        let save_res = if combined_text.len() > MCP_DISK_WRITE_MAX_BYTES {
+            None
+        } else if let Some(ref s) = saver {
+            s(combined_text.into_bytes(), ".txt".to_string()).await.ok()
         } else {
-            save_mcp_output_file_async(combined_text.as_bytes().to_vec(), ".txt".to_string())
+            save_mcp_output_file_async(combined_text.into_bytes(), ".txt".to_string())
                 .await
                 .ok()
         };
@@ -555,6 +789,7 @@ pub struct McpAgentTool {
     sanitized_schema: serde_json::Value,
     tool_info: McpToolInfo,
     client: Arc<McpClient>,
+    timeout: Option<Duration>,
 }
 
 impl McpAgentTool {
@@ -585,7 +820,14 @@ impl McpAgentTool {
             sanitized_schema,
             tool_info,
             client,
+            timeout: None,
         }
+    }
+
+    /// Configures an optional per-call timeout forwarded to `McpRequestOptions`.
+    pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     pub fn server_name(&self) -> &str {
@@ -628,16 +870,25 @@ impl AgentTool for McpAgentTool {
     }
 
     fn is_read_only(&self) -> Option<bool> {
-        self.tool_info
-            .annotations
-            .as_ref()
-            .and_then(|a| a.read_only_hint)
+        let annotations = self.tool_info.annotations.as_ref()?;
+        if annotations.destructive_hint == Some(true) {
+            return Some(false);
+        }
+        annotations.read_only_hint
+    }
+
+    fn is_safe_for_auto_approve(
+        &self,
+        _args: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<bool> {
+        // Untrusted external MCP servers must never auto-approve purely on read_only_hint.
+        Some(false)
     }
 
     async fn execute(
         &self,
         _tool_call_id: &str,
-        params: serde_json::Map<String, serde_json::Value>,
+        mut params: serde_json::Map<String, serde_json::Value>,
         cancel: tokio_util::sync::CancellationToken,
         on_update: Option<AgentToolUpdateCallback>,
     ) -> Result<AgentToolResult, String> {
@@ -645,6 +896,8 @@ impl AgentTool for McpAgentTool {
             return Err("Tool execution cancelled".to_string());
         }
 
+        // Strip internal security-inspector metadata before forwarding to untrusted MCP servers.
+        params.remove(mehh_agent::types::INSPECTED_TARGET_ARG);
         let arguments = serde_json::Value::Object(params);
         let progress_cb = on_update.map(|cb| {
             Arc::new(move |prog: crate::client::McpProgressNotification| {
@@ -656,7 +909,11 @@ impl AgentTool for McpAgentTool {
                     _ => format!("Progress: {}", prog.progress),
                 };
                 if let Some(m) = &prog.message {
-                    msg.push_str(&format!(" - {m}"));
+                    let clean_m = sanitize_progress_message(m);
+                    if !clean_m.is_empty() {
+                        msg.push_str(" - ");
+                        msg.push_str(&clean_m);
+                    }
                 }
                 cb(AgentToolResult {
                     content: vec![ToolResultContentBlock::Text(TextContent {
@@ -669,9 +926,10 @@ impl AgentTool for McpAgentTool {
         });
 
         let options = crate::client::McpRequestOptions {
-            timeout: None,
+            timeout: self.timeout,
             cancel: Some(cancel.clone()),
             on_progress: progress_cb,
+            ..Default::default()
         };
 
         let res = self
@@ -842,7 +1100,9 @@ impl AgentTool for ListMcpResourcesTool {
                 }
             });
             let mut next_cursors = serde_json::Map::new();
-            for (srv, outcome) in futures::future::join_all(requests).await {
+            let mut stream =
+                futures::stream::StreamExt::buffered(futures::stream::iter(requests), 8);
+            while let Some((srv, outcome)) = futures::StreamExt::next(&mut stream).await {
                 match outcome {
                     Ok(res) => {
                         if let Some(next) = res.get("nextCursor").filter(|v| !v.is_null()) {
@@ -1007,7 +1267,9 @@ impl AgentTool for ListMcpResourceTemplatesTool {
                 }
             });
             let mut next_cursors = serde_json::Map::new();
-            for (srv, outcome) in futures::future::join_all(requests).await {
+            let mut stream =
+                futures::stream::StreamExt::buffered(futures::stream::iter(requests), 8);
+            while let Some((srv, outcome)) = futures::StreamExt::next(&mut stream).await {
                 match outcome {
                     Ok(res) => {
                         if let Some(next) = res.get("nextCursor").filter(|v| !v.is_null()) {
@@ -1148,10 +1410,11 @@ impl AgentTool for ReadMcpResourceTool {
             for item in contents_arr {
                 if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
                     text_parts.push(text.to_string());
-                } else if let (Some(blob), Some(mime)) = (
-                    item.get("blob").and_then(|b| b.as_str()),
-                    item.get("mimeType").and_then(|m| m.as_str()),
-                ) {
+                } else if let Some(blob) = item.get("blob").and_then(|b| b.as_str()) {
+                    let mime = item
+                        .get("mimeType")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("application/octet-stream");
                     if mime.starts_with("image/") {
                         push_capped_image(
                             blob.to_string(),
@@ -1160,6 +1423,29 @@ impl AgentTool for ReadMcpResourceTool {
                             &mut text_parts,
                             &mut total_image_bytes,
                         );
+                    } else if is_text_mime_type(mime) {
+                        let max_b64_len = MCP_DISK_WRITE_MAX_BYTES.div_ceil(3).saturating_mul(4);
+                        if blob.len() > max_b64_len {
+                            text_parts.push(format!(
+                                "[text resource {mime} omitted: encoded size {} bytes exceeds {} byte cap]",
+                                blob.len(),
+                                MCP_DISK_WRITE_MAX_BYTES
+                            ));
+                        } else {
+                            match decode_base64_maybe_blocking(blob).await {
+                                Ok(data) => match String::from_utf8(data) {
+                                    Ok(text) => text_parts.push(text),
+                                    Err(_) => {
+                                        text_parts.push(format!("[binary resource {mime} omitted]"))
+                                    }
+                                },
+                                Err(e) => {
+                                    text_parts.push(format!(
+                                        "[resource {mime} failed to decode base64: {e}]"
+                                    ));
+                                }
+                            }
+                        }
                     } else {
                         text_parts.push(format!("[binary resource {mime} omitted]"));
                     }
@@ -1609,5 +1895,488 @@ mod tests {
 
         client.close().await.unwrap();
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn execute_strips_inspected_target_arg_and_sanitizes_progress_message() {
+        use crate::jsonrpc::{JsonRpcMessage, JsonRpcNotification, JsonRpcResponse};
+
+        let (client_transport, server_transport) = crate::transport::InMemoryTransport::pair();
+        let captured_args = Arc::new(tokio::sync::Mutex::new(None));
+        let captured_clone = captured_args.clone();
+
+        let server = tokio::spawn(async move {
+            if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "serverInfo": { "name": "test-server", "version": "1.0.0" }
+                    }),
+                );
+                server_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+            }
+            let _ = server_transport.recv().await; // notifications/initialized
+
+            if let Some(Ok(JsonRpcMessage::Request(req))) = server_transport.recv().await {
+                let args = req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("arguments"))
+                    .cloned();
+                *captured_clone.lock().await = args;
+
+                let token = req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("_meta"))
+                    .and_then(|m| m.get("progressToken"))
+                    .cloned()
+                    .expect("progressToken");
+
+                let dirty_progress = JsonRpcNotification::new(
+                    "notifications/progress",
+                    Some(serde_json::json!({
+                        "progressToken": token,
+                        "progress": 1.0,
+                        "total": 2.0,
+                        "message": "\x1b[31mstep\x1b[0m \x1b]8;;https://evil.test\x07link\x1b]8;;\x07\r\n\u{202E}spoof\u{2066}!"
+                    })),
+                );
+                server_transport
+                    .send(JsonRpcMessage::Notification(dirty_progress))
+                    .await
+                    .unwrap();
+
+                let resp = JsonRpcResponse::success(
+                    req.id,
+                    serde_json::json!({
+                        "content": [{ "type": "text", "text": "done" }]
+                    }),
+                );
+                server_transport.send(JsonRpcMessage::Response(resp)).await.unwrap();
+            }
+        });
+
+        let client = Arc::new(McpClient::connect(Arc::new(client_transport)).await.unwrap());
+        let tool_info = McpToolInfo {
+            name: "echo".to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        let tool = McpAgentTool::new("srv", tool_info, client.clone());
+
+        let received_progress = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let progress_seen = Arc::new(tokio::sync::Notify::new());
+        let progress_clone = received_progress.clone();
+        let progress_seen_cb = progress_seen.clone();
+        let on_update: AgentToolUpdateCallback = Arc::new(move |res| {
+            if let Some(ToolResultContentBlock::Text(t)) = res.content.first() {
+                progress_clone.lock().unwrap().push(t.text.clone());
+                progress_seen_cb.notify_one();
+            }
+        });
+
+        let mut params = serde_json::Map::new();
+        params.insert("query".to_string(), serde_json::json!("hello"));
+        params.insert(
+            mehh_agent::types::INSPECTED_TARGET_ARG.to_string(),
+            serde_json::json!("/secret/internal/path"),
+        );
+
+        let result = tool
+            .execute(
+                "call-1",
+                params,
+                tokio_util::sync::CancellationToken::new(),
+                Some(on_update),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.content.len(), 1);
+
+        let forwarded = captured_args.lock().await.clone().unwrap();
+        assert_eq!(forwarded.get("query").and_then(|v| v.as_str()), Some("hello"));
+        assert!(
+            forwarded.get(mehh_agent::types::INSPECTED_TARGET_ARG).is_none(),
+            "INSPECTED_TARGET_ARG must be stripped before forwarding to MCP server: {forwarded}"
+        );
+
+        if received_progress.lock().unwrap().is_empty() {
+            tokio::time::timeout(std::time::Duration::from_secs(2), progress_seen.notified())
+                .await
+                .expect("expected sanitized progress update");
+        }
+        {
+            let updates = received_progress.lock().unwrap();
+            assert_eq!(updates.len(), 1);
+            let msg = &updates[0];
+            assert!(!msg.contains('\x1b'), "ANSI escape leaked: {msg:?}");
+            assert!(!msg.contains('\x07'), "BEL leaked: {msg:?}");
+            assert!(!msg.contains('\r'), "CR leaked: {msg:?}");
+            assert!(!msg.contains('\n'), "LF leaked: {msg:?}");
+            assert!(!msg.contains('\u{202E}'), "bidi RLO leaked: {msg:?}");
+            assert!(!msg.contains('\u{2066}'), "bidi LRI leaked: {msg:?}");
+            assert!(msg.contains("step"), "expected clean progress text in {msg:?}");
+            assert!(msg.contains("spoof!"), "expected clean progress text in {msg:?}");
+        }
+
+        client.close().await.unwrap();
+        server.abort();
+    }
+
+    #[test]
+    fn sanitize_input_schema_bounds_fallback_size() {
+        let mut props = serde_json::Map::new();
+        let mut required = Vec::new();
+        for i in 0..3000 {
+            let name = format!("field_{i:04}_{}", "x".repeat(40));
+            props.insert(
+                name.clone(),
+                serde_json::json!({
+                    "type": "string",
+                    "description": "d".repeat(64)
+                }),
+            );
+            required.push(serde_json::Value::String(name));
+        }
+        let giant = serde_json::json!({
+            "type": "object",
+            "properties": props,
+            "required": required
+        });
+        let sanitized = sanitize_input_schema(giant);
+        let serialized_len = serde_json::to_vec(&sanitized).unwrap().len();
+        assert!(
+            serialized_len <= MAX_TOOL_SCHEMA_BYTES,
+            "fallback schema exceeded MAX_TOOL_SCHEMA_BYTES: {serialized_len}"
+        );
+    }
+
+    #[tokio::test]
+    async fn convert_mcp_result_bounds_binary_resource_writes_and_sanitizes_ext() {
+        let oversized_b64 = "A".repeat(MCP_DISK_WRITE_MAX_BYTES.div_ceil(3) * 4 + 16);
+        let res = McpCallToolResult {
+            content: vec![McpContentBlock::Resource {
+                resource: serde_json::json!({
+                    "uri": "file:///tmp/huge.bin",
+                    "mimeType": "application/octet-stream",
+                    "blob": oversized_b64,
+                }),
+            }],
+            is_error: false,
+            structured_content: None,
+        };
+        let converted = convert_mcp_result_with_saver(res, None).await;
+        match &converted.content[0] {
+            ToolResultContentBlock::Text(t) => {
+                assert!(t.text.contains("exceeds"), "expected size cap omission: {}", t.text);
+            }
+            _ => panic!("expected text omission"),
+        }
+
+        // Verify extension passed to custom saver is sanitized and strips #fragment/?query.
+        let captured_ext = Arc::new(std::sync::Mutex::new(String::new()));
+        let ext_clone = captured_ext.clone();
+        let saver: McpOutputSaver = Arc::new(move |_data, ext| {
+            let ext_clone = ext_clone.clone();
+            Box::pin(async move {
+                *ext_clone.lock().unwrap() = ext;
+                Ok(PathBuf::from("/tmp/fake.out"))
+            })
+        });
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, b"hello");
+        let res2 = McpCallToolResult {
+            content: vec![McpContentBlock::Resource {
+                resource: serde_json::json!({
+                    "uri": "file:///tmp/doc.PDF?dl=1#../evil",
+                    "mimeType": "application/pdf",
+                    "blob": b64,
+                }),
+            }],
+            is_error: false,
+            structured_content: None,
+        };
+        let _ = convert_mcp_result_with_saver(res2, Some(saver)).await;
+        assert_eq!(captured_ext.lock().unwrap().as_str(), ".pdf");
+
+        // Verify direct disk write rejects oversized payload.
+        let dir = crate::TempTestDir::new("tool_adapter_disk_cap");
+        let err = save_mcp_output_file_in_dir(
+            dir.path(),
+            &vec![0u8; MCP_DISK_WRITE_MAX_BYTES + 1],
+            ".bin",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("disk write limit"));
+    }
+
+    #[test]
+    fn save_mcp_output_refuses_symlink_dir_and_cleanup_scopes_to_regular_prefixed_files() {
+        let dir = crate::TempTestDir::new("tool_adapter_cleanup");
+        let target_dir = dir.path().join("real_target");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        let victim_file = target_dir.join("mcp-output-old.txt");
+        let unrelated_file = target_dir.join("unrelated.txt");
+        std::fs::write(&victim_file, b"keep-me").unwrap();
+        std::fs::write(&unrelated_file, b"keep-unrelated").unwrap();
+
+        let symlink_dir = dir.path().join("link_dir");
+        #[cfg(unix)]
+        let linked_dir = std::os::unix::fs::symlink(&target_dir, &symlink_dir).is_ok();
+        #[cfg(windows)]
+        let linked_dir = std::os::windows::fs::symlink_dir(&target_dir, &symlink_dir).is_ok();
+
+        if linked_dir {
+            let err = save_mcp_output_file_in_dir(&symlink_dir, b"payload", ".txt").unwrap_err();
+            assert!(err.to_string().contains("symlinked directory"), "got: {err}");
+            assert!(victim_file.exists(), "symlinked dir contents must not be deleted");
+            assert!(unrelated_file.exists());
+        }
+
+        // Cleanup with future cutoff must delete only regular `mcp-output-*` files,
+        // never unrelated files or symlinks named `mcp-output-*`.
+        let external_victim = dir.path().join("external.txt");
+        std::fs::write(&external_victim, b"secret").unwrap();
+        let symlink_entry = target_dir.join("mcp-output-link.txt");
+        #[cfg(unix)]
+        let linked_file = std::os::unix::fs::symlink(&external_victim, &symlink_entry).is_ok();
+        #[cfg(windows)]
+        let linked_file =
+            std::os::windows::fs::symlink_file(&external_victim, &symlink_entry).is_ok();
+
+        let future_cutoff = SystemTime::now() + Duration::from_secs(60);
+        cleanup_old_mcp_outputs_with_cutoff(&target_dir, future_cutoff);
+
+        assert!(!victim_file.exists(), "expired regular mcp-output-* file should be cleaned up");
+        assert!(unrelated_file.exists(), "unrelated file must not be deleted");
+        assert!(external_victim.exists(), "symlink target must not be deleted");
+        if linked_file {
+            assert!(
+                std::fs::symlink_metadata(&symlink_entry).is_ok(),
+                "symlink named mcp-output-* must not be deleted"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn i23_convert_mcp_result_handles_blob_without_mime_type_and_saves_untruncated_resource_text() {
+        // 1. Blob missing mimeType must be saved as binary (application/octet-stream), not omitted.
+        let payload = b"raw-binary-bytes";
+        let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, payload);
+        type SavedBlobs = Arc<std::sync::Mutex<Vec<(Vec<u8>, String)>>>;
+        let saved_blobs: SavedBlobs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let saved_blobs_cb = saved_blobs.clone();
+        let saver: McpOutputSaver = Arc::new(move |data, ext| {
+            let saved_blobs_cb = saved_blobs_cb.clone();
+            Box::pin(async move {
+                saved_blobs_cb.lock().unwrap().push((data, ext));
+                Ok(PathBuf::from("/tmp/saved.out"))
+            })
+        });
+
+        let res_blob = McpCallToolResult {
+            content: vec![McpContentBlock::Resource {
+                resource: serde_json::json!({
+                    "uri": "file:///tmp/mystery.dat",
+                    "blob": b64,
+                }),
+            }],
+            is_error: false,
+            structured_content: None,
+        };
+        let converted_blob = convert_mcp_result_with_saver(res_blob, Some(saver.clone())).await;
+        let blob_text = match &converted_blob.content[0] {
+            ToolResultContentBlock::Text(t) => &t.text,
+            _ => panic!("expected text block"),
+        };
+        assert!(
+            blob_text.contains("saved to"),
+            "blob without mimeType must be saved, got: {blob_text}"
+        );
+        assert_eq!(saved_blobs.lock().unwrap()[0].0, payload);
+
+        // 2. Resource text larger than MCP_RESOURCE_MAX_BYTES must NOT be pre-truncated before saving.
+        let oversized_resource_text =
+            format!("HEAD_MARKER_{}_TAIL_MARKER", "Z".repeat(MCP_RESOURCE_MAX_BYTES + 10_000));
+        let res_text = McpCallToolResult {
+            content: vec![McpContentBlock::Resource {
+                resource: serde_json::json!({
+                    "uri": "file:///tmp/big.txt",
+                    "mimeType": "text/plain",
+                    "text": oversized_resource_text,
+                }),
+            }],
+            is_error: false,
+            structured_content: None,
+        };
+        let _ = convert_mcp_result_with_saver(res_text, Some(saver)).await;
+        let saved_guard = saved_blobs.lock().unwrap();
+        let full_saved = String::from_utf8(saved_guard[1].0.clone()).unwrap();
+        assert_eq!(
+            full_saved.len(),
+            oversized_resource_text.len(),
+            "saved resource text must not be pre-truncated before disk write"
+        );
+        assert!(!full_saved.contains("chars truncated"));
+    }
+
+    #[tokio::test]
+    async fn i23_read_mcp_resource_tool_decodes_text_blobs_and_omits_unknown_mime_cleanly() {
+        use crate::jsonrpc::{JsonRpcMessage, JsonRpcResponse};
+
+        let (client_tr, server_tr) = crate::transport::InMemoryTransport::pair();
+        let text_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            b"hello decoded text",
+        );
+        let bin_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            [0xff, 0x00, 0xfe, 0x01],
+        );
+
+        let bin_b64_srv = bin_b64.clone();
+        let srv = tokio::spawn(async move {
+            while let Some(Ok(msg)) = server_tr.recv().await {
+                let JsonRpcMessage::Request(req) = msg else {
+                    continue;
+                };
+                let resp = if req.method == "initialize" {
+                    JsonRpcResponse::success(
+                        req.id,
+                        serde_json::json!({
+                            "protocolVersion": "2025-06-18",
+                            "capabilities": { "resources": {} },
+                            "serverInfo": { "name": "res-srv", "version": "1.0" }
+                        }),
+                    )
+                } else if req.method == "resources/read" {
+                    let uri = req
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("uri"))
+                        .and_then(|u| u.as_str())
+                        .unwrap_or("");
+                    if uri == "mem://text" {
+                        JsonRpcResponse::success(
+                            req.id,
+                            serde_json::json!({
+                                "contents": [{
+                                    "uri": uri,
+                                    "mimeType": "text/plain",
+                                    "blob": text_b64,
+                                }]
+                            }),
+                        )
+                    } else {
+                        JsonRpcResponse::success(
+                            req.id,
+                            serde_json::json!({
+                                "contents": [{
+                                    "uri": uri,
+                                    "blob": bin_b64_srv,
+                                }]
+                            }),
+                        )
+                    }
+                } else {
+                    JsonRpcResponse::success(req.id, serde_json::json!({}))
+                };
+                let _ = server_tr.send(JsonRpcMessage::Response(resp)).await;
+            }
+        });
+
+        let client = Arc::new(McpClient::connect(Arc::new(client_tr)).await.unwrap());
+        let reg: McpServerRegistry = Arc::new(RwLock::new(vec![("srv".to_string(), client.clone())]));
+        let tool = ReadMcpResourceTool::new(reg);
+
+        let mut p1 = serde_json::Map::new();
+        p1.insert("server".to_string(), serde_json::json!("srv"));
+        p1.insert("uri".to_string(), serde_json::json!("mem://text"));
+        let r1 = tool
+            .execute("c1", p1, tokio_util::sync::CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let t1 = match &r1.content[0] {
+            ToolResultContentBlock::Text(t) => &t.text,
+            _ => panic!("expected text"),
+        };
+        assert_eq!(t1, "hello decoded text");
+
+        let mut p2 = serde_json::Map::new();
+        p2.insert("server".to_string(), serde_json::json!("srv"));
+        p2.insert("uri".to_string(), serde_json::json!("mem://unknown"));
+        let r2 = tool
+            .execute("c2", p2, tokio_util::sync::CancellationToken::new(), None)
+            .await
+            .unwrap();
+        let t2 = match &r2.content[0] {
+            ToolResultContentBlock::Text(t) => &t.text,
+            _ => panic!("expected text"),
+        };
+        assert_eq!(t2, "[binary resource application/octet-stream omitted]");
+        assert!(!t2.contains(&bin_b64));
+
+        client.close().await.unwrap();
+        srv.abort();
+    }
+
+    #[tokio::test]
+    async fn c9_mcp_agent_tool_enforces_configured_timeout() {
+        use crate::jsonrpc::{JsonRpcMessage, JsonRpcResponse};
+
+        let (client_tr, server_tr) = crate::transport::InMemoryTransport::pair();
+        let srv = tokio::spawn(async move {
+            while let Some(Ok(msg)) = server_tr.recv().await {
+                if let JsonRpcMessage::Request(req) = msg {
+                    if req.method == "initialize" {
+                        let resp = JsonRpcResponse::success(
+                            req.id,
+                            serde_json::json!({
+                                "protocolVersion": "2025-06-18",
+                                "capabilities": { "tools": {} },
+                                "serverInfo": { "name": "slow-srv", "version": "1.0" }
+                            }),
+                        );
+                        let _ = server_tr.send(JsonRpcMessage::Response(resp)).await;
+                    } else if req.method == "tools/call" {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
+            }
+        });
+
+        let client = Arc::new(McpClient::connect(Arc::new(client_tr)).await.unwrap());
+        let tool_info = McpToolInfo {
+            name: "slow_op".to_string(),
+            description: None,
+            input_schema: serde_json::json!({ "type": "object" }),
+            annotations: None,
+        };
+        let mut used = HashSet::new();
+        let tools = create_mcp_agent_tools_with_shared_names_and_timeout(
+            "srv",
+            vec![tool_info],
+            client.clone(),
+            &mut used,
+            Some(Duration::from_millis(60)),
+        );
+        let start = std::time::Instant::now();
+        let err = tools[0]
+            .execute(
+                "call-1",
+                serde_json::Map::new(),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(err.contains("timed out"), "expected timeout error, got: {err}");
+
+        client.close().await.unwrap();
+        srv.abort();
     }
 }

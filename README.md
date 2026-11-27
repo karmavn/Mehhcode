@@ -6,7 +6,7 @@ Mehhcode (`mehh`) is a Rust terminal coding agent CLI for software engineers, co
 
 - **Multiple execution modes:** Run the interactive terminal UI (`mehh`), one-shot print mode (`mehh -p "..."` or piped stdin), structured JSON output (`--mode json`), or JSON-RPC (`--mode rpc`) for editor and automation integrations.
 - **15 built-in LLM providers and OAuth:** Stream via Anthropic, OpenAI (Chat & Responses), Google Gemini / Vertex, Amazon Bedrock, Azure OpenAI, Mistral, OpenRouter, Groq, DeepSeek, xAI, Cerebras, Together, Fireworks, and GitHub Copilot, with custom providers/models in `~/.mehh/agent/models.json` and OAuth login via `mehh --login <provider>`.
-- **Built-in coding tools with undo:** Inspect and modify workspaces with `read`, `write`, `edit`, `undo_edit`, `bash`, `grep`, `find`, `ls`, `analyze`, `todo`, `subagent`, and opt-in `powershell` (selectable via `--tools` / `--exclude-tools`).
+- **Built-in coding and web tools with undo:** Inspect workspaces, browse web sources, and edit files with `read`, `write`, `edit`, `undo_edit`, `bash`, `grep`, `find`, `ls`, `analyze`, `web_search`, `web_fetch`, `todo`, `subagent`, and opt-in `powershell` (selectable via `--tools` / `--exclude-tools`, with `web_search` and `web_fetch` configured via `settings.json`).
 - **Fail-closed governance and sandboxing:** Enforce `smart_approve` (default), `approve`, `auto`, and `chat` permission modes, project trust gating for workspace-local configs, shell-aware prefix rules (`mehh-execpolicy`), secret environment variable scrubbing, and OS sandboxing (`bwrap` on Linux, Seatbelt `sandbox-exec` on macOS).
 - **MCP, subagents, and QuickJS codemode:** Connect local stdio and streamable HTTP MCP servers (`mcp.json`), delegate tasks to subagents or lead/worker model splits (`--worker-model`, `--lead-turns`), and batch tool calls inside an embedded QuickJS runtime (`--codemode`).
 - **Branching sessions and project context:** Persist JSONL v3 sessions with `-c`/`--continue`, `--resume`, `--fork`, `/tree`, `/compact`, and `--export`, while automatically discovering `AGENTS.md` / `CLAUDE.md`, `SKILL.md` skills, and prompt templates.
@@ -77,7 +77,7 @@ Global configuration files live under `~/.mehh/agent/`. Trusted workspaces may a
 | --- | --- | --- |
 | `settings.json` | Global & project | Default provider/model, thinking level, theme, permission mode, compaction, and lead/worker settings |
 | `auth.json` | Global only | Stored API keys and OAuth tokens (written with restricted file permissions) |
-| `models.json` | Global & project | Custom provider base URLs, headers, and model definitions |
+| `models.json` | Global only | Custom provider base URLs, headers, and model definitions |
 | `mcp.json` | Global & project | Stdio and streamable HTTP MCP server definitions and overrides |
 | `permissions.json` | Global & project | Persisted `always_allow`, `ask_before`, and `never_allow` tool rules |
 
@@ -89,7 +89,7 @@ Global configuration files live under `~/.mehh/agent/`. Trusted workspaces may a
 | `mehh-coding-agent` | Session lifecycle (JSONL v3), TUI orchestration, RPC/print modes, trust, permissions, subagents, skills, compaction |
 | `mehh-agent` | Core agent turn loop, tool dispatch, steering/follow-up queues, cancellation |
 | `mehh-ai` | Multi-provider LLM streaming adapters, built-in model catalog, OAuth, retry/overflow handling |
-| `mehh-tools` | Built-in filesystem, search, analysis, undo, and shell tools |
+| `mehh-tools` | Built-in filesystem, search, web, analysis, undo, and shell tools |
 | `mehh-tui` | Terminal UI widgets, markdown renderer, editor, themes, and input handling (`crossterm`) |
 | `mehh-mcp` | MCP client over stdio and streamable HTTP, OAuth, and resource meta-tools |
 | `mehh-codemode` | Embedded QuickJS (`rquickjs`) sandbox for programmatic tool orchestration |

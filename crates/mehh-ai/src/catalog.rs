@@ -1,7 +1,19 @@
 use crate::types::{Model, ModelCost};
 
+static BUILTIN_MODELS: std::sync::LazyLock<Vec<Model>> =
+    std::sync::LazyLock::new(build_builtin_models);
+
+/// Shared static slice of the builtin model catalog.
+pub fn builtin_models_slice() -> &'static [Model] {
+    &BUILTIN_MODELS
+}
+
 /// Builtin catalog of popular LLM models across 15 providers.
 pub fn builtin_models() -> Vec<Model> {
+    BUILTIN_MODELS.clone()
+}
+
+fn build_builtin_models() -> Vec<Model> {
     vec![
         // 1. Anthropic models (anthropic-messages)
         Model {
@@ -342,7 +354,7 @@ pub fn builtin_models() -> Vec<Model> {
             name: "Claude 3.7 Sonnet (Bedrock)".to_string(),
             api: "bedrock-converse-stream".to_string(),
             provider: "amazon-bedrock".to_string(),
-            base_url: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            base_url: "".to_string(),
             reasoning: true,
             input: vec!["text".to_string(), "image".to_string()],
             cost: ModelCost {
@@ -361,7 +373,7 @@ pub fn builtin_models() -> Vec<Model> {
             name: "Claude Sonnet 4 (Bedrock)".to_string(),
             api: "bedrock-converse-stream".to_string(),
             provider: "amazon-bedrock".to_string(),
-            base_url: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
+            base_url: "".to_string(),
             reasoning: true,
             input: vec!["text".to_string(), "image".to_string()],
             cost: ModelCost {
@@ -756,7 +768,7 @@ pub fn builtin_models() -> Vec<Model> {
             api: "openai-completions".to_string(),
             provider: "xai".to_string(),
             base_url: "https://api.x.ai/v1".to_string(),
-            reasoning: true,
+            reasoning: false,
             input: vec!["text".to_string(), "image".to_string()],
             cost: ModelCost {
                 input: 3.0,
@@ -924,7 +936,7 @@ pub fn builtin_models() -> Vec<Model> {
 
 /// Returns the primary environment variable name storing the API key for a provider.
 pub fn env_api_key_name(provider: &str) -> &'static str {
-    match provider {
+    match provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" => "ANTHROPIC_API_KEY",
         "openai" | "openai-responses" => "OPENAI_API_KEY",
         "google" => "GEMINI_API_KEY",
@@ -946,7 +958,7 @@ pub fn env_api_key_name(provider: &str) -> &'static str {
 
 /// Returns the default base URL for a provider if standard/applicable.
 pub fn default_base_url(provider: &str) -> Option<&'static str> {
-    match provider {
+    match provider.trim().to_ascii_lowercase().as_str() {
         "anthropic" => Some("https://api.anthropic.com/v1"),
         "openai" | "openai-responses" => Some("https://api.openai.com/v1"),
         "google" => Some("https://generativelanguage.googleapis.com/v1beta"),
@@ -968,12 +980,15 @@ pub fn default_base_url(provider: &str) -> Option<&'static str> {
 /// Resolves a model given either (provider, Some(model_id)) or a single identifier string
 /// (e.g., "anthropic/claude-sonnet-4-5", "gpt-4o", or "google").
 pub fn resolve_model(provider_or_id: &str, model_id: Option<&str>) -> Option<Model> {
-    let models = builtin_models();
+    let models = builtin_models_slice();
 
     if let Some(id) = model_id {
-        return models.into_iter().find(|m| {
-            m.provider.eq_ignore_ascii_case(provider_or_id) && m.id.eq_ignore_ascii_case(id)
-        });
+        return models
+            .iter()
+            .find(|m| {
+                m.provider.eq_ignore_ascii_case(provider_or_id) && m.id.eq_ignore_ascii_case(id)
+            })
+            .cloned();
     }
 
     // 1. Check slash notation: "provider/model_id"
@@ -996,8 +1011,9 @@ pub fn resolve_model(provider_or_id: &str, model_id: Option<&str>) -> Option<Mod
 
     // 3. Check provider default fallback
     models
-        .into_iter()
+        .iter()
         .find(|m| m.provider.eq_ignore_ascii_case(provider_or_id))
+        .cloned()
 }
 
 #[cfg(test)]
@@ -1107,5 +1123,19 @@ mod tests {
             assert_eq!(m.cost.input, 0.0, "{id} must be free on input");
             assert_eq!(m.cost.output, 0.0, "{id} must be free on output");
         }
+    }
+
+    #[test]
+    fn test_grok3_reasoning_false_and_provider_normalization() {
+        let grok3 = resolve_model("xai", Some("grok-3")).unwrap();
+        assert!(!grok3.reasoning);
+        let grok3_mini = resolve_model("xai", Some("grok-3-mini")).unwrap();
+        assert!(grok3_mini.reasoning);
+
+        assert_eq!(env_api_key_name(" OpenAI "), "OPENAI_API_KEY");
+        assert_eq!(
+            default_base_url(" Anthropic "),
+            Some("https://api.anthropic.com/v1")
+        );
     }
 }

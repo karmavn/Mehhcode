@@ -1,6 +1,14 @@
 use crate::types::{ToolCall, ToolDefinition};
 use serde_json::{Map, Value};
 
+fn schema_allows_null(schema: &Value) -> bool {
+    match schema.get("type") {
+        Some(Value::String(s)) => s == "null",
+        Some(Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some("null")),
+        _ => false,
+    }
+}
+
 /// Validates and coerces tool call arguments against a tool's JSON Schema definition.
 pub fn validate_tool_arguments(
     tool: &ToolDefinition,
@@ -16,22 +24,36 @@ pub fn validate_tool_arguments(
         .parameters
         .get("properties")
         .and_then(|p| p.as_object());
+    let additional_props = tool
+        .parameters
+        .get("additionalProperties")
+        .filter(|v| v.is_object());
 
     // 1. Coerce values where schema defines expected types
-    if let Some(props) = properties {
-        for (prop_name, prop_schema) in props {
-            if let Some(val) = args.get_mut(prop_name) {
-                coerce_value(prop_schema, val);
-            }
+    for (prop_name, val) in &mut args {
+        if let Some(prop_schema) = properties.and_then(|p| p.get(prop_name)) {
+            coerce_value(prop_schema, val);
+        } else if let Some(add_schema) = additional_props {
+            coerce_value(add_schema, val);
         }
     }
 
     // 2. Check required properties
-    if let Some(required) = tool.parameters.get("required").and_then(|r| r.as_array()) {
+    let required = tool.parameters.get("required").and_then(|r| r.as_array());
+    if let Some(required) = required {
         for req in required {
             if let Some(req_name) = req.as_str() {
+                let allows_null = properties
+                    .and_then(|props| props.get(req_name))
+                    .is_some_and(schema_allows_null);
                 match args.get(req_name) {
-                    None | Some(Value::Null) => {
+                    None => {
+                        return Err(format!(
+                            "Missing required property \"{}\" for tool \"{}\"",
+                            req_name, tool.name
+                        ));
+                    }
+                    Some(Value::Null) if !allows_null => {
                         return Err(format!(
                             "Missing required property \"{}\" for tool \"{}\"",
                             req_name, tool.name
@@ -47,11 +69,16 @@ pub fn validate_tool_arguments(
     if let Some(props) = properties {
         for (prop_name, val) in &args {
             if let Some(prop_schema) = props.get(prop_name) {
+                let is_required = required
+                    .is_some_and(|req| req.iter().any(|r| r.as_str() == Some(prop_name)));
+                if val.is_null() && !is_required {
+                    continue;
+                }
                 validate_schema(prop_name, prop_schema, val, &tool.name)?;
             }
         }
     }
-    check_additional_properties(&tool.parameters, properties, &args, &tool.name)?;
+    check_additional_properties(None, &tool.parameters, properties, &args, &tool.name)?;
 
     Ok(args)
 }
@@ -59,11 +86,16 @@ pub fn validate_tool_arguments(
 /// Rejects undeclared properties when a schema sets `additionalProperties: false`,
 /// and validates them against a schema object when one is supplied.
 fn check_additional_properties(
+    parent_path: Option<&str>,
     schema: &Value,
     properties: Option<&Map<String, Value>>,
     map: &Map<String, Value>,
     tool_name: &str,
 ) -> Result<(), String> {
+    let format_path = |name: &str| match parent_path {
+        Some(prefix) => format!("{prefix}.{name}"),
+        None => name.to_string(),
+    };
     let additional = match schema.get("additionalProperties") {
         Some(Value::Bool(false)) => {
             if let Some(name) = map.keys().find(|name| {
@@ -71,8 +103,9 @@ fn check_additional_properties(
                     .map(|p| p.contains_key(*name))
                     .unwrap_or(false)
             }) {
+                let prop_path = format_path(name);
                 return Err(format!(
-                    "Property \"{name}\" in tool \"{tool_name}\" is not allowed (additionalProperties: false)"
+                    "Property \"{prop_path}\" in tool \"{tool_name}\" is not allowed (additionalProperties: false)"
                 ));
             }
             return Ok(());
@@ -85,7 +118,8 @@ fn check_additional_properties(
             .map(|p| p.contains_key(name))
             .unwrap_or(false);
         if !declared {
-            validate_schema(name, additional, val, tool_name)?;
+            let prop_path = format_path(name);
+            validate_schema(&prop_path, additional, val, tool_name)?;
         }
     }
     Ok(())
@@ -98,11 +132,6 @@ fn validate_schema(
     val: &Value,
     tool_name: &str,
 ) -> Result<(), String> {
-    // A present `null` on an optional property means "not provided" for tools.
-    // Required properties already reject null in the caller's required check.
-    if val.is_null() {
-        return Ok(());
-    }
     validate_type(path, schema, val, tool_name)?;
 
     if let Some(allowed) = schema.get("enum").and_then(|e| e.as_array()) {
@@ -132,20 +161,21 @@ fn validate_schema(
 
     if let Some(obj) = val.as_object() {
         let nested_props = schema.get("properties").and_then(|p| p.as_object());
-        if let Some(nested_props) = nested_props {
-            for (name, child) in obj {
-                if let Some(child_schema) = nested_props.get(name) {
-                    let child_path = format!("{path}.{name}");
-                    validate_schema(&child_path, child_schema, child, tool_name)?;
-                }
-            }
-        }
+        let required = schema.get("required").and_then(|r| r.as_array());
         // `required` applies to an object schema even when it declares no
         // `properties` (e.g. `{"type":"object","required":["x"]}`).
-        if let Some(required) = schema.get("required").and_then(|r| r.as_array()) {
+        if let Some(required) = required {
             for req in required {
                 if let Some(req_name) = req.as_str() {
-                    if !obj.get(req_name).is_some_and(|v| !v.is_null()) {
+                    let allows_null = nested_props
+                        .and_then(|props| props.get(req_name))
+                        .is_some_and(schema_allows_null);
+                    let present = match obj.get(req_name) {
+                        None => false,
+                        Some(Value::Null) => allows_null,
+                        Some(_) => true,
+                    };
+                    if !present {
                         return Err(format!(
                             "Missing required property \"{req_name}\" in \"{path}\" for tool \"{tool_name}\""
                         ));
@@ -153,7 +183,20 @@ fn validate_schema(
                 }
             }
         }
-        check_additional_properties(schema, nested_props, obj, tool_name)?;
+        if let Some(nested_props) = nested_props {
+            for (name, child) in obj {
+                if let Some(child_schema) = nested_props.get(name) {
+                    let is_required = required
+                        .is_some_and(|req| req.iter().any(|r| r.as_str() == Some(name)));
+                    if child.is_null() && !is_required {
+                        continue;
+                    }
+                    let child_path = format!("{path}.{name}");
+                    validate_schema(&child_path, child_schema, child, tool_name)?;
+                }
+            }
+        }
+        check_additional_properties(Some(path), schema, nested_props, obj, tool_name)?;
     }
 
     if let Some(arr) = val.as_array() {
@@ -186,51 +229,53 @@ fn coerce_value(schema: &Value, val: &mut Value) {
         }
     };
 
-    if matches_type("integer") {
-        if let Value::String(s) = val {
-            if let Ok(i) = s.trim().parse::<i64>() {
-                *val = Value::Number(i.into());
-                return;
-            }
-        }
-    }
-
-    if matches_type("number") {
-        if let Value::String(s) = val {
-            if let Ok(f) = s.trim().parse::<f64>() {
-                if let Some(num) = serde_json::Number::from_f64(f) {
-                    *val = Value::Number(num);
+    if !matches_type("string") {
+        if matches_type("integer") {
+            if let Value::String(s) = val {
+                if let Ok(i) = s.trim().parse::<i64>() {
+                    *val = Value::Number(i.into());
                     return;
                 }
             }
         }
-    }
 
-    if matches_type("boolean") {
-        if let Value::String(s) = val {
-            let lower = s.trim().to_lowercase();
-            if lower == "true" {
-                *val = Value::Bool(true);
-                return;
-            } else if lower == "false" {
-                *val = Value::Bool(false);
-                return;
+        if matches_type("number") {
+            if let Value::String(s) = val {
+                if let Ok(f) = s.trim().parse::<f64>() {
+                    if let Some(num) = serde_json::Number::from_f64(f) {
+                        *val = Value::Number(num);
+                        return;
+                    }
+                }
             }
         }
-    }
 
-    if matches_type("array") {
-        if let Value::String(s) = val {
-            if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(s) {
-                *val = Value::Array(arr);
+        if matches_type("boolean") {
+            if let Value::String(s) = val {
+                let lower = s.trim().to_lowercase();
+                if lower == "true" {
+                    *val = Value::Bool(true);
+                    return;
+                } else if lower == "false" {
+                    *val = Value::Bool(false);
+                    return;
+                }
             }
         }
-    }
 
-    if matches_type("object") {
-        if let Value::String(s) = val {
-            if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(s) {
-                *val = Value::Object(map);
+        if matches_type("array") {
+            if let Value::String(s) = val {
+                if let Ok(Value::Array(arr)) = serde_json::from_str::<Value>(s) {
+                    *val = Value::Array(arr);
+                }
+            }
+        }
+
+        if matches_type("object") {
+            if let Value::String(s) = val {
+                if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(s) {
+                    *val = Value::Object(map);
+                }
             }
         }
     }
@@ -239,11 +284,13 @@ fn coerce_value(schema: &Value, val: &mut Value) {
     // arrays, and the type check runs after this pass.
     match val {
         Value::Object(map) => {
-            if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
-                for (name, child) in map {
-                    if let Some(child_schema) = props.get(name) {
-                        coerce_value(child_schema, child);
-                    }
+            let props = schema.get("properties").and_then(|p| p.as_object());
+            let additional = schema.get("additionalProperties").filter(|v| v.is_object());
+            for (name, child) in map {
+                if let Some(child_schema) = props.and_then(|p| p.get(name)) {
+                    coerce_value(child_schema, child);
+                } else if let Some(add_schema) = additional {
+                    coerce_value(add_schema, child);
                 }
             }
         }
@@ -564,6 +611,162 @@ mod tests {
         assert!(
             err.contains("Missing required property \"token\""),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn validation_allows_nullable_required_fields_for_openai_strict_mode() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cursor": { "type": ["string", "null"] },
+                "reason": { "type": "null" },
+                "nested": {
+                    "type": "object",
+                    "properties": {
+                        "tag": { "type": ["string", "null"] },
+                        "required_str": { "type": "string" }
+                    },
+                    "required": ["tag", "required_str"]
+                }
+            },
+            "required": ["cursor", "reason", "nested"]
+        });
+
+        let ok = call_with(
+            "t",
+            schema.clone(),
+            serde_json::json!({
+                "cursor": null,
+                "reason": null,
+                "nested": { "tag": null, "required_str": "ok" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(ok["cursor"], Value::Null);
+        assert_eq!(ok["nested"]["tag"], Value::Null);
+
+        let err = call_with(
+            "t",
+            schema,
+            serde_json::json!({
+                "cursor": null,
+                "reason": null,
+                "nested": { "tag": null, "required_str": null }
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("Missing required property \"required_str\""),
+            "non-nullable nested required null must fail: {err}"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_null_inside_non_nullable_items_and_additional_properties() {
+        let arr_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "ids": { "type": "array", "items": { "type": "integer" } }
+            }
+        });
+        let err = call_with("t", arr_schema, serde_json::json!({ "ids": [1, null] })).unwrap_err();
+        assert!(err.contains("expected type"), "unexpected error: {err}");
+
+        let add_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+        });
+        let err_add =
+            call_with("t", add_schema, serde_json::json!({ "extra": null })).unwrap_err();
+        assert!(err_add.contains("expected type"), "unexpected error: {err_add}");
+    }
+
+    #[test]
+    fn validation_preserves_strings_in_string_integer_unions() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "code": { "type": ["string", "integer"] },
+                "flag": { "type": ["string", "boolean"] }
+            }
+        });
+        let args = call_with(
+            "t",
+            schema,
+            serde_json::json!({ "code": "007", "flag": "true" }),
+        )
+        .unwrap();
+        assert_eq!(args["code"], Value::String("007".to_string()));
+        assert_eq!(args["flag"], Value::String("true".to_string()));
+    }
+
+    #[test]
+    fn validation_coerces_additional_properties() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "additionalProperties": { "type": "integer" }
+                }
+            },
+            "additionalProperties": { "type": "integer" }
+        });
+        let args = call_with(
+            "t",
+            schema,
+            serde_json::json!({
+                "top_extra": "42",
+                "nested": { "inner_extra": "7" }
+            }),
+        )
+        .unwrap();
+        assert_eq!(args["top_extra"], Value::Number(42.into()));
+        assert_eq!(args["nested"]["inner_extra"], Value::Number(7.into()));
+    }
+
+    #[test]
+    fn validation_reports_qualified_path_for_nested_additional_properties() {
+        let strict_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "properties": { "ok": { "type": "string" } },
+                    "additionalProperties": false
+                }
+            }
+        });
+        let err = call_with(
+            "t",
+            strict_schema,
+            serde_json::json!({ "nested": { "ok": "yes", "extra": 1 } }),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("Property \"nested.extra\""),
+            "expected qualified path in error: {err}"
+        );
+
+        let typed_schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "nested": {
+                    "type": "object",
+                    "additionalProperties": { "type": "integer" }
+                }
+            }
+        });
+        let err_typed = call_with(
+            "t",
+            typed_schema,
+            serde_json::json!({ "nested": { "bad": "not_an_int" } }),
+        )
+        .unwrap_err();
+        assert!(
+            err_typed.contains("Property \"nested.bad\""),
+            "expected qualified path in error: {err_typed}"
         );
     }
 }

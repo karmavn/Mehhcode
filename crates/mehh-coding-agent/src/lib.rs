@@ -55,6 +55,15 @@ pub use tool_inspection::*;
 pub use tool_search::*;
 pub use trust::*;
 
+/// Returns the current user's home directory from `USERPROFILE` or `HOME`,
+/// ignoring unset or empty values.
+pub(crate) fn user_home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("HOME").filter(|v| !v.is_empty()))
+        .map(std::path::PathBuf::from)
+}
+
 /// Serializes tests that mutate process-global environment variables.
 #[cfg(test)]
 pub(crate) static ENV_MUTEX: std::sync::LazyLock<tokio::sync::Mutex<()>> =
@@ -555,5 +564,38 @@ mod tests {
         assert!(session.system_prompt.contains("codemode"));
 
         let _ = fs::remove_dir_all(temp_dir);
+    }
+
+    #[tokio::test]
+    async fn user_home_dir_falls_back_to_home_when_userprofile_empty() {
+        let _env_lock = crate::ENV_MUTEX.lock().await;
+        struct EnvGuard {
+            userprofile: Option<std::ffi::OsString>,
+            home: Option<std::ffi::OsString>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match &self.userprofile {
+                    Some(v) => std::env::set_var("USERPROFILE", v),
+                    None => std::env::remove_var("USERPROFILE"),
+                }
+                match &self.home {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+        }
+        let _guard = EnvGuard {
+            userprofile: std::env::var_os("USERPROFILE"),
+            home: std::env::var_os("HOME"),
+        };
+
+        let expected = std::env::temp_dir().join("mehh_home_fallback_test");
+        std::env::set_var("USERPROFILE", "");
+        std::env::set_var("HOME", &expected);
+        assert_eq!(crate::user_home_dir().as_deref(), Some(expected.as_path()));
+
+        std::env::set_var("HOME", "");
+        assert_eq!(crate::user_home_dir(), None);
     }
 }

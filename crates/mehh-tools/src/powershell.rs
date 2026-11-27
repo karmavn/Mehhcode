@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::core::context::PathPolicy;
 use crate::core::shell::{parse_timeout_ms, run_shell, ShellKind};
-use mehh_sandbox::{SandboxPlan, SandboxPolicy};
+use mehh_sandbox::SandboxPolicy;
 
 #[derive(Debug, Clone)]
 pub struct PowerShellTool {
@@ -88,6 +88,7 @@ impl AgentTool for PowerShellTool {
         if !cfg!(windows) {
             return Err("PowerShell is not supported on this platform".to_string());
         }
+        self.path_policy.validate(&self.cwd)?;
 
         let command = params
             .get("command")
@@ -95,18 +96,16 @@ impl AgentTool for PowerShellTool {
             .ok_or_else(|| "Missing required parameter 'command'".to_string())?;
         let timeout_ms = parse_timeout_ms(&params);
 
-        let plan = SandboxPlan::new(self.sandbox_policy, self.cwd.clone());
-        let outcome =
-            run_shell(
-                ShellKind::WindowsPowerShell,
-                &self.cwd,
-                command,
-                timeout_ms,
-                cancel,
-                on_update,
-                Some(&plan),
-            )
-                .await?;
+        let outcome = run_shell(
+            ShellKind::WindowsPowerShell,
+            &self.cwd,
+            command,
+            timeout_ms,
+            cancel,
+            on_update,
+            Some(self.sandbox_policy),
+        )
+        .await?;
 
         if let Some(reason) = outcome.aborted_reason {
             return Err(if outcome.text == "(no output)" {
@@ -209,6 +208,29 @@ mod tests {
         assert!(
             err.contains("Sandbox setup failed"),
             "sandbox plan must be applied before spawn, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn powershell_rejects_cwd_outside_workspace_policy() {
+        if !cfg!(windows) {
+            return;
+        }
+        let ws = crate::TempTestDir::new("ps_policy_ws");
+        let outside = crate::TempTestDir::new("ps_policy_outside");
+        let tool = PowerShellTool::new(outside.path().to_path_buf())
+            .with_path_policy(PathPolicy::WorkspaceOnly(vec![ws.path().to_path_buf()]));
+        let params = json!({ "command": "Write-Output ok" })
+            .as_object()
+            .unwrap()
+            .clone();
+        let err = tool
+            .execute("call-1", params, CancellationToken::new(), None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("outside the allowed workspace"),
+            "unexpected err: {err}"
         );
     }
 }

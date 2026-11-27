@@ -49,7 +49,6 @@ packages/agent/docs/extensions/mehh-server-artifact/index.md
 
 # Rust
 /target
-Cargo.lock
 
 # Local agent & audit artifacts
 .bug-hunter/

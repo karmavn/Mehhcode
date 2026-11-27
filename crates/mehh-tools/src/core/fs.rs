@@ -1,7 +1,18 @@
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Read up to `max_bytes` from `path`. Returns `Ok(None)` if the file exceeds `max_bytes`.
+pub async fn read_file_bounded(path: &Path, max_bytes: u64) -> std::io::Result<Option<Vec<u8>>> {
+    let file = tokio::fs::File::open(path).await?;
+    let mut buf = Vec::new();
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut buf)
+        .await?;
+    if buf.len() as u64 > max_bytes {
+        return Ok(None);
+    }
+    Ok(Some(buf))
+}
 
 /// Write `bytes` to a temporary file in the same directory, copy the target's
 /// permissions when it exists, then replace the target in one rename. A failed
@@ -73,8 +84,29 @@ pub async fn atomic_write_checked(
 }
 
 pub(crate) fn targets_match(current: &Path, expected: &Path) -> bool {
-    crate::core::context::canonicalize_lossy(current)
-        == crate::core::context::canonicalize_lossy(expected)
+    let norm_current = crate::core::context::normalize_path_for_comparison(
+        &crate::core::context::canonicalize_lossy(current),
+    );
+    let norm_expected = crate::core::context::normalize_path_for_comparison(
+        &crate::core::context::canonicalize_lossy(expected),
+    );
+    norm_current == norm_expected
+}
+
+async fn write_temp_exclusive(temp_path: &Path, bytes: &[u8]) -> Result<(), String> {
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(temp_path)
+        .await
+        .map_err(|e| format!("Failed to create temporary file: {e}"))?;
+    file.write_all(bytes)
+        .await
+        .map_err(|e| format!("Failed to write temporary file: {e}"))?;
+    file.flush()
+        .await
+        .map_err(|e| format!("Failed to flush temporary file: {e}"))?;
+    Ok(())
 }
 
 async fn atomic_write_inner(
@@ -97,12 +129,11 @@ async fn atomic_write_inner(
     let file_name = path
         .file_name()
         .ok_or_else(|| format!("Invalid file path: {}", path.display()))?;
-    let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
     let temp_name = format!(
         ".{}.mehh-tmp-{}-{}",
         file_name.to_string_lossy(),
         std::process::id(),
-        id
+        uuid::Uuid::new_v4()
     );
     let temp_path = parent.join(temp_name);
 
@@ -113,9 +144,7 @@ async fn atomic_write_inner(
     };
 
     let write_result = async {
-        tokio::fs::write(&temp_path, bytes)
-            .await
-            .map_err(|e| format!("Failed to write temporary file: {e}"))?;
+        write_temp_exclusive(&temp_path, bytes).await?;
         if let Some(perms) = permissions {
             tokio::fs::set_permissions(&temp_path, perms)
                 .await
@@ -137,6 +166,16 @@ async fn atomic_write_inner(
     .await;
 
     if write_result.is_err() {
+        #[cfg(windows)]
+        if let Ok(meta) = tokio::fs::metadata(&temp_path).await {
+            let mut perms = meta.permissions();
+            if perms.readonly() {
+                // Windows-only cleanup of DOS readonly bit on failed temp file.
+                #[allow(clippy::permissions_set_readonly_false)]
+                perms.set_readonly(false);
+                let _ = tokio::fs::set_permissions(&temp_path, perms).await;
+            }
+        }
         let _ = tokio::fs::remove_file(&temp_path).await;
     }
     write_result
@@ -248,5 +287,68 @@ mod tests {
         atomic_write_checked(&link, &expected, b"data").await.unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"data");
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+    }
+
+    #[tokio::test]
+    async fn write_temp_exclusive_refuses_preexisting_file_or_symlink() {
+        let dir = crate::TempTestDir::new("fs_exclusive_tmp");
+        let existing = dir.path().join("already.tmp");
+        std::fs::write(&existing, b"original").unwrap();
+
+        let err = write_temp_exclusive(&existing, b"overwrite")
+            .await
+            .unwrap_err();
+        assert!(err.contains("Failed to create temporary file"), "got: {err}");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"original");
+
+        let victim = dir.path().join("victim.txt");
+        let link = dir.path().join("precreated_link.tmp");
+        std::fs::write(&victim, b"sensitive").unwrap();
+        if create_file_symlink(&victim, &link).is_ok() {
+            assert!(write_temp_exclusive(&link, b"clobber").await.is_err());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"sensitive");
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn checked_write_failure_cleans_up_readonly_temp_file() {
+        let dir = crate::TempTestDir::new("fs_win_readonly_tmp_cleanup");
+        let target = dir.path().join("readonly.txt");
+        std::fs::write(&target, b"original").unwrap();
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&target, perms).unwrap();
+
+        let expected = resolve_write_target(&target).await;
+        // On Windows, replacing a readonly file fails at rename after copying
+        // the readonly attribute onto temp_path.
+        let res = atomic_write_checked(&target, &expected, b"new").await;
+        assert!(res.is_err(), "expected rename over readonly target to fail");
+
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".mehh-tmp-"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "readonly temp file must be cleaned up on failure: {leftovers:?}"
+        );
+
+        // Clean up readonly attribute so TempTestDir drop can remove the file.
+        let mut perms = std::fs::metadata(&target).unwrap().permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o644);
+        }
+        #[cfg(not(unix))]
+        {
+            #[allow(clippy::permissions_set_readonly_false)]
+            perms.set_readonly(false);
+        }
+        std::fs::set_permissions(&target, perms).unwrap();
     }
 }

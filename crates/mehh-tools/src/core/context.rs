@@ -10,47 +10,139 @@ pub enum PathPolicy {
     WorkspaceOnly(Vec<PathBuf>),
 }
 
-fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut parts: Vec<Component<'_>> = Vec::new();
-    for component in path.components() {
+fn canonicalize_lossy_checked(path: &Path) -> Result<(PathBuf, bool), String> {
+    let anchored = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|e| {
+                format!(
+                    "Failed to determine current directory for {}: {e}",
+                    path.display()
+                )
+            })?
+    };
+
+    if !anchored
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        if let Ok(canon) = anchored.canonicalize() {
+            return Ok((canon, false));
+        }
+        let mut cur = anchored.as_path();
+        let mut tail: Vec<&std::ffi::OsStr> = Vec::new();
+        while let Some(parent) = cur.parent() {
+            if let Some(Component::Normal(seg)) = cur.components().next_back() {
+                tail.push(seg);
+            }
+            if let Ok(mut canon) = parent.canonicalize() {
+                for seg in tail.into_iter().rev() {
+                    canon.push(seg);
+                }
+                return Ok((canon, false));
+            }
+            cur = parent;
+        }
+    }
+
+    let mut acc = PathBuf::new();
+    let mut escaped_above_root = false;
+
+    for component in anchored.components() {
         match component {
-            Component::CurDir => {}
-            Component::ParentDir
-                if matches!(parts.last(), Some(Component::Normal(_)) | Some(Component::RootDir)) =>
-            {
-                if matches!(parts.last(), Some(Component::Normal(_))) {
-                    parts.pop();
+            Component::Prefix(prefix) => {
+                acc.push(prefix.as_os_str());
+            }
+            Component::RootDir => {
+                acc.push(Component::RootDir);
+                if let Ok(canon) = acc.canonicalize() {
+                    acc = canon;
                 }
             }
-            _ => parts.push(component),
+            Component::CurDir => {}
+            Component::Normal(seg) => {
+                acc.push(seg);
+                if let Ok(canon) = acc.canonicalize() {
+                    acc = canon;
+                }
+            }
+            Component::ParentDir => {
+                if matches!(acc.components().next_back(), Some(Component::Normal(_))) {
+                    acc.pop();
+                } else {
+                    escaped_above_root = true;
+                    acc.push(Component::ParentDir);
+                }
+            }
         }
     }
-    parts.into_iter().collect()
+
+    Ok((acc, escaped_above_root))
 }
 
-/// Resolve an existing or not-yet-created path to an absolute form. Symbolic
-/// links are followed for the deepest existing ancestor.
+/// Resolve an existing or not-yet-created path to an absolute form. Relative
+/// paths are anchored to `current_dir()`, and each existing prefix is
+/// canonicalized left-to-right before any subsequent `..` is folded.
 pub fn canonicalize_lossy(path: &Path) -> PathBuf {
-    if let Ok(canonical) = path.canonicalize() {
-        return canonical;
+    canonicalize_lossy_checked(path)
+        .map(|(resolved, _)| resolved)
+        .unwrap_or_else(|_| path.to_path_buf())
+}
+
+/// Normalize a path for equality/prefix comparison: strip Windows verbatim
+/// prefixes (`\\?\UNC\` -> `\\`, `\\?\` -> ``) and fold case on Windows/macOS.
+pub fn normalize_path_for_comparison(path: &Path) -> PathBuf {
+    let Some(raw) = path.to_str() else {
+        return path.to_path_buf();
+    };
+    let stripped: std::borrow::Cow<'_, str> = if raw
+        .get(..8)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\UNC\") || p.eq_ignore_ascii_case("//?/UNC/"))
+    {
+        std::borrow::Cow::Owned(format!(r"\\{}", &raw[8..]))
+    } else if raw
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case(r"\\?\") || p.eq_ignore_ascii_case("//?/"))
+    {
+        std::borrow::Cow::Borrowed(&raw[4..])
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    };
+
+    // macOS APFS is case-insensitive by default, like Windows NTFS.
+    if cfg!(any(windows, target_os = "macos")) {
+        PathBuf::from(stripped.to_lowercase())
+    } else {
+        PathBuf::from(stripped.as_ref())
     }
-    let normalized = lexical_normalize(path);
-    let mut ancestors = Vec::new();
-    let mut current = normalized.as_path();
-    while let Some(parent) = current.parent() {
-        if let Some(name) = current.file_name() {
-            ancestors.push(name.to_os_string());
-        }
-        if let Ok(canonical_parent) = parent.canonicalize() {
-            let mut result = canonical_parent;
-            for name in ancestors.into_iter().rev() {
-                result.push(name);
-            }
-            return result;
-        }
-        current = parent;
-    }
-    normalized
+}
+
+pub(crate) fn is_protected_credential_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(".mehh")
+        || name.eq_ignore_ascii_case(".ssh")
+        || name.eq_ignore_ascii_case(".env")
+        || (name.len() > 5
+            && name
+                .as_bytes()
+                .get(..5)
+                .is_some_and(|p| p.eq_ignore_ascii_case(b".env.")))
+        || name.eq_ignore_ascii_case("auth.json")
+        || name.eq_ignore_ascii_case("mcp-auth.json")
+        || name.eq_ignore_ascii_case("trust.json")
+}
+
+pub(crate) fn path_targets_protected_credential(raw_path: &str, resolved: &Path) -> bool {
+    Path::new(raw_path).components().any(|c| {
+        matches!(
+            c,
+            Component::Normal(s) if s.to_str().is_some_and(is_protected_credential_name)
+        )
+    }) || resolved
+        .file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(is_protected_credential_name)
 }
 
 impl PathPolicy {
@@ -63,15 +155,37 @@ impl PathPolicy {
             PathPolicy::WorkspaceOnly(roots) => roots,
         };
 
-        let resolved = canonicalize_lossy(candidate);
-        let canonical_roots: Vec<PathBuf> = roots
-            .iter()
-            .map(|root| canonicalize_lossy(root))
-            .collect();
-        if canonical_roots
-            .iter()
-            .any(|root| resolved.starts_with(root))
-        {
+        let (resolved_raw, escaped) = canonicalize_lossy_checked(candidate)?;
+        if escaped {
+            return Err(format!(
+                "Path {} is outside the allowed workspace",
+                candidate.display()
+            ));
+        }
+        let resolved = normalize_path_for_comparison(&resolved_raw);
+        if resolved.as_os_str().is_empty() {
+            return Err(format!(
+                "Path {} is outside the allowed workspace",
+                candidate.display()
+            ));
+        }
+        let allowed = roots.iter().any(|root| {
+            if root.as_os_str().is_empty() {
+                return false;
+            }
+            let Ok((root_raw, root_escaped)) = canonicalize_lossy_checked(root) else {
+                return false;
+            };
+            if root_escaped {
+                return false;
+            }
+            let normalized_root = normalize_path_for_comparison(&root_raw);
+            if normalized_root.as_os_str().is_empty() {
+                return false;
+            }
+            resolved.starts_with(&normalized_root)
+        });
+        if allowed {
             Ok(())
         } else {
             Err(format!(
@@ -120,5 +234,122 @@ mod tests {
         let empty = PathPolicy::WorkspaceOnly(Vec::new());
         assert!(resolve_path(&root, &empty, "inside.txt").is_err());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn workspace_only_rejects_parent_traversal_through_symlink() {
+        let ws = crate::TempTestDir::new("policy_symlink_ws");
+        let outside = crate::TempTestDir::new("policy_symlink_outside");
+        let outside_sub = outside.path().join("sub");
+        std::fs::create_dir_all(&outside_sub).unwrap();
+        let link = ws.path().join("symlink");
+
+        #[cfg(unix)]
+        let link_res = std::os::unix::fs::symlink(&outside_sub, &link);
+        #[cfg(windows)]
+        let link_res = std::os::windows::fs::symlink_dir(&outside_sub, &link);
+        #[cfg(not(any(unix, windows)))]
+        let link_res: std::io::Result<()> = Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported",
+        ));
+
+        if let Err(e) = link_res {
+            eprintln!("skipping symlink traversal test: {e}");
+            return;
+        }
+
+        let policy = PathPolicy::WorkspaceOnly(vec![ws.path().to_path_buf()]);
+        let err = resolve_path(ws.path(), &policy, "symlink/../new.txt").unwrap_err();
+        assert!(
+            err.contains("outside the allowed workspace"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn workspace_only_handles_relative_cwd_dot() {
+        let cwd_abs = std::env::current_dir().unwrap();
+        let policy_dot = PathPolicy::WorkspaceOnly(vec![PathBuf::from(".")]);
+        assert!(resolve_path(Path::new("."), &policy_dot, "inside.txt").is_ok());
+        assert!(resolve_path(Path::new("."), &policy_dot, "../outside.txt").is_err());
+
+        let policy_abs = PathPolicy::WorkspaceOnly(vec![cwd_abs]);
+        assert!(resolve_path(Path::new("."), &policy_abs, "inside.txt").is_ok());
+    }
+
+    #[test]
+    fn workspace_only_rejects_parent_dir_above_root() {
+        #[cfg(unix)]
+        {
+            let policy = PathPolicy::WorkspaceOnly(vec![PathBuf::from("/")]);
+            assert!(policy.validate(Path::new("/../outside.txt")).is_err());
+        }
+        #[cfg(windows)]
+        {
+            let sys_drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+            let root = PathBuf::from(format!(r"{sys_drive}\"));
+            let policy = PathPolicy::WorkspaceOnly(vec![root.clone()]);
+            assert!(policy.validate(&root.join(r"..\outside.txt")).is_err());
+        }
+    }
+
+    #[test]
+    fn workspace_only_matches_case_insensitively_on_windows_and_macos() {
+        let dir = crate::TempTestDir::new("policy_case");
+        let sub = dir.path().join("CamelCaseDir");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let swapped_root = PathBuf::from(
+            dir.path()
+                .to_string_lossy()
+                .chars()
+                .map(|c| {
+                    if c.is_ascii_lowercase() {
+                        c.to_ascii_uppercase()
+                    } else if c.is_ascii_uppercase() {
+                        c.to_ascii_lowercase()
+                    } else {
+                        c
+                    }
+                })
+                .collect::<String>(),
+        );
+        let policy = PathPolicy::WorkspaceOnly(vec![swapped_root]);
+        let candidate = sub.join("NewFile.txt");
+
+        if cfg!(any(windows, target_os = "macos")) {
+            assert!(
+                policy.validate(&candidate).is_ok(),
+                "expected case-insensitive match on Windows/macOS"
+            );
+        }
+
+        assert_eq!(
+            normalize_path_for_comparison(Path::new(r"\\?\UNC\Server\Share\File.txt")),
+            if cfg!(any(windows, target_os = "macos")) {
+                PathBuf::from(r"\\server\share\file.txt")
+            } else {
+                PathBuf::from(r"\\Server\Share\File.txt")
+            }
+        );
+        assert_eq!(
+            normalize_path_for_comparison(Path::new(r"\\?\C:\Work\File.txt")),
+            if cfg!(any(windows, target_os = "macos")) {
+                PathBuf::from(r"c:\work\file.txt")
+            } else {
+                PathBuf::from(r"C:\Work\File.txt")
+            }
+        );
+    }
+
+    #[test]
+    fn workspace_only_rejects_empty_root_path() {
+        let dir = crate::TempTestDir::new("policy_empty_root");
+        let policy = PathPolicy::WorkspaceOnly(vec![PathBuf::from("")]);
+        assert!(
+            policy.validate(&dir.path().join("file.txt")).is_err(),
+            "empty root must never match arbitrary paths"
+        );
     }
 }

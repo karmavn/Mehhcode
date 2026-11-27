@@ -3,20 +3,24 @@
 use std::sync::OnceLock;
 use std::time::Duration;
 
+use mehh_ai::http_safety::DnsPolicy;
 use regex::Regex;
 use serde_json::{json, Value};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::mcp_rpc::{
-    call_mcp_tool, classify_http_status, read_bounded_body, send_cancellable_request,
-    snippet_for_error, MAX_PROVIDER_RESPONSE_BYTES, WEB_USER_AGENT,
+    call_mcp_tool, classify_http_status, read_bounded_body, read_error_body_snippet,
+    send_cancellable_request, snippet_for_error, MAX_PROVIDER_ERROR_BODY_BYTES,
+    MAX_PROVIDER_RESPONSE_BYTES, WEB_USER_AGENT,
 };
+use super::native::{search_mehh, NativeEndpoints, NativeSearchContext};
 use super::types::{ExtractedPage, ProviderError, ProviderId, SearchHit};
 
 /// Configurable provider endpoints (production constants by default, overrideable in tests).
 #[derive(Debug, Clone)]
 pub struct WebEndpoints {
+    pub native: NativeEndpoints,
     pub exa_mcp: String,
     pub parallel_mcp: String,
     pub firecrawl_mcp: String,
@@ -29,6 +33,7 @@ pub struct WebEndpoints {
 impl WebEndpoints {
     pub fn production() -> Self {
         Self {
+            native: NativeEndpoints::production(),
             exa_mcp: "https://mcp.exa.ai/mcp".to_string(),
             parallel_mcp: "https://search.parallel.ai/mcp".to_string(),
             firecrawl_mcp: "https://mcp.firecrawl.dev/v2/mcp".to_string(),
@@ -46,7 +51,7 @@ impl Default for WebEndpoints {
     }
 }
 
-/// Executes a search request against one keyless provider.
+/// Executes a search request against one built-in provider.
 pub async fn execute_search(
     client: &reqwest::Client,
     endpoints: &WebEndpoints,
@@ -57,6 +62,17 @@ pub async fn execute_search(
     cancel: &CancellationToken,
 ) -> Result<Vec<SearchHit>, ProviderError> {
     match provider {
+        ProviderId::Mehh => {
+            let ctx = NativeSearchContext {
+                client,
+                enrich_client: client,
+                enrich_dns_policy: DnsPolicy::PublicOnly,
+                url_policy_checker: None,
+                endpoints: &endpoints.native,
+                state: None,
+            };
+            search_mehh(&ctx, query, timeout, cancel).await
+        }
         ProviderId::Exa => search_exa(client, &endpoints.exa_mcp, query, timeout, cancel).await,
         ProviderId::Parallel => {
             search_parallel(
@@ -113,10 +129,12 @@ pub async fn execute_extract(
         ProviderId::Keenable => {
             extract_keenable(client, &endpoints.keenable_base, url, timeout, cancel).await
         }
-        ProviderId::Tavily | ProviderId::TinyFish => Err(ProviderError::BadRequest(format!(
-            "Provider '{}' does not support page extraction",
-            provider.as_str()
-        ))),
+        ProviderId::Mehh | ProviderId::Tavily | ProviderId::TinyFish => {
+            Err(ProviderError::BadRequest(format!(
+                "Provider '{}' does not support page extraction",
+                provider.as_str()
+            )))
+        }
     }
 }
 
@@ -133,6 +151,11 @@ async fn send_rest_json(
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    if status >= 400 {
+        let body =
+            read_error_body_snippet(resp, MAX_PROVIDER_ERROR_BODY_BYTES, deadline, cancel).await?;
+        return Ok((status, retry_after, body));
+    }
     let bytes = read_bounded_body(resp, MAX_PROVIDER_RESPONSE_BYTES, deadline, cancel).await?;
     let body = String::from_utf8_lossy(&bytes).into_owned();
     Ok((status, retry_after, body))

@@ -22,7 +22,7 @@ pub fn parse_frontmatter(content: &str) -> (HashMap<String, String>, &str) {
     let trimmed = clean.trim_start();
 
     if !trimmed.starts_with("---") {
-        return (map, content);
+        return (map, clean);
     }
 
     let after_start = &trimmed[3..];
@@ -31,7 +31,7 @@ pub fn parse_frontmatter(content: &str) -> (HashMap<String, String>, &str) {
     } else if let Some(stripped) = after_start.strip_prefix('\n') {
         stripped
     } else {
-        return (map, content);
+        return (map, clean);
     };
 
     let (fm_str, body) = match after_nl.find("\n---") {
@@ -47,7 +47,7 @@ pub fn parse_frontmatter(content: &str) -> (HashMap<String, String>, &str) {
             };
             (fm, body)
         }
-        None => return (map, content),
+        None => return (map, clean),
     };
 
     for line in fm_str.lines() {
@@ -67,6 +67,26 @@ pub fn parse_frontmatter(content: &str) -> (HashMap<String, String>, &str) {
 }
 
 const MAX_SKILL_SCAN_DEPTH: usize = 32;
+pub(crate) const MAX_MARKDOWN_FILE_BYTES: usize = 512 * 1024;
+
+/// Reads a UTF-8 markdown file up to `max_bytes` and strips any leading UTF-8 BOM.
+pub(crate) fn read_bounded_utf8_file(path: &Path, max_bytes: usize) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > max_bytes as u64 {
+        return None;
+    }
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(max_bytes));
+    file.take((max_bytes + 1) as u64)
+        .read_to_end(&mut buf)
+        .ok()?;
+    if buf.len() > max_bytes {
+        return None;
+    }
+    let text = String::from_utf8(buf).ok()?;
+    Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_string())
+}
 
 /// Returns true for symlinks and other reparse points (e.g. Windows junctions).
 /// Following them would let a link cycle recurse forever, so they are skipped.
@@ -93,12 +113,19 @@ fn is_link_entry(path: &Path) -> bool {
 }
 
 /// Recursively scans a directory for `SKILL.md` files, ignoring hidden dirs, `node_modules`, and `target`.
-/// Linked directories are never followed and recursion is depth-bounded so cycles cannot overflow the stack.
+/// Linked directories are never followed, recursion is depth-bounded, and symlinked `SKILL.md` files
+/// must remain contained within the canonicalized skill root.
 fn scan_dir_for_skills(dir: &Path, out: &mut Vec<Skill>) {
-    scan_dir_for_skills_inner(dir, out, 0);
+    let Ok(canon_root) = std::fs::canonicalize(dir) else {
+        return;
+    };
+    if !canon_root.is_dir() {
+        return;
+    }
+    scan_dir_for_skills_inner(dir, &canon_root, out, 0);
 }
 
-fn scan_dir_for_skills_inner(dir: &Path, out: &mut Vec<Skill>, depth: usize) {
+fn scan_dir_for_skills_inner(dir: &Path, canon_root: &Path, out: &mut Vec<Skill>, depth: usize) {
     if depth > MAX_SKILL_SCAN_DEPTH || !dir.is_dir() {
         return;
     }
@@ -109,47 +136,72 @@ fn scan_dir_for_skills_inner(dir: &Path, out: &mut Vec<Skill>, depth: usize) {
     };
 
     for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            // Only a linked directory can create a scan cycle. A linked
-            // SKILL.md is a leaf; skipping it loses legitimate skills (for
-            // example a SKILL.md symlinked from a dotfiles repository).
-            if is_link_entry(&path) {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        let skip_dir_name =
+            name_str.starts_with('.') || name_str == "node_modules" || name_str == "target";
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if ft.is_dir() || ft.is_symlink() {
+            if !ft.is_symlink() {
+                if skip_dir_name {
+                    continue;
+                }
+                let path = entry.path();
+                if is_link_entry(&path) {
+                    continue;
+                }
+                let Ok(canon_dir) = std::fs::canonicalize(&path) else {
+                    continue;
+                };
+                if !canon_dir.starts_with(canon_root) {
+                    continue;
+                }
+                scan_dir_for_skills_inner(&path, canon_root, out, depth + 1);
                 continue;
             }
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') || name_str == "node_modules" || name_str == "target" {
+            let path = entry.path();
+            if path.is_dir() {
+                // Only a linked directory can create a scan cycle. A linked
+                // SKILL.md is a leaf; skipping it loses legitimate skills (for
+                // example a SKILL.md symlinked within the same skill root).
                 continue;
             }
-            scan_dir_for_skills_inner(&path, out, depth + 1);
-        } else if path.is_file() {
-            if let Some(file_name) = path.file_name().and_then(|n| n.to_str()) {
-                if file_name.eq_ignore_ascii_case("skill.md") {
-                    if let Ok(content) = std::fs::read_to_string(&path) {
-                        let (fm, _) = parse_frontmatter(&content);
-                        let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-                        let default_name = base_dir
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unnamed")
-                            .to_string();
+        }
+        if name_str.eq_ignore_ascii_case("skill.md") {
+            let path = entry.path();
+            if path.is_file() {
+                let Ok(canon_file) = std::fs::canonicalize(&path) else {
+                    continue;
+                };
+                if !canon_file.starts_with(canon_root) || !canon_file.is_file() {
+                    continue;
+                }
+                if let Some(content) = read_bounded_utf8_file(&canon_file, MAX_MARKDOWN_FILE_BYTES)
+                {
+                    let (fm, _) = parse_frontmatter(&content);
+                    let base_dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+                    let default_name = base_dir
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("unnamed")
+                        .to_string();
 
-                        let name = fm.get("name").cloned().unwrap_or(default_name);
-                        let description = fm.get("description").cloned().unwrap_or_default();
-                        let disable_model_invocation = fm
-                            .get("disable-model-invocation")
-                            .map(|v| v.eq_ignore_ascii_case("true"))
-                            .unwrap_or(false);
+                    let name = fm.get("name").cloned().unwrap_or(default_name);
+                    let description = fm.get("description").cloned().unwrap_or_default();
+                    let disable_model_invocation = fm
+                        .get("disable-model-invocation")
+                        .map(|v| v.eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
 
-                        out.push(Skill {
-                            name,
-                            description,
-                            file_path: path,
-                            base_dir,
-                            disable_model_invocation,
-                        });
-                    }
+                    out.push(Skill {
+                        name,
+                        description,
+                        file_path: path,
+                        base_dir,
+                        disable_model_invocation,
+                    });
                 }
             }
         }
@@ -163,12 +215,7 @@ pub fn load_skills_with_trust(cwd: &Path, trusted: bool) -> Vec<Skill> {
     let mut skill_map: HashMap<String, Skill> = HashMap::new();
 
     // 1. Global skills
-    let home = std::env::var_os("USERPROFILE")
-        .or_else(|| std::env::var_os("HOME"))
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-
-    if let Some(home_path) = home {
+    if let Some(home_path) = crate::user_home_dir() {
         let global_dir = home_path.join(".mehh").join("agent").join("skills");
         let mut global_skills = Vec::new();
         scan_dir_for_skills(&global_dir, &mut global_skills);
@@ -201,7 +248,7 @@ pub fn load_skills(cwd: &Path) -> Vec<Skill> {
     load_skills_with_trust(cwd, false)
 }
 
-fn escape_xml(s: &str) -> String {
+pub(crate) fn escape_xml(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
@@ -251,7 +298,8 @@ pub fn expand_skill_command(input: &str, skills: &[Skill]) -> Option<String> {
     };
 
     let skill = skills.iter().find(|s| s.name == skill_name)?;
-    let content = std::fs::read_to_string(&skill.file_path).ok()?;
+    let canon_file = std::fs::canonicalize(&skill.file_path).ok()?;
+    let content = read_bounded_utf8_file(&canon_file, MAX_MARKDOWN_FILE_BYTES)?;
     let (_, body) = parse_frontmatter(&content);
 
     let norm_file = skill.file_path.to_string_lossy().replace('\\', "/");
@@ -446,35 +494,50 @@ Use Clippy and avoid unnecessary allocations.
     // behavior is platform-independent, so exercise it wherever symlinks work.
     #[cfg(unix)]
     #[test]
-    fn test_scan_dir_for_skills_loads_symlinked_skill_file() {
+    fn test_scan_dir_for_skills_enforces_symlink_containment_within_root() {
         let dir = std::env::temp_dir().join(format!("mehh_skill_file_link_{}", Uuid::now_v7()));
         let skills_root = dir.join(".agents").join("skills");
-        let skill_dir = skills_root.join("linked-file-skill");
-        fs::create_dir_all(&skill_dir).unwrap();
-        let dotfiles = dir.join("dotfiles");
-        fs::create_dir_all(&dotfiles).unwrap();
-        let real_skill = dotfiles.join("SKILL.md");
+        let outside_dir = dir.join("dotfiles");
+        let escaped_dir = skills_root.join("escaped-skill");
+        let shared_dir = skills_root.join("shared");
+        let in_root_dir = skills_root.join("in-root-skill");
+        fs::create_dir_all(&outside_dir).unwrap();
+        fs::create_dir_all(&escaped_dir).unwrap();
+        fs::create_dir_all(&shared_dir).unwrap();
+        fs::create_dir_all(&in_root_dir).unwrap();
+
+        let outside_skill = outside_dir.join("SKILL.md");
         fs::write(
-            &real_skill,
-            "---\nname: linked-file-skill\ndescription: from dotfiles\n---\nBody",
+            &outside_skill,
+            "---\nname: escaped-skill\ndescription: from outside\n---\nSecret",
+        )
+        .unwrap();
+        let shared_skill = shared_dir.join("SKILL.md");
+        fs::write(
+            &shared_skill,
+            "---\nname: shared-skill\ndescription: inside root\n---\nBody",
         )
         .unwrap();
 
-        // Only the file is linked; the link guard exists for directory cycles.
-        create_dir_link(&real_skill, &skill_dir.join("SKILL.md"));
+        std::os::unix::fs::symlink(&outside_skill, escaped_dir.join("SKILL.md")).unwrap();
+        std::os::unix::fs::symlink(&shared_skill, in_root_dir.join("SKILL.md")).unwrap();
 
         let mut found = Vec::new();
         scan_dir_for_skills(&skills_root, &mut found);
         assert!(
-            found.iter().any(|s| s.name == "linked-file-skill"),
-            "a symlinked SKILL.md must load, got {found:?}"
+            !found.iter().any(|s| s.name == "escaped-skill"),
+            "symlinked SKILL.md escaping root must be rejected, got {found:?}"
+        );
+        assert!(
+            found.iter().any(|s| s.name == "shared-skill"),
+            "symlinked SKILL.md inside root should still load, got {found:?}"
         );
 
         let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn test_load_skills_respects_trust_and_strips_bom() {
+    fn test_load_skills_respects_trust_strips_bom_and_bounds_reads() {
         let dir = std::env::temp_dir().join(format!("mehh_skill_trust_{}", Uuid::now_v7()));
         let skill_dir = dir.join(".agents").join("skills").join("proj-skill");
         fs::create_dir_all(&skill_dir).unwrap();
@@ -484,14 +547,24 @@ Use Clippy and avoid unnecessary allocations.
         )
         .unwrap();
 
+        let oversized_dir = dir.join(".agents").join("skills").join("huge-skill");
+        fs::create_dir_all(&oversized_dir).unwrap();
+        let huge_body = "x".repeat(MAX_MARKDOWN_FILE_BYTES + 1024);
+        fs::write(oversized_dir.join("SKILL.md"), huge_body).unwrap();
+
         // Untrusted project must NOT load repo-local skills
         let untrusted = load_skills_with_trust(&dir, false);
         assert!(!untrusted.iter().any(|s| s.name == "proj-skill"));
 
-        // Trusted project loads .agents/skills and strips UTF-8 BOM cleanly
+        // Trusted project loads .agents/skills, strips UTF-8 BOM, and skips oversized files
         let trusted = load_skills_with_trust(&dir, true);
         let found = trusted.iter().find(|s| s.name == "proj-skill").unwrap();
         assert_eq!(found.description, "Project skill");
+        assert!(!trusted.iter().any(|s| s.name == "huge-skill"));
+
+        // parse_frontmatter without frontmatter still strips leading UTF-8 BOM
+        let (_, body_no_fm) = parse_frontmatter("\u{feff}# Heading");
+        assert_eq!(body_no_fm, "# Heading");
 
         let _ = fs::remove_dir_all(dir);
     }

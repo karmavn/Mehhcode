@@ -79,6 +79,7 @@ fn build_walk_entries(cwd: &Path) -> Vec<CachedWalkEntry> {
         });
     }
 
+    entries.sort_by(|a, b| a.rel_str.cmp(&b.rel_str));
     entries
 }
 
@@ -156,32 +157,33 @@ pub fn complete_file_paths(cwd: &Path, prefix: &str, limit: usize) -> Vec<String
         }
     };
 
-    let mut prefix_matches = Vec::new();
-    let mut substring_matches = Vec::new();
+    let mut prefix_matches = Vec::with_capacity(limit);
+    let mut substring_matches = Vec::with_capacity(limit);
 
     if query_lower.is_empty() {
-        for entry in entries.iter() {
+        for entry in entries.iter().take(limit) {
             prefix_matches.push(entry.rel_str.clone());
-            if prefix_matches.len() >= limit * 4 {
+        }
+        return prefix_matches;
+    }
+
+    for entry in entries.iter() {
+        if entry.rel_lower.starts_with(&query_lower)
+            || entry.file_name_lower.starts_with(&query_lower)
+        {
+            prefix_matches.push(entry.rel_str.clone());
+            if prefix_matches.len() >= limit {
                 break;
             }
-        }
-    } else {
-        for entry in entries.iter() {
-            if entry.rel_lower.starts_with(&query_lower)
-                || entry.file_name_lower.starts_with(&query_lower)
-            {
-                prefix_matches.push(entry.rel_str.clone());
-            } else if entry.rel_lower.contains(&query_lower) {
-                substring_matches.push(entry.rel_str.clone());
-            }
+        } else if substring_matches.len() < limit && entry.rel_lower.contains(&query_lower) {
+            substring_matches.push(entry.rel_str.clone());
         }
     }
 
-    prefix_matches.sort();
-    substring_matches.sort();
-    prefix_matches.extend(substring_matches);
-    prefix_matches.truncate(limit);
+    if prefix_matches.len() < limit {
+        let need = limit - prefix_matches.len();
+        prefix_matches.extend(substring_matches.into_iter().take(need));
+    }
     prefix_matches
 }
 

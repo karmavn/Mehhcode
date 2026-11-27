@@ -3,9 +3,10 @@
 use std::fmt;
 use std::time::Duration;
 
-/// Built-in keyless web search/extract providers.
+/// Built-in web search/extract providers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderId {
+    Mehh,
     Exa,
     Parallel,
     Firecrawl,
@@ -15,17 +16,19 @@ pub enum ProviderId {
 }
 
 impl ProviderId {
-    /// All providers capable of `web_search`.
-    pub const ALL_SEARCH: [ProviderId; 6] = [
+    /// All built-in providers capable of `web_search`, ordered deterministically from highest to
+    /// lowest priority/quality in `Auto` mode.
+    pub const ALL_SEARCH: [ProviderId; 7] = [
+        ProviderId::Mehh,
         ProviderId::Exa,
         ProviderId::Parallel,
         ProviderId::Firecrawl,
         ProviderId::Tavily,
-        ProviderId::TinyFish,
         ProviderId::Keenable,
+        ProviderId::TinyFish,
     ];
 
-    /// All providers capable of `web_fetch` Stage 2 remote page extraction.
+    /// All providers capable of `web_fetch` Stage 2 remote page extraction, ordered by priority.
     pub const ALL_EXTRACT: [ProviderId; 4] = [
         ProviderId::Exa,
         ProviderId::Parallel,
@@ -35,6 +38,7 @@ impl ProviderId {
 
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Mehh => "mehh",
             Self::Exa => "exa",
             Self::Parallel => "parallel",
             Self::Firecrawl => "firecrawl",
@@ -46,6 +50,7 @@ impl ProviderId {
 
     pub fn display_name(self) -> &'static str {
         match self {
+            Self::Mehh => "Mehh Search",
             Self::Exa => "Exa",
             Self::Parallel => "Parallel",
             Self::Firecrawl => "Firecrawl",
@@ -57,6 +62,7 @@ impl ProviderId {
 
     pub fn from_str_id(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
+            "mehh" => Some(Self::Mehh),
             "exa" => Some(Self::Exa),
             "parallel" => Some(Self::Parallel),
             "firecrawl" => Some(Self::Firecrawl),
@@ -141,7 +147,7 @@ impl ProviderError {
                 Some(retry_after.unwrap_or(Duration::from_secs(60)))
             }
             Self::VendorUnavailable { status, .. } => {
-                let secs = if matches!(status, Some(401 | 402 | 403)) {
+                let secs = if matches!(status, Some(401..=403)) {
                     300
                 } else {
                     30
@@ -175,12 +181,16 @@ mod tests {
 
     #[test]
     fn test_provider_capabilities_and_error_failover() {
-        assert_eq!(ProviderId::ALL_SEARCH.len(), 6);
+        assert_eq!(ProviderId::ALL_SEARCH.len(), 7);
+        assert_eq!(ProviderId::ALL_SEARCH[0], ProviderId::Mehh);
         assert_eq!(ProviderId::ALL_EXTRACT.len(), 4);
         assert!(ProviderId::Exa.supports_extract());
+        assert!(!ProviderId::Mehh.supports_extract());
         assert!(!ProviderId::Tavily.supports_extract());
         assert!(!ProviderId::TinyFish.supports_extract());
         assert_eq!(ProviderId::from_str_id(" TinyFish "), Some(ProviderId::TinyFish));
+        assert_eq!(ProviderId::from_str_id(" mehh "), Some(ProviderId::Mehh));
+        assert_eq!(ProviderId::from_str_id("searxng"), None);
 
         let rl = ProviderError::RateLimited {
             retry_after: None,

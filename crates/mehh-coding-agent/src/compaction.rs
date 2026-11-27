@@ -1,6 +1,6 @@
 //! Context compaction and history summarization for long agent sessions.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
@@ -14,7 +14,7 @@ use mehh_ai::{
     UserContent, UserMessage,
 };
 
-use crate::session::{SessionEntry, SessionEntryKind};
+use crate::session::{ContextEditReplacement, SessionEntry, SessionEntryKind};
 
 /// Default token threshold retained at the tail of the active branch.
 pub const DEFAULT_KEEP_RECENT_TOKENS: usize = 20_000;
@@ -234,21 +234,60 @@ pub fn estimate_tool_definitions_tokens(tools: &[Arc<dyn AgentTool>]) -> usize {
         .div_ceil(4)
 }
 
-/// Projects the entry kinds that `SessionManager::build_context_messages` sends to the LLM.
-fn messages_for_entry(entry: &SessionEntry) -> Vec<Message> {
+/// Projects the entry kinds that `SessionManager::build_context_messages` sends to the LLM,
+/// applying any active-path `ContextEdit` omissions or replacements.
+fn messages_for_entry_with_edits(
+    entry: &SessionEntry,
+    edits: &HashMap<&str, &Option<ContextEditReplacement>>,
+) -> Option<Message> {
+    if let Some(edit) = edits.get(entry.id.as_str()) {
+        if edit.is_none() {
+            return None;
+        }
+    }
+    let replacement = edits.get(entry.id.as_str()).and_then(|r| r.as_ref());
+
     match &entry.kind {
-        SessionEntryKind::Message { message } => vec![message.clone()],
-        SessionEntryKind::CustomMessage { content, .. } => vec![Message::User(UserMessage {
-            content: content.clone(),
-            timestamp: now_ms(),
-        })],
-        SessionEntryKind::BranchSummary { summary, .. } => vec![Message::User(UserMessage {
+        SessionEntryKind::Message { message } => {
+            if let Some(rep) = replacement {
+                let mut msg = message.clone();
+                match &mut msg {
+                    Message::User(u) => {
+                        u.content = rep.content.to_user_content();
+                    }
+                    Message::Assistant(a) => {
+                        a.content = rep.content.to_assistant_content();
+                    }
+                    Message::ToolResult(tr) => {
+                        tr.content = rep.content.to_tool_result_content();
+                    }
+                    Message::System(s) => {
+                        s.content = rep.content.to_text();
+                    }
+                }
+                Some(msg)
+            } else {
+                Some(message.clone())
+            }
+        }
+        SessionEntryKind::CustomMessage { content, .. } => {
+            let effective_content = if let Some(rep) = replacement {
+                rep.content.to_user_content()
+            } else {
+                content.clone()
+            };
+            Some(Message::User(UserMessage {
+                content: effective_content,
+                timestamp: now_ms(),
+            }))
+        }
+        SessionEntryKind::BranchSummary { summary, .. } => Some(Message::User(UserMessage {
             content: UserContent::Text(format!(
                 "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n{summary}\n</summary>"
             )),
             timestamp: now_ms(),
-        })],
-        _ => Vec::new(),
+        })),
+        _ => None,
     }
 }
 
@@ -272,78 +311,187 @@ fn is_cut_point_message(msg: &Message) -> bool {
 
 /// Formats a conversation into a serialized text transcript for summarization.
 pub fn serialize_conversation(messages: &[Message]) -> String {
-    let mut parts = Vec::new();
+    let mut out = String::new();
+    let push_sep = |out: &mut String| {
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+    };
 
     for msg in messages {
         match msg {
             Message::User(u) => {
                 let text = u.content.text();
                 if !text.is_empty() {
-                    parts.push(format!("[User]: {text}"));
+                    push_sep(&mut out);
+                    out.push_str("[User]: ");
+                    out.push_str(&text);
                 }
             }
             Message::Assistant(a) => {
                 let text = a.text_content();
                 if !text.is_empty() {
-                    parts.push(format!("[Assistant]: {text}"));
+                    push_sep(&mut out);
+                    out.push_str("[Assistant]: ");
+                    out.push_str(&text);
                 }
 
-                let tool_calls = a.tool_calls();
-                if !tool_calls.is_empty() {
-                    let calls_str = tool_calls
-                        .iter()
-                        .map(|tc| {
-                            let args_str = tc
-                                .arguments
-                                .iter()
-                                .map(|(k, v)| {
-                                    format!("{k}={}", serde_json::to_string(v).unwrap_or_default())
-                                })
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            format!("{}({})", tc.name, args_str)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; ");
-                    parts.push(format!("[Assistant tool calls]: {calls_str}"));
+                let mut tc_idx = 0usize;
+                for b in &a.content {
+                    if let AssistantContentBlock::ToolCall(tc) = b {
+                        if tc_idx == 0 {
+                            push_sep(&mut out);
+                            out.push_str("[Assistant tool calls]: ");
+                        } else {
+                            out.push_str("; ");
+                        }
+                        tc_idx += 1;
+                        out.push_str(&tc.name);
+                        out.push('(');
+                        for (arg_idx, (k, v)) in tc.arguments.iter().enumerate() {
+                            if arg_idx > 0 {
+                                out.push_str(", ");
+                            }
+                            out.push_str(k);
+                            out.push('=');
+                            struct StringUtf8Writer<'a>(&'a mut String);
+                            impl std::io::Write for StringUtf8Writer<'_> {
+                                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                                    let s = std::str::from_utf8(buf).map_err(|e| {
+                                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                                    })?;
+                                    self.0.push_str(s);
+                                    Ok(buf.len())
+                                }
+                                fn flush(&mut self) -> std::io::Result<()> {
+                                    Ok(())
+                                }
+                            }
+                            let _ = serde_json::to_writer(StringUtf8Writer(&mut out), v);
+                        }
+                        out.push(')');
+                    }
                 }
             }
             Message::ToolResult(tr) => {
-                let content_text = tr
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        mehh_ai::ToolResultContentBlock::Text(t) => Some(t.text.as_str()),
-                        mehh_ai::ToolResultContentBlock::Image(_) => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                use std::fmt::Write;
+                let mut written_chars = 0usize;
+                let mut remaining = 0usize;
+                let mut any_text = false;
+                let mut header_written = false;
 
-                let mut char_iter = content_text.char_indices();
-                let truncated = if let Some((byte_end, _)) = char_iter.nth(TOOL_RESULT_MAX_CHARS) {
-                    let remaining = 1 + char_iter.count();
-                    format!(
-                        "{}\n\n[... {remaining} more characters truncated]",
-                        &content_text[..byte_end]
-                    )
-                } else {
-                    content_text
-                };
+                for b in &tr.content {
+                    let mehh_ai::ToolResultContentBlock::Text(t) = b else {
+                        continue;
+                    };
+                    if any_text {
+                        if written_chars < TOOL_RESULT_MAX_CHARS {
+                            out.push('\n');
+                            written_chars += 1;
+                        } else {
+                            remaining += 1;
+                        }
+                    } else if !t.text.is_empty() {
+                        push_sep(&mut out);
+                        out.push_str("[Tool result]: ");
+                        header_written = true;
+                    }
+                    any_text = true;
 
-                if !truncated.is_empty() {
-                    parts.push(format!("[Tool result]: {truncated}"));
+                    if written_chars >= TOOL_RESULT_MAX_CHARS {
+                        remaining += t.text.chars().count();
+                        continue;
+                    }
+                    let budget = TOOL_RESULT_MAX_CHARS - written_chars;
+                    let mut char_iter = t.text.char_indices();
+                    if let Some((byte_end, _)) = char_iter.nth(budget) {
+                        out.push_str(&t.text[..byte_end]);
+                        written_chars = TOOL_RESULT_MAX_CHARS;
+                        remaining += 1 + char_iter.count();
+                    } else {
+                        out.push_str(&t.text);
+                        written_chars += t.text.chars().count();
+                    }
+                }
+                if header_written && remaining > 0 {
+                    let _ = write!(out, "\n\n[... {remaining} more characters truncated]");
                 }
             }
             Message::System(_) => {}
         }
     }
 
-    parts.join("\n\n")
+    out
+}
+
+fn entry_stats_with_edits(
+    entry: &SessionEntry,
+    edits: &HashMap<&str, &Option<ContextEditReplacement>>,
+) -> (usize, bool, bool, bool) {
+    if let Some(edit) = edits.get(entry.id.as_str()) {
+        if edit.is_none() {
+            return (0, false, false, false);
+        }
+        if edit.is_some() {
+            if let Some(msg) = messages_for_entry_with_edits(entry, edits) {
+                return (
+                    estimate_message_tokens(&msg),
+                    is_cut_point_message(&msg),
+                    matches!(msg, Message::User(_)),
+                    matches!(msg, Message::Assistant(_)),
+                );
+            }
+            return (0, false, false, false);
+        }
+    }
+    match &entry.kind {
+        SessionEntryKind::Message { message } => (
+            estimate_message_tokens(message),
+            is_cut_point_message(message),
+            matches!(message, Message::User(_)),
+            matches!(message, Message::Assistant(_)),
+        ),
+        SessionEntryKind::CustomMessage { content, .. } => {
+            let chars = match content {
+                UserContent::Text(t) => t.chars().count(),
+                UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|b| match b {
+                        mehh_ai::UserContentBlock::Text(t) => t.text.chars().count(),
+                        mehh_ai::UserContentBlock::Image(_) => 4800,
+                    })
+                    .sum(),
+            };
+            (chars.div_ceil(4), true, true, false)
+        }
+        SessionEntryKind::BranchSummary { summary, .. } => {
+            const PREFIX_CHARS: usize = "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n".len();
+            const SUFFIX_CHARS: usize = "\n</summary>".len();
+            let tokens = (PREFIX_CHARS + summary.chars().count() + SUFFIX_CHARS).div_ceil(4);
+            (tokens, true, true, false)
+        }
+        _ => (0, false, false, false),
+    }
 }
 
 /// Evaluates active session entries and prepares a compaction cut point if history exceeds the budget.
 pub fn prepare_compaction(
     entries: &[SessionEntry],
+    keep_recent_tokens: usize,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_with(entries, keep_recent_tokens)
+}
+
+/// Borrow-based variant of `prepare_compaction` avoiding cloning `Vec<SessionEntry>` from `active_path_entries()`.
+pub fn prepare_compaction_refs(
+    entries: &[&SessionEntry],
+    keep_recent_tokens: usize,
+) -> Option<CompactionPreparation> {
+    prepare_compaction_with(entries, keep_recent_tokens)
+}
+
+fn prepare_compaction_with<E: std::borrow::Borrow<SessionEntry>>(
+    entries: &[E],
     keep_recent_tokens: usize,
 ) -> Option<CompactionPreparation> {
     if entries.is_empty() {
@@ -353,7 +501,7 @@ pub fn prepare_compaction(
     // Locate latest compaction boundary
     let last_compaction_pos = entries
         .iter()
-        .rposition(|e| matches!(&e.kind, SessionEntryKind::Compaction { .. }));
+        .rposition(|e| matches!(&e.borrow().kind, SessionEntryKind::Compaction { .. }));
 
     let (boundary_start, previous_summary) = match last_compaction_pos {
         Some(pos) => {
@@ -361,14 +509,14 @@ pub fn prepare_compaction(
                 summary,
                 first_kept_entry_id,
                 ..
-            } = &entries[pos].kind
+            } = &entries[pos].borrow().kind
             {
                 // Entries kept by the previous compaction are still live context; the
                 // next summary must cover them too. Match `SessionManager::build_context_messages()`
                 // fallback to `0` when `first_kept_entry_id` cannot be found.
                 let prev_kept_pos = entries[..pos]
                     .iter()
-                    .position(|e| e.id == *first_kept_entry_id)
+                    .position(|e| e.borrow().id == *first_kept_entry_id)
                     .unwrap_or(0);
                 (prev_kept_pos, Some(summary.clone()))
             } else {
@@ -382,28 +530,39 @@ pub fn prepare_compaction(
         return None;
     }
 
-    // Collect valid cut point candidate indices: Message::User or Message::Assistant
-    let mut cut_point_candidates = Vec::new();
-    for (i, entry) in entries.iter().enumerate().skip(boundary_start) {
-        if messages_for_entry(entry).iter().any(is_cut_point_message) {
-            cut_point_candidates.push(i);
+    // Collect context edits across the active branch so hidden/replaced entries
+    // are accurately reflected in token estimates, cut points, and summaries.
+    let mut edits: HashMap<&str, &Option<ContextEditReplacement>> = HashMap::new();
+    for entry in entries {
+        let entry = entry.borrow();
+        if let SessionEntryKind::ContextEdit {
+            target_id,
+            replacement,
+        } = &entry.kind
+        {
+            edits.insert(target_id.as_str(), replacement);
         }
+    }
+
+    // Precompute per-entry token counts and message roles in one borrow pass without cloning Messages.
+    let tail_len = entries.len() - boundary_start;
+    let mut stats: Vec<(usize, bool, bool, bool)> = Vec::with_capacity(tail_len);
+    let mut cut_point_candidates = Vec::new();
+    let mut tokens_before: usize = previous_summary
+        .as_ref()
+        .map_or(0, |prev| prev.len().div_ceil(4));
+
+    for (rel_idx, entry) in entries[boundary_start..].iter().enumerate() {
+        let st = entry_stats_with_edits(entry.borrow(), &edits);
+        tokens_before += st.0;
+        if st.1 {
+            cut_point_candidates.push(boundary_start + rel_idx);
+        }
+        stats.push(st);
     }
 
     if cut_point_candidates.is_empty() {
         return None;
-    }
-
-    // Calculate total tokens before compaction
-    let mut tokens_before: usize = 0;
-    if let Some(prev) = &previous_summary {
-        tokens_before += prev.len().div_ceil(4);
-    }
-    for entry in &entries[boundary_start..] {
-        tokens_before += messages_for_entry(entry)
-            .iter()
-            .map(estimate_message_tokens)
-            .sum::<usize>();
     }
 
     // Walk backwards from the tail, accumulating tokens until >= keep_recent_tokens
@@ -412,9 +571,7 @@ pub fn prepare_compaction(
     let mut budget_exceeded = false;
 
     for i in (boundary_start..entries.len()).rev() {
-        for msg in &messages_for_entry(&entries[i]) {
-            accumulated_tokens += estimate_message_tokens(msg);
-        }
+        accumulated_tokens += stats[i - boundary_start].0;
         if accumulated_tokens >= keep_recent_tokens {
             budget_exceeded = true;
             // Snap to the closest candidate at or after index i
@@ -422,61 +579,69 @@ pub fn prepare_compaction(
                 .iter()
                 .copied()
                 .find(|&c| c >= i)
-                .unwrap_or(*cut_point_candidates.last().unwrap());
+                .unwrap_or(*cut_point_candidates.last()?);
             break;
         }
     }
 
     if !budget_exceeded {
-        // If the entire history fits within keep_recent_tokens, cut at first message if > 1 message
+        // Explicit `/compact` under token budget: compact earlier messages while
+        // keeping the most recent candidate when at least 2 candidates exist.
         if cut_point_candidates.len() <= 1 {
             return None;
         }
-        cut_index = cut_point_candidates[0];
+        cut_index = *cut_point_candidates.last()?;
     }
 
     // Check if the cut splits a turn (cut point is Assistant message).
-    // Always align kept history on a User message so post-compaction context never starts with Assistant.
-    let cut_entry = &entries[cut_index];
-    let is_assistant_cut = matches!(
-        &cut_entry.kind,
-        SessionEntryKind::Message {
-            message: Message::Assistant(_)
-        }
-    );
+    // Prefer aligning kept history on a User message so post-compaction context
+    // starts cleanly; for single-turn tool-loop overflows with no other User turn,
+    // keep from the assistant cut point rather than failing compaction.
+    let is_assistant_cut = stats[cut_index - boundary_start].3;
 
-    let first_kept_index = if is_assistant_cut {
+    let mut first_kept_index = if is_assistant_cut {
         let mut turn_start = None;
         for i in (boundary_start..=cut_index).rev() {
-            if let SessionEntryKind::Message {
-                message: Message::User(_),
-            } = &entries[i].kind
-            {
+            if stats[i - boundary_start].2 {
                 turn_start = Some(i);
                 break;
             }
         }
-        match turn_start {
-            Some(ts) if ts > boundary_start => ts,
-            _ => entries[cut_index + 1..]
+        let can_rewind_to_turn_start = turn_start.is_some_and(|ts| {
+            if ts <= boundary_start {
+                return false;
+            }
+            let rewind_extra_tokens: usize = stats[(ts - boundary_start)..(cut_index - boundary_start)]
                 .iter()
-                .position(|e| {
-                    matches!(
-                        &e.kind,
-                        SessionEntryKind::Message {
-                            message: Message::User(_)
-                        }
-                    )
-                })
-                .map(|rel| cut_index + 1 + rel)?,
+                .map(|st| st.0)
+                .sum();
+            rewind_extra_tokens <= keep_recent_tokens
+        });
+        if can_rewind_to_turn_start {
+            turn_start.expect("turn_start checked above")
+        } else {
+            stats[(cut_index + 1 - boundary_start)..]
+                .iter()
+                .position(|st| st.2)
+                .map(|rel| cut_index + 1 + rel)
+                .unwrap_or(cut_index)
         }
     } else {
         cut_index
     };
 
+    if first_kept_index <= boundary_start {
+        first_kept_index = cut_point_candidates
+            .iter()
+            .copied()
+            .find(|&c| c > boundary_start)?;
+    }
+
     let mut messages_to_summarize = Vec::new();
     for entry in &entries[boundary_start..first_kept_index] {
-        messages_to_summarize.extend(messages_for_entry(entry));
+        if let Some(m) = messages_for_entry_with_edits(entry.borrow(), &edits) {
+            messages_to_summarize.push(m);
+        }
     }
 
     let turn_prefix_messages = Vec::new();
@@ -485,7 +650,7 @@ pub fn prepare_compaction(
         return None;
     }
 
-    let first_kept_entry = &entries[first_kept_index];
+    let first_kept_entry = entries[first_kept_index].borrow();
 
     // Extract file operations from read, write, and edit tool calls
     let mut read_files_set = BTreeSet::new();
@@ -496,16 +661,18 @@ pub fn prepare_compaction(
         .chain(turn_prefix_messages.iter())
     {
         if let Message::Assistant(ast) = msg {
-            for call in ast.tool_calls() {
-                if let Some(path_val) = call.arguments.get("path").and_then(|v| v.as_str()) {
-                    match call.name.as_str() {
-                        "read" => {
-                            read_files_set.insert(path_val.to_string());
+            for b in &ast.content {
+                if let AssistantContentBlock::ToolCall(call) = b {
+                    if let Some(path_val) = call.arguments.get("path").and_then(|v| v.as_str()) {
+                        match call.name.as_str() {
+                            "read" => {
+                                read_files_set.insert(path_val.to_string());
+                            }
+                            "write" | "edit" => {
+                                modified_files_set.insert(path_val.to_string());
+                            }
+                            _ => {}
                         }
-                        "write" | "edit" => {
-                            modified_files_set.insert(path_val.to_string());
-                        }
-                        _ => {}
                     }
                 }
             }
@@ -632,6 +799,9 @@ pub async fn compact_with_provider(
     }
 
     let mut summary = final_msg.text_content().trim().to_string();
+    if summary.is_empty() {
+        return Err(anyhow!("Compaction model returned an empty summary"));
+    }
 
     if !prep.read_files.is_empty() {
         summary.push_str("\n\n<read-files>\n");
@@ -957,7 +1127,7 @@ mod tests {
     fn test_compaction_non_ascii_truncation_and_assistant_cut_starts_with_user() {
         // Non-ASCII tool output around byte 2000 must not panic when serialized for compaction.
         let mut big = "a".repeat(TOOL_RESULT_MAX_CHARS - 2);
-        big.push_str("你好世界🙂extra");
+        big.push_str("\u{4F60}\u{597D}\u{4E16}\u{754C}\u{1F642}extra");
         let serialized =
             serialize_conversation(&[Message::ToolResult(mehh_ai::ToolResultMessage {
                 tool_call_id: "c1".to_string(),
@@ -1126,5 +1296,285 @@ mod tests {
                 ..default_settings
             }
         ));
+    }
+
+    #[test]
+    fn prepare_compaction_handles_single_turn_tool_loop_overflow() {
+        let mk_user = |id: &str, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: None,
+            timestamp: "2026-11-12T10:00:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: now_ms(),
+                }),
+            },
+        };
+        let mk_ast = |id: &str, parent: &str, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            timestamp: "2026-11-12T10:01:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::Assistant(mehh_ai::faux_assistant_message(text)),
+            },
+        };
+        let mk_tr = |id: &str, parent: &str, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            timestamp: "2026-11-12T10:02:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::ToolResult(ToolResultMessage {
+                    tool_call_id: format!("call_{id}"),
+                    tool_name: "read".to_string(),
+                    content: vec![mehh_ai::ToolResultContentBlock::Text(TextContent {
+                        text: text.to_string(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    duration_ms: None,
+                    usage: None,
+                    timestamp: now_ms(),
+                }),
+            },
+        };
+
+        let big = "x".repeat(4000);
+        let entries = vec![
+            mk_user("u1", "solve single-turn loop"),
+            mk_ast("a1", "u1", &big),
+            mk_tr("t1", "a1", &big),
+            mk_ast("a2", "t1", &big),
+            mk_tr("t2", "a2", &big),
+            mk_ast("a3", "t2", "recent step"),
+            mk_tr("t3", "a3", "recent output"),
+        ];
+
+        let prep = prepare_compaction(&entries, 200)
+            .expect("single-turn tool-loop overflow must still prepare compaction");
+        assert!(prep.first_kept_entry_id == "a2" || prep.first_kept_entry_id == "a3");
+        assert!(!prep.messages_to_summarize.is_empty());
+        let summarized = serialize_conversation(&prep.messages_to_summarize);
+        assert!(summarized.contains("solve single-turn loop"));
+    }
+
+    #[test]
+    fn prepare_compaction_allows_explicit_compaction_under_token_budget() {
+        let entries = vec![
+            SessionEntry {
+                id: "u1".to_string(),
+                parent_id: None,
+                timestamp: "2026-11-12T10:00:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::User(UserMessage {
+                        content: UserContent::Text("hello".to_string()),
+                        timestamp: now_ms(),
+                    }),
+                },
+            },
+            SessionEntry {
+                id: "a1".to_string(),
+                parent_id: Some("u1".to_string()),
+                timestamp: "2026-11-12T10:01:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::Assistant(mehh_ai::faux_assistant_message("hi there")),
+                },
+            },
+        ];
+
+        let prep = prepare_compaction(&entries, DEFAULT_KEEP_RECENT_TOKENS)
+            .expect("explicit compaction under budget must prepare when > 1 candidate exists");
+        assert_eq!(prep.first_kept_entry_id, "a1");
+        assert_eq!(prep.messages_to_summarize.len(), 1);
+    }
+
+    #[test]
+    fn prepare_compaction_respects_context_edits() {
+        let big = "y".repeat(4000);
+        let entries = vec![
+            SessionEntry {
+                id: "u1".to_string(),
+                parent_id: None,
+                timestamp: "2026-11-12T10:00:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::User(UserMessage {
+                        content: UserContent::Text("first".to_string()),
+                        timestamp: now_ms(),
+                    }),
+                },
+            },
+            SessionEntry {
+                id: "a1".to_string(),
+                parent_id: Some("u1".to_string()),
+                timestamp: "2026-11-12T10:01:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::Assistant(mehh_ai::faux_assistant_message(&big)),
+                },
+            },
+            SessionEntry {
+                id: "u2".to_string(),
+                parent_id: Some("a1".to_string()),
+                timestamp: "2026-11-12T10:02:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::User(UserMessage {
+                        content: UserContent::Text("second".to_string()),
+                        timestamp: now_ms(),
+                    }),
+                },
+            },
+            SessionEntry {
+                id: "a2".to_string(),
+                parent_id: Some("u2".to_string()),
+                timestamp: "2026-11-12T10:03:00.000Z".to_string(),
+                kind: SessionEntryKind::Message {
+                    message: Message::Assistant(mehh_ai::faux_assistant_message("done")),
+                },
+            },
+            // Hide a1 and replace u1
+            SessionEntry {
+                id: "ce1".to_string(),
+                parent_id: Some("a2".to_string()),
+                timestamp: "2026-11-12T10:04:00.000Z".to_string(),
+                kind: SessionEntryKind::ContextEdit {
+                    target_id: "a1".to_string(),
+                    replacement: None,
+                },
+            },
+            SessionEntry {
+                id: "ce2".to_string(),
+                parent_id: Some("ce1".to_string()),
+                timestamp: "2026-11-12T10:05:00.000Z".to_string(),
+                kind: SessionEntryKind::ContextEdit {
+                    target_id: "u1".to_string(),
+                    replacement: Some(crate::session::ContextEditReplacement {
+                        content: crate::session::ContextEditableContent::Text("edited first".to_string()),
+                    }),
+                },
+            },
+        ];
+
+        let prep = prepare_compaction(&entries, DEFAULT_KEEP_RECENT_TOKENS).unwrap();
+        assert_eq!(prep.first_kept_entry_id, "u2");
+        let summarized = serialize_conversation(&prep.messages_to_summarize);
+        assert!(summarized.contains("edited first"));
+        assert!(!summarized.contains(&big));
+        assert!(prep.tokens_before < 200);
+    }
+
+    #[tokio::test]
+    async fn compact_with_provider_rejects_empty_summary() {
+        let prep = CompactionPreparation {
+            first_kept_entry_id: "e2".to_string(),
+            messages_to_summarize: vec![Message::User(UserMessage {
+                content: UserContent::Text("hello".to_string()),
+                timestamp: now_ms(),
+            })],
+            turn_prefix_messages: Vec::new(),
+            tokens_before: 10,
+            previous_summary: None,
+            read_files: vec!["foo.rs".to_string()],
+            modified_files: Vec::new(),
+        };
+        let faux = FauxProvider::new();
+        faux.add_response(mehh_ai::faux_assistant_message("   \n  "));
+
+        let err = compact_with_provider(
+            &prep,
+            &make_test_model(),
+            &faux,
+            None,
+            None,
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("empty LLM summary must be rejected");
+        assert!(err.to_string().contains("empty summary"));
+    }
+
+    #[test]
+    fn test_compaction_mid_turn_tool_loop_overflow_does_not_rewind_to_turn_start() {
+        let mk_user = |id: &str, parent: Option<&str>, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: parent.map(str::to_string),
+            timestamp: "2026-11-12T10:00:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::User(UserMessage {
+                    content: UserContent::Text(text.to_string()),
+                    timestamp: now_ms(),
+                }),
+            },
+        };
+        let mk_ast = |id: &str, parent: &str, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            timestamp: "2026-11-12T10:01:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::Assistant(mehh_ai::faux_assistant_message(text)),
+            },
+        };
+        let mk_tr = |id: &str, parent: &str, text: &str| SessionEntry {
+            id: id.to_string(),
+            parent_id: Some(parent.to_string()),
+            timestamp: "2026-11-12T10:02:00.000Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: Message::ToolResult(ToolResultMessage {
+                    tool_call_id: format!("call_{id}"),
+                    tool_name: "read".to_string(),
+                    content: vec![mehh_ai::ToolResultContentBlock::Text(TextContent {
+                        text: text.to_string(),
+                        text_signature: None,
+                    })],
+                    details: None,
+                    is_error: false,
+                    duration_ms: None,
+                    usage: None,
+                    timestamp: now_ms(),
+                }),
+            },
+        };
+
+        let big = "x".repeat(4_000); // 1,000 tokens
+        let entries = vec![
+            mk_user("u1", None, "first turn"),
+            mk_ast("a1", "u1", "first reply"),
+            mk_user("u2", Some("a1"), "second turn tool loop"),
+            mk_ast("a2_1", "u2", &format!("EARLY_AST_1 {big}")),
+            mk_tr("t2_1", "a2_1", &format!("EARLY_TR_1 {big}")),
+            mk_ast("a2_2", "t2_1", &big),
+            mk_tr("t2_2", "a2_2", &big),
+            mk_ast("a2_3", "t2_2", &big),
+            mk_tr("t2_3", "a2_3", &big),
+            mk_ast("a2_4", "t2_3", "recent step"),
+            mk_tr("t2_4", "a2_4", "recent output"),
+        ];
+
+        let keep_recent = 2_500;
+        let prep = prepare_compaction(&entries, keep_recent)
+            .expect("multi-step mid-turn overflow must prepare compaction");
+        assert_ne!(
+            prep.first_kept_entry_id, "u2",
+            "must not rewind to turn_start u2 when rewind_extra_tokens exceeds keep_recent_tokens"
+        );
+        let summarized = serialize_conversation(&prep.messages_to_summarize);
+        assert!(summarized.contains("second turn tool loop"));
+        assert!(summarized.contains("EARLY_AST_1"));
+        assert!(summarized.contains("EARLY_TR_1"));
+
+        let first_kept_pos = entries
+            .iter()
+            .position(|e| e.id == prep.first_kept_entry_id)
+            .unwrap();
+        let kept_tokens: usize = entries[first_kept_pos..]
+            .iter()
+            .filter_map(|e| match &e.kind {
+                SessionEntryKind::Message { message } => Some(estimate_message_tokens(message)),
+                _ => None,
+            })
+            .sum();
+        assert!(
+            kept_tokens <= keep_recent + 1_000,
+            "kept tokens ({kept_tokens}) should stay bounded near keep_recent ({keep_recent})"
+        );
     }
 }

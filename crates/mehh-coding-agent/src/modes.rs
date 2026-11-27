@@ -2,8 +2,7 @@
 
 use anyhow::Result;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use mehh_agent::AgentEvent;
 use mehh_ai::{AssistantMessageEvent, Message, StopReason};
@@ -35,6 +34,56 @@ pub async fn run_print_mode(
     .await
 }
 
+/// Streams `OutputMode::Text` deltas to an arbitrary `Write` sink, inserting a
+/// newline separator between consecutive assistant messages so multi-step replies
+/// do not concatenate mid-word.
+struct TextModeStreamPrinter<W: Write> {
+    writer: W,
+    streamed_any: bool,
+    need_separator: bool,
+    last_ended_with_newline: bool,
+}
+
+impl<W: Write> TextModeStreamPrinter<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer,
+            streamed_any: false,
+            need_separator: false,
+            last_ended_with_newline: false,
+        }
+    }
+
+    fn handle_event(&mut self, event: &AgentEvent) {
+        match event {
+            AgentEvent::MessageUpdate {
+                assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
+                ..
+            } => {
+                if delta.is_empty() {
+                    return;
+                }
+                if self.need_separator {
+                    if !self.last_ended_with_newline {
+                        let _ = writeln!(self.writer);
+                    }
+                    self.need_separator = false;
+                }
+                let _ = write!(self.writer, "{delta}");
+                let _ = self.writer.flush();
+                self.streamed_any = true;
+                self.last_ended_with_newline = delta.ends_with('\n');
+            }
+            AgentEvent::MessageEnd {
+                message: Message::Assistant(_),
+            } if self.streamed_any => {
+                self.need_separator = true;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// Executes arbitrary user content in print mode, streaming events according to `mode`.
 /// Returns the text content of the final assistant message.
 pub async fn run_print_mode_content(
@@ -42,8 +91,8 @@ pub async fn run_print_mode_content(
     content: mehh_ai::UserContent,
     mode: OutputMode,
 ) -> Result<String> {
-    let streamed_any = Arc::new(AtomicBool::new(false));
-    let streamed_flag = streamed_any.clone();
+    let text_printer = Arc::new(Mutex::new(TextModeStreamPrinter::new(std::io::stdout())));
+    let printer_cb = text_printer.clone();
 
     let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = match mode {
         OutputMode::Json => Arc::new(|event: AgentEvent| {
@@ -52,15 +101,7 @@ pub async fn run_print_mode_content(
             }
         }),
         OutputMode::Text => Arc::new(move |event: AgentEvent| {
-            if let AgentEvent::MessageUpdate {
-                assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
-                ..
-            } = event
-            {
-                print!("{delta}");
-                let _ = std::io::stdout().flush();
-                streamed_flag.store(true, Ordering::SeqCst);
-            }
+            mehh_ai::lock_recover(&printer_cb).handle_event(&event);
         }),
     };
 
@@ -87,7 +128,8 @@ pub async fn run_print_mode_content(
         .unwrap_or_default();
 
     if mode == OutputMode::Text {
-        if streamed_any.load(Ordering::SeqCst) {
+        let streamed = mehh_ai::lock_recover(&text_printer).streamed_any;
+        if streamed {
             println!();
         } else if !final_text.is_empty() {
             println!("{final_text}");
@@ -133,6 +175,49 @@ mod tests {
             .await
             .expect_err("print mode must fail when assistant stops with Error");
         assert!(format!("{err:#}").contains("upstream 500 failure"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn print_mode_text_separates_consecutive_assistant_messages_with_newline() {
+        let dir = std::env::temp_dir().join(format!("mehh_print_sep_{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ast = |stop_reason| AssistantMessage {
+            content: vec![],
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            model: "faux".to_string(),
+            response_id: None,
+            usage: Usage::default(),
+            stop_reason,
+            error_message: None,
+            timestamp: now_ms(),
+        };
+        let mut buf = Vec::<u8>::new();
+        {
+            let mut printer = TextModeStreamPrinter::new(&mut buf);
+            printer.handle_event(&AgentEvent::MessageUpdate {
+                message: ast(StopReason::Stop),
+                assistant_message_event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "Step one.".to_string(),
+                    partial: ast(StopReason::Stop),
+                },
+            });
+            printer.handle_event(&AgentEvent::MessageEnd {
+                message: Message::Assistant(ast(StopReason::ToolUse)),
+            });
+            printer.handle_event(&AgentEvent::MessageUpdate {
+                message: ast(StopReason::Stop),
+                assistant_message_event: AssistantMessageEvent::TextDelta {
+                    content_index: 0,
+                    delta: "Step two.".to_string(),
+                    partial: ast(StopReason::Stop),
+                },
+            });
+        }
+        let rendered = String::from_utf8(buf).unwrap();
+        assert_eq!(rendered, "Step one.\nStep two.");
         let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -205,7 +205,13 @@ impl std::fmt::Debug for AgentRequestUpdate {
             .field("context", &self.context)
             .field("model", &self.model)
             .field("provider", &self.provider.as_ref().map(|_| "<LlmProvider>"))
-            .field("api_key", &self.api_key)
+            .field(
+                "api_key",
+                &self
+                    .api_key
+                    .as_ref()
+                    .map(|inner| inner.as_ref().map(|_| "[REDACTED]")),
+            )
             .field("thinking_level", &self.thinking_level)
             .finish()
     }
@@ -234,7 +240,13 @@ impl std::fmt::Debug for AgentLoopTurnUpdate {
             .field("messages", &self.messages)
             .field("model", &self.model)
             .field("provider", &self.provider.as_ref().map(|_| "<LlmProvider>"))
-            .field("api_key", &self.api_key)
+            .field(
+                "api_key",
+                &self
+                    .api_key
+                    .as_ref()
+                    .map(|inner| inner.as_ref().map(|_| "[REDACTED]")),
+            )
             .field("thinking_level", &self.thinking_level)
             .finish()
     }
@@ -448,5 +460,24 @@ mod tests {
 
         let d5: QueueMode = serde_json::from_str("\"All\"").unwrap();
         assert_eq!(d5, QueueMode::All);
+    }
+
+    #[test]
+    fn debug_redacts_api_key_in_update_structs() {
+        let req_update = AgentRequestUpdate {
+            api_key: Some(Some("sk-secret-req-key".to_string())),
+            ..Default::default()
+        };
+        let req_dbg = format!("{req_update:?}");
+        assert!(!req_dbg.contains("sk-secret-req-key"), "{req_dbg}");
+        assert!(req_dbg.contains("[REDACTED]"), "{req_dbg}");
+
+        let turn_update = AgentLoopTurnUpdate {
+            api_key: Some(Some("sk-secret-turn-key".to_string())),
+            ..Default::default()
+        };
+        let turn_dbg = format!("{turn_update:?}");
+        assert!(!turn_dbg.contains("sk-secret-turn-key"), "{turn_dbg}");
+        assert!(turn_dbg.contains("[REDACTED]"), "{turn_dbg}");
     }
 }
