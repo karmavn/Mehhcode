@@ -125,6 +125,8 @@ pub struct BeforeToolCallResult {
     pub terminate: bool,
     /// Canonical target approved by the inspector for a path-bearing tool.
     pub approved_path: Option<PathBuf>,
+    /// Optional structured metadata propagated onto the blocked `ToolResultMessage.details`.
+    pub details: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]

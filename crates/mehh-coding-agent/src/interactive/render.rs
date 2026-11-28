@@ -673,6 +673,7 @@ pub(super) fn render_markdown_incremental(
         if cached.prefix_byte_len == split_byte && cached.prefix_hash == prefix_hash {
             cached.prefix_lines.clone()
         } else if cached.prefix_byte_len < split_byte
+            && clean_text.is_char_boundary(cached.prefix_byte_len)
             && hash_str_128(&clean_text[..cached.prefix_byte_len]) == cached.prefix_hash
         {
             let mid = clean_text[cached.prefix_byte_len..split_byte].trim_start_matches(['\r', '\n']);

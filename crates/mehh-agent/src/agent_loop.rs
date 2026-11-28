@@ -883,7 +883,8 @@ async fn execute_single_tool(
             let reason = before_res
                 .reason
                 .unwrap_or_else(|| "Tool execution was blocked".to_string());
-            let res = AgentToolResult::text(reason);
+            let mut res = AgentToolResult::text(reason);
+            res.details = before_res.details;
             emit(AgentEvent::ToolExecutionEnd {
                 tool_call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
@@ -1514,8 +1515,7 @@ mod tests {
                 crate::types::BeforeToolCallResult {
                     block: true,
                     reason: Some("blocked by policy".to_string()),
-                    terminate: false,
-                    approved_path: None,
+                    ..Default::default()
                 }
             })
         }));
@@ -2457,5 +2457,77 @@ mod tests {
         let turn2_tools = requests[1].context.tools.as_ref().expect("turn 2 tools");
         assert_eq!(turn2_tools.len(), 1);
         assert_eq!(turn2_tools[0].name, "t2");
+    }
+
+    #[tokio::test]
+    async fn before_tool_call_block_propagates_details_to_tool_result_and_event() {
+        let provider = Arc::new(FauxProvider::new());
+        provider.add_response(faux_tool_call_message(vec![faux_tool_call(
+            "c1",
+            "echo",
+            serde_json::json!({}),
+        )]));
+        provider.add_response(faux_assistant_message("done"));
+
+        let dummy_tool = Arc::new(DummyTool {
+            tool_name: "echo".to_string(),
+            mode: ToolExecutionMode::Parallel,
+            on_exec: None,
+        });
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let events_clone = events.clone();
+
+        let mut config = AgentLoopConfig::new(faux_model(), provider);
+        config.tools = vec![dummy_tool];
+        config.before_tool_call = Some(Arc::new(|_ctx, _cancel| {
+            Box::pin(async {
+                crate::types::BeforeToolCallResult {
+                    block: true,
+                    reason: Some("blocked".to_string()),
+                    details: Some(serde_json::json!({ "block_kind": "repetition" })),
+                    ..Default::default()
+                }
+            })
+        }));
+
+        let out = run_agent_loop(
+            vec![Message::User(UserMessage {
+                content: UserContent::Text("go".to_string()),
+                timestamp: now_ms(),
+            })],
+            vec![],
+            config,
+            Some(Arc::new(move |ev| {
+                events_clone.lock().unwrap().push(ev);
+            })),
+        )
+        .await;
+
+        let tool_res = out
+            .iter()
+            .find_map(|m| match m {
+                Message::ToolResult(tr) => Some(tr),
+                _ => None,
+            })
+            .expect("blocked tool result");
+        assert_eq!(
+            tool_res.details,
+            Some(serde_json::json!({ "block_kind": "repetition" }))
+        );
+
+        let recorded_events = events.lock().unwrap();
+        let end_details = recorded_events.iter().find_map(|ev| match ev {
+            AgentEvent::ToolExecutionEnd {
+                tool_call_id,
+                result,
+                ..
+            } if tool_call_id == "c1" => Some(result.details.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            end_details.flatten(),
+            Some(serde_json::json!({ "block_kind": "repetition" }))
+        );
     }
 }

@@ -34,7 +34,7 @@ const ENRICH_CACHE_MAX_TOTAL_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct CachedEnrichPage {
-    pub final_url: Option<String>,
+    pub checked_urls: Arc<[String]>,
     pub markdown: Arc<str>,
     pub inserted_at: StdInstant,
     pub last_used: StdInstant,
@@ -59,13 +59,13 @@ impl EnrichPageCache {
         self.total_bytes = self.total_bytes.saturating_sub(removed_bytes);
     }
 
-    fn get(&mut self, raw_url: &str) -> Option<(Option<String>, Arc<str>)> {
+    fn get(&mut self, raw_url: &str) -> Option<(Arc<[String]>, Arc<str>)> {
         let key = canonicalize_url(raw_url)?;
         let now = StdInstant::now();
         if let Some(entry) = self.entries.get_mut(&key) {
             if now.duration_since(entry.inserted_at) < ENRICH_CACHE_TTL {
                 entry.last_used = now;
-                return Some((entry.final_url.clone(), entry.markdown.clone()));
+                return Some((entry.checked_urls.clone(), entry.markdown.clone()));
             }
         }
         if let Some(expired) = self.entries.remove(&key) {
@@ -74,7 +74,7 @@ impl EnrichPageCache {
         None
     }
 
-    fn insert(&mut self, raw_url: &str, final_url: Option<String>, markdown: Arc<str>) {
+    fn insert(&mut self, raw_url: &str, checked_urls: Arc<[String]>, markdown: Arc<str>) {
         if markdown.len() > ENRICH_CACHE_MAX_TOTAL_BYTES {
             return;
         }
@@ -106,7 +106,7 @@ impl EnrichPageCache {
         self.entries.insert(
             key,
             CachedEnrichPage {
-                final_url,
+                checked_urls,
                 markdown,
                 inserted_at: now,
                 last_used: now,
@@ -160,14 +160,14 @@ impl NativeSearchState {
         guard.insert(source, StdInstant::now() + dur);
     }
 
-    pub(crate) fn get_cached_page(&self, raw_url: &str) -> Option<(Option<String>, Arc<str>)> {
+    pub(crate) fn get_cached_page(&self, raw_url: &str) -> Option<(Arc<[String]>, Arc<str>)> {
         let mut guard = mehh_ai::lock_recover(&self.0.page_cache);
         guard.get(raw_url)
     }
 
-    pub(crate) fn cache_page(&self, raw_url: &str, final_url: Option<String>, markdown: Arc<str>) {
+    pub(crate) fn cache_page(&self, raw_url: &str, checked_urls: Arc<[String]>, markdown: Arc<str>) {
         let mut guard = mehh_ai::lock_recover(&self.0.page_cache);
-        guard.insert(raw_url, final_url, markdown);
+        guard.insert(raw_url, checked_urls, markdown);
     }
 }
 
@@ -189,19 +189,31 @@ pub async fn search_mehh(
     timeout: Duration,
     cancel: &CancellationToken,
 ) -> Result<Vec<SearchHit>, ProviderError> {
+    search_mehh_with_stage1_budget(ctx, query, timeout, STAGE1_BUDGET, cancel).await
+}
+
+async fn search_mehh_with_stage1_budget(
+    ctx: &NativeSearchContext<'_>,
+    query: &str,
+    timeout: Duration,
+    stage1_budget: Duration,
+    cancel: &CancellationToken,
+) -> Result<Vec<SearchHit>, ProviderError> {
     if cancel.is_cancelled() {
         return Err(ProviderError::Cancelled);
     }
 
     let now = Instant::now();
     let total_deadline = now + timeout;
-    let stage1_deadline = total_deadline.min(now + STAGE1_BUDGET);
+    let stage1_deadline = total_deadline.min(now + stage1_budget);
     let mut selected_sources = classify_query(query);
     if let Some(state) = ctx.state {
         selected_sources = state.filter_sources(selected_sources);
     }
 
     let query_arc: Arc<str> = Arc::from(query);
+    let source_dns_policy = ctx.enrich_dns_policy;
+    let mut pending_sources: Vec<SourceId> = selected_sources.clone();
     let mut set: JoinSet<(SourceId, SourceOutcome)> = JoinSet::new();
     for source in selected_sources {
         let client = ctx.client.clone();
@@ -209,9 +221,16 @@ pub async fn search_mehh(
         let query = query_arc.clone();
         let cancel = cancel.clone();
         set.spawn(async move {
-            let outcome =
-                fetch_source_url(&client, &endpoint, source, &query, stage1_deadline, &cancel)
-                    .await;
+            let outcome = fetch_source_url(
+                &client,
+                &endpoint,
+                source,
+                &query,
+                source_dns_policy,
+                stage1_deadline,
+                &cancel,
+            )
+            .await;
             (source, outcome)
         });
     }
@@ -234,14 +253,22 @@ pub async fn search_mehh(
         }
         _ = &mut stage1_sleep => {
             set.abort_all();
-            if raw_hits.is_empty() {
-                failures.push("stage 1 metasearch timed out".to_string());
+            if !straggler_tightened {
+                if let Some(state) = ctx.state {
+                    for src in &pending_sources {
+                        state.record_source_cooldown(*src, sources::TRANSIENT_SOURCE_COOLDOWN);
+                    }
+                }
+                if raw_hits.is_empty() {
+                    failures.push("stage 1 metasearch timed out".to_string());
+                }
             }
             None
         }
         joined = set.join_next() => joined,
     } {
         if let Ok((source, outcome)) = res {
+            pending_sources.retain(|s| *s != source);
             match outcome {
                 SourceOutcome::Hits(hits) => {
                     if source.is_general_web() {
@@ -697,5 +724,149 @@ mod tests {
             .unwrap();
         assert_eq!(ddg_calls.load(Ordering::SeqCst), 2);
         assert!(r3.iter().any(|h| h.url == "https://ddg.example/recovered"));
+    }
+
+    #[tokio::test]
+    async fn test_search_mehh_3xx_failure_triggers_vendor_unavailable_failover() {
+        let base = serve_routes(vec![
+            ("/ddg", 302, "text/html", String::new()),
+            ("/bing", 302, "text/html", String::new()),
+            (
+                "/wiki",
+                200,
+                "application/json",
+                serde_json::json!({"query":{"search":[]}}).to_string(),
+            ),
+        ])
+        .await;
+
+        let client = build_safe_http_client(DnsPolicy::AllowPrivate, Duration::from_secs(5), None)
+            .unwrap();
+        let mut endpoints = NativeEndpoints::production();
+        endpoints.ddg_html = format!("{base}/ddg");
+        endpoints.bing_html = format!("{base}/bing");
+        endpoints.wikipedia_api = format!("{base}/wiki");
+
+        let ctx = NativeSearchContext {
+            client: &client,
+            enrich_client: &client,
+            enrich_dns_policy: DnsPolicy::AllowPrivate,
+            url_policy_checker: None,
+            endpoints: &endpoints,
+            state: None,
+        };
+        let err = search_mehh(
+            &ctx,
+            "what is 3xx failure failover",
+            Duration::from_secs(5),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.should_failover(), "expected VendorUnavailable failover, got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn test_stage1_timeout_puts_hanging_source_on_cooldown() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let bing_calls = Arc::new(AtomicUsize::new(0));
+        let bing_calls_bg = bing_calls.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let bing_calls_req = bing_calls_bg.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .split('?')
+                        .next()
+                        .unwrap_or("/");
+                    match path {
+                        "/ddg" => {
+                            let body = format!(
+                                "<div class=\"result web-result\"><a class=\"result__a\" href=\"https://ddg.example/1\">One</a><div class=\"result__snippet\">{}</div></div>",
+                                "long ".repeat(110)
+                            );
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        }
+                        "/bing" => {
+                            bing_calls_req.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        }
+                        _ => {
+                            let body = serde_json::json!({"query":{"search":[]}}).to_string();
+                            let resp = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = sock.write_all(resp.as_bytes()).await;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = build_safe_http_client(DnsPolicy::AllowPrivate, Duration::from_secs(5), None)
+            .unwrap();
+        let mut endpoints = NativeEndpoints::production();
+        endpoints.ddg_html = format!("http://{addr}/ddg");
+        endpoints.bing_html = format!("http://{addr}/bing");
+        endpoints.wikipedia_api = format!("http://{addr}/wiki");
+
+        let state = NativeSearchState::new();
+        let ctx = NativeSearchContext {
+            client: &client,
+            enrich_client: &client,
+            enrich_dns_policy: DnsPolicy::AllowPrivate,
+            url_policy_checker: None,
+            endpoints: &endpoints,
+            state: Some(&state),
+        };
+
+        let hits = search_mehh_with_stage1_budget(
+            &ctx,
+            "what is hanging source cooldown",
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(bing_calls.load(Ordering::SeqCst), 1);
+        {
+            let guard = state.0.source_cooldowns.lock().unwrap();
+            assert!(
+                guard.contains_key(&SourceId::Bing),
+                "hanging Bing source must enter cooldown when Stage 1 times out"
+            );
+        }
+
+        // Second query must skip Bing while it is cooling down.
+        let _hits2 = search_mehh_with_stage1_budget(
+            &ctx,
+            "what is hanging source cooldown second",
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+            &CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(bing_calls.load(Ordering::SeqCst), 1);
     }
 }

@@ -13,6 +13,7 @@ use crate::sandbox::{
 };
 
 struct ToolCache {
+    tools: Arc<[Arc<dyn AgentTool>]>,
     meta: PreparedToolMeta,
     by_name: HashMap<String, usize>,
     by_ident: HashMap<String, usize>,
@@ -30,6 +31,7 @@ impl ToolCache {
         }
         let meta = resolve_tool_meta(Arc::from(defs));
         Self {
+            tools: Arc::from(tools),
             meta,
             by_name,
             by_ident,
@@ -80,9 +82,8 @@ impl CodemodeTool {
             .filter(|t| t.name() != "codemode")
             .collect();
         let next_cache = Arc::new(ToolCache::from_tools(&filtered_tools));
+        *mehh_ai::write_recover(&self.tools) = filtered_tools;
         *mehh_ai::write_recover(&self.cache) = next_cache;
-        let mut guard = mehh_ai::write_recover(&self.tools);
-        *guard = filtered_tools;
     }
 
     pub fn with_config(mut self, config: CodemodeConfig) -> Self {
@@ -188,11 +189,7 @@ impl AgentTool for CodemodeTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| "Missing required parameter: code".to_string())?;
 
-        let current_tools: Arc<[Arc<dyn AgentTool>]> =
-            Arc::from(mehh_ai::read_recover(&self.tools).as_slice());
         let cache = Arc::clone(&*mehh_ai::read_recover(&self.cache));
-
-        let tools = Arc::clone(&current_tools);
         let tool_call_prefix = tool_call_id.to_string();
         let interceptor = self.interceptor.clone();
         let executor_cache = Arc::clone(&cache);
@@ -200,7 +197,6 @@ impl AgentTool for CodemodeTool {
 
         let executor: SandboxToolExecutor = Arc::new(
             move |tool_name: &str, args: serde_json::Value, call_cancel: CancellationToken| {
-                let tools = Arc::clone(&tools);
                 let name_str = tool_name.to_string();
                 let prefix = tool_call_prefix.clone();
                 let interceptor = interceptor.clone();
@@ -218,7 +214,11 @@ impl AgentTool for CodemodeTool {
                         Some(i) => i,
                         None => return Err(format!("Tool '{name_str}' not found")),
                     };
-                    let tool = tools[idx].clone();
+                    let tool = cache
+                        .tools
+                        .get(idx)
+                        .cloned()
+                        .ok_or_else(|| format!("Tool '{name_str}' not found"))?;
                     let canonical_name = tool.name();
                     let params_map = match args {
                         serde_json::Value::Object(m) => m,
@@ -680,5 +680,72 @@ mod tests {
                 .any(|b| matches!(b, ToolResultContentBlock::Image(_))),
             "expected image content block in codemode result"
         );
+    }
+
+    #[tokio::test]
+    async fn test_replace_tools_concurrent_with_execute_never_panics_or_mismatches() {
+        struct NamedEchoTool(&'static str);
+
+        #[async_trait]
+        impl AgentTool for NamedEchoTool {
+            fn name(&self) -> &str {
+                self.0
+            }
+
+            fn description(&self) -> &str {
+                "Returns its own name."
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object", "properties": {} })
+            }
+
+            async fn execute(
+                &self,
+                _tool_call_id: &str,
+                _params: serde_json::Map<String, serde_json::Value>,
+                _cancel: CancellationToken,
+                _on_update: Option<AgentToolUpdateCallback>,
+            ) -> Result<AgentToolResult, String> {
+                Ok(AgentToolResult::text(self.0))
+            }
+        }
+
+        let small: Vec<Arc<dyn AgentTool>> = vec![Arc::new(NamedEchoTool("t0"))];
+        let large: Vec<Arc<dyn AgentTool>> = vec![
+            Arc::new(NamedEchoTool("t1")),
+            Arc::new(NamedEchoTool("t2")),
+            Arc::new(NamedEchoTool("t3")),
+            Arc::new(NamedEchoTool("t0")),
+        ];
+
+        let codemode = Arc::new(CodemodeTool::new(large.clone()));
+        let writer_cm = Arc::clone(&codemode);
+        let writer = tokio::spawn(async move {
+            for i in 0..80 {
+                if i % 2 == 0 {
+                    writer_cm.replace_tools(small.clone());
+                } else {
+                    writer_cm.replace_tools(large.clone());
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        for i in 0..40 {
+            let params = serde_json::json!({
+                "code": "return await tools.t0({});"
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            let res = codemode
+                .execute(&format!("tc_{i}"), params, CancellationToken::new(), None)
+                .await
+                .expect("t0 exists in every tool snapshot and must execute without panic");
+            assert_eq!(res.details, Some(serde_json::json!("t0")));
+        }
+
+        writer.await.unwrap();
     }
 }

@@ -171,6 +171,23 @@ impl LeadWorkerManager {
         self.current_turn_in_prompt += 1;
     }
 
+    /// Resolves the effective context window for an assistant response produced by `(model_id, provider)`.
+    pub fn context_window_for(&self, model_id: &str, provider: &str) -> u64 {
+        if let Some(worker) = self
+            .worker_model
+            .as_ref()
+            .filter(|w| w.id == model_id && w.provider == provider)
+        {
+            worker.context_window
+        } else if self.lead_model.id == model_id && self.lead_model.provider == provider {
+            self.lead_model.context_window
+        } else if let Some(worker) = self.worker_model.as_ref().filter(|w| w.id == model_id) {
+            worker.context_window
+        } else {
+            self.lead_model.context_window
+        }
+    }
+
     pub fn reset_for_new_prompt(&mut self) {
         self.current_turn_in_prompt = 0;
         self.lead_rescue_remaining = 0;
@@ -229,5 +246,22 @@ mod tests {
         assert_eq!(mgr.consecutive_tool_errors, 1);
         mgr.record_tool_outcome(false);
         assert_eq!(mgr.consecutive_tool_errors, 0);
+    }
+
+    #[test]
+    fn context_window_for_matches_worker_and_lead_with_fallback() {
+        let mut mgr = LeadWorkerManager::new_for_test("shared-id", "shared-id", 1);
+        mgr.lead_model.provider = "anthropic".to_string();
+        mgr.lead_model.context_window = 200_000;
+        let worker = mgr.worker_model.as_mut().unwrap();
+        worker.provider = "openai".to_string();
+        worker.context_window = 16_000;
+
+        assert_eq!(mgr.context_window_for("shared-id", "openai"), 16_000);
+        assert_eq!(mgr.context_window_for("shared-id", "anthropic"), 200_000);
+
+        mgr.worker_model.as_mut().unwrap().id = "worker-only".to_string();
+        assert_eq!(mgr.context_window_for("worker-only", "other"), 16_000);
+        assert_eq!(mgr.context_window_for("unknown", "other"), 200_000);
     }
 }

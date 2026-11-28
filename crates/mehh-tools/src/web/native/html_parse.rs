@@ -227,7 +227,12 @@ impl HtmlSink for DdgParser {
             self.title_anchor_depth += 1;
         }
         if self.in_snippet {
-            self.snippet_tag_depth += 1;
+            if name == "br" {
+                self.current_snippet.push(' ');
+            }
+            if !is_html_void_tag(name) {
+                self.snippet_tag_depth += 1;
+            }
         }
     }
 
@@ -263,6 +268,26 @@ impl HtmlSink for DdgParser {
             self.current_snippet.push_str(text);
         }
     }
+}
+
+fn is_html_void_tag(name: &str) -> bool {
+    matches!(
+        name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 /// Extracts organic web search results from DuckDuckGo HTML SERP responses.
@@ -523,5 +548,20 @@ mod tests {
         assert!(looks_like_captcha("<div class=\"anomaly-modal\">Please solve</div>"));
         assert!(looks_like_captcha("Our systems detected unusual traffic from your computer"));
         assert!(!looks_like_captcha("<ol id=\"b_results\"><li class=\"b_algo\">ok</li></ol>"));
+    }
+
+    #[test]
+    fn test_parse_ddg_html_void_tags_in_snippet_do_not_leak_depth() {
+        let html = r##"<html><body>
+          <div class="result web-result">
+            <h2 class="result__title"><a class="result__a" href="https://example.org/doc">Doc Title</a></h2>
+            <a class="result__snippet" href="https://example.org/doc">First line<br>second<wbr>line</a>
+            <div class="result__extras"><span class="result__url">example.org/doc</span></div>
+          </div>
+        </body></html>"##;
+
+        let hits = parse_ddg_html(html);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].snippet.as_deref(), Some("First line secondline"));
     }
 }

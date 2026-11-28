@@ -348,15 +348,10 @@ impl AgentSession {
                 let mut mgr = mehh_ai::lock_recover(&lead_worker);
                 let stop_reason = turn_ctx.assistant_message.stop_reason;
                 let is_empty_assistant = turn_ctx.assistant_message.content.is_empty();
-                let repetition_detected = turn_ctx.tool_results.iter().any(|tr| {
-                    tr.is_error
-                        && tr.content.iter().any(|b| match b {
-                            mehh_ai::ToolResultContentBlock::Text(t) => {
-                                t.text.contains("Repeated identical tool call")
-                            }
-                            _ => false,
-                        })
-                });
+                let repetition_detected = turn_ctx
+                    .tool_results
+                    .iter()
+                    .any(crate::tool_inspection::is_repetition_block_result);
                 let is_repetition_break = is_empty_assistant || repetition_detected;
                 mgr.record_turn_outcome(stop_reason, is_repetition_break);
 

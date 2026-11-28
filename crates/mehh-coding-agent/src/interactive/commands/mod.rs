@@ -703,11 +703,24 @@ Keybindings:
         }
         "/tools" => {
             let tool_names: Vec<&str> = session.tools().iter().map(|t| t.name()).collect();
-            let summary = format!(
+            let mut summary = format!(
                 "Active tools ({}): {}",
                 tool_names.len(),
                 tool_names.join(", ")
             );
+            let deferred_cm = session.codemode_deferred_tool_count();
+            if deferred_cm > 0 {
+                summary.push_str(&format!(
+                    " (+{deferred_cm} deferred MCP tools inside codemode)"
+                ));
+            } else if let Some(cat) = session.deferred_catalog() {
+                if !cat.is_empty() {
+                    summary.push_str(&format!(
+                        " (+{} deferred MCP tools via tool_search)",
+                        cat.len()
+                    ));
+                }
+            }
             state.items.push(TranscriptItem::System(summary));
             SlashCommandOutcome::Handled
         }

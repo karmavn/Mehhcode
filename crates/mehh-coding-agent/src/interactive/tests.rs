@@ -1687,6 +1687,72 @@ fn test_interactive_sync_preserves_codemode_handle() {
     );
 }
 
+#[tokio::test]
+async fn test_tools_command_reports_deferred_mcp_count_in_codemode() {
+    struct SimpleMcpTool(String);
+    #[async_trait::async_trait]
+    impl mehh_agent::AgentTool for SimpleMcpTool {
+        fn name(&self) -> &str {
+            &self.0
+        }
+        fn description(&self) -> &str {
+            "mock mcp"
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object" })
+        }
+        async fn execute(
+            &self,
+            _id: &str,
+            _params: serde_json::Map<String, serde_json::Value>,
+            _cancel: tokio_util::sync::CancellationToken,
+            _on_update: Option<mehh_agent::AgentToolUpdateCallback>,
+        ) -> Result<mehh_agent::AgentToolResult, String> {
+            Ok(mehh_agent::AgentToolResult::text("ok"))
+        }
+    }
+
+    let mut session = make_test_session();
+    let mut state = make_test_state();
+    let mcp_tools: Vec<Arc<dyn mehh_agent::AgentTool>> = (0..25)
+        .map(|i| Arc::new(SimpleMcpTool(format!("mcp__srv__t_{i}"))) as Arc<dyn mehh_agent::AgentTool>)
+        .collect();
+    session.enable_mcp_and_codemode(mcp_tools, true);
+
+    assert_eq!(
+        handle_slash_command("/tools", &mut session, &mut state, None, true).await,
+        SlashCommandOutcome::Handled
+    );
+    let msg = match state.items.last() {
+        Some(TranscriptItem::System(s)) => s.clone(),
+        other => panic!("expected system message, got: {other:?}"),
+    };
+    assert!(
+        msg.contains("(+25 deferred MCP tools inside codemode)"),
+        "got: {msg}"
+    );
+
+    // Switching codemode off keeps the 25 tools deferred behind tool_search and /tools reports that count.
+    session.sync_mcp_tools(
+        (0..25)
+            .map(|i| Arc::new(SimpleMcpTool(format!("mcp__srv__t_{i}"))) as Arc<dyn mehh_agent::AgentTool>)
+            .collect(),
+        false,
+    );
+    assert_eq!(
+        handle_slash_command("/tools", &mut session, &mut state, None, false).await,
+        SlashCommandOutcome::Handled
+    );
+    let ts_msg = match state.items.last() {
+        Some(TranscriptItem::System(s)) => s.clone(),
+        other => panic!("expected system message, got: {other:?}"),
+    };
+    assert!(
+        ts_msg.contains("(+25 deferred MCP tools via tool_search)"),
+        "got: {ts_msg}"
+    );
+}
+
 #[test]
 fn test_split_system_prompt_recovers_the_preamble_and_addendum() {
     let prompt = crate::system_prompt::build_system_prompt_with_skills(
@@ -6471,4 +6537,157 @@ fn incremental_streaming_markdown_matches_full_document_render() {
         super::render::render_markdown_incremental(&with_ref, &dark, 72, cache.as_ref(), 1);
     assert!(ref_cache.is_none(), "reference-link document must bypass split cache");
     assert_eq!(ref_lines, mehh_tui::render_markdown(&with_ref, &dark, 72));
+}
+
+#[test]
+fn render_markdown_incremental_handles_stale_non_char_boundary_prefix() {
+    let dark = Theme::load(Some("dark"));
+    let old_doc = format!("{}\n\n{}", "a ".repeat(80), "b ".repeat(80));
+    let (_, prev) = super::render::render_markdown_incremental(&old_doc, &dark, 72, None, 1);
+    let stale = prev.expect("expected prefix cache entry");
+    assert!(stale.prefix_byte_len >= 158);
+
+    // Place a 3-byte UTF-8 character across `stale.prefix_byte_len` with `split_byte > stale.prefix_byte_len`.
+    let pad_len = stale.prefix_byte_len - 1;
+    let new_doc = format!(
+        "{}ế remaining first paragraph words.\n\n{}",
+        "x".repeat(pad_len),
+        "c ".repeat(80)
+    );
+    assert!(!new_doc.is_char_boundary(stale.prefix_byte_len));
+    let split = super::render::find_safe_markdown_split(&new_doc).expect("split for new_doc");
+    assert!(stale.prefix_byte_len < split);
+
+    let (lines, _) =
+        super::render::render_markdown_incremental(&new_doc, &dark, 72, Some(&stale), 1);
+    assert_eq!(lines, mehh_tui::render_markdown(&new_doc, &dark, 72));
+}
+
+#[tokio::test]
+async fn test_windows_multiline_paste_burst_does_not_auto_submit_and_respects_modals() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use mehh_tui::{Component, PasteBurst};
+
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    let _env_clear = ProviderEnvClearGuard::clear_all();
+
+    let session = make_test_session();
+    let mut state = InteractiveState::new(Vec::new(), &session.settings);
+    let mut editor = Editor::new();
+    let kb = Keybindings::default_bindings();
+
+    let feed_paste_burst = |text: &str| -> Vec<Event> {
+        let mut pb = PasteBurst::new();
+        let mut t = std::time::Instant::now();
+        let mut emitted = Vec::new();
+        for ch in text.chars() {
+            let (code, mods) = match ch {
+                '\n' => (KeyCode::Enter, KeyModifiers::NONE),
+                '\t' => (KeyCode::Tab, KeyModifiers::NONE),
+                c if c.is_ascii_uppercase() => (KeyCode::Char(c), KeyModifiers::SHIFT),
+                c => (KeyCode::Char(c), KeyModifiers::NONE),
+            };
+            emitted.extend(pb.on_event(
+                Event::Key(KeyEvent::new_with_kind(code, mods, KeyEventKind::Press)),
+                t,
+            ));
+            emitted.extend(pb.on_event(
+                Event::Key(KeyEvent::new_with_kind(code, mods, KeyEventKind::Release)),
+                t,
+            ));
+            t += std::time::Duration::from_millis(1);
+        }
+        emitted.extend(pb.flush_if_due(t + std::time::Duration::from_millis(60)));
+        emitted
+    };
+
+    // 1. Long multi-line Windows paste (>10 lines) must never trigger EditorOutput::Submit
+    //    and must collapse cleanly in the editor buffer.
+    let multiline_prompt: String = (1..=12)
+        .map(|i| format!("Line {i}: inspect crates/mehh-tui/src/paste_burst.rs"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let emitted = feed_paste_burst(&multiline_prompt);
+    assert!(
+        !emitted.iter().any(|e| matches!(e, Event::Key(k) if k.code == KeyCode::Enter)),
+        "paste burst must not emit KeyCode::Enter: {emitted:?}"
+    );
+    for evt in emitted {
+        match evt {
+            Event::Paste(pasted) => {
+                assert!(handle_interactive_paste(&pasted, &session, &mut state, &mut editor));
+            }
+            Event::Key(key_event) => {
+                if let Some(key_str) = normalize_crossterm_key(key_event) {
+                    let out = editor.handle_editor_key(&key_str, &kb);
+                    assert!(
+                        !matches!(out, EditorOutput::Submit(_)),
+                        "paste burst must not auto-submit"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(editor.text(), multiline_prompt);
+    let rendered = editor.render(80).join("\n");
+    assert!(
+        rendered.contains("[paste #1 +12 lines]"),
+        "expected collapsed paste chip in editor render:\n{rendered}"
+    );
+    editor.clear();
+
+    // 2. When ToolApproval modal is open, a pasted "yes\n" burst must be isolated & dropped.
+    let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+    let mut session_mut = make_test_session();
+    apply_agent_signal(
+        AgentSignal::ToolApprovalRequest(Box::new(PendingApproval {
+            tool_name: "bash".to_string(),
+            args: serde_json::Map::new(),
+            reason: "Verify".to_string(),
+            preview: Some("echo hi".to_string()),
+            reply_tx,
+        })),
+        &mut session_mut,
+        &mut state,
+    );
+    for evt in feed_paste_burst("yes\n") {
+        if let Event::Paste(pasted) = evt {
+            assert!(!handle_interactive_paste(&pasted, &session_mut, &mut state, &mut editor));
+        } else {
+            panic!("expected single Event::Paste for 'yes\\n' burst, got {evt:?}");
+        }
+    }
+    assert!(reply_rx.try_recv().is_err(), "approval must remain pending");
+    assert_eq!(editor.text(), "");
+    state.pending_approval = None;
+    state.selector = None;
+
+    // 3. When ConnectInput modal is open, pasted key with trailing newline populates connect_input cleanly.
+    state.connect_input = Some(ConnectInputState {
+        kind: ConnectInputKind::ApiKey {
+            provider: "openrouter".to_string(),
+            display_name: "OpenRouter".to_string(),
+        },
+        value: String::new(),
+        masked: true,
+        error: None,
+    });
+    state.open_modal(Selector {
+        kind: SelectorKind::ConnectInput,
+        list: SelectList::new(Vec::new(), 1),
+        settings_list: None,
+    });
+    for evt in feed_paste_burst("sk-or-v1-test123456789\n") {
+        if let Event::Paste(pasted) = evt {
+            assert!(handle_interactive_paste(&pasted, &session_mut, &mut state, &mut editor));
+        } else {
+            panic!("expected single Event::Paste for ConnectInput burst, got {evt:?}");
+        }
+    }
+    assert_eq!(
+        state.connect_input.as_ref().map(|c| c.value.as_str()),
+        Some("sk-or-v1-test123456789")
+    );
+    assert_eq!(editor.text(), "");
 }

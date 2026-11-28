@@ -4,6 +4,8 @@ use std::borrow::Cow;
 use std::fmt::Write as _;
 use std::time::{Duration, SystemTime};
 
+use mehh_ai::http_safety::{check_url_host_policy, normalize_and_validate_http_url, DnsPolicy};
+use reqwest::Url;
 use serde::Deserialize;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -20,8 +22,9 @@ use crate::web::types::ProviderError;
 const BROWSER_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 const API_UA: &str = "MehhCode/0.1 (https://github.com/karmavn/mehhcode)";
 const HTML_OFFLOAD_THRESHOLD_BYTES: usize = 16 * 1024;
+const MAX_SOURCE_REDIRECTS: usize = 3;
 const BLOCKED_SOURCE_COOLDOWN: Duration = Duration::from_secs(120);
-const TRANSIENT_SOURCE_COOLDOWN: Duration = Duration::from_secs(30);
+pub(crate) const TRANSIENT_SOURCE_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// Configurable endpoints for native search sources (overrideable in offline tests).
 #[derive(Debug, Clone)]
@@ -91,10 +94,63 @@ pub(crate) async fn fetch_source(
         endpoints.endpoint_for(source),
         source,
         query,
+        DnsPolicy::AllowPrivate,
         deadline,
         cancel,
     )
     .await
+}
+
+fn build_source_request(
+    client: &reqwest::Client,
+    url: Url,
+    source: SourceId,
+    query: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let mut req = client.get(url);
+    if let Some(query) = query {
+        req = match source {
+            SourceId::DuckDuckGo => req.query(&[("q", query), ("kl", "wt-wt")]),
+            SourceId::Bing => req.query(&[("q", query), ("setlang", "en"), ("count", "10")]),
+            SourceId::Wikipedia => req.query(&[
+                ("action", "query"),
+                ("list", "search"),
+                ("srsearch", query),
+                ("format", "json"),
+                ("utf8", "1"),
+                ("srlimit", "5"),
+            ]),
+            SourceId::GitHub => req.query(&[
+                ("q", query),
+                ("sort", "stars"),
+                ("order", "desc"),
+                ("per_page", "6"),
+            ]),
+            SourceId::CratesIo => {
+                req.query(&[("q", query), ("per_page", "6"), ("sort", "relevance")])
+            }
+            SourceId::Npm => req.query(&[("text", query), ("size", "6")]),
+            SourceId::StackOverflow => req.query(&[
+                ("q", query),
+                ("site", "stackoverflow"),
+                ("sort", "relevance"),
+                ("order", "desc"),
+                ("pagesize", "6"),
+            ]),
+        };
+    }
+    match source {
+        SourceId::DuckDuckGo | SourceId::Bing => req
+            .header(reqwest::header::USER_AGENT, BROWSER_UA)
+            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
+            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9"),
+        SourceId::GitHub => req
+            .header(reqwest::header::USER_AGENT, API_UA)
+            .header(reqwest::header::ACCEPT, "application/vnd.github+json"),
+        SourceId::Wikipedia | SourceId::CratesIo | SourceId::Npm | SourceId::StackOverflow => req
+            .header(reqwest::header::USER_AGENT, API_UA)
+            .header(reqwest::header::ACCEPT, "application/json"),
+    }
 }
 
 pub(crate) async fn fetch_source_url(
@@ -102,109 +158,143 @@ pub(crate) async fn fetch_source_url(
     endpoint: &str,
     source: SourceId,
     query: &str,
+    dns_policy: DnsPolicy,
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> SourceOutcome {
-    let req = match source {
-        SourceId::DuckDuckGo => client
-            .get(endpoint)
-            .query(&[("q", query), ("kl", "wt-wt")])
-            .header(reqwest::header::USER_AGENT, BROWSER_UA)
-            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
-            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9"),
-        SourceId::Bing => client
-            .get(endpoint)
-            .query(&[("q", query), ("setlang", "en"), ("count", "10")])
-            .header(reqwest::header::USER_AGENT, BROWSER_UA)
-            .header(reqwest::header::ACCEPT, "text/html,application/xhtml+xml")
-            .header(reqwest::header::ACCEPT_LANGUAGE, "en-US,en;q=0.9"),
-        SourceId::Wikipedia => client
-            .get(endpoint)
-            .query(&[
-                ("action", "query"),
-                ("list", "search"),
-                ("srsearch", query),
-                ("format", "json"),
-                ("utf8", "1"),
-                ("srlimit", "5"),
-            ])
-            .header(reqwest::header::USER_AGENT, API_UA)
-            .header(reqwest::header::ACCEPT, "application/json"),
-        SourceId::GitHub => client
-            .get(endpoint)
-            .query(&[
-                ("q", query),
-                ("sort", "stars"),
-                ("order", "desc"),
-                ("per_page", "6"),
-            ])
-            .header(reqwest::header::USER_AGENT, API_UA)
-            .header(reqwest::header::ACCEPT, "application/vnd.github+json"),
-        SourceId::CratesIo => client
-            .get(endpoint)
-            .query(&[("q", query), ("per_page", "6"), ("sort", "relevance")])
-            .header(reqwest::header::USER_AGENT, API_UA)
-            .header(reqwest::header::ACCEPT, "application/json"),
-        SourceId::Npm => client
-            .get(endpoint)
-            .query(&[("text", query), ("size", "6")])
-            .header(reqwest::header::USER_AGENT, API_UA)
-            .header(reqwest::header::ACCEPT, "application/json"),
-        SourceId::StackOverflow => client
-            .get(endpoint)
-            .query(&[
-                ("q", query),
-                ("site", "stackoverflow"),
-                ("sort", "relevance"),
-                ("order", "desc"),
-                ("pagesize", "6"),
-            ])
-            .header(reqwest::header::USER_AGENT, API_UA)
-            .header(reqwest::header::ACCEPT, "application/json"),
-    };
-
-    let resp = match send_cancellable_request(req, deadline, cancel).await {
-        Ok(r) => r,
-        Err(ProviderError::Cancelled) => return SourceOutcome::Cancelled,
+    let mut current_url = match Url::parse(endpoint) {
+        Ok(url) => url,
         Err(err) => {
             return SourceOutcome::Failed {
-                reason: format!("{}: {err}", source.label()),
+                reason: format!("{}: invalid endpoint URL: {err}", source.label()),
                 cooldown: Some(TRANSIENT_SOURCE_COOLDOWN),
             };
         }
     };
 
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        let retry_after = resp
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|hdr| parse_retry_after(Some(hdr), SystemTime::now()));
-        let snippet =
-            match read_error_body_snippet(resp, MAX_PROVIDER_ERROR_BODY_BYTES, deadline, cancel).await
+    let mut final_resp = None;
+    for hop in 0..=MAX_SOURCE_REDIRECTS {
+        let req = build_source_request(
+            client,
+            current_url.clone(),
+            source,
+            (hop == 0).then_some(query),
+        );
+        let resp = match send_cancellable_request(req, deadline, cancel).await {
+            Ok(r) => r,
+            Err(ProviderError::Cancelled) => return SourceOutcome::Cancelled,
+            Err(err) => {
+                return SourceOutcome::Failed {
+                    reason: format!("{}: {err}", source.label()),
+                    cooldown: Some(TRANSIENT_SOURCE_COOLDOWN),
+                };
+            }
+        };
+
+        let status = resp.status().as_u16();
+        if matches!(status, 301 | 302 | 303 | 307 | 308) {
+            if hop >= MAX_SOURCE_REDIRECTS {
+                return SourceOutcome::Failed {
+                    reason: format!(
+                        "{} exceeded max redirects (HTTP {status})",
+                        source.label()
+                    ),
+                    cooldown: Some(TRANSIENT_SOURCE_COOLDOWN),
+                };
+            }
+            let Some(loc) = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                return SourceOutcome::Failed {
+                    reason: format!(
+                        "{} returned HTTP {status} redirect without Location",
+                        source.label()
+                    ),
+                    cooldown: Some(TRANSIENT_SOURCE_COOLDOWN),
+                };
+            };
+            let next_raw = match current_url.join(loc) {
+                Ok(u) => u,
+                Err(err) => {
+                    return SourceOutcome::Failed {
+                        reason: format!("{} invalid redirect target: {err}", source.label()),
+                        cooldown: Some(TRANSIENT_SOURCE_COOLDOWN),
+                    };
+                }
+            };
+            let next = match normalize_and_validate_http_url(next_raw.as_str()) {
+                Ok(u) => u,
+                Err(reason) => {
+                    return SourceOutcome::Failed {
+                        reason: format!("{} rejected redirect: {reason}", source.label()),
+                        cooldown: Some(TRANSIENT_SOURCE_COOLDOWN),
+                    };
+                }
+            };
+            if let Err(reason) = check_url_host_policy(dns_policy, &next) {
+                return SourceOutcome::Failed {
+                    reason: format!("{} redirect policy blocked: {reason}", source.label()),
+                    cooldown: Some(TRANSIENT_SOURCE_COOLDOWN),
+                };
+            }
+            current_url = next;
+            continue;
+        }
+        if status >= 400 {
+            let retry_after = resp
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|hdr| parse_retry_after(Some(hdr), SystemTime::now()));
+            let snippet = match read_error_body_snippet(
+                resp,
+                MAX_PROVIDER_ERROR_BODY_BYTES,
+                deadline,
+                cancel,
+            )
+            .await
             {
                 Ok(s) => s,
                 Err(ProviderError::Cancelled) => return SourceOutcome::Cancelled,
                 Err(_) => String::new(),
             };
-        let detail = if snippet.trim().is_empty() {
-            format!("{} returned HTTP {status}", source.label())
-        } else {
-            format!("{} returned HTTP {status}: {}", source.label(), snippet.trim())
-        };
-        let cooldown = if status == 429 {
-            Some(retry_after.unwrap_or(BLOCKED_SOURCE_COOLDOWN))
-        } else if matches!(status, 401..=403) {
-            Some(BLOCKED_SOURCE_COOLDOWN)
-        } else {
-            Some(TRANSIENT_SOURCE_COOLDOWN)
-        };
-        return SourceOutcome::Failed {
-            reason: detail,
-            cooldown,
-        };
+            let detail = if snippet.trim().is_empty() {
+                format!("{} returned HTTP {status}", source.label())
+            } else {
+                format!("{} returned HTTP {status}: {}", source.label(), snippet.trim())
+            };
+            let cooldown = if status == 429 {
+                Some(retry_after.unwrap_or(BLOCKED_SOURCE_COOLDOWN))
+            } else if matches!(status, 401..=403) {
+                Some(BLOCKED_SOURCE_COOLDOWN)
+            } else {
+                Some(TRANSIENT_SOURCE_COOLDOWN)
+            };
+            return SourceOutcome::Failed {
+                reason: detail,
+                cooldown,
+            };
+        }
+        if !(200..300).contains(&status) {
+            return SourceOutcome::Failed {
+                reason: format!("{} returned unexpected HTTP {status}", source.label()),
+                cooldown: Some(TRANSIENT_SOURCE_COOLDOWN),
+            };
+        }
+        final_resp = Some(resp);
+        break;
     }
+
+    let Some(resp) = final_resp else {
+        return SourceOutcome::Failed {
+            reason: format!("{} failed before receiving a final response", source.label()),
+            cooldown: Some(TRANSIENT_SOURCE_COOLDOWN),
+        };
+    };
 
     let bytes = match read_bounded_body(resp, MAX_PROVIDER_RESPONSE_BYTES, deadline, cancel).await {
         Ok(b) => b,
@@ -868,6 +958,124 @@ mod tests {
         assert!(matches!(
             fetch_source(&client, &endpoints, SourceId::Bing, "q", deadline, &cancel).await,
             SourceOutcome::Failed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_source_follows_bounded_redirects_and_rejects_bad_3xx() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let client = mehh_ai::http_safety::build_safe_http_client(
+            DnsPolicy::AllowPrivate,
+            Duration::from_secs(5),
+            None,
+        )
+        .unwrap();
+        let cancel = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+
+        let loop_hops = Arc::new(AtomicUsize::new(0));
+        let loop_hops_bg = loop_hops.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                let loop_hops_req = loop_hops_bg.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .split('?')
+                        .next()
+                        .unwrap_or("/");
+                    let resp = match path {
+                        "/ddg-redir" => format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{addr}/ddg-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        ),
+                        "/ddg-target" => {
+                            let body = "<div class=\"result web-result\"><a class=\"result__a\" href=\"https://rust-lang.org/\">Rust</a><div class=\"result__snippet\">Safe systems</div></div>";
+                            format!(
+                                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            )
+                        }
+                        "/loop" => {
+                            let n = loop_hops_req.fetch_add(1, Ordering::SeqCst);
+                            format!(
+                                "HTTP/1.1 302 Found\r\nLocation: http://{addr}/loop?hop={n}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            )
+                        }
+                        "/no-loc" => {
+                            "HTTP/1.1 302 Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_string()
+                        }
+                        "/to-loopback" => {
+                            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:9/internal\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_string()
+                        }
+                        "/not-modified" => {
+                            "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                                .to_string()
+                        }
+                        _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_string(),
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut endpoints = NativeEndpoints::production();
+        endpoints.ddg_html = format!("http://{addr}/ddg-redir");
+        match fetch_source(&client, &endpoints, SourceId::DuckDuckGo, "rust", deadline, &cancel).await
+        {
+            SourceOutcome::Hits(hits) => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].url, "https://rust-lang.org/");
+            }
+            other => panic!("expected 302->200 hits, got {other:?}"),
+        }
+
+        endpoints.ddg_html = format!("http://{addr}/loop");
+        assert!(matches!(
+            fetch_source(&client, &endpoints, SourceId::DuckDuckGo, "rust", deadline, &cancel).await,
+            SourceOutcome::Failed { cooldown: Some(_), .. }
+        ));
+
+        endpoints.ddg_html = format!("http://{addr}/no-loc");
+        assert!(matches!(
+            fetch_source(&client, &endpoints, SourceId::DuckDuckGo, "rust", deadline, &cancel).await,
+            SourceOutcome::Failed { cooldown: Some(_), .. }
+        ));
+
+        endpoints.ddg_html = format!("http://{addr}/not-modified");
+        assert!(matches!(
+            fetch_source(&client, &endpoints, SourceId::DuckDuckGo, "rust", deadline, &cancel).await,
+            SourceOutcome::Failed { cooldown: Some(_), .. }
+        ));
+
+        let blocked_out = fetch_source_url(
+            &client,
+            &format!("http://{addr}/to-loopback"),
+            SourceId::DuckDuckGo,
+            "rust",
+            DnsPolicy::PublicOnly,
+            deadline,
+            &cancel,
+        )
+        .await;
+        assert!(matches!(
+            blocked_out,
+            SourceOutcome::Failed { cooldown: Some(_), .. }
         ));
     }
 }

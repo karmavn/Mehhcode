@@ -27,7 +27,9 @@ fn tool_summary(name: &str) -> Option<&'static str> {
         }
         "subagent" => Some("Delegate focused subtasks to child agents"),
         "todo" => Some("Track multi-step tasks and progress"),
-        "codemode" => Some("Execute multi-tool workflows via sandboxed JavaScript"),
+        "codemode" => Some(
+            "Execute multi-tool workflows and discover deferred MCP tools via sandboxed JavaScript",
+        ),
         "tool_search" => Some("Discover deferred MCP tools by keyword"),
         _ => None,
     }

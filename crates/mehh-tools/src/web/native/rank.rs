@@ -478,6 +478,13 @@ fn block_char_len(heading: Option<&str>, block: &str) -> usize {
     prefix_chars + block.chars().count()
 }
 
+/// Passage extracted by Stage 2 Auto-Enrich along with whether it matched any query terms.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExtractedPassage {
+    pub text: String,
+    pub matched_query: bool,
+}
+
 /// Extracts top query-relevant passages from rendered Markdown up to `max_chars` UTF-8 safe chars,
 /// preserving document order and filtering navigation boilerplate.
 #[cfg(test)]
@@ -490,11 +497,20 @@ pub(crate) fn extract_relevant_passages(
     extract_relevant_passages_with_terms(&query_terms, markdown, max_chars)
 }
 
+#[cfg(test)]
 pub(crate) fn extract_relevant_passages_with_terms(
     query_terms: &[String],
     markdown: &str,
     max_chars: usize,
 ) -> Option<String> {
+    extract_relevant_passages_scored(query_terms, markdown, max_chars).map(|p| p.text)
+}
+
+pub(crate) fn extract_relevant_passages_scored(
+    query_terms: &[String],
+    markdown: &str,
+    max_chars: usize,
+) -> Option<ExtractedPassage> {
     let trimmed_md = markdown.trim();
     if trimmed_md.is_empty() || max_chars == 0 {
         return None;
@@ -567,7 +583,10 @@ pub(crate) fn extract_relevant_passages_with_terms(
             fallback.push_str(cand.block);
             fallback_chars = next_chars;
         }
-        return (!fallback.is_empty()).then_some(fallback);
+        return (!fallback.is_empty()).then_some(ExtractedPassage {
+            text: fallback,
+            matched_query: false,
+        });
     }
 
     candidates.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| a.idx.cmp(&b.idx)));
@@ -606,7 +625,10 @@ pub(crate) fn extract_relevant_passages_with_terms(
             push_formatted_block(&mut out, heading, block);
         }
     }
-    (!out.is_empty()).then_some(out)
+    (!out.is_empty()).then_some(ExtractedPassage {
+        text: out,
+        matched_query: true,
+    })
 }
 
 fn byte_cut_chars(s: &str, max_chars: usize) -> usize {

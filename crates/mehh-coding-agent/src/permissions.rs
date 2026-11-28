@@ -864,8 +864,10 @@ impl PermissionStore {
         // AskBefore is not an allow/deny decision: its `false` would become a
         // hard deny in `verdict_for`, so let the action match below handle it.
         if rule.action != PermissionAction::AskBefore && is_shell {
-            if let (Some(pfx), Some(cmd)) = (rule.arg_prefix.as_deref(), shell_cmd) {
-                let eval = mehh_execpolicy::check_prefix(pfx, cmd);
+            if let (Some(pfx), Some(cmd), Some(parsed)) =
+                (rule.arg_prefix.as_deref(), shell_cmd, parsed_shell.as_ref())
+            {
+                let eval = parsed.check_prefix(pfx);
                 let prompt = || InspectionVerdict::RequireApproval {
                     reason: format!(
                         "Permission rule for '{}' cannot safely cover this command",
@@ -908,9 +910,9 @@ impl PermissionStore {
         }
 
         if is_shell && matched_shell_never_allow && rule.action == PermissionAction::AskBefore {
-            if let Some(cmd) = shell_cmd {
+            if let (Some(cmd), Some(parsed)) = (shell_cmd, parsed_shell.as_ref()) {
                 let uncovered = match rule.arg_prefix.as_deref() {
-                    Some(pfx) => !mehh_execpolicy::check_prefix(pfx, cmd).all_covered,
+                    Some(pfx) => !parsed.check_prefix(pfx).all_covered,
                     None => rule.path_glob.is_some(),
                 };
                 if uncovered {

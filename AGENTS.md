@@ -26,6 +26,12 @@
 - Always ask before removing functionality or code that appears intentional.
 - Do not preserve backward compatibility unless the user asks for it.
 - Never hardcode raw key checks in interactive handlers. Register defaults in `TuiAction` / `Keybindings` (`crates/mehh-tui/src/keys.rs`) so they stay configurable.
+- HTTP clients built with `build_safe_http_client` disable automatic redirects (`redirect::Policy::none()`). Explicitly follow bounded redirects (validating every hop via `normalize_and_validate_http_url` + `check_url_host_policy`), reject any remaining non-2xx (`!(200..300)`) rather than only `status >= 400`, and make canonicalized URL caches store and re-validate every initial/redirect/final hop fail-closed on cache hits.
+- Before slicing any `&str` at a cached byte offset, guard with `is_char_boundary(idx)`; whenever a vector paired with a parallel cache (e.g., `InteractiveState::items` and `transcript_cache`) shrinks (`truncate`/`clear`/`drain`), shrink the cache synchronously.
+- Never split an index map and its backing slice across two independent locks; store both inside a single `Arc<Snapshot>` so readers observe one atomic snapshot.
+- Keep shared runtime policy/tool handles (`ToolInspectionManager`, `CodemodeTool`, `ApprovalHandlerSlot`) stable across `reload()` and setters using in-place interior mutability instead of replacing `Arc`s or splitting one field across two locks; when clearing provider credentials (e.g., `clear_provider_api_keys`), evict secondary caches (`subagent_api_key_cache`) unconditionally rather than gating on primary-field matches.
+- Pass structured block/escalation metadata (e.g., `BeforeToolCallResult.details["block_kind"]`) across crate and module boundaries instead of substring-matching human-readable denial text.
+- Short-circuit feature gates (`auto_compact_enabled`) before cloning session history (`build_context_messages()` / `active_path_entries()`), and keep `try_*` UI snapshot helpers strictly non-blocking (`try_lock()`) when the underlying lock guards synchronous filesystem I/O.
 
 ## Code Review Focus
 
@@ -54,6 +60,7 @@
 - Isolate `HOME`, `USERPROFILE`, and provider API-key env vars behind a shared crate-wide mutex (`crate::ENV_MUTEX` in `mehh-coding-agent`, `crate::bootstrap::tests::ENV_LOCK` in `mehh-cli`) in any test within that binary that mutates or reads them so host `~/.mehh/` credentials never leak and parallel tests never race.
 - For `FauxProvider` / `MEHH_FAUX_SCRIPT` tests and E2E suites, execute at least one prompt turn and assert on observable state (emitted `--mode json` / RPC events, returned messages, session files, or disk side effects) rather than inspecting static config fields alone.
 - For `render_interactive_frame` tests, assert `lines.len() == height`, `visible_width(&strip_ansi(line)) <= width`, and pass `show_hardware_cursor = false` to `TuiRenderer::render_frame`.
+- In `tokio::select!` cancellation tests, remember non-biased `select!` may drop a losing branch before statements after `cancel.cancelled().await` run; observe cancellation via the `CancellationToken` or a `Drop` guard checking `cancel.is_cancelled()`.
 - Aim edits at root causes. If 2 consecutive fix attempts fail, stop and report the roadblock instead of churning files.
 - When a proposed fix fails an existing test that asserts intentional behavior, stop and report the conflict before weakening or rewriting the test.
 - Never report "verified" or "done" without running the relevant checks after the final edit and citing the exact command output. For Rust changes, verify locally with targeted tests (`cargo test -p <crate>`) or `cargo check -p <crate>`. Full release builds and release binary generation (`mehh.exe`) are delegated to GitHub Actions (`.github/workflows/ci.yml`).

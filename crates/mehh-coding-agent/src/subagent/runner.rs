@@ -484,12 +484,16 @@ impl SubagentTool {
         if let Some(ref mgr) = self.inspection_manager {
             let mgr = mgr.clone();
             let session_cwd = self.cwd.clone();
-            let approval_h = self.approval_handler.clone();
+            let approval_slot = self.approval_handler_slot.clone();
+            let fallback_approval = self.approval_handler.clone();
             let origin_label = format!("subagent:{child_agent_id}:{mode}");
             base_config.before_tool_call = Some(Arc::new(move |before_ctx, cancel| {
                 let mgr = mgr.clone();
                 let session_cwd = session_cwd.clone();
-                let approval_h = approval_h.clone();
+                let approval_h = approval_slot
+                    .as_ref()
+                    .map(|slot| mehh_ai::read_recover(slot).clone())
+                    .unwrap_or_else(|| fallback_approval.clone());
                 let origin_label = origin_label.clone();
                 Box::pin(async move {
                     let tool_name = before_ctx.tool_call.name.clone();
@@ -609,16 +613,10 @@ impl SubagentTool {
                                     let mut m = lw.lock().unwrap_or_else(PoisonError::into_inner);
                                     let is_empty_assistant =
                                         turn_ctx.assistant_message.content.is_empty();
-                                    let repetition_detected =
-                                        turn_ctx.tool_results.iter().any(|tr| {
-                                            tr.is_error
-                                                && tr.content.iter().any(|b| match b {
-                                                    mehh_ai::ToolResultContentBlock::Text(t) => {
-                                                        t.text.contains("Repeated identical tool call")
-                                                    }
-                                                    _ => false,
-                                                })
-                                        });
+                                    let repetition_detected = turn_ctx
+                                        .tool_results
+                                        .iter()
+                                        .any(crate::tool_inspection::is_repetition_block_result);
                                     m.record_turn_outcome(
                                         turn_ctx.assistant_message.stop_reason,
                                         is_empty_assistant || repetition_detected,

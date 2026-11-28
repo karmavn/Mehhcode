@@ -21,6 +21,38 @@ pub enum InspectionVerdict {
     Deny { reason: String },
 }
 
+/// Categorizes which inspection stage denied a tool call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DenialKind {
+    Security,
+    Permission,
+    Repetition,
+}
+
+impl DenialKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Security => "security",
+            Self::Permission => "permission",
+            Self::Repetition => "repetition",
+        }
+    }
+}
+
+/// Key stored in `ToolResultMessage::details` when a tool call is blocked by inspection.
+pub const BLOCK_KIND_DETAIL_KEY: &str = "block_kind";
+
+/// Returns true when a tool result was blocked by the repetition breaker.
+pub fn is_repetition_block_result(result: &mehh_ai::ToolResultMessage) -> bool {
+    result.is_error
+        && result
+            .details
+            .as_ref()
+            .and_then(|d| d.get(BLOCK_KIND_DETAIL_KEY))
+            .and_then(|v| v.as_str())
+            == Some(DenialKind::Repetition.as_str())
+}
+
 /// Active permission mode controlling tool execution governance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -495,13 +527,9 @@ impl PermissionInspector {
     }
 }
 
-#[async_trait]
-impl ToolInspector for PermissionInspector {
-    fn name(&self) -> &str {
-        "permission_inspector"
-    }
-
-    async fn inspect(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
+impl PermissionInspector {
+    /// Synchronously evaluates permission rules and active mode against `ctx`.
+    pub fn inspect_sync(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
         // 0. Chat mode is a hard read-only gate. It must run before persisted
         //    rules: an earlier AlwaysAllow grant must not re-enable a mutation
         //    simply because the user switched into Chat mode.
@@ -580,6 +608,17 @@ impl ToolInspector for PermissionInspector {
     }
 }
 
+#[async_trait]
+impl ToolInspector for PermissionInspector {
+    fn name(&self) -> &str {
+        "permission_inspector"
+    }
+
+    async fn inspect(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
+        self.inspect_sync(ctx)
+    }
+}
+
 /// State tracking consecutive identical tool calls per requesting origin.
 #[derive(Debug, Default)]
 struct RepetitionEntry {
@@ -597,15 +636,56 @@ const MAX_REPETITION_ORIGINS: usize = 256;
 /// Priority 3 Inspector: Halts identical repeated tool calls after `max_repetitions`.
 pub struct RepetitionInspector {
     max_repetitions: usize,
-    state: Mutex<RepetitionState>,
+    state: std::sync::Mutex<RepetitionState>,
 }
 
 impl RepetitionInspector {
     pub fn new(max_repetitions: usize) -> Self {
         Self {
             max_repetitions,
-            state: Mutex::new(RepetitionState::default()),
+            state: std::sync::Mutex::new(RepetitionState::default()),
         }
+    }
+
+    /// Clears all tracked repetition history (e.g. on policy reload).
+    pub fn reset(&self) {
+        mehh_ai::lock_recover(&self.state).per_origin.clear();
+    }
+
+    /// Synchronously evaluates and updates repetition state for `ctx`.
+    pub fn inspect_sync(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
+        use sha2::Digest;
+        let mut writer = Sha256Writer(sha2::Sha256::new());
+        writer.0.update(ctx.tool_name.as_bytes());
+        writer.0.update(b":");
+        let _ = serde_json::to_writer(&mut writer, &ctx.args);
+        let key_hash: [u8; 32] = writer.0.finalize().into();
+
+        let mut st = mehh_ai::lock_recover(&self.state);
+        if st.per_origin.len() >= MAX_REPETITION_ORIGINS && !st.per_origin.contains_key(&ctx.origin) {
+            if let Some(evict_key) = st.per_origin.keys().find(|k| k.is_some()).cloned() {
+                st.per_origin.remove(&evict_key);
+            }
+        }
+        // Scope repetition tracking per origin so parallel subagents doing
+        // legitimate identical reads do not trip each other's breaker.
+        let entry = st.per_origin.entry(ctx.origin.clone()).or_default();
+        if entry.last_hash == Some(key_hash) {
+            entry.count += 1;
+            if entry.count > self.max_repetitions {
+                return InspectionVerdict::Deny {
+                    reason: format!(
+                        "Repeated identical tool call '{}' detected ({} times). Change strategy or inspect prior output instead of repeating the exact same call.",
+                        ctx.tool_name, entry.count
+                    ),
+                };
+            }
+        } else {
+            entry.last_hash = Some(key_hash);
+            entry.count = 1;
+        }
+
+        InspectionVerdict::Allow
     }
 }
 
@@ -636,48 +716,18 @@ impl ToolInspector for RepetitionInspector {
     }
 
     async fn inspect(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
-        use sha2::Digest;
-        let mut writer = Sha256Writer(sha2::Sha256::new());
-        writer.0.update(ctx.tool_name.as_bytes());
-        writer.0.update(b":");
-        let _ = serde_json::to_writer(&mut writer, &ctx.args);
-        let key_hash: [u8; 32] = writer.0.finalize().into();
-
-        let mut st = self.state.lock().await;
-        if st.per_origin.len() >= MAX_REPETITION_ORIGINS && !st.per_origin.contains_key(&ctx.origin) {
-            if let Some(evict_key) = st.per_origin.keys().find(|k| k.is_some()).cloned() {
-                st.per_origin.remove(&evict_key);
-            }
-        }
-        // Scope repetition tracking per origin so parallel subagents doing
-        // legitimate identical reads do not trip each other's breaker.
-        let entry = st.per_origin.entry(ctx.origin.clone()).or_default();
-        if entry.last_hash == Some(key_hash) {
-            entry.count += 1;
-            if entry.count > self.max_repetitions {
-                return InspectionVerdict::Deny {
-                    reason: format!(
-                        "Repeated identical tool call '{}' detected ({} times). Change strategy or inspect prior output instead of repeating the exact same call.",
-                        ctx.tool_name, entry.count
-                    ),
-                };
-            }
-        } else {
-            entry.last_hash = Some(key_hash);
-            entry.count = 1;
-        }
-
-        InspectionVerdict::Allow
+        self.inspect_sync(ctx)
     }
 }
 
 /// Manager orchestrating the priority chain of tool inspectors.
 pub struct ToolInspectionManager {
-    mode: Mutex<PermissionMode>,
     security: SecurityInspector,
-    permission: Mutex<PermissionInspector>,
+    permission: std::sync::Mutex<PermissionInspector>,
     repetition: RepetitionInspector,
     cwd: PathBuf,
+    /// Serializes disk rule persistence with its in-memory store update.
+    persist_lock: Mutex<()>,
     /// Serializes user approval prompts across the session and all subagents.
     approval_lock: Mutex<()>,
 }
@@ -697,11 +747,11 @@ impl ToolInspectionManager {
         store: crate::permissions::PermissionStore,
     ) -> Self {
         Self {
-            mode: Mutex::new(mode),
             security: SecurityInspector::new(),
-            permission: Mutex::new(PermissionInspector::new_with_store(mode, store)),
+            permission: std::sync::Mutex::new(PermissionInspector::new_with_store(mode, store)),
             repetition: RepetitionInspector::default(),
             cwd,
+            persist_lock: Mutex::new(()),
             approval_lock: Mutex::new(()),
         }
     }
@@ -714,8 +764,12 @@ impl ToolInspectionManager {
             &rule,
             "PermissionStore::add_rule",
         )?;
-        let mut perm = self.permission.lock().await;
-        if let Some(path) = perm.store().user_rules_path().map(Path::to_path_buf) {
+        let _persist_guard = self.persist_lock.lock().await;
+        let user_rules_path = mehh_ai::lock_recover(&self.permission)
+            .store()
+            .user_rules_path()
+            .map(Path::to_path_buf);
+        if let Some(path) = user_rules_path {
             let rule_for_disk = rule.clone();
             tokio::task::spawn_blocking(move || {
                 crate::permissions::PermissionStore::persist_rule_to_file(&path, &rule_for_disk)
@@ -723,7 +777,9 @@ impl ToolInspectionManager {
             .await
             .map_err(|e| anyhow::anyhow!("Permission persistence task failed: {e}"))??;
         }
-        perm.store_mut().insert_in_memory_rule(rule);
+        mehh_ai::lock_recover(&self.permission)
+            .store_mut()
+            .insert_in_memory_rule(rule);
         Ok(())
     }
 
@@ -732,9 +788,7 @@ impl ToolInspectionManager {
         &self,
         rule: crate::permissions::PermissionRule,
     ) -> anyhow::Result<()> {
-        self.permission
-            .lock()
-            .await
+        mehh_ai::lock_recover(&self.permission)
             .store_mut()
             .add_session_rule(rule)
     }
@@ -748,67 +802,80 @@ impl ToolInspectionManager {
     }
 
     pub async fn set_mode(&self, mode: PermissionMode) {
-        // Hold `permission` across the `mode` update so concurrent `set_mode`
-        // calls cannot interleave and leave `self.mode` and `permission.mode` out of sync.
-        let mut perm = self.permission.lock().await;
-        perm.set_mode(mode);
-        *self.mode.lock().await = mode;
+        mehh_ai::lock_recover(&self.permission).set_mode(mode);
     }
 
     pub async fn mode(&self) -> PermissionMode {
-        *self.mode.lock().await
+        mehh_ai::lock_recover(&self.permission).mode()
     }
 
     /// Non-blocking snapshot of the active permission mode for synchronous UI rendering.
     pub fn try_mode(&self) -> Option<PermissionMode> {
-        self.mode.try_lock().ok().map(|g| *g)
+        self.permission.try_lock().ok().map(|g| g.mode())
     }
 
-    /// Non-blocking snapshot of active in-memory session permission rules.
+    /// Blocking snapshot of the active permission mode for synchronous maintenance paths (e.g. `reload`).
+    pub fn mode_sync(&self) -> PermissionMode {
+        mehh_ai::lock_recover(&self.permission).mode()
+    }
+
+    /// Synchronous snapshot of active in-memory session permission rules (used across reload).
     pub(crate) fn try_snapshot_session_rules(&self) -> Vec<crate::permissions::PermissionRule> {
-        self.permission
-            .try_lock()
-            .ok()
-            .map(|p| p.store().session_rules().to_vec())
-            .unwrap_or_default()
+        mehh_ai::lock_recover(&self.permission)
+            .store()
+            .session_rules()
+            .to_vec()
+    }
+
+    /// Atomically replaces the active permission mode and store in-place while preserving
+    /// this `ToolInspectionManager` instance for existing `Arc` holders (web tools, subagents).
+    pub fn reload_policy(&self, mode: PermissionMode, store: crate::permissions::PermissionStore) {
+        let mut perm = mehh_ai::lock_recover(&self.permission);
+        *perm = PermissionInspector::new_with_store(mode, store);
+        drop(perm);
+        self.repetition.reset();
     }
 
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
 
-    pub async fn inspect(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
+    async fn inspect_with_kind(&self, ctx: &ToolInspectionContext) -> (InspectionVerdict, Option<DenialKind>) {
         // Priority 1: Security Inspector (runs in all modes, strictly authoritative)
         let sec_verdict = self.security.inspect(ctx).await;
         if let InspectionVerdict::Deny { .. } = sec_verdict {
-            return sec_verdict;
+            return (sec_verdict, Some(DenialKind::Security));
         }
 
         // Priority 2: Permission Inspector. This must run even when the security
         // inspector asked for approval, otherwise a persisted NeverAllow rule
         // would never be evaluated for out-of-cwd paths.
-        let perm_verdict = self.permission.lock().await.inspect(ctx).await;
+        let perm_verdict = mehh_ai::lock_recover(&self.permission).inspect_sync(ctx);
         if let InspectionVerdict::Deny { .. } = perm_verdict {
-            return perm_verdict;
+            return (perm_verdict, Some(DenialKind::Permission));
         }
 
         // Priority 3: Repetition Inspector (must run even when sec_verdict asks
         // for out-of-cwd approval so repeated out-of-cwd attempts still trip).
-        let rep_verdict = self.repetition.inspect(ctx).await;
+        let rep_verdict = self.repetition.inspect_sync(ctx);
         if let InspectionVerdict::Deny { .. } = rep_verdict {
-            return rep_verdict;
+            return (rep_verdict, Some(DenialKind::Repetition));
         }
 
         if let InspectionVerdict::RequireApproval { .. } = sec_verdict {
-            return sec_verdict;
+            return (sec_verdict, None);
         }
 
         // If any inspector requested approval, return RequireApproval
         if let InspectionVerdict::RequireApproval { .. } = perm_verdict {
-            return perm_verdict;
+            return (perm_verdict, None);
         }
 
-        InspectionVerdict::Allow
+        (InspectionVerdict::Allow, None)
+    }
+
+    pub async fn inspect(&self, ctx: &ToolInspectionContext) -> InspectionVerdict {
+        self.inspect_with_kind(ctx).await.0
     }
 
     /// Evaluates persisted/session `NeverAllow` rules for `web_fetch` against candidate URLs
@@ -824,8 +891,10 @@ impl ToolInspectionManager {
             cwd: self.cwd.clone(),
             origin: None,
         };
-        let guard = self.permission.lock().await;
-        if let Some(InspectionVerdict::Deny { reason }) = guard.store().evaluate(&ctx) {
+        let verdict = mehh_ai::lock_recover(&self.permission)
+            .store()
+            .evaluate(&ctx);
+        if let Some(InspectionVerdict::Deny { reason }) = verdict {
             return Err(reason);
         }
         Ok(())
@@ -871,24 +940,23 @@ impl ToolInspectionManager {
                     "Tool '{}' blocked: operation cancelled",
                     ctx.tool_name
                 )),
-                terminate: false,
-                approved_path: None,
+                ..Default::default()
             };
         }
 
         let approved = Self::approved_target(ctx).await;
-        match self.inspect(ctx).await {
-            InspectionVerdict::Allow => mehh_agent::BeforeToolCallResult {
+        match self.inspect_with_kind(ctx).await {
+            (InspectionVerdict::Allow, _) => mehh_agent::BeforeToolCallResult {
                 approved_path: approved.clone(),
                 ..Default::default()
             },
-            InspectionVerdict::Deny { reason } => mehh_agent::BeforeToolCallResult {
+            (InspectionVerdict::Deny { reason }, kind) => mehh_agent::BeforeToolCallResult {
                 block: true,
                 reason: Some(reason),
-                terminate: false,
-                approved_path: None,
+                details: kind.map(|k| serde_json::json!({ BLOCK_KIND_DETAIL_KEY: k.as_str() })),
+                ..Default::default()
             },
-            InspectionVerdict::RequireApproval { reason, preview } => {
+            (InspectionVerdict::RequireApproval { reason, preview }, _) => {
                 if let Some(h) = handler {
                     // One prompt at a time across session + subagents; label
                     // the request with its origin so the user knows who asks.
@@ -901,8 +969,7 @@ impl ToolInspectionManager {
                                     "Tool '{}' blocked: operation cancelled while waiting for approval",
                                     ctx.tool_name
                                 )),
-                                terminate: false,
-                                approved_path: None,
+                                ..Default::default()
                             };
                         }
                         gate = self.approval_lock.lock() => gate,
@@ -915,17 +982,21 @@ impl ToolInspectionManager {
                         return mehh_agent::BeforeToolCallResult {
                             block: true,
                             reason: Some(reason),
-                            terminate: false,
-                            approved_path: None,
+                            details: Some(serde_json::json!({
+                                BLOCK_KIND_DETAIL_KEY: DenialKind::Security.as_str()
+                            })),
+                            ..Default::default()
                         };
                     }
-                    let perm_verdict = self.permission.lock().await.inspect(ctx).await;
+                    let perm_verdict = mehh_ai::lock_recover(&self.permission).inspect_sync(ctx);
                     if let InspectionVerdict::Deny { reason } = perm_verdict {
                         return mehh_agent::BeforeToolCallResult {
                             block: true,
                             reason: Some(reason),
-                            terminate: false,
-                            approved_path: None,
+                            details: Some(serde_json::json!({
+                                BLOCK_KIND_DETAIL_KEY: DenialKind::Permission.as_str()
+                            })),
+                            ..Default::default()
                         };
                     }
                     let (effective_reason, effective_preview) = match (&sec_verdict, &perm_verdict)
@@ -958,8 +1029,7 @@ impl ToolInspectionManager {
                                     "Tool '{}' blocked: operation cancelled during approval",
                                     ctx.tool_name
                                 )),
-                                terminate: false,
-                                approved_path: None,
+                                ..Default::default()
                             };
                         }
                         ok = h.request_approval(ctx, &labeled, effective_preview.as_deref()) => ok,
@@ -976,8 +1046,7 @@ impl ToolInspectionManager {
                             "Tool '{}' blocked: approval required but not granted ({})",
                             ctx.tool_name, effective_reason
                         )),
-                        terminate: false,
-                        approved_path: None,
+                        ..Default::default()
                     };
                 }
                 mehh_agent::BeforeToolCallResult {
@@ -986,8 +1055,7 @@ impl ToolInspectionManager {
                         "Tool '{}' blocked: approval required but not granted ({})",
                         ctx.tool_name, reason
                     )),
-                    terminate: false,
-                    approved_path: None,
+                    ..Default::default()
                 }
             }
         }
@@ -1011,6 +1079,10 @@ pub trait ApprovalHandler: Send + Sync {
         preview: Option<&str>,
     ) -> bool;
 }
+
+/// Thread-safe live slot for updating the active approval handler in-place.
+pub type ApprovalHandlerSlot =
+    std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<dyn ApprovalHandler>>>>;
 
 /// Headless approval handler: fails closed on any approval requirement.
 pub struct HeadlessDenyHandler;
@@ -1585,7 +1657,7 @@ mod tests {
         ] {
             mgr.set_mode(mode).await;
             assert_eq!(mgr.mode().await, mode);
-            assert_eq!(mgr.permission.lock().await.mode(), mode);
+            assert_eq!(mehh_ai::lock_recover(&mgr.permission).mode(), mode);
         }
     }
 
@@ -1857,5 +1929,62 @@ mod tests {
             .inspect_and_authorize_cancellable(&ctx_re, Some(gh.as_ref()), &CancellationToken::new())
             .await;
         assert!(!rc.block, "3rd call must not trip repetition breaker (count=3 <= 3)");
+    }
+
+    #[tokio::test]
+    async fn repetition_block_sets_typed_detail_and_ignores_plain_error_text() {
+        let dir = crate::TempTestDir::new("repetition_typed_detail");
+        let mgr = ToolInspectionManager::new_with_store(
+            PermissionMode::Auto,
+            dir.path().to_path_buf(),
+            crate::permissions::PermissionStore::default(),
+        );
+        let ctx = ctx_for("read", None, Some("Cargo.toml"), dir.path(), true);
+
+        for _ in 0..3 {
+            let res = mgr.inspect_and_authorize(&ctx, None).await;
+            assert!(!res.block);
+        }
+        let blocked = mgr.inspect_and_authorize(&ctx, None).await;
+        assert!(blocked.block);
+        assert_eq!(
+            blocked
+                .details
+                .as_ref()
+                .and_then(|d| d.get(BLOCK_KIND_DETAIL_KEY))
+                .and_then(|v| v.as_str()),
+            Some("repetition"),
+            "4th identical call must carry typed block_kind=repetition detail"
+        );
+
+        let typed_msg = mehh_ai::ToolResultMessage {
+            tool_call_id: "c1".to_string(),
+            tool_name: "read".to_string(),
+            content: vec![mehh_ai::ToolResultContentBlock::Text(mehh_ai::TextContent {
+                text: "Arbitrary wording".to_string(),
+                text_signature: None,
+            })],
+            details: Some(serde_json::json!({ BLOCK_KIND_DETAIL_KEY: "repetition" })),
+            is_error: true,
+            timestamp: 0,
+            duration_ms: None,
+            usage: None,
+        };
+        assert!(is_repetition_block_result(&typed_msg));
+
+        let text_only_msg = mehh_ai::ToolResultMessage {
+            tool_call_id: "c2".to_string(),
+            tool_name: "bash".to_string(),
+            content: vec![mehh_ai::ToolResultContentBlock::Text(mehh_ai::TextContent {
+                text: "Repeated identical tool call inside tool stdout".to_string(),
+                text_signature: None,
+            })],
+            details: None,
+            is_error: true,
+            timestamp: 0,
+            duration_ms: None,
+            usage: None,
+        };
+        assert!(!is_repetition_block_result(&text_only_msg));
     }
 }

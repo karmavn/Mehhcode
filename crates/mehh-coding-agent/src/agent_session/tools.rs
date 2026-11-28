@@ -18,9 +18,29 @@ fn strip_mcp_tools(tools: &mut Vec<Arc<dyn AgentTool>>) {
 }
 
 impl AgentSession {
-    /// Injects MCP tools (deferring large MCP toolsets behind `tool_search` when codemode is off)
-    /// and optionally wraps all tools in CodemodeTool, rebuilding the system prompt.
+    /// Injects MCP tools (deferring large `mcp__*` toolsets behind `codemode` or `tool_search`)
+    /// and optionally wraps all tools in `CodemodeTool`, rebuilding the system prompt.
     pub fn enable_mcp_and_codemode(
+        &mut self,
+        mcp_tools: Vec<Arc<dyn AgentTool>>,
+        enable_codemode: bool,
+    ) {
+        self.sync_mcp_tools(mcp_tools, enable_codemode);
+    }
+
+    pub(super) fn codemode_backing_tools(&self) -> Vec<Arc<dyn AgentTool>> {
+        let mut backing =
+            Vec::with_capacity(self.tools.len() + self.codemode_deferred_tools.len());
+        for tool in &self.tools {
+            if tool.name() != "codemode" {
+                backing.push(Arc::clone(tool));
+            }
+        }
+        backing.extend(self.codemode_deferred_tools.iter().cloned());
+        backing
+    }
+
+    fn apply_mcp_and_codemode(
         &mut self,
         mcp_tools: Vec<Arc<dyn AgentTool>>,
         enable_codemode: bool,
@@ -29,8 +49,9 @@ impl AgentSession {
             .iter()
             .filter(|t| t.name().starts_with("mcp__"))
             .count();
-        if !enable_codemode && mcp_server_tool_count > DEFERRED_MCP_TOOL_THRESHOLD {
-            self.codemode_tool = None;
+        let defer_mcp = mcp_server_tool_count > DEFERRED_MCP_TOOL_THRESHOLD;
+
+        let (visible_mcp, deferred_mcp) = if defer_mcp {
             let mut eager = Vec::new();
             let mut deferred = Vec::new();
             for tool in mcp_tools {
@@ -40,26 +61,47 @@ impl AgentSession {
                     eager.push(tool);
                 }
             }
-            if let Some(ref mut custom) = self.subagent_child_tools {
-                custom.extend(eager.iter().cloned());
-            }
-            self.tools.extend(eager);
-            self.enable_deferred_mcp_tools(deferred);
-            self.refresh_subagent_tool();
+            (eager, deferred)
         } else {
-            if let Some(ref mut custom) = self.subagent_child_tools {
-                custom.extend(mcp_tools.iter().cloned());
+            (mcp_tools, Vec::new())
+        };
+
+        if let Some(ref mut custom) = self.subagent_child_tools {
+            custom.extend(visible_mcp.iter().cloned());
+        }
+        self.tools.extend(visible_mcp);
+
+        if enable_codemode {
+            if self.deferred_catalog.is_some() {
+                self.clear_deferred_mcp_tools();
             }
-            self.tools.extend(mcp_tools);
-            if enable_codemode {
-                let codemode_tool = self.create_codemode_tool(self.tools.clone());
+            self.codemode_deferred_tools = deferred_mcp;
+            self.tools.retain(|t| t.name() != "codemode");
+            self.refresh_subagent_tool_only();
+            let backing = self.codemode_backing_tools();
+            if let Some(ref codemode) = self.codemode_tool {
+                codemode.replace_tools(backing);
+                self.tools.push(codemode.clone());
+            } else {
+                let codemode_tool = self.create_codemode_tool(backing);
                 self.codemode_tool = Some(codemode_tool.clone());
                 self.tools.push(codemode_tool);
-            } else {
-                self.codemode_tool = None;
             }
             self.rebuild_system_prompt();
-            self.refresh_subagent_tool();
+        } else {
+            self.codemode_tool = None;
+            self.codemode_deferred_tools.clear();
+            self.tools.retain(|t| t.name() != "codemode");
+            if defer_mcp {
+                self.enable_deferred_mcp_tools(deferred_mcp);
+                self.refresh_subagent_tool_only();
+            } else {
+                if self.deferred_catalog.is_some() {
+                    self.clear_deferred_mcp_tools();
+                }
+                self.rebuild_system_prompt();
+                self.refresh_subagent_tool_only();
+            }
         }
     }
 
@@ -133,52 +175,12 @@ impl AgentSession {
         if let Some(ref mut custom) = self.subagent_child_tools {
             strip_mcp_tools(custom);
         }
+        self.apply_mcp_and_codemode(mcp_tools, enable_codemode);
+    }
 
-        let mcp_server_tool_count = mcp_tools
-            .iter()
-            .filter(|t| t.name().starts_with("mcp__"))
-            .count();
-
-        if !enable_codemode && mcp_server_tool_count > DEFERRED_MCP_TOOL_THRESHOLD {
-            self.codemode_tool = None;
-            let mut eager = Vec::new();
-            let mut deferred = Vec::new();
-            for tool in mcp_tools {
-                if tool.name().starts_with("mcp__") {
-                    deferred.push(tool);
-                } else {
-                    eager.push(tool);
-                }
-            }
-            if let Some(ref mut custom) = self.subagent_child_tools {
-                custom.extend(eager.iter().cloned());
-            }
-            self.tools.extend(eager);
-            self.enable_deferred_mcp_tools(deferred);
-            self.refresh_subagent_tool();
-        } else {
-            if self.deferred_catalog.is_some() {
-                self.clear_deferred_mcp_tools();
-            }
-            if let Some(ref mut custom) = self.subagent_child_tools {
-                custom.extend(mcp_tools.iter().cloned());
-            }
-            self.tools.extend(mcp_tools);
-            if enable_codemode {
-                if let Some(ref codemode) = self.codemode_tool {
-                    codemode.replace_tools(self.tools.clone());
-                    self.tools.push(codemode.clone());
-                } else {
-                    let codemode_tool = self.create_codemode_tool(self.tools.clone());
-                    self.codemode_tool = Some(codemode_tool.clone());
-                    self.tools.push(codemode_tool);
-                }
-            } else {
-                self.codemode_tool = None;
-            }
-            self.rebuild_system_prompt();
-            self.refresh_subagent_tool();
-        }
+    /// Returns the number of deferred MCP tools held inside `CodemodeTool`.
+    pub fn codemode_deferred_tool_count(&self) -> usize {
+        self.codemode_deferred_tools.len()
     }
 
     /// Returns the active CodemodeTool handle, if enabled.
@@ -262,7 +264,8 @@ impl AgentSession {
                 0,
             )
             .with_inspection_manager(self.inspection_manager.clone())
-            .with_approval_handler(self.approval_handler.clone())
+            .with_approval_handler_slot(self.approval_handler_slot.clone())
+            .with_api_key_cache(self.subagent_api_key_cache.clone())
             .with_control(self.subagent_control.clone())
             .with_lead_worker(self.lead_worker.clone()),
         )
@@ -282,7 +285,7 @@ impl AgentSession {
             self.tools.push(updated);
         }
         if let Some(ref codemode) = self.codemode_tool {
-            codemode.replace_tools(self.tools.clone());
+            codemode.replace_tools(self.codemode_backing_tools());
         }
         self.rebuild_system_prompt();
     }
@@ -292,7 +295,7 @@ impl AgentSession {
         self.subagent_child_tools.as_deref()
     }
 
-    pub(super) fn refresh_subagent_tool(&mut self) {
+    pub(super) fn refresh_subagent_tool_only(&mut self) {
         let child_tools = self
             .subagent_child_tools
             .clone()
@@ -301,8 +304,12 @@ impl AgentSession {
         if let Some(slot) = self.tools.iter_mut().find(|t| t.name() == "subagent") {
             *slot = updated;
         }
+    }
+
+    pub(super) fn refresh_subagent_tool(&mut self) {
+        self.refresh_subagent_tool_only();
         if let Some(ref codemode) = self.codemode_tool {
-            codemode.replace_tools(self.tools.clone());
+            codemode.replace_tools(self.codemode_backing_tools());
         }
     }
 }

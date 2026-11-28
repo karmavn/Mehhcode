@@ -922,8 +922,7 @@ mod tests {
                     BeforeToolCallResult {
                         block: true,
                         reason: Some("Echoing secret is blocked".to_string()),
-                        terminate: false,
-                        approved_path: None,
+                        ..Default::default()
                     }
                 } else {
                     BeforeToolCallResult::default()

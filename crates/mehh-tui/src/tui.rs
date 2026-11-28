@@ -29,11 +29,22 @@ pub struct CrosstermTerminal {
 impl CrosstermTerminal {
     pub fn new() -> std::io::Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
+        // crossterm 0.28 reads Win32 ReadConsoleInput on Windows and never emits Event::Paste;
+        // sending ?2004h causes Windows terminal modifier interference (crossterm #962),
+        // so Windows relies on PasteBurst coalescing instead.
+        #[cfg(not(windows))]
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::terminal::EnterAlternateScreen,
             crossterm::cursor::Hide,
             crossterm::event::EnableBracketedPaste,
+            crossterm::event::EnableMouseCapture
+        );
+        #[cfg(windows)]
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::cursor::Hide,
             crossterm::event::EnableMouseCapture
         );
         Ok(Self {
@@ -45,10 +56,18 @@ impl CrosstermTerminal {
 impl Drop for CrosstermTerminal {
     fn drop(&mut self) {
         if self.raw_mode_enabled {
+            #[cfg(not(windows))]
             let _ = crossterm::execute!(
                 std::io::stdout(),
                 crossterm::event::DisableMouseCapture,
                 crossterm::event::DisableBracketedPaste,
+                crossterm::cursor::Show,
+                crossterm::terminal::LeaveAlternateScreen
+            );
+            #[cfg(windows)]
+            let _ = crossterm::execute!(
+                std::io::stdout(),
+                crossterm::event::DisableMouseCapture,
                 crossterm::cursor::Show,
                 crossterm::terminal::LeaveAlternateScreen
             );

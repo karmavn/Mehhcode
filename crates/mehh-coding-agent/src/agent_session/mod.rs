@@ -114,7 +114,7 @@ impl Drop for ActiveCancelGuard {
     }
 }
 
-/// MCP tool count above which `mcp__*` tools are registered behind `tool_search`.
+/// MCP tool count above which `mcp__*` tools are deferred behind `codemode` or `tool_search`.
 pub const DEFERRED_MCP_TOOL_THRESHOLD: usize = 20;
 
 /// Startup options allowing CLI callers to skip unused default tool, skill, or prompt discovery.
@@ -156,16 +156,19 @@ pub struct AgentSession {
     dynamic_tools: Arc<RwLock<Vec<Arc<dyn AgentTool>>>>,
     deferred_catalog: Option<Arc<DeferredToolCatalog>>,
     codemode_tool: Option<Arc<mehh_codemode::CodemodeTool>>,
+    codemode_deferred_tools: Vec<Arc<dyn AgentTool>>,
     pub inspection_manager: Arc<crate::tool_inspection::ToolInspectionManager>,
     pub approval_handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
-    /// Shared with the codemode interceptor so `set_approval_handler` takes
-    /// effect without recreating the sandbox tool.
-    approval_handler_slot: Arc<RwLock<Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>>>,
+    /// Shared with the codemode and subagent interceptors so `set_approval_handler` takes
+    /// effect without recreating those tools.
+    approval_handler_slot: crate::tool_inspection::ApprovalHandlerSlot,
+    /// Credential cache shared across `SubagentTool` runs and invalidated on key/model changes.
+    subagent_api_key_cache: Arc<Mutex<std::collections::HashMap<String, Option<String>>>>,
     pub todo_state: Arc<tokio::sync::RwLock<crate::todo::TodoState>>,
     pub lead_worker: Arc<Mutex<crate::lead_worker::LeadWorkerManager>>,
     pub subagent_control: Arc<SubagentControl>,
     /// Custom child toolset set by CLI (`--tools subagent`); preserved across
-    /// `refresh_subagent_tool` (e.g. `set_approval_handler`, `set_api_key`, `set_model`).
+    /// `refresh_subagent_tool` (e.g. `set_tools`, `sync_mcp_tools`, `reload`).
     subagent_child_tools: Option<Vec<Arc<dyn AgentTool>>>,
     /// Explicit tool allowlist recorded by `set_tools` (e.g. CLI `--tools` / `--no-tools`)
     /// so `reload()` never re-injects excluded web tools.
@@ -369,6 +372,8 @@ impl AgentSession {
 
         let subagent_control = Arc::new(SubagentControl::new(DEFAULT_MAX_CONCURRENT_SUBAGENTS));
         let todo_state = Arc::new(tokio::sync::RwLock::new(crate::todo::TodoState::default()));
+        let approval_handler_slot = Arc::new(RwLock::new(None));
+        let subagent_api_key_cache = Arc::new(Mutex::new(std::collections::HashMap::new()));
 
         let tools = if options.skip_default_tools {
             Vec::new()
@@ -404,6 +409,8 @@ impl AgentSession {
                     0,
                 )
                 .with_inspection_manager(inspection_manager.clone())
+                .with_approval_handler_slot(approval_handler_slot.clone())
+                .with_api_key_cache(subagent_api_key_cache.clone())
                 .with_control(subagent_control.clone())
                 .with_lead_worker(lead_worker.clone()),
             );
@@ -458,9 +465,11 @@ impl AgentSession {
             dynamic_tools: Arc::new(RwLock::new(Vec::new())),
             deferred_catalog: None,
             codemode_tool: None,
+            codemode_deferred_tools: Vec::new(),
             inspection_manager,
             approval_handler: None,
-            approval_handler_slot: Arc::new(RwLock::new(None)),
+            approval_handler_slot,
+            subagent_api_key_cache,
             todo_state,
             lead_worker,
             subagent_control,
@@ -602,7 +611,6 @@ impl AgentSession {
     ) {
         self.approval_handler = handler;
         *mehh_ai::write_recover(&self.approval_handler_slot) = self.approval_handler.clone();
-        self.refresh_subagent_tool();
     }
 
     /// Overrides active tools for the session.
@@ -611,10 +619,16 @@ impl AgentSession {
         self.tools = tools;
         self.subagent_child_tools = None;
         self.subagent_child_tool_allowlist = None;
-        self.refresh_subagent_tool();
-        if let Some(ref codemode) = self.codemode_tool {
-            codemode.replace_tools(self.tools.clone());
+        if !self.tools.iter().any(|t| t.name() == "codemode") {
+            self.codemode_tool = None;
+            self.codemode_deferred_tools.clear();
         }
+        if self.deferred_catalog.is_some()
+            && !self.tools.iter().any(|t| t.name() == "tool_search")
+        {
+            self.clear_deferred_mcp_tools();
+        }
+        self.refresh_subagent_tool();
         self.rebuild_system_prompt();
     }
 
@@ -689,29 +703,25 @@ impl AgentSession {
             crate::tool_inspection::PermissionMode::SmartApprove
         };
         let prev_session_rules = self.inspection_manager.try_snapshot_session_rules();
-        let prev_mode = self.inspection_manager.try_mode();
+        let prev_mode = self.inspection_manager.mode_sync();
         let permission_mode = match self.settings.permission_mode {
             Some(disk_mode) => disk_mode,
-            None => match prev_mode {
-                Some(prev)
-                    if crate::settings::permission_mode_rank(prev)
-                        < crate::settings::permission_mode_rank(default_mode) =>
+            None => {
+                if crate::settings::permission_mode_rank(prev_mode)
+                    < crate::settings::permission_mode_rank(default_mode)
                 {
-                    prev
+                    prev_mode
+                } else {
+                    default_mode
                 }
-                _ => default_mode,
-            },
+            }
         };
         let mut perm_store =
             crate::permissions::PermissionStore::load_fail_closed(&self.cwd, self.trusted);
         perm_store.restore_session_rules(prev_session_rules);
-        self.inspection_manager = Arc::new(
-            crate::tool_inspection::ToolInspectionManager::new_with_store(
-                permission_mode,
-                self.cwd.clone(),
-                perm_store,
-            ),
-        );
+        self.inspection_manager
+            .reload_policy(permission_mode, perm_store);
+        mehh_ai::lock_recover(&self.subagent_api_key_cache).clear();
 
         {
             let mut lw = mehh_ai::lock_recover(&self.lead_worker);
@@ -742,7 +752,7 @@ impl AgentSession {
             }
         }
 
-        // Re-sync web tools with updated WebConfig and new inspection_manager URL checker,
+        // Re-sync web tools with updated WebConfig and live inspection_manager URL checker,
         // preserving explicit CLI tool allowlists so excluded tools are never re-injected.
         let web_config = self
             .settings
@@ -788,14 +798,11 @@ impl AgentSession {
             sync_web(child_tools, self.subagent_child_tool_allowlist.as_ref());
         }
 
-        if self.codemode_tool.is_some() {
-            self.tools.retain(|t| t.name() != "codemode");
-            let new_codemode = self.create_codemode_tool(self.tools.clone());
-            self.codemode_tool = Some(new_codemode.clone());
-            self.tools.push(new_codemode);
+        self.refresh_subagent_tool_only();
+        if let Some(ref codemode) = self.codemode_tool {
+            codemode.replace_tools(self.codemode_backing_tools());
         }
 
-        self.refresh_subagent_tool();
         self.rebuild_system_prompt();
         Ok(())
     }
@@ -813,7 +820,7 @@ impl AgentSession {
         self.has_explicit_api_key = false;
         self.api_key = api_key.clone();
         mehh_ai::lock_recover(&self.lead_worker).set_lead_api_key(api_key);
-        self.refresh_subagent_tool();
+        mehh_ai::lock_recover(&self.subagent_api_key_cache).clear();
     }
 
     /// Clears in-memory credentials for `provider` from both lead and worker state if matched.
@@ -838,8 +845,12 @@ impl AgentSession {
                 cleared = true;
             }
         }
-        if cleared {
-            self.refresh_subagent_tool();
+        let key = provider.trim().to_ascii_lowercase();
+        if mehh_ai::lock_recover(&self.subagent_api_key_cache)
+            .remove(&key)
+            .is_some()
+        {
+            cleared = true;
         }
         cleared
     }
@@ -849,7 +860,7 @@ impl AgentSession {
         self.has_explicit_api_key = api_key.as_deref().is_some_and(|k| !k.trim().is_empty());
         self.api_key = api_key.clone();
         mehh_ai::lock_recover(&self.lead_worker).set_lead_api_key(api_key);
-        self.refresh_subagent_tool();
+        mehh_ai::lock_recover(&self.subagent_api_key_cache).clear();
     }
 
     /// Returns whether the active key was explicitly pinned by CLI `--api-key`.
@@ -887,7 +898,7 @@ impl AgentSession {
             mgr.lead_model = self.model.clone();
             mgr.lead_provider = self.provider.clone();
         }
-        self.refresh_subagent_tool();
+        mehh_ai::lock_recover(&self.subagent_api_key_cache).clear();
     }
 
     /// Returns a reference to the active session manager.
@@ -1048,7 +1059,7 @@ impl AgentSession {
         }
 
         if changed {
-            self.refresh_subagent_tool();
+            mehh_ai::lock_recover(&self.subagent_api_key_cache).clear();
         }
         Ok(())
     }

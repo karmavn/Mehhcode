@@ -761,6 +761,7 @@ pub(in crate::interactive) async fn handle_agent_signal_async(
                                 state.invalidate_context_tokens();
                                 if let Some(start_idx) = state.turn_start_idx {
                                     state.items.truncate(start_idx);
+                                    mehh_ai::lock_recover(&state.transcript_cache).truncate(start_idx);
                                 }
                                 state.last_turn_error = None;
                                 state.items.push(TranscriptItem::System(

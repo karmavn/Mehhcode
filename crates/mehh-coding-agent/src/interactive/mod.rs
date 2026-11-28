@@ -19,9 +19,9 @@ use mehh_ai::{
 };
 use mehh_tui::{
     normalize_crossterm_key, truncate_to_width, wrap_text_with_ansi, BorderStyle, BorderedBox,
-    Component, CrosstermTerminal, Editor, EditorOutput, Keybindings, Loader, SelectItem,
-    SelectList, SettingItem, SettingsList, Terminal, Text, Theme, TuiAction, TuiRenderer,
-    WheelScrollAccelerator,
+    Component, CrosstermTerminal, Editor, EditorOutput, Keybindings, Loader, PasteBurst,
+    SelectItem, SelectList, SettingItem, SettingsList, Terminal, Text, Theme, TuiAction,
+    TuiRenderer, WheelScrollAccelerator,
 };
 use tokio_util::sync::CancellationToken;
 

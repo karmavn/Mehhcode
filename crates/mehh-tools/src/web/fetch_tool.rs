@@ -657,7 +657,7 @@ fn is_textual_mime(mime: &str) -> bool {
         || mime.ends_with("+xml")
 }
 
-fn looks_like_binary_bytes(bytes: &[u8]) -> bool {
+pub(crate) fn looks_like_binary_bytes(bytes: &[u8]) -> bool {
     if bytes.contains(&0) {
         return true;
     }

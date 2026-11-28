@@ -25,7 +25,7 @@ All 30 built-in slash commands are registered and dispatched in `crates/mehh-cod
 | Tools, MCP & Turn Queue | `/tools`, `/mcp`, `/follow-up` | `crates/mehh-coding-agent/src/interactive/commands/mod.rs`, `crates/mehh-coding-agent/src/mcp_manager.rs`, `crates/mehh-agent/src/agent.rs` |
 | Help, Clipboard & Exit | `/help`, `/hotkeys`, `/copy`, `/clear`, `/exit`, `/quit` | `crates/mehh-coding-agent/src/interactive/commands/mod.rs`, `crates/mehh-coding-agent/src/clipboard.rs` |
 | Keybindings (`TuiAction` / `Keybindings`) | Global & editor key normalization and bindings | `crates/mehh-tui/src/keys.rs`, `crates/mehh-coding-agent/src/interactive/events/input.rs` |
-| TUI Renderer & Components | `TuiRenderer`, `MockTerminal`, `Editor`, `MarkdownView`, `SettingsList`, ANSI width | `crates/mehh-tui/src/tui.rs`, `crates/mehh-tui/src/ansi.rs`, `crates/mehh-tui/src/components/editor.rs`, `crates/mehh-tui/src/components/markdown.rs`, `crates/mehh-tui/src/components/settings_list.rs`, `crates/mehh-tui/src/components/basic.rs`, `crates/mehh-tui/src/wheel_scroll.rs` |
+| TUI Renderer & Components | `TuiRenderer`, `MockTerminal`, `Editor`, `PasteBurst`, `MarkdownView`, `SettingsList`, ANSI width | `crates/mehh-tui/src/tui.rs`, `crates/mehh-tui/src/paste_burst.rs`, `crates/mehh-tui/src/ansi.rs`, `crates/mehh-tui/src/components/editor.rs`, `crates/mehh-tui/src/components/markdown.rs`, `crates/mehh-tui/src/components/settings_list.rs`, `crates/mehh-tui/src/components/basic.rs`, `crates/mehh-tui/src/wheel_scroll.rs` |
 
 ## 3. Built-in Tools
 
@@ -35,7 +35,7 @@ All 30 built-in slash commands are registered and dispatched in `crates/mehh-cod
 | File read, write, edit & undo | `crates/mehh-tools/src/read.rs`, `crates/mehh-tools/src/write.rs`, `crates/mehh-tools/src/edit.rs`, `crates/mehh-tools/src/undo_edit.rs`, `crates/mehh-tools/src/file_mutation_queue.rs` | `cargo test -p mehh-tools --test test_undo_edit` |
 | Search & symbol analysis (`grep`, `find`, `ls`, `analyze`) | `crates/mehh-tools/src/grep.rs`, `crates/mehh-tools/src/find.rs`, `crates/mehh-tools/src/ls.rs`, `crates/mehh-tools/src/analyze.rs` | `cargo test -p mehh-tools --test test_analyze` |
 | Shell tools (`bash`, `powershell`) | `crates/mehh-tools/src/bash.rs`, `crates/mehh-tools/src/powershell.rs`, `crates/mehh-tools/src/core/shell.rs` | `cargo test -p mehh-tools bash` |
-| Web tools (`web_search`, `web_fetch`) | `crates/mehh-tools/src/web/search_tool.rs`, `crates/mehh-tools/src/web/fetch_tool.rs`, `crates/mehh-tools/src/web/router.rs`, `crates/mehh-tools/src/web/providers.rs` | `cargo test -p mehh-tools web` |
+| Web tools (`web_search`, `web_fetch`) | `crates/mehh-tools/src/web/search_tool.rs`, `crates/mehh-tools/src/web/fetch_tool.rs`, `crates/mehh-tools/src/web/router.rs`, `crates/mehh-tools/src/web/providers.rs`, `crates/mehh-tools/src/web/native/mod.rs`, `crates/mehh-tools/src/web/native/sources.rs`, `crates/mehh-tools/src/web/native/html_parse.rs`, `crates/mehh-tools/src/web/native/rank.rs`, `crates/mehh-tools/src/web/native/enrich.rs` | `cargo test -p mehh-tools web` |
 | Session tools (`todo`, `subagent`) | `crates/mehh-coding-agent/src/todo.rs`, `crates/mehh-coding-agent/src/subagent/mod.rs`, `crates/mehh-coding-agent/src/subagent/runner.rs`, `crates/mehh-coding-agent/src/subagent/scratchpad.rs`, `crates/mehh-coding-agent/src/subagent_control.rs`, `crates/mehh-coding-agent/src/subagent_lifecycle.rs` | `cargo test -p mehh-coding-agent --test test_todo_moim` |
 
 ## 4. Governance, Permissions, Trust & Sandboxing

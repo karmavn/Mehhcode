@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 
-use mehh_ai::{is_context_overflow, Message};
+use mehh_ai::Message;
 
 use super::{ActiveCancelGuard, AgentSession};
 
@@ -11,20 +11,14 @@ impl AgentSession {
         if !auto_compact_enabled {
             return None;
         }
-        let comp_settings = crate::compaction::CompactionSettings::for_context_window(
-            self.model.context_window,
+        let budget = crate::compaction::ContextBudget {
+            context_window: self.model.context_window,
+            overhead_tokens: self.cached_prompt_and_tools_tokens,
             auto_compact_enabled,
-        );
-        let current_tokens =
-            crate::compaction::estimate_context_tokens(&self.session.build_context_messages())
-                + self.cached_prompt_and_tools_tokens;
-        if !crate::compaction::should_auto_compact(
-            current_tokens,
-            usize::try_from(self.model.context_window).unwrap_or(usize::MAX),
-            &comp_settings,
-        ) {
-            return None;
-        }
+        };
+        let context_messages = self.session.build_context_messages();
+        let comp_settings =
+            crate::compaction::proactive_compaction_settings_for_budget(&context_messages, budget)?;
         let active_entries = self.session.active_path_entries();
         crate::compaction::prepare_compaction_refs(
             &active_entries,
@@ -76,35 +70,18 @@ impl AgentSession {
 
     /// Returns true if `messages` ended due to context overflow and auto-compaction is enabled.
     pub fn is_overflow_turn(&self, messages: &[Message]) -> bool {
-        let auto_compact_enabled = self.settings.auto_compact.unwrap_or(true);
-        if !auto_compact_enabled {
+        if !self.settings.auto_compact.unwrap_or(true) {
             return false;
         }
-        messages
-            .iter()
-            .rev()
-            .find_map(|m| match m {
-                Message::Assistant(ast) => Some(ast),
-                _ => None,
-            })
-            .is_some_and(|ast| {
-                let context_window = {
-                    let lw = mehh_ai::lock_recover(&self.lead_worker);
-                    if let Some(worker) = lw
-                        .worker_model()
-                        .filter(|w| w.id == ast.model && w.provider == ast.provider)
-                    {
-                        worker.context_window
-                    } else if self.model.id == ast.model && self.model.provider == ast.provider {
-                        self.model.context_window
-                    } else if let Some(worker) = lw.worker_model().filter(|w| w.id == ast.model) {
-                        worker.context_window
-                    } else {
-                        self.model.context_window
-                    }
-                };
-                is_context_overflow(ast, context_window)
-            })
+        let Some((last_msg, ast)) = messages.iter().rev().find_map(|m| match m {
+            Message::Assistant(ast) => Some((m, ast)),
+            _ => None,
+        }) else {
+            return false;
+        };
+        let context_window =
+            mehh_ai::lock_recover(&self.lead_worker).context_window_for(&ast.model, &ast.provider);
+        crate::compaction::is_overflow_messages(std::slice::from_ref(last_msg), context_window, true)
     }
 
     /// Attempts emergency compaction after a context overflow turn. Propagates provider/cancel errors.

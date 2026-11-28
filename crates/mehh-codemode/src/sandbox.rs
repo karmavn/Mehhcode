@@ -1833,6 +1833,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_dropping_run_codemode_future_cancels_immediately() {
+        struct CancelNotify {
+            cancel: CancellationToken,
+            tx: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+        }
+
+        impl Drop for CancelNotify {
+            fn drop(&mut self) {
+                if self.cancel.is_cancelled() {
+                    if let Some(tx) = lock_or_recover(&self.tx).take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+        }
+
         let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
         let (cancelled_tx, cancelled_rx) = tokio::sync::oneshot::channel::<()>();
         let started_tx = Arc::new(Mutex::new(Some(started_tx)));
@@ -1842,13 +1857,14 @@ mod tests {
             let started_tx = started_tx.clone();
             let cancelled_tx = cancelled_tx.clone();
             Box::pin(async move {
+                let _notify = CancelNotify {
+                    cancel: cancel.clone(),
+                    tx: cancelled_tx,
+                };
                 if let Some(tx) = lock_or_recover(&started_tx).take() {
                     let _ = tx.send(());
                 }
                 cancel.cancelled().await;
-                if let Some(tx) = lock_or_recover(&cancelled_tx).take() {
-                    let _ = tx.send(());
-                }
                 Err("cancelled".to_string())
             })
         });

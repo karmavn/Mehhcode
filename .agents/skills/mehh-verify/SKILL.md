@@ -28,7 +28,9 @@ Verify Mehhcode changes end-to-end without real LLM API keys or modifying `~/.me
    ```powershell
    cargo test -p mehh-cli --test workspace_guardrails
    cargo clippy -p <changed-crate> --no-deps --all-targets -- -D warnings
-   cargo clippy --locked --workspace --no-deps --lib --bins -- -D clippy::unwrap_used -D clippy::panic
+   cargo clippy -p <changed-crate> --no-deps --lib -- -D clippy::unwrap_used -D clippy::panic
    ```
+   - Workspace-wide `cargo clippy --locked --workspace --no-deps --lib --bins -- -D clippy::unwrap_used -D clippy::panic` runs in CI; keep local Clippy checks scoped per changed crate (`-p <changed-crate>`).
+   - If `cargo test -p mehh-cli --test workspace_guardrails` fails at link time on Windows with `Access is denied (os error 5)` on `target\debug\mehh.exe`, check `Get-Process mehh`: never kill a user's running `mehh.exe`. Because `workspace_guardrails` reads repo files from disk and Cargo compiles `target\debug\deps\workspace_guardrails-*.exe` first, run that freshly built `workspace_guardrails-*.exe` binary directly alongside targeted `--no-deps` Clippy checks and report the lock transparently.
    - On Windows PowerShell 5.1, chain commands with `;`, never `&&`.
    - If the user explicitly asks to skip test/build runs (e.g., static-only code review), do not invoke `cargo` and inspect code/guardrails statically instead.

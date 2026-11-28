@@ -4,15 +4,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use mehh_ai::http_safety::{check_url_host_policy, DnsPolicy};
+use mehh_ai::http_safety::{
+    check_url_host_policy, normalize_and_validate_http_url, DnsPolicy,
+};
 use reqwest::Url;
 use tokio::task::JoinSet;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::web::fetch_tool::looks_like_binary_bytes;
 use crate::web::html_markdown::{html_to_markdown, looks_like_empty_spa_shell};
 use crate::web::mcp_rpc::{read_bounded_prefix, send_cancellable_request, WEB_USER_AGENT};
-use crate::web::native::rank::{extract_relevant_passages_with_terms, tokenize_query_terms};
+use crate::web::native::rank::{
+    extract_relevant_passages_scored, tokenize_query_terms, ExtractedPassage,
+};
 use crate::web::native::NativeSearchState;
 use crate::web::types::{ProviderError, SearchHit};
 use crate::web::UrlPolicyChecker;
@@ -32,35 +37,43 @@ const BINARY_EXTENSIONS: &[&str] = &[
 
 /// Returns `true` when `hit` is eligible for Stage 2 page fetching and passage extraction.
 pub(crate) fn is_enrich_candidate(hit: &SearchHit) -> bool {
-    if hit.content.as_deref().map_or(0, str::len) >= ENRICH_SKIP_SNIPPET_LEN {
+    if hit
+        .content
+        .as_deref()
+        .map_or(0, |s| s.chars().count())
+        >= ENRICH_SKIP_SNIPPET_LEN
+    {
         return false;
     }
-    let Ok(url) = Url::parse(hit.url.trim()) else {
+    let Ok(url) = normalize_and_validate_http_url(hit.url.trim()) else {
         return false;
     };
-    if !matches!(url.scheme(), "http" | "https") {
-        return false;
-    }
     let path_lower = url.path().to_ascii_lowercase();
     !BINARY_EXTENSIONS.iter().any(|ext| path_lower.ends_with(ext))
 }
 
-fn is_supported_text_mime(content_type: Option<&str>) -> bool {
-    let Some(raw) = content_type else {
-        return true;
-    };
-    let mime = raw
-        .split(';')
-        .next()
+fn normalized_mime(raw: Option<&str>) -> String {
+    raw.and_then(|v| v.split(';').next())
         .map(str::trim)
         .unwrap_or("")
-        .to_ascii_lowercase();
+        .to_ascii_lowercase()
+}
+
+fn is_supported_text_mime(content_type: Option<&str>) -> bool {
+    let mime = normalized_mime(content_type);
     mime.is_empty()
         || mime.starts_with("text/html")
         || mime == "application/xhtml+xml"
         || mime == "text/markdown"
         || mime == "text/x-markdown"
         || mime == "text/plain"
+}
+
+fn is_plain_or_markdown_mime(content_type: Option<&str>) -> bool {
+    matches!(
+        normalized_mime(content_type).as_str(),
+        "text/markdown" | "text/x-markdown" | "text/plain"
+    )
 }
 
 async fn check_hop_allowed(
@@ -95,34 +108,37 @@ async fn fetch_and_extract_passage(
     env: EnrichEnv,
     raw_url: String,
     query_terms: Arc<[String]>,
-) -> Option<String> {
+) -> Option<ExtractedPassage> {
     let client = &env.client;
     let dns_policy = env.dns_policy;
     let url_policy_checker = env.url_policy_checker;
     let native_state = env.native_state;
     let deadline = env.deadline;
     let cancel = env.cancel;
-    let mut current = Url::parse(raw_url.trim()).ok()?;
+    let mut current = normalize_and_validate_http_url(raw_url.trim()).ok()?;
     check_hop_allowed(dns_policy, url_policy_checker.as_ref(), &current)
         .await
         .ok()?;
 
     if let Some(ref state) = native_state {
-        if let Some((cached_final, cached_md)) = state.get_cached_page(current.as_str()) {
-            let final_allowed = if let Some(ref fu) = cached_final {
-                if let Ok(parsed_final) = Url::parse(fu) {
-                    check_hop_allowed(dns_policy, url_policy_checker.as_ref(), &parsed_final)
-                        .await
-                        .is_ok()
-                } else {
-                    false
+        if let Some((checked_urls, cached_md)) = state.get_cached_page(current.as_str()) {
+            let mut all_hops_allowed = !checked_urls.is_empty();
+            for hop_url in checked_urls.iter() {
+                let Ok(parsed_hop) = normalize_and_validate_http_url(hop_url) else {
+                    all_hops_allowed = false;
+                    break;
+                };
+                if check_hop_allowed(dns_policy, url_policy_checker.as_ref(), &parsed_hop)
+                    .await
+                    .is_err()
+                {
+                    all_hops_allowed = false;
+                    break;
                 }
-            } else {
-                true
-            };
-            if final_allowed {
+            }
+            if all_hops_allowed {
                 return tokio::task::spawn_blocking(move || {
-                    extract_relevant_passages_with_terms(&query_terms, &cached_md, ENRICH_MAX_CHARS)
+                    extract_relevant_passages_scored(&query_terms, &cached_md, ENRICH_MAX_CHARS)
                 })
                 .await
                 .ok()
@@ -133,6 +149,7 @@ async fn fetch_and_extract_passage(
 
     let mut final_resp = None;
     let mut final_url = current.clone();
+    let mut checked_urls = vec![current.as_str().to_string()];
     for hop in 0..=MAX_ENRICH_REDIRECTS {
         let req = client
             .get(current.clone())
@@ -158,18 +175,20 @@ async fn fetch_and_extract_passage(
                 .and_then(|v| v.to_str().ok())
                 .map(str::trim)
                 .filter(|s| !s.is_empty())?;
-            let next = current.join(loc).ok()?;
-            if !matches!(next.scheme(), "http" | "https") {
-                return None;
-            }
+            let next_raw = current.join(loc).ok()?;
+            let next = normalize_and_validate_http_url(next_raw.as_str()).ok()?;
             check_hop_allowed(dns_policy, url_policy_checker.as_ref(), &next)
                 .await
                 .ok()?;
+            let next_str = next.as_str().to_string();
+            if !checked_urls.contains(&next_str) {
+                checked_urls.push(next_str);
+            }
             current = next;
             final_url = current.clone();
             continue;
         }
-        if status >= 400 {
+        if !(200..300).contains(&status) {
             return None;
         }
         final_resp = Some(resp);
@@ -189,16 +208,12 @@ async fn fetch_and_extract_passage(
     let bytes = read_bounded_prefix(resp, MAX_ENRICH_BYTES, deadline, &cancel)
         .await
         .ok()?;
-    if bytes.is_empty() {
+    if bytes.is_empty() || looks_like_binary_bytes(&bytes) {
         return None;
     }
 
-    let is_plain_or_md = content_type.as_deref().is_some_and(|ct| {
-        let lower = ct.to_ascii_lowercase();
-        lower.contains("text/markdown") || lower.contains("text/plain")
-    });
+    let is_plain_or_md = is_plain_or_markdown_mime(content_type.as_deref());
 
-    let final_url_str = final_url.as_str().to_string();
     let (cacheable_md, passage) = tokio::task::spawn_blocking(move || {
         let body = String::from_utf8_lossy(&bytes);
         if body.trim().is_empty() {
@@ -213,7 +228,8 @@ async fn fetch_and_extract_passage(
             }
             md
         };
-        let passage = extract_relevant_passages_with_terms(&query_terms, &rendered, ENRICH_MAX_CHARS);
+        let passage =
+            extract_relevant_passages_scored(&query_terms, &rendered, ENRICH_MAX_CHARS);
         let md_arc: Arc<str> = Arc::from(rendered);
         (Some(md_arc), passage)
     })
@@ -221,8 +237,7 @@ async fn fetch_and_extract_passage(
     .ok()?;
 
     if let (Some(state), Some(md_arc)) = (native_state, cacheable_md) {
-        let final_opt = (final_url_str != raw_url).then_some(final_url_str);
-        state.cache_page(&raw_url, final_opt, md_arc);
+        state.cache_page(&raw_url, Arc::from(checked_urls), md_arc);
     }
 
     passage
@@ -289,9 +304,18 @@ pub(crate) async fn enrich_top_hits(
         res = set.join_next() => res,
     } {
         if let Ok((idx, Some(passage))) = joined {
-            let existing_len = hits[idx].content.as_deref().map_or(0, str::len);
-            if passage.len() > existing_len {
-                hits[idx].content = Some(passage);
+            let existing_chars = hits[idx]
+                .content
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .chars()
+                .count();
+            let passage_chars = passage.text.chars().count();
+            if (existing_chars == 0 && passage_chars > 0)
+                || (passage.matched_query && passage_chars > existing_chars)
+            {
+                hits[idx].content = Some(passage.text);
             }
         }
     }
@@ -648,5 +672,215 @@ mod tests {
         )
         .await;
         assert_eq!(hits3[0].content.as_deref(), Some("short"));
+    }
+
+    #[tokio::test]
+    async fn test_enrich_rejects_binary_payload_and_does_not_overwrite_snippet_with_zero_match_boilerplate() {
+        let base = spawn_page_server(vec![
+            (
+                "/binary-no-ext",
+                200,
+                "text/plain",
+                "%PDF-1.7\u{0000}\u{0001} binary stream payload that looks long enough if decoded as UTF-8 replacement chars",
+                Duration::ZERO,
+            ),
+            (
+                "/cookie-wall",
+                200,
+                "text/html",
+                "<html><body><h1>Sign In Required</h1><p>Please enable cookies and log in to continue browsing this portal with many extra words for length.</p></body></html>",
+                Duration::ZERO,
+            ),
+        ])
+        .await;
+
+        let client = build_safe_http_client(DnsPolicy::AllowPrivate, Duration::from_secs(5), None)
+            .unwrap();
+        let mut hits = vec![
+            SearchHit {
+                url: format!("{base}/binary-no-ext"),
+                title: Some("Doc".into()),
+                published: None,
+                content: Some("clean serp snippet".into()),
+            },
+            SearchHit {
+                url: format!("{base}/cookie-wall"),
+                title: Some("Guide".into()),
+                published: None,
+                content: Some("relevant serp snippet".into()),
+            },
+        ];
+
+        enrich_top_hits(
+            &client,
+            DnsPolicy::AllowPrivate,
+            None,
+            None,
+            "tokio async runtime",
+            &mut hits,
+            Instant::now() + Duration::from_secs(3),
+            &CancellationToken::new(),
+        )
+        .await;
+
+        assert_eq!(hits[0].content.as_deref(), Some("clean serp snippet"));
+        assert_eq!(hits[1].content.as_deref(), Some("relevant serp snippet"));
+    }
+
+    #[tokio::test]
+    async fn test_enrich_preserves_text_x_markdown_and_multibyte_char_threshold() {
+        let base = spawn_page_server(vec![(
+            "/doc.md",
+            200,
+            "text/x-markdown; charset=utf-8",
+            "Use `Vec<T>` and Option<String>\n\nLine 1 for tokio guide\nLine 2 preserves line breaks safely",
+            Duration::ZERO,
+        )])
+        .await;
+
+        // 250 'ế' chars = 750 UTF-8 bytes (< 500 char cap, >= 500 byte len).
+        let vi_snippet = "ế".repeat(250);
+        assert!(vi_snippet.len() >= ENRICH_SKIP_SNIPPET_LEN);
+        assert!(vi_snippet.chars().count() < ENRICH_SKIP_SNIPPET_LEN);
+
+        let hit = SearchHit {
+            url: format!("{base}/doc.md"),
+            title: Some("Markdown".into()),
+            published: None,
+            content: Some(vi_snippet),
+        };
+        assert!(is_enrich_candidate(&hit));
+
+        let client = build_safe_http_client(DnsPolicy::AllowPrivate, Duration::from_secs(5), None)
+            .unwrap();
+        let mut hits = vec![SearchHit {
+            url: format!("{base}/doc.md"),
+            title: Some("Markdown".into()),
+            published: None,
+            content: Some("short".into()),
+        }];
+        enrich_top_hits(
+            &client,
+            DnsPolicy::AllowPrivate,
+            None,
+            None,
+            "tokio Vec<T>",
+            &mut hits,
+            Instant::now() + Duration::from_secs(3),
+            &CancellationToken::new(),
+        )
+        .await;
+        let enriched = hits[0].content.as_deref().unwrap();
+        assert!(
+            enriched.contains("Option<String>") && enriched.contains("Line 1 for tokio guide\nLine 2"),
+            "text/x-markdown must bypass html_to_markdown so generics/newlines remain intact: {enriched}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enrich_rejects_embedded_credentials_and_rechecks_canonical_and_redirect_hops_on_cache_hit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        assert!(!is_enrich_candidate(&SearchHit {
+            url: "https://user:secret@example.com/page".to_string(),
+            title: None,
+            published: None,
+            content: Some("short".into()),
+        }));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let path = req
+                        .lines()
+                        .next()
+                        .and_then(|l| l.split_whitespace().nth(1))
+                        .unwrap_or("/");
+                    let resp = if path.starts_with("/start") {
+                        format!(
+                            "HTTP/1.1 302 Found\r\nLocation: http://{addr}/blocked-hop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        )
+                    } else {
+                        let body = "<html><body><h1>Tokio</h1><p>Tokio futures runtime details.</p></body></html>";
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        struct SelectiveChecker {
+            block_redirect_hop: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl UrlPolicyChecker for SelectiveChecker {
+            async fn check_url(&self, url: &str) -> Result<(), String> {
+                if self.block_redirect_hop.load(Ordering::SeqCst) && url.contains("/blocked-hop") {
+                    Err("redirect hop now blocked".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        let block_hop = Arc::new(AtomicBool::new(false));
+        let checker: Arc<dyn UrlPolicyChecker> = Arc::new(SelectiveChecker {
+            block_redirect_hop: block_hop.clone(),
+        });
+        let state = NativeSearchState::new();
+        let client = build_safe_http_client(DnsPolicy::AllowPrivate, Duration::from_secs(5), None)
+            .unwrap();
+
+        let mut hits1 = vec![SearchHit {
+            url: format!("http://{addr}/start?utm_source=a"),
+            title: None,
+            published: None,
+            content: Some("short".into()),
+        }];
+        enrich_top_hits(
+            &client,
+            DnsPolicy::AllowPrivate,
+            Some(&checker),
+            Some(&state),
+            "tokio",
+            &mut hits1,
+            Instant::now() + Duration::from_secs(3),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert!(hits1[0].content.as_deref().unwrap().contains("Tokio futures"));
+
+        // Now block only the redirect hop `/blocked-hop`; a canonicalized lookup (`/start?utm_source=b`)
+        // must re-check all cached hops and fail closed.
+        block_hop.store(true, Ordering::SeqCst);
+        let mut hits2 = vec![SearchHit {
+            url: format!("http://{addr}/start?utm_source=b"),
+            title: None,
+            published: None,
+            content: Some("short".into()),
+        }];
+        enrich_top_hits(
+            &client,
+            DnsPolicy::AllowPrivate,
+            Some(&checker),
+            Some(&state),
+            "tokio",
+            &mut hits2,
+            Instant::now() + Duration::from_secs(3),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(hits2[0].content.as_deref(), Some("short"));
     }
 }

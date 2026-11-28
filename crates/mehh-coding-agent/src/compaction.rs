@@ -79,6 +79,63 @@ pub fn estimate_context_tokens(messages: &[Message]) -> usize {
     messages.iter().map(estimate_message_tokens).sum()
 }
 
+/// Explicit context-budget inputs for proactive compaction so compaction logic
+/// does not depend on `AgentSession` or model-routing internals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextBudget {
+    pub context_window: u64,
+    pub overhead_tokens: usize,
+    pub auto_compact_enabled: bool,
+}
+
+/// Returns `Some(CompactionSettings)` when `context_messages` + `overhead_tokens`
+/// crosses the proactive compaction threshold for `budget`, else `None`.
+pub fn proactive_compaction_settings_for_budget(
+    context_messages: &[Message],
+    budget: ContextBudget,
+) -> Option<CompactionSettings> {
+    if !budget.auto_compact_enabled {
+        return None;
+    }
+    let comp_settings = CompactionSettings::for_context_window(budget.context_window, true);
+    let current_tokens = estimate_context_tokens(context_messages) + budget.overhead_tokens;
+    should_auto_compact(
+        current_tokens,
+        usize::try_from(budget.context_window).unwrap_or(usize::MAX),
+        &comp_settings,
+    )
+    .then_some(comp_settings)
+}
+
+/// Pure proactive compaction check using an explicit `ContextBudget`.
+pub fn prepare_proactive_compaction_for_budget(
+    active_entries: &[&SessionEntry],
+    context_messages: &[Message],
+    budget: ContextBudget,
+) -> Option<CompactionPreparation> {
+    let comp_settings = proactive_compaction_settings_for_budget(context_messages, budget)?;
+    prepare_compaction_refs(active_entries, comp_settings.keep_recent_tokens)
+}
+
+/// Pure context-overflow check for the latest assistant message against an explicit `context_window`.
+pub fn is_overflow_messages(
+    messages: &[Message],
+    context_window: u64,
+    auto_compact_enabled: bool,
+) -> bool {
+    if !auto_compact_enabled {
+        return false;
+    }
+    messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            Message::Assistant(ast) => Some(ast),
+            _ => None,
+        })
+        .is_some_and(|ast| mehh_ai::is_context_overflow(ast, context_window))
+}
+
 /// System prompt used for the summarization LLM call.
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = r#"You are a context summarization assistant. Your task is to read a conversation between a user and an AI assistant, then produce a structured summary following the exact format specified.
 
@@ -377,26 +434,25 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                 use std::fmt::Write;
                 let mut written_chars = 0usize;
                 let mut remaining = 0usize;
-                let mut any_text = false;
                 let mut header_written = false;
 
                 for b in &tr.content {
                     let mehh_ai::ToolResultContentBlock::Text(t) = b else {
                         continue;
                     };
-                    if any_text {
-                        if written_chars < TOOL_RESULT_MAX_CHARS {
-                            out.push('\n');
-                            written_chars += 1;
-                        } else {
-                            remaining += 1;
+                    if !header_written {
+                        if t.text.is_empty() {
+                            continue;
                         }
-                    } else if !t.text.is_empty() {
                         push_sep(&mut out);
                         out.push_str("[Tool result]: ");
                         header_written = true;
+                    } else if written_chars < TOOL_RESULT_MAX_CHARS {
+                        out.push('\n');
+                        written_chars += 1;
+                    } else {
+                        remaining += 1;
                     }
-                    any_text = true;
 
                     if written_chars >= TOOL_RESULT_MAX_CHARS {
                         remaining += t.text.chars().count();
@@ -1576,5 +1632,141 @@ mod tests {
             kept_tokens <= keep_recent + 1_000,
             "kept tokens ({kept_tokens}) should stay bounded near keep_recent ({keep_recent})"
         );
+    }
+
+    #[test]
+    fn serialize_conversation_preserves_tool_result_header_after_leading_empty_block() {
+        let messages = vec![
+            Message::User(UserMessage {
+                content: mehh_ai::UserContent::Text("hello".to_string()),
+                timestamp: now_ms(),
+            }),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "c1".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![
+                    mehh_ai::ToolResultContentBlock::Text(TextContent {
+                        text: String::new(),
+                        text_signature: None,
+                    }),
+                    mehh_ai::ToolResultContentBlock::Text(TextContent {
+                        text: "actual output".to_string(),
+                        text_signature: None,
+                    }),
+                ],
+                details: None,
+                is_error: false,
+                duration_ms: None,
+                usage: None,
+                timestamp: now_ms(),
+            }),
+            Message::ToolResult(ToolResultMessage {
+                tool_call_id: "c2".to_string(),
+                tool_name: "read".to_string(),
+                content: vec![
+                    mehh_ai::ToolResultContentBlock::Text(TextContent {
+                        text: String::new(),
+                        text_signature: None,
+                    }),
+                    mehh_ai::ToolResultContentBlock::Text(TextContent {
+                        text: "x".repeat(TOOL_RESULT_MAX_CHARS + 50),
+                        text_signature: None,
+                    }),
+                ],
+                details: None,
+                is_error: false,
+                duration_ms: None,
+                usage: None,
+                timestamp: now_ms(),
+            }),
+        ];
+
+        let serialized = serialize_conversation(&messages);
+        assert!(
+            serialized.contains("[User]: hello\n\n[Tool result]: actual output"),
+            "missing separator/header after leading empty text block: {serialized}"
+        );
+        assert!(
+            serialized.contains("[... 50 more characters truncated]"),
+            "missing truncation notice after leading empty text block: {serialized}"
+        );
+    }
+
+    #[test]
+    fn context_budget_proactive_and_overflow_helpers_work_purely() {
+        let m1 = Message::User(UserMessage {
+            content: mehh_ai::UserContent::Text("x".repeat(40_000)),
+            timestamp: now_ms(),
+        });
+        let m2 = Message::User(UserMessage {
+            content: mehh_ai::UserContent::Text("recent".to_string()),
+            timestamp: now_ms(),
+        });
+        let e1 = SessionEntry {
+            id: "e1".to_string(),
+            parent_id: None,
+            timestamp: "2026-01-01T00:00:00Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: m1.clone(),
+            },
+        };
+        let e2 = SessionEntry {
+            id: "e2".to_string(),
+            parent_id: Some("e1".to_string()),
+            timestamp: "2026-01-01T00:00:01Z".to_string(),
+            kind: SessionEntryKind::Message {
+                message: m2.clone(),
+            },
+        };
+        let entries = vec![&e1, &e2];
+        let msgs = vec![m1, m2];
+
+        assert!(prepare_proactive_compaction_for_budget(
+            &entries,
+            &msgs,
+            ContextBudget {
+                context_window: 10_000,
+                overhead_tokens: 500,
+                auto_compact_enabled: false,
+            },
+        )
+        .is_none());
+
+        assert!(prepare_proactive_compaction_for_budget(
+            &entries,
+            &msgs,
+            ContextBudget {
+                context_window: 10_000,
+                overhead_tokens: 500,
+                auto_compact_enabled: true,
+            },
+        )
+        .is_some());
+
+        let ast_over = Message::Assistant(mehh_ai::AssistantMessage {
+            content: Vec::new(),
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            model: "faux-1".to_string(),
+            response_id: None,
+            usage: mehh_ai::Usage {
+                input: 20_000,
+                ..Default::default()
+            },
+            stop_reason: StopReason::Stop,
+            error_message: None,
+            timestamp: now_ms(),
+        });
+        assert!(is_overflow_messages(
+            std::slice::from_ref(&ast_over),
+            16_000,
+            true
+        ));
+        assert!(!is_overflow_messages(
+            std::slice::from_ref(&ast_over),
+            16_000,
+            false
+        ));
+        assert!(!is_overflow_messages(&[ast_over], 200_000, true));
     }
 }

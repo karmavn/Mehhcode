@@ -48,10 +48,18 @@ fn render_and_mark_approval(
 }
 
 fn restore_terminal_best_effort() {
+    #[cfg(not(windows))]
     let _ = crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableMouseCapture,
         crossterm::event::DisableBracketedPaste,
+        crossterm::cursor::Show,
+        crossterm::terminal::LeaveAlternateScreen
+    );
+    #[cfg(windows)]
+    let _ = crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture,
         crossterm::cursor::Show,
         crossterm::terminal::LeaveAlternateScreen
     );
@@ -232,17 +240,37 @@ pub async fn run_interactive_mode(
     let reader_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let reader_stop_bg = reader_stop.clone();
     let reader_handle = std::thread::spawn(move || {
+        let mut paste_burst = PasteBurst::new();
         while !reader_stop_bg.load(Ordering::Relaxed) {
-            match crossterm::event::poll(Duration::from_millis(100)) {
+            let now = std::time::Instant::now();
+            for emitted in paste_burst.flush_if_due(now) {
+                if event_tx.blocking_send(emitted).is_err() {
+                    return;
+                }
+            }
+            let poll_timeout = paste_burst
+                .next_flush_deadline()
+                .map(|deadline| deadline.saturating_duration_since(now))
+                .unwrap_or_else(|| Duration::from_millis(100))
+                .min(Duration::from_millis(100));
+            match crossterm::event::poll(poll_timeout) {
                 Ok(true) => match crossterm::event::read() {
                     Ok(evt) => {
-                        if event_tx.blocking_send(evt).is_err() {
-                            break;
+                        for emitted in paste_burst.on_event(evt, std::time::Instant::now()) {
+                            if event_tx.blocking_send(emitted).is_err() {
+                                return;
+                            }
                         }
                     }
                     Err(_) => break,
                 },
-                Ok(false) => {}
+                Ok(false) => {
+                    for emitted in paste_burst.flush_if_due(std::time::Instant::now()) {
+                        if event_tx.blocking_send(emitted).is_err() {
+                            return;
+                        }
+                    }
+                }
                 Err(_) => break,
             }
         }

@@ -129,9 +129,11 @@ fn render_to_mock(
         .join("\n")
 }
 
-#[test]
-fn tui_renders_startup_and_conversation_turn_within_bounds() {
+#[tokio::test]
+async fn tui_renders_startup_and_conversation_turn_within_bounds() {
+    let _env_lock = ENV_LOCK.lock().await;
     let ws = TempWorkspace::new("startup_turn");
+    let _env = IsolatedEnvGuard::isolate(&ws.0.join("home"));
     let session = new_test_session(&ws.0);
     let mut state = InteractiveState::new(Vec::new(), &Settings::default());
     let editor = Editor::new().with_prefix("> ");
@@ -254,9 +256,11 @@ async fn tui_slash_commands_update_state_and_render_cleanly() {
     assert!(cleared.contains("mehh"));
 }
 
-#[test]
-fn tui_handles_resize_with_unicode_and_code_blocks() {
+#[tokio::test]
+async fn tui_handles_resize_with_unicode_and_code_blocks() {
+    let _env_lock = ENV_LOCK.lock().await;
     let ws = TempWorkspace::new("resize_unicode");
+    let _env = IsolatedEnvGuard::isolate(&ws.0.join("home"));
     let session = new_test_session(&ws.0);
     let mut state = InteractiveState::new(Vec::new(), &Settings::default());
     let editor = Editor::new().with_prefix("> ");
@@ -282,9 +286,11 @@ fn tui_handles_resize_with_unicode_and_code_blocks() {
     }
 }
 
-#[test]
-fn tui_renders_tool_execution_lifecycle_without_overflow() {
+#[tokio::test]
+async fn tui_renders_tool_execution_lifecycle_without_overflow() {
+    let _env_lock = ENV_LOCK.lock().await;
     let ws = TempWorkspace::new("tool_lifecycle");
+    let _env = IsolatedEnvGuard::isolate(&ws.0.join("home"));
     let session = new_test_session(&ws.0);
     let mut state = InteractiveState::new(Vec::new(), &Settings::default());
     let editor = Editor::new().with_prefix("> ");

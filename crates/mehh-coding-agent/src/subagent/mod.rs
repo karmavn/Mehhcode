@@ -60,6 +60,9 @@ pub struct SubagentTool {
     pub depth: usize,
     pub inspection_manager: Option<Arc<ToolInspectionManager>>,
     pub approval_handler: Option<Arc<dyn crate::tool_inspection::ApprovalHandler>>,
+    /// Live approval-handler slot shared with `AgentSession` so `set_approval_handler`
+    /// takes effect without rebuilding `SubagentTool`.
+    pub approval_handler_slot: Option<crate::tool_inspection::ApprovalHandlerSlot>,
     pub control: Option<Arc<SubagentControl>>,
     /// Optional Lead/Worker routing template; each child run clones its own state.
     pub lead_worker: Option<Arc<Mutex<LeadWorkerManager>>>,
@@ -90,6 +93,7 @@ impl SubagentTool {
             depth,
             inspection_manager: None,
             approval_handler: None,
+            approval_handler_slot: None,
             control: None,
             lead_worker: None,
             scratchpad: None,
@@ -121,6 +125,52 @@ impl SubagentTool {
     ) -> Self {
         self.approval_handler = handler;
         self
+    }
+
+    pub fn with_approval_handler_slot(
+        mut self,
+        slot: crate::tool_inspection::ApprovalHandlerSlot,
+    ) -> Self {
+        self.approval_handler_slot = Some(slot);
+        self
+    }
+
+    pub fn with_api_key_cache(
+        mut self,
+        cache: Arc<Mutex<HashMap<String, Option<String>>>>,
+    ) -> Self {
+        self.api_key_cache = cache;
+        self
+    }
+
+    fn initial_model_id(&self) -> String {
+        if let Some(ref lw) = self.lead_worker {
+            let m = mehh_ai::lock_recover(lw);
+            m.worker_model()
+                .map(|w| w.id.clone())
+                .unwrap_or_else(|| m.lead_model.id.clone())
+        } else {
+            self.model.id.clone()
+        }
+    }
+
+    fn clone_for_child(&self, depth: usize, scratchpad: Option<Scratchpad>) -> Self {
+        Self {
+            cwd: self.cwd.clone(),
+            model: self.model.clone(),
+            provider: self.provider.clone(),
+            api_key: self.api_key.clone(),
+            tools: self.tools.clone(),
+            depth,
+            inspection_manager: self.inspection_manager.clone(),
+            approval_handler: self.approval_handler.clone(),
+            approval_handler_slot: self.approval_handler_slot.clone(),
+            control: self.control.clone(),
+            lead_worker: self.lead_worker.clone(),
+            scratchpad,
+            timeout: self.timeout,
+            api_key_cache: self.api_key_cache.clone(),
+        }
     }
 
     pub fn with_control(mut self, control: Arc<SubagentControl>) -> Self {
@@ -259,21 +309,8 @@ impl SubagentTool {
                 if nested_depth >= MAX_SUBAGENT_DEPTH {
                     return None;
                 }
-                Some(Arc::new(SubagentTool {
-                    cwd: self.cwd.clone(),
-                    model: self.model.clone(),
-                    provider: self.provider.clone(),
-                    api_key: self.api_key.clone(),
-                    tools: self.tools.clone(),
-                    depth: nested_depth,
-                    inspection_manager: self.inspection_manager.clone(),
-                    approval_handler: self.approval_handler.clone(),
-                    control: self.control.clone(),
-                    lead_worker: self.lead_worker.clone(),
-                    scratchpad: self.scratchpad.clone(),
-                    timeout: self.timeout,
-                    api_key_cache: self.api_key_cache.clone(),
-                }) as Arc<dyn AgentTool>)
+                Some(Arc::new(self.clone_for_child(nested_depth, self.scratchpad.clone()))
+                    as Arc<dyn AgentTool>)
             })
             .collect()
     }
@@ -403,27 +440,13 @@ impl AgentTool for SubagentTool {
                     let mode_str = mode.to_string();
                     let custom_sys_owned = custom_sys.map(str::to_string);
                     let model_tier_owned = model_tier.map(str::to_string);
-                    let sub = Self {
-                        cwd: self.cwd.clone(),
-                        model: self.model.clone(),
-                        provider: self.provider.clone(),
-                        api_key: self.api_key.clone(),
-                        tools: self.tools.clone(),
-                        depth: self.depth + 1,
-                        inspection_manager: self.inspection_manager.clone(),
-                        approval_handler: self.approval_handler.clone(),
-                        control: self.control.clone(),
-                        lead_worker: self.lead_worker.clone(),
-                        scratchpad: Some(batch_pad.clone()),
-                        timeout: self.timeout,
-                        api_key_cache: self.api_key_cache.clone(),
-                    };
+                    let sub = self.clone_for_child(self.depth + 1, Some(batch_pad.clone()));
                     let task_agent_id = new_agent_id();
                     task_ids.push(task_agent_id.clone());
                     let mut task_manifest_for_task = new_manifest(
                         task_agent_id.clone(),
                         mode_str.clone(),
-                        self.model.id.clone(),
+                        self.initial_model_id(),
                         now_ms(),
                     );
                     child_manifests.push(task_manifest_for_task.clone());
@@ -633,21 +656,7 @@ impl AgentTool for SubagentTool {
             .filter(|s| !s.is_empty())
             .ok_or_else(|| "Missing required 'prompt' or 'tasks' parameter".to_string())?;
 
-        let child_sub = Self {
-            cwd: self.cwd.clone(),
-            model: self.model.clone(),
-            provider: self.provider.clone(),
-            api_key: self.api_key.clone(),
-            tools: self.tools.clone(),
-            depth: self.depth + 1,
-            inspection_manager: self.inspection_manager.clone(),
-            approval_handler: self.approval_handler.clone(),
-            control: self.control.clone(),
-            lead_worker: self.lead_worker.clone(),
-            scratchpad: self.scratchpad.clone(),
-            timeout: self.timeout,
-            api_key_cache: self.api_key_cache.clone(),
-        };
+        let child_sub = self.clone_for_child(self.depth + 1, self.scratchpad.clone());
 
         let control = self.control();
         let _permit = tokio::select! {
@@ -663,7 +672,7 @@ impl AgentTool for SubagentTool {
         let mut manifest = new_manifest(
             handle.agent_id.clone(),
             mode.to_string(),
-            self.model.id.clone(),
+            self.initial_model_id(),
             now_ms(),
         );
         // Shared event log: finalize copies it back into the manifest, and the

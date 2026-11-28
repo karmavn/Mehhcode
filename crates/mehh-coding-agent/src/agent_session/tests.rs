@@ -1715,3 +1715,660 @@ fn is_overflow_turn_uses_worker_context_window_for_worker_model() {
         "lead usage of 20k is well within lead 200k window"
     );
 }
+
+#[tokio::test]
+async fn codemode_defers_large_mcp_toolset_from_prompt_and_executes_inside_sandbox() {
+    let dir = crate::TempTestDir::new("codemode_defer_large");
+    let faux = Arc::new(FauxProvider::with_responses(vec![
+        mehh_ai::AssistantMessage {
+            content: vec![mehh_ai::AssistantContentBlock::ToolCall(mehh_ai::ToolCall {
+                id: "call_cm_1".to_string(),
+                name: "codemode".to_string(),
+                arguments: serde_json::json!({
+                    "code": "const found = await searchTools('tool_17'); const out = await tools.mcp__srv__tool_17({}); return { found: found.map(t => t.name), out };"
+                })
+                .as_object()
+                .unwrap()
+                .clone(),
+                arguments_error: None,
+                thought_signature: None,
+            })],
+            api: "faux".to_string(),
+            provider: "faux".to_string(),
+            model: "faux-model".to_string(),
+            response_id: None,
+            usage: mehh_ai::Usage::default(),
+            stop_reason: StopReason::ToolUse,
+            error_message: None,
+            timestamp: now_ms(),
+        },
+        mehh_ai::faux_assistant_message("completed via codemode"),
+    ]));
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        faux_model(),
+        faux.clone(),
+        SessionManager::in_memory(dir.path()),
+        Settings::default(),
+        true,
+    );
+
+    let mut mcp_tools: Vec<Arc<dyn AgentTool>> = (0..25)
+        .map(|i| {
+            Arc::new(MockTool {
+                name: format!("mcp__srv__tool_{i}"),
+            }) as Arc<dyn AgentTool>
+        })
+        .collect();
+    mcp_tools.push(Arc::new(MockTool {
+        name: "list_mcp_resources".to_string(),
+    }));
+
+    session.enable_mcp_and_codemode(mcp_tools, true);
+
+    assert!(session.deferred_catalog().is_none());
+    assert!(session.tools().iter().any(|t| t.name() == "codemode"));
+    assert!(session.tools().iter().any(|t| t.name() == "list_mcp_resources"));
+    assert!(
+        !session.tools().iter().any(|t| t.name().starts_with("mcp__")),
+        "large MCP toolsets must stay hidden from session.tools() when codemode is enabled"
+    );
+    assert!(
+        !session.tools().iter().any(|t| t.name() == "tool_search"),
+        "tool_search must not duplicate codemode discovery"
+    );
+    assert!(
+        !session.system_prompt.contains("mcp__srv__tool_"),
+        "system prompt must not enumerate deferred MCP tools when codemode is enabled"
+    );
+
+    // Execute a real prompt turn via FauxProvider and verify outbound request tool schemas omit mcp__* tools.
+    let turn_msgs = session.prompt("discover and call tool 17", None).await.unwrap();
+    let reqs = faux.recorded_requests();
+    assert_eq!(reqs.len(), 2);
+    for req in &reqs {
+        let sent_tools = req.context.tools.as_deref().unwrap_or(&[]);
+        assert!(sent_tools.iter().any(|t| t.name == "codemode"));
+        assert!(
+            !sent_tools.iter().any(|t| t.name.starts_with("mcp__")),
+            "outbound provider request must omit deferred MCP schemas"
+        );
+    }
+    let tool_result_text = turn_msgs
+        .iter()
+        .find_map(|m| match m {
+            Message::ToolResult(tr) => Some(
+                tr.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        mehh_ai::ToolResultContentBlock::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+            _ => None,
+        })
+        .expect("expected codemode tool result");
+    assert!(tool_result_text.contains("mcp__srv__tool_17"), "got: {tool_result_text}");
+    assert!(tool_result_text.contains("\"out\": \"ok\""), "got: {tool_result_text}");
+
+    let codemode = session.codemode_tool().expect("codemode tool must exist");
+    assert_eq!(
+        codemode
+            .tools()
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count(),
+        25
+    );
+
+    // Reloading settings/permissions and refreshing subagent/approval handlers must keep deferred tools inside codemode.
+    session.set_approval_handler(None);
+    session.reload().expect("reload succeeds");
+    assert!(
+        !session.tools().iter().any(|t| t.name().starts_with("mcp__")),
+        "reload must keep deferred MCP tools hidden from session.tools()"
+    );
+    let reloaded_cm = session.codemode_tool().expect("codemode survives reload");
+    assert_eq!(
+        reloaded_cm
+            .tools()
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count(),
+        25
+    );
+
+    let mut post_reload_args = serde_json::Map::new();
+    post_reload_args.insert(
+        "code".to_string(),
+        serde_json::json!("return await tools.mcp__srv__tool_17({});"),
+    );
+    let post_reload_res = reloaded_cm
+        .execute("cm_defer_2", post_reload_args, CancellationToken::new(), None)
+        .await
+        .expect("post-reload codemode execution succeeds");
+    let post_reload_text = match &post_reload_res.content[0] {
+        mehh_ai::ToolResultContentBlock::Text(t) => t.text.as_str(),
+        _ => "",
+    };
+    assert!(
+        post_reload_text.contains("Return value:") && post_reload_text.contains("\"ok\""),
+        "got: {post_reload_text}"
+    );
+}
+
+#[test]
+fn sync_mcp_tools_transitions_between_deferred_codemode_and_small_or_tool_search_sets() {
+    let dir = crate::TempTestDir::new("codemode_sync_transitions");
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        faux_model(),
+        Arc::new(FauxProvider::new()),
+        SessionManager::in_memory(dir.path()),
+        Settings::default(),
+        true,
+    );
+
+    let tools_25: Vec<Arc<dyn AgentTool>> = (0..25)
+        .map(|i| {
+            Arc::new(MockTool {
+                name: format!("mcp__srv__tool_{i}"),
+            }) as Arc<dyn AgentTool>
+        })
+        .collect();
+
+    // 1. Start with >20 tools without codemode -> tool_search active.
+    session.enable_mcp_and_codemode(tools_25.clone(), false);
+    assert!(session.deferred_catalog().is_some());
+    assert!(session.tools().iter().any(|t| t.name() == "tool_search"));
+
+    // 2. Sync to codemode -> tool_search cleared, >20 MCP tools stay hidden in codemode.
+    session.sync_mcp_tools(tools_25.clone(), true);
+    assert!(session.deferred_catalog().is_none());
+    assert!(!session.tools().iter().any(|t| t.name() == "tool_search"));
+    assert!(!session.tools().iter().any(|t| t.name().starts_with("mcp__")));
+    let cm_25 = session.codemode_tool().expect("codemode enabled");
+    assert_eq!(
+        cm_25
+            .tools()
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count(),
+        25
+    );
+
+    // 3. Re-sync with 22 tools preserves CodemodeTool Arc and drops removed tools.
+    let tools_22: Vec<Arc<dyn AgentTool>> = (0..22)
+        .map(|i| {
+            Arc::new(MockTool {
+                name: format!("mcp__srv__tool_{i}"),
+            }) as Arc<dyn AgentTool>
+        })
+        .collect();
+    session.sync_mcp_tools(tools_22, true);
+    let cm_22 = session.codemode_tool().expect("codemode still enabled");
+    assert!(Arc::ptr_eq(&cm_25, &cm_22));
+    assert_eq!(
+        cm_22
+            .tools()
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count(),
+        22
+    );
+
+    // 4. Sync down to 2 tools (<= threshold) clears old deferred tools and exposes small set eagerly.
+    let tools_2: Vec<Arc<dyn AgentTool>> = (0..2)
+        .map(|i| {
+            Arc::new(MockTool {
+                name: format!("mcp__small__tool_{i}"),
+            }) as Arc<dyn AgentTool>
+        })
+        .collect();
+    session.sync_mcp_tools(tools_2, true);
+    assert_eq!(
+        session
+            .tools()
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count(),
+        2
+    );
+    assert_eq!(
+        cm_22
+            .tools()
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count(),
+        2
+    );
+    assert!(
+        !cm_22
+            .tools()
+            .iter()
+            .any(|t| t.name().starts_with("mcp__srv__")),
+        "stale deferred tools must be cleared when syncing down"
+    );
+
+    // 5. Sync back up to 25 tools with codemode=false -> restores tool_search and clears codemode.
+    session.sync_mcp_tools(tools_25, false);
+    assert!(session.codemode_tool().is_none());
+    assert!(session.deferred_catalog().is_some());
+    assert!(session.tools().iter().any(|t| t.name() == "tool_search"));
+    assert!(!session.tools().iter().any(|t| t.name().starts_with("mcp__")));
+}
+
+#[test]
+fn codemode_deferral_threshold_boundary_and_repeated_enable_idempotency() {
+    let dir = crate::TempTestDir::new("codemode_threshold_boundary");
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        faux_model(),
+        Arc::new(FauxProvider::new()),
+        SessionManager::in_memory(dir.path()),
+        Settings::default(),
+        true,
+    );
+
+    // Exactly 20 mcp__* tools (+1 resource meta-tool) stays eager.
+    let mut tools_20: Vec<Arc<dyn AgentTool>> = (0..DEFERRED_MCP_TOOL_THRESHOLD)
+        .map(|i| {
+            Arc::new(MockTool {
+                name: format!("mcp__srv__t_{i}"),
+            }) as Arc<dyn AgentTool>
+        })
+        .collect();
+    tools_20.push(Arc::new(MockTool {
+        name: "list_mcp_resources".to_string(),
+    }));
+    session.enable_mcp_and_codemode(tools_20, true);
+    assert_eq!(
+        session
+            .tools()
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count(),
+        DEFERRED_MCP_TOOL_THRESHOLD
+    );
+    assert_eq!(session.codemode_deferred_tool_count(), 0);
+
+    // Growing to 21 mcp__* tools via enable_mcp_and_codemode strips prior tools (no duplicates) and defers all 21.
+    let mut tools_21: Vec<Arc<dyn AgentTool>> = (0..=DEFERRED_MCP_TOOL_THRESHOLD)
+        .map(|i| {
+            Arc::new(MockTool {
+                name: format!("mcp__srv__t_{i}"),
+            }) as Arc<dyn AgentTool>
+        })
+        .collect();
+    tools_21.push(Arc::new(MockTool {
+        name: "list_mcp_resources".to_string(),
+    }));
+    session.enable_mcp_and_codemode(tools_21, true);
+    assert_eq!(
+        session
+            .tools()
+            .iter()
+            .filter(|t| t.name() == "list_mcp_resources")
+            .count(),
+        1
+    );
+    assert_eq!(
+        session
+            .tools()
+            .iter()
+            .filter(|t| t.name() == "codemode")
+            .count(),
+        1
+    );
+    assert_eq!(
+        session
+            .tools()
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count(),
+        0
+    );
+    assert_eq!(
+        session.codemode_deferred_tool_count(),
+        DEFERRED_MCP_TOOL_THRESHOLD + 1
+    );
+
+    // Matches bootstrap.rs sequence: set_subagent_with_child_tools followed by reload() preserves deferred tools.
+    let child_tools: Vec<Arc<dyn AgentTool>> = session
+        .tools()
+        .iter()
+        .filter(|t| t.name() != "subagent" && t.name() != "codemode")
+        .cloned()
+        .collect();
+    session.set_subagent_with_child_tools(child_tools);
+    session.reload().expect("reload succeeds");
+    assert_eq!(
+        session
+            .codemode_tool()
+            .expect("codemode survives")
+            .tools()
+            .iter()
+            .filter(|t| t.name().starts_with("mcp__"))
+            .count(),
+        DEFERRED_MCP_TOOL_THRESHOLD + 1
+    );
+}
+
+#[test]
+fn set_tools_omitting_codemode_clears_handle_so_reload_does_not_resurrect_it() {
+    let dir = crate::TempTestDir::new("codemode_set_tools_reload");
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        faux_model(),
+        Arc::new(FauxProvider::new()),
+        SessionManager::in_memory(dir.path()),
+        Settings::default(),
+        true,
+    );
+
+    let tools_25: Vec<Arc<dyn AgentTool>> = (0..25)
+        .map(|i| {
+            Arc::new(MockTool {
+                name: format!("mcp__srv__tool_{i}"),
+            }) as Arc<dyn AgentTool>
+        })
+        .collect();
+    session.enable_mcp_and_codemode(tools_25, true);
+    assert!(session.codemode_tool().is_some());
+
+    // Restricting active tools without codemode must clear codemode_tool and keep it gone across reload.
+    session.set_tools(vec![Arc::new(MockTool {
+        name: "read".to_string(),
+    })]);
+    assert!(session.codemode_tool().is_none());
+    assert_eq!(session.codemode_deferred_tool_count(), 0);
+
+    session.reload().expect("reload succeeds");
+    assert!(
+        !session.tools().iter().any(|t| t.name() == "codemode"),
+        "reload must not resurrect codemode after set_tools omitted it"
+    );
+    assert!(session.codemode_tool().is_none());
+}
+
+#[tokio::test]
+async fn reload_preserves_inspection_manager_arc_and_codemode_kv_store() {
+    let _env_lock = crate::ENV_MUTEX.lock().await;
+    struct EnvGuard {
+        userprofile: Option<std::ffi::OsString>,
+        home: Option<std::ffi::OsString>,
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.userprofile {
+                Some(v) => std::env::set_var("USERPROFILE", v),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            match &self.home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+    let _guard = EnvGuard {
+        userprofile: std::env::var_os("USERPROFILE"),
+        home: std::env::var_os("HOME"),
+    };
+
+    let dir = crate::TempTestDir::new("reload_preserves_handles");
+    std::env::set_var("USERPROFILE", dir.path());
+    std::env::set_var("HOME", dir.path());
+
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        faux_model(),
+        Arc::new(FauxProvider::new()),
+        SessionManager::in_memory(dir.path()),
+        Settings::default(),
+        true,
+    );
+    session.enable_mcp_and_codemode(Vec::new(), true);
+
+    let before_mgr = Arc::clone(&session.inspection_manager);
+    let before_cm = session.codemode_tool().expect("codemode must be enabled");
+    before_cm
+        .kv_store()
+        .lock()
+        .unwrap()
+        .insert("persisted_key".to_string(), serde_json::json!("kept_across_reload"));
+
+    assert!(
+        before_mgr
+            .check_url_not_denied("https://blocked.example/secret")
+            .await
+            .is_ok(),
+        "URL should be allowed before permissions.json rule is added"
+    );
+
+    let mehh_dir = dir.path().join(".mehh");
+    std::fs::create_dir_all(&mehh_dir).unwrap();
+    std::fs::write(
+        mehh_dir.join("permissions.json"),
+        serde_json::json!({
+            "rules": [{
+                "tool_name": "web_fetch",
+                "arg_prefix": "https://blocked.example",
+                "action": "never_allow"
+            }]
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    session.reload().expect("reload succeeds");
+
+    assert!(
+        Arc::ptr_eq(&before_mgr, &session.inspection_manager),
+        "reload must update ToolInspectionManager in-place instead of replacing its Arc"
+    );
+    assert!(
+        before_mgr
+            .check_url_not_denied("https://blocked.example/secret")
+            .await
+            .is_err(),
+        "existing ToolInspectionManager handle must enforce reloaded permissions.json rules"
+    );
+
+    let after_cm = session.codemode_tool().expect("codemode must survive reload");
+    assert!(
+        Arc::ptr_eq(&before_cm, &after_cm),
+        "reload must preserve CodemodeTool identity"
+    );
+    assert_eq!(
+        after_cm.kv_store().lock().unwrap().get("persisted_key"),
+        Some(&serde_json::json!("kept_across_reload")),
+        "reload must preserve codemode kv_store entries"
+    );
+}
+
+#[tokio::test]
+async fn set_approval_handler_and_set_model_take_effect_in_existing_subagent_without_rebuilding() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingApproveHandler {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool_inspection::ApprovalHandler for CountingApproveHandler {
+        async fn request_approval(
+            &self,
+            _ctx: &crate::tool_inspection::ToolInspectionContext,
+            _reason: &str,
+            _preview: Option<&str>,
+        ) -> bool {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            true
+        }
+    }
+
+    let dir = crate::TempTestDir::new("live_subagent_state");
+    std::fs::write(dir.path().join("note.txt"), "hello").unwrap();
+
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        faux_model(),
+        Arc::new(FauxProvider::new()),
+        SessionManager::in_memory(dir.path()),
+        Settings {
+            permission_mode: Some(crate::tool_inspection::PermissionMode::Approve),
+            ..Default::default()
+        },
+        false,
+    );
+
+    let before_sub = Arc::clone(
+        session
+            .tools()
+            .iter()
+            .find(|t| t.name() == "subagent")
+            .expect("subagent tool must exist"),
+    );
+
+    let handler = Arc::new(CountingApproveHandler {
+        calls: AtomicUsize::new(0),
+    });
+    session.set_approval_handler(Some(handler.clone()));
+
+    let mut next_model = faux_model();
+    next_model.id = "faux-updated".to_string();
+    let next_provider = Arc::new(FauxProvider::new());
+    next_provider.add_response(mehh_ai::faux_tool_call_message(vec![
+        mehh_ai::faux_tool_call(
+            "c_read",
+            "read",
+            serde_json::json!({ "path": "note.txt" }),
+        ),
+    ]));
+    next_provider.add_response(mehh_ai::faux_assistant_message("subagent_live_ok"));
+    session.set_model(next_model, next_provider.clone());
+
+    let after_sub = session
+        .tools()
+        .iter()
+        .find(|t| t.name() == "subagent")
+        .expect("subagent tool must still exist");
+    assert!(
+        Arc::ptr_eq(&before_sub, after_sub),
+        "set_approval_handler and set_model must not rebuild SubagentTool"
+    );
+
+    let mut params = serde_json::Map::new();
+    params.insert("prompt".to_string(), serde_json::json!("read note.txt"));
+    params.insert("mode".to_string(), serde_json::json!("research"));
+    let res = before_sub
+        .execute("tc_live", params, CancellationToken::new(), None)
+        .await
+        .expect("subagent execution succeeds");
+    assert_ne!(res.is_error, Some(true));
+    assert_eq!(
+        handler.calls.load(Ordering::SeqCst),
+        1,
+        "live approval_handler_slot must be observed by existing SubagentTool"
+    );
+    assert_eq!(
+        next_provider.recorded_requests().len(),
+        2,
+        "new provider set via set_model must be used by existing SubagentTool"
+    );
+}
+
+#[test]
+fn clear_provider_api_keys_evicts_cache_only_subagent_credential() {
+    let dir = crate::TempTestDir::new("clear_cache_only_key");
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        faux_model(),
+        Arc::new(FauxProvider::new()),
+        SessionManager::in_memory(dir.path()),
+        Settings::default(),
+        false,
+    );
+    mehh_ai::lock_recover(&session.subagent_api_key_cache)
+        .insert("openai".to_string(), Some("stale-sub-key".to_string()));
+
+    assert!(
+        session.clear_provider_api_keys("OpenAI"),
+        "evicting a cached subagent credential must report cleared = true"
+    );
+    assert!(
+        !mehh_ai::lock_recover(&session.subagent_api_key_cache).contains_key("openai"),
+        "subagent_api_key_cache must be evicted even when primary session key was unset"
+    );
+}
+
+#[tokio::test]
+async fn worker_repetition_block_escalates_to_lead_via_typed_detail() {
+    let dir = crate::TempTestDir::new("worker_rep_escalate");
+    std::fs::write(dir.path().join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+
+    let mut lead = faux_model();
+    lead.id = "lead-model".to_string();
+    lead.provider = "faux".to_string();
+    let mut worker = faux_model();
+    worker.id = "worker-model".to_string();
+    worker.provider = "faux".to_string();
+
+    let lead_provider = Arc::new(FauxProvider::with_responses(vec![
+        mehh_ai::faux_assistant_message("lead rescued after repetition"),
+    ]));
+    let worker_provider = Arc::new(FauxProvider::with_responses(vec![
+        mehh_ai::faux_tool_call_message(vec![mehh_ai::faux_tool_call(
+            "r1",
+            "read",
+            serde_json::json!({ "path": "Cargo.toml" }),
+        )]),
+        mehh_ai::faux_tool_call_message(vec![mehh_ai::faux_tool_call(
+            "r2",
+            "read",
+            serde_json::json!({ "path": "Cargo.toml" }),
+        )]),
+        mehh_ai::faux_tool_call_message(vec![mehh_ai::faux_tool_call(
+            "r3",
+            "read",
+            serde_json::json!({ "path": "Cargo.toml" }),
+        )]),
+        mehh_ai::faux_tool_call_message(vec![mehh_ai::faux_tool_call(
+            "r4",
+            "read",
+            serde_json::json!({ "path": "Cargo.toml" }),
+        )]),
+    ]));
+
+    let mut session = AgentSession::new_with_trust(
+        dir.path().to_path_buf(),
+        lead.clone(),
+        lead_provider.clone(),
+        SessionManager::in_memory(dir.path()),
+        Settings {
+            permission_mode: Some(crate::tool_inspection::PermissionMode::Auto),
+            ..Default::default()
+        },
+        false,
+    );
+    {
+        let mut lw = mehh_ai::lock_recover(&session.lead_worker);
+        lw.worker_model = Some(worker);
+        lw.worker_provider = Some(worker_provider.clone());
+        lw.lead_turns = 0;
+    }
+
+    let msgs = session.prompt("inspect Cargo.toml", None).await.unwrap();
+    assert_eq!(worker_provider.recorded_requests().len(), 4);
+    assert_eq!(
+        lead_provider.recorded_requests().len(),
+        1,
+        "4th identical read blocked by RepetitionInspector must escalate turn 5 to Lead"
+    );
+    assert!(msgs.iter().any(|m| match m {
+        Message::ToolResult(tr) => crate::tool_inspection::is_repetition_block_result(tr),
+        _ => false,
+    }));
+}
