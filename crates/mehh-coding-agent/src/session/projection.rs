@@ -360,8 +360,8 @@ fn clean_orphaned_tool_pairs(
     messages: &mut Vec<Message>,
     edited_removed_result_ids: &HashSet<String>,
 ) {
-    let mut present_call_ids: HashSet<String> = HashSet::new();
-    let mut present_result_ids: HashSet<String> = HashSet::new();
+    let mut present_call_ids: HashSet<String> = HashSet::with_capacity(messages.len());
+    let mut present_result_ids: HashSet<String> = HashSet::with_capacity(messages.len());
 
     for msg in messages.iter() {
         match msg {
@@ -396,16 +396,20 @@ fn clean_orphaned_tool_pairs(
 }
 
 fn truncate_chars(s: &str, max_chars: usize, keep_chars: usize) -> Option<&str> {
-    let mut iter = s.char_indices();
-    if iter.nth(max_chars).is_some() {
-        let byte_end = s
-            .char_indices()
-            .nth(keep_chars)
-            .map_or(s.len(), |(idx, _)| idx);
-        Some(&s[..byte_end])
-    } else {
-        None
+    if s.len() <= max_chars {
+        return None;
     }
+    let mut keep_byte_end: Option<usize> = (keep_chars == 0).then_some(0);
+    for (count, (idx, _)) in s.char_indices().enumerate() {
+        if count == keep_chars {
+            keep_byte_end = Some(idx);
+        }
+        if count == max_chars {
+            let end = keep_byte_end.unwrap_or(s.len());
+            return s.get(..end);
+        }
+    }
+    None
 }
 
 fn entry_to_label(entry: &SessionEntry) -> String {

@@ -18,13 +18,13 @@ pub(super) const MAX_QUEUED_OUTBOUND_EVENTS: usize = 1024;
 
 /// Serializes and sends JSONL responses and events to the writer.
 pub(super) struct RpcOutput<W> {
-    writer: Arc<Mutex<W>>,
+    inner: Arc<Mutex<(W, Vec<u8>)>>,
 }
 
 impl<W> Clone for RpcOutput<W> {
     fn clone(&self) -> Self {
         Self {
-            writer: Arc::clone(&self.writer),
+            inner: Arc::clone(&self.inner),
         }
     }
 }
@@ -32,16 +32,29 @@ impl<W> Clone for RpcOutput<W> {
 impl<W: AsyncWrite + Unpin + Send + 'static> RpcOutput<W> {
     pub(super) fn new(writer: W) -> Self {
         Self {
-            writer: Arc::new(Mutex::new(writer)),
+            inner: Arc::new(Mutex::new((writer, Vec::with_capacity(512)))),
         }
     }
 
     pub(super) async fn send_raw(&self, val: &serde_json::Value) -> Result<()> {
-        let mut line = serde_json::to_string(val)?;
-        line.push('\n');
-        let mut lock = self.writer.lock().await;
-        lock.write_all(line.as_bytes()).await?;
-        lock.flush().await?;
+        let mut lock = self.inner.lock().await;
+        let (writer, buf) = &mut *lock;
+        buf.clear();
+        serde_json::to_writer(&mut *buf, val)?;
+        buf.push(b'\n');
+        writer.write_all(buf).await?;
+        writer.flush().await?;
+        Ok(())
+    }
+
+    pub(super) async fn send_event(&self, event: &AgentEvent) -> Result<()> {
+        let mut lock = self.inner.lock().await;
+        let (writer, buf) = &mut *lock;
+        buf.clear();
+        write_rpc_event_json(buf, event)?;
+        buf.push(b'\n');
+        writer.write_all(buf).await?;
+        writer.flush().await?;
         Ok(())
     }
 
@@ -96,6 +109,195 @@ impl<W: AsyncWrite + Unpin + Send + 'static> RpcOutput<W> {
         );
         self.send_raw(&serde_json::Value::Object(obj)).await
     }
+}
+
+#[derive(serde::Serialize)]
+struct RpcMessageUpdateBorrowed<E> {
+    #[serde(rename = "assistantMessageEvent")]
+    assistant_message_event: E,
+    #[serde(rename = "type")]
+    r#type: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct RpcStartBorrowed {
+    #[serde(rename = "type")]
+    r#type: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct RpcIndexTypeBorrowed {
+    #[serde(rename = "contentIndex")]
+    content_index: usize,
+    #[serde(rename = "type")]
+    r#type: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct RpcDeltaBorrowed<'a> {
+    #[serde(rename = "contentIndex")]
+    content_index: usize,
+    delta: &'a str,
+    #[serde(rename = "type")]
+    r#type: &'static str,
+}
+
+#[derive(serde::Serialize)]
+struct RpcEndBorrowed<'a> {
+    content: &'a str,
+    #[serde(rename = "contentIndex")]
+    content_index: usize,
+    #[serde(rename = "type")]
+    r#type: &'static str,
+}
+
+/// Serializes an `AgentEvent` directly into `buf` for RPC JSONL output, bypassing
+/// intermediate `serde_json::Value` allocations for hot streaming delta events while
+/// matching `format_rpc_event(event)` byte-for-byte.
+pub(super) fn write_rpc_event_json(buf: &mut Vec<u8>, event: &AgentEvent) -> serde_json::Result<()> {
+    if let AgentEvent::MessageUpdate {
+        assistant_message_event,
+        ..
+    } = event
+    {
+        use mehh_ai::AssistantMessageEvent;
+        match assistant_message_event {
+            AssistantMessageEvent::Start { .. } => {
+                return serde_json::to_writer(
+                    buf,
+                    &RpcMessageUpdateBorrowed {
+                        assistant_message_event: RpcStartBorrowed { r#type: "start" },
+                        r#type: "message_update",
+                    },
+                );
+            }
+            AssistantMessageEvent::TextStart { content_index, .. } => {
+                return serde_json::to_writer(
+                    buf,
+                    &RpcMessageUpdateBorrowed {
+                        assistant_message_event: RpcIndexTypeBorrowed {
+                            content_index: *content_index,
+                            r#type: "text_start",
+                        },
+                        r#type: "message_update",
+                    },
+                );
+            }
+            AssistantMessageEvent::TextDelta {
+                content_index,
+                delta,
+                ..
+            } => {
+                return serde_json::to_writer(
+                    buf,
+                    &RpcMessageUpdateBorrowed {
+                        assistant_message_event: RpcDeltaBorrowed {
+                            content_index: *content_index,
+                            delta,
+                            r#type: "text_delta",
+                        },
+                        r#type: "message_update",
+                    },
+                );
+            }
+            AssistantMessageEvent::TextEnd {
+                content_index,
+                content,
+                ..
+            } => {
+                return serde_json::to_writer(
+                    buf,
+                    &RpcMessageUpdateBorrowed {
+                        assistant_message_event: RpcEndBorrowed {
+                            content,
+                            content_index: *content_index,
+                            r#type: "text_end",
+                        },
+                        r#type: "message_update",
+                    },
+                );
+            }
+            AssistantMessageEvent::ThinkingStart { content_index, .. } => {
+                return serde_json::to_writer(
+                    buf,
+                    &RpcMessageUpdateBorrowed {
+                        assistant_message_event: RpcIndexTypeBorrowed {
+                            content_index: *content_index,
+                            r#type: "thinking_start",
+                        },
+                        r#type: "message_update",
+                    },
+                );
+            }
+            AssistantMessageEvent::ThinkingDelta {
+                content_index,
+                delta,
+                ..
+            } => {
+                return serde_json::to_writer(
+                    buf,
+                    &RpcMessageUpdateBorrowed {
+                        assistant_message_event: RpcDeltaBorrowed {
+                            content_index: *content_index,
+                            delta,
+                            r#type: "thinking_delta",
+                        },
+                        r#type: "message_update",
+                    },
+                );
+            }
+            AssistantMessageEvent::ThinkingEnd {
+                content_index,
+                content,
+                ..
+            } => {
+                return serde_json::to_writer(
+                    buf,
+                    &RpcMessageUpdateBorrowed {
+                        assistant_message_event: RpcEndBorrowed {
+                            content,
+                            content_index: *content_index,
+                            r#type: "thinking_end",
+                        },
+                        r#type: "message_update",
+                    },
+                );
+            }
+            AssistantMessageEvent::ToolCallStart { content_index, .. } => {
+                return serde_json::to_writer(
+                    buf,
+                    &RpcMessageUpdateBorrowed {
+                        assistant_message_event: RpcIndexTypeBorrowed {
+                            content_index: *content_index,
+                            r#type: "toolcall_start",
+                        },
+                        r#type: "message_update",
+                    },
+                );
+            }
+            AssistantMessageEvent::ToolCallDelta {
+                content_index,
+                delta,
+                ..
+            } => {
+                return serde_json::to_writer(
+                    buf,
+                    &RpcMessageUpdateBorrowed {
+                        assistant_message_event: RpcDeltaBorrowed {
+                            content_index: *content_index,
+                            delta,
+                            r#type: "toolcall_delta",
+                        },
+                        r#type: "message_update",
+                    },
+                );
+            }
+            AssistantMessageEvent::ToolCallEnd { .. }
+            | AssistantMessageEvent::Done { .. }
+            | AssistantMessageEvent::Error { .. } => {}
+        }
+    }
+    serde_json::to_writer(buf, &format_rpc_event(event))
 }
 
 /// Converts an `AgentEvent` into a wire JSON object, stripping the cumulative

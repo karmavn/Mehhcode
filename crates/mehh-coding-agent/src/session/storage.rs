@@ -24,8 +24,13 @@ pub fn session_dir_for_cwd(cwd: &Path) -> Result<PathBuf> {
     let mut hasher = Sha256::new();
     hasher.update(norm_cwd_str.as_bytes());
     let hash_bytes = hasher.finalize();
-    let hex_str = format!("{:x}", hash_bytes);
-    let cwd_hash = &hex_str[..16];
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut cwd_hash_buf = [0u8; 16];
+    for (idx, &b) in hash_bytes.iter().take(8).enumerate() {
+        cwd_hash_buf[idx * 2] = HEX[(b >> 4) as usize];
+        cwd_hash_buf[idx * 2 + 1] = HEX[(b & 0x0f) as usize];
+    }
+    let cwd_hash = std::str::from_utf8(&cwd_hash_buf).unwrap_or("0000000000000000");
 
     let home = crate::user_home_dir()
         .ok_or_else(|| anyhow!("Failed to determine user home directory"))?;
@@ -259,9 +264,9 @@ pub fn export_session(input_file: &Path, output_file: Option<&Path>, cwd: &Path)
 
     // Both stdout paths share the same serialization, including the final
     // branch selection, so reopening the output restores the active leaf.
-    let content = sm.export_content()?;
+    let content = sm.export_bytes()?;
     let mut stdout = std::io::stdout().lock();
-    stdout.write_all(content.as_bytes())?;
+    stdout.write_all(&content)?;
     std::io::Write::flush(&mut stdout)?;
     Ok(())
 }
@@ -605,30 +610,30 @@ impl SessionManager {
         }
     }
 
-    /// Serializes the header, every entry, and the active leaf as JSONL text.
+    /// Serializes the header, every entry, and the active leaf as JSONL bytes.
     /// The trailing branch-selection line is required when the leaf is not the
     /// last stored entry; `open_file` otherwise restores that newer entry.
-    fn export_content(&self) -> Result<String> {
-        let mut content = String::new();
-        content.push_str(&serde_json::to_string(&self.header)?);
-        content.push('\n');
+    fn export_bytes(&self) -> Result<Vec<u8>> {
+        let mut buf = Vec::with_capacity(self.entries.len().saturating_mul(256).saturating_add(256));
+        serde_json::to_writer(&mut buf, &self.header)?;
+        buf.push(b'\n');
         for entry in &self.entries {
-            content.push_str(&serde_json::to_string(entry)?);
-            content.push('\n');
+            serde_json::to_writer(&mut buf, entry)?;
+            buf.push(b'\n');
         }
         if let Some(leaf_id) = &self.leaf_id {
             if self.entries.last().map(|e| e.id.as_str()) != Some(leaf_id.as_str()) {
-                content.push_str(&serde_json::to_string(&PersistedBranchSelection::new(leaf_id))?);
-                content.push('\n');
+                serde_json::to_writer(&mut buf, &PersistedBranchSelection::new(leaf_id))?;
+                buf.push(b'\n');
             }
         }
-        Ok(content)
+        Ok(buf)
     }
 
     /// Exports the entire session as a JSONL file to `output_path`.
     pub fn export_jsonl(&self, output_path: &Path) -> Result<()> {
-        let content = self.export_content()?;
-        crate::settings::write_file_atomic(output_path, content.as_bytes(), true)
+        let content = self.export_bytes()?;
+        crate::settings::write_file_atomic(output_path, &content, true)
     }
 
     /// Creates a default file-backed session manager for the given working directory.
@@ -652,8 +657,10 @@ impl SessionManager {
             let new_filename = format!("{ts}_{id}.jsonl");
             let new_path = parent.join(new_filename);
 
-            let header_line = format!("{}\n", serde_json::to_string(&new_header)?);
-            crate::settings::write_file_atomic(&new_path, header_line.as_bytes(), true)
+            let mut header_buf = Vec::with_capacity(256);
+            serde_json::to_writer(&mut header_buf, &new_header)?;
+            header_buf.push(b'\n');
+            crate::settings::write_file_atomic(&new_path, &header_buf, true)
                 .with_context(|| {
                     format!("Failed to create new session file: {}", new_path.display())
                 })?;
@@ -700,20 +707,21 @@ impl SessionManager {
             parent_session,
         };
 
-        let mut content = serde_json::to_string(&new_header)?;
-        content.push('\n');
+        let mut content = Vec::with_capacity(path_indices.len().saturating_mul(256).saturating_add(256));
+        serde_json::to_writer(&mut content, &new_header)?;
+        content.push(b'\n');
 
-        let mut entries = Vec::new();
-        let mut by_id = HashMap::new();
+        let mut entries = Vec::with_capacity(path_indices.len());
+        let mut by_id = HashMap::with_capacity(path_indices.len());
 
         for &idx in &path_indices {
             let entry = self.entries[idx].clone();
-            content.push_str(&serde_json::to_string(&entry)?);
-            content.push('\n');
+            serde_json::to_writer(&mut content, &entry)?;
+            content.push(b'\n');
             by_id.insert(entry.id.clone(), entries.len());
             entries.push(entry);
         }
-        crate::settings::write_file_atomic(&new_session_path, content.as_bytes(), true)
+        crate::settings::write_file_atomic(&new_session_path, &content, true)
             .with_context(|| {
                 format!(
                     "Failed to create forked session file: {}",
@@ -750,20 +758,21 @@ impl SessionManager {
             parent_session: None,
         };
 
-        let mut content = serde_json::to_string(&new_header)?;
-        content.push('\n');
+        let mut content = Vec::with_capacity(path_indices.len().saturating_mul(256).saturating_add(256));
+        serde_json::to_writer(&mut content, &new_header)?;
+        content.push(b'\n');
 
-        let mut entries = Vec::new();
-        let mut by_id = HashMap::new();
+        let mut entries = Vec::with_capacity(path_indices.len());
+        let mut by_id = HashMap::with_capacity(path_indices.len());
 
         for &idx in &path_indices {
             let entry = self.entries[idx].clone();
-            content.push_str(&serde_json::to_string(&entry)?);
-            content.push('\n');
+            serde_json::to_writer(&mut content, &entry)?;
+            content.push(b'\n');
             by_id.insert(entry.id.clone(), entries.len());
             entries.push(entry);
         }
-        crate::settings::write_file_atomic(&new_session_path, content.as_bytes(), true)
+        crate::settings::write_file_atomic(&new_session_path, &content, true)
             .with_context(|| {
                 format!(
                     "Failed to create cloned session file: {}",

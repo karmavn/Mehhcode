@@ -125,8 +125,7 @@ where
 
                 let drain_handle = tokio::spawn(async move {
                     while let Some(ev) = event_rx.recv().await {
-                        let json_val = format_rpc_event(&ev);
-                        if out_clone.send_raw(&json_val).await.is_err() {
+                        if out_clone.send_event(&ev).await.is_err() {
                             break;
                         }
                     }

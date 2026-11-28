@@ -95,29 +95,35 @@ pub struct AtFileQuery {
 /// Extracts an active `@file` completion query ending at `cursor_col` (char index) on `line`.
 /// Returns `None` when `@` is mid-word (e.g. an email address `user@example.com`).
 pub fn extract_at_query(line: &str, cursor_col: usize) -> Option<AtFileQuery> {
-    let chars: Vec<char> = line.chars().take(cursor_col).collect();
-    let mut i = chars.len();
-    while i > 0 {
-        let c = chars[i - 1];
-        if c == '@' {
-            let at_idx = i - 1;
-            let boundary_ok =
-                at_idx == 0 || matches!(chars[at_idx - 1], ' ' | '\t' | '(' | '[' | '"' | '\'');
-            if !boundary_ok {
-                return None;
-            }
-            let query: String = chars[i..].iter().collect();
-            return Some(AtFileQuery {
-                replace_start: at_idx,
-                query,
-            });
-        }
-        if c.is_whitespace() {
-            return None;
-        }
-        i -= 1;
+    if cursor_col == 0 || !line.contains('@') {
+        return None;
     }
-    None
+
+    let mut prev_ch: Option<char> = None;
+    let mut last_at: Option<(usize, usize, bool)> = None;
+    let mut cursor_byte_end = 0usize;
+
+    for (char_idx, (byte_idx, ch)) in line.char_indices().take(cursor_col).enumerate() {
+        cursor_byte_end = byte_idx + ch.len_utf8();
+        if ch == '@' {
+            let boundary_ok =
+                char_idx == 0 || matches!(prev_ch, Some(' ' | '\t' | '(' | '[' | '"' | '\''));
+            last_at = Some((char_idx, cursor_byte_end, boundary_ok));
+        } else if ch.is_whitespace() {
+            last_at = None;
+        }
+        prev_ch = Some(ch);
+    }
+
+    let (at_idx, query_start_byte, boundary_ok) = last_at?;
+    if !boundary_ok {
+        return None;
+    }
+    let query = line.get(query_start_byte..cursor_byte_end)?.to_string();
+    Some(AtFileQuery {
+        replace_start: at_idx,
+        query,
+    })
 }
 
 /// Completes workspace-relative file paths matching `prefix`, honoring `.gitignore` and skipping `.git`.
@@ -215,6 +221,17 @@ mod tests {
             Some(AtFileQuery {
                 replace_start: 4,
                 query: "tệp".to_string(),
+            })
+        );
+        // No '@' fast path, trailing whitespace, mid-token double '@'
+        assert_eq!(extract_at_query("plain code line", 10), None);
+        assert_eq!(extract_at_query("@src ", 5), None);
+        assert_eq!(extract_at_query("@foo@bar", 8), None);
+        assert_eq!(
+            extract_at_query("mail user@host.com @src", 23),
+            Some(AtFileQuery {
+                replace_start: 19,
+                query: "src".to_string(),
             })
         );
     }

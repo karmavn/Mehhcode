@@ -149,8 +149,8 @@ impl AgentTool for LsTool {
                 return Ok(AgentToolResult::text("(empty directory)"));
             }
 
-            entries.sort_by(|a, b| {
-                if a.is_ascii() && b.is_ascii() {
+            if entries.iter().all(|s| s.is_ascii()) {
+                entries.sort_by(|a, b| {
                     for (&ba, &bb) in a.as_bytes().iter().zip(b.as_bytes()) {
                         let cmp = ba.to_ascii_lowercase().cmp(&bb.to_ascii_lowercase());
                         if cmp != std::cmp::Ordering::Equal {
@@ -158,17 +158,22 @@ impl AgentTool for LsTool {
                         }
                     }
                     a.len().cmp(&b.len())
-                } else {
-                    a.to_lowercase().cmp(&b.to_lowercase())
-                }
-            });
+                });
+            } else {
+                entries.sort_by_cached_key(|s| s.to_lowercase());
+            }
 
             let limit_reached = entries.len() > limit;
             if limit_reached {
                 entries.truncate(limit);
             }
 
-            let mut output = String::new();
+            let output_cap = entries
+                .iter()
+                .map(|e| e.len().saturating_add(1))
+                .sum::<usize>()
+                .min(LS_MAX_OUTPUT_BYTES.saturating_add(64));
+            let mut output = String::with_capacity(output_cap);
             let mut total_bytes = 0usize;
             let mut byte_cap_reached = false;
             for entry in entries {

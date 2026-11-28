@@ -91,18 +91,29 @@ pub async fn run_print_mode_content(
     content: mehh_ai::UserContent,
     mode: OutputMode,
 ) -> Result<String> {
-    let text_printer = Arc::new(Mutex::new(TextModeStreamPrinter::new(std::io::stdout())));
-    let printer_cb = text_printer.clone();
-
+    let mut text_printer: Option<Arc<Mutex<TextModeStreamPrinter<std::io::Stdout>>>> = None;
     let on_event: Arc<dyn Fn(AgentEvent) + Send + Sync> = match mode {
-        OutputMode::Json => Arc::new(|event: AgentEvent| {
-            if let Ok(line) = serde_json::to_string(&event) {
-                println!("{line}");
-            }
-        }),
-        OutputMode::Text => Arc::new(move |event: AgentEvent| {
-            mehh_ai::lock_recover(&printer_cb).handle_event(&event);
-        }),
+        OutputMode::Json => {
+            let json_buf = Mutex::new(Vec::<u8>::with_capacity(512));
+            Arc::new(move |event: AgentEvent| {
+                let mut buf = mehh_ai::lock_recover(&json_buf);
+                buf.clear();
+                if serde_json::to_writer(&mut *buf, &event).is_ok() {
+                    buf.push(b'\n');
+                    let mut out = std::io::stdout().lock();
+                    let _ = out.write_all(&buf);
+                    let _ = out.flush();
+                }
+            })
+        }
+        OutputMode::Text => {
+            let printer = Arc::new(Mutex::new(TextModeStreamPrinter::new(std::io::stdout())));
+            let printer_cb = printer.clone();
+            text_printer = Some(printer);
+            Arc::new(move |event: AgentEvent| {
+                mehh_ai::lock_recover(&printer_cb).handle_event(&event);
+            })
+        }
     };
 
     let new_messages = session.prompt_content(content, Some(on_event)).await?;
@@ -127,8 +138,8 @@ pub async fn run_print_mode_content(
         .map(|a| a.text_content())
         .unwrap_or_default();
 
-    if mode == OutputMode::Text {
-        let streamed = mehh_ai::lock_recover(&text_printer).streamed_any;
+    if let Some(printer) = text_printer {
+        let streamed = mehh_ai::lock_recover(&printer).streamed_any;
         if streamed {
             println!();
         } else if !final_text.is_empty() {

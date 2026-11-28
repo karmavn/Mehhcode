@@ -211,6 +211,45 @@ pub enum TuiAction {
     ScrollBottom,
 }
 
+const ALL_TUI_ACTIONS: [TuiAction; 27] = [
+    TuiAction::CursorLeft,
+    TuiAction::CursorRight,
+    TuiAction::CursorUp,
+    TuiAction::CursorDown,
+    TuiAction::WordLeft,
+    TuiAction::WordRight,
+    TuiAction::LineStart,
+    TuiAction::LineEnd,
+    TuiAction::Submit,
+    TuiAction::Newline,
+    TuiAction::Backspace,
+    TuiAction::Delete,
+    TuiAction::DeleteWordBackward,
+    TuiAction::DeleteWordForward,
+    TuiAction::KillToEnd,
+    TuiAction::KillToStart,
+    TuiAction::Yank,
+    TuiAction::YankPop,
+    TuiAction::Undo,
+    TuiAction::HistoryPrev,
+    TuiAction::HistoryNext,
+    TuiAction::TabComplete,
+    TuiAction::Interrupt,
+    TuiAction::ClearOrExit,
+    TuiAction::ScrollUp,
+    TuiAction::ScrollDown,
+    TuiAction::ScrollBottom,
+];
+
+const _: () = assert!((TuiAction::ScrollBottom as u32) < 32);
+
+impl TuiAction {
+    #[inline]
+    const fn bit(self) -> u32 {
+        1u32 << (self as u32)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CompiledBinding {
     raw: String,
@@ -236,6 +275,8 @@ impl CompiledBinding {
 pub struct Keybindings {
     bindings: HashMap<TuiAction, Vec<String>>,
     compiled: HashMap<TuiAction, Vec<CompiledBinding>>,
+    ascii_fast: [u32; 128],
+    exact_fast: HashMap<String, u32>,
 }
 
 impl Default for Keybindings {
@@ -342,13 +383,17 @@ impl Keybindings {
             })
             .collect();
 
-        Self {
+        let mut kb = Self {
             bindings: map,
             compiled,
-        }
+            ascii_fast: [0u32; 128],
+            exact_fast: HashMap::new(),
+        };
+        kb.rebuild_fast_cache();
+        kb
     }
 
-    pub fn matches(&self, key: &str, action: TuiAction) -> bool {
+    fn matches_slow(&self, key: &str, action: TuiAction) -> bool {
         let Some(entries) = self.compiled.get(&action) else {
             return false;
         };
@@ -361,6 +406,94 @@ impl Keybindings {
             .any(|b| k_mask == b.mod_mask && k_extra == b.extra_mods && k_base == b.base)
     }
 
+    fn compute_mask_slow(&self, key: &str) -> u32 {
+        let (k_mask, k_extra, k_base) = canonicalize_key_spec(key);
+        let mut mask = 0u32;
+        for action in ALL_TUI_ACTIONS {
+            let Some(entries) = self.compiled.get(&action) else {
+                continue;
+            };
+            let hit = entries.iter().any(|b| {
+                key.eq_ignore_ascii_case(&b.raw)
+                    || (k_mask == b.mod_mask && k_extra == b.extra_mods && k_base == b.base)
+            });
+            if hit {
+                mask |= action.bit();
+            }
+        }
+        mask
+    }
+
+    fn rebuild_fast_cache(&mut self) {
+        for b in 0u8..128 {
+            let buf = [b];
+            if let Ok(s) = std::str::from_utf8(&buf) {
+                self.ascii_fast[b as usize] = self.compute_mask_slow(s);
+            }
+        }
+
+        let mut keys_to_index: Vec<String> = Vec::with_capacity(128);
+        for spec in [
+            "enter", "tab", "backtab", "escape", "backspace", "delete", "left", "right", "up",
+            "down", "home", "end", "pageup", "pagedown",
+        ] {
+            keys_to_index.push(spec.to_string());
+        }
+        for ch in 'a'..='z' {
+            keys_to_index.push(format!("ctrl+{ch}"));
+            keys_to_index.push(format!("alt+{ch}"));
+        }
+        for entries in self.compiled.values() {
+            for b in entries {
+                keys_to_index.push(b.raw.clone());
+                keys_to_index.push(b.raw.to_ascii_lowercase());
+                if b.extra_mods.is_none() {
+                    let mut canon = String::new();
+                    if (b.mod_mask & MOD_CTRL) != 0 {
+                        canon.push_str("ctrl+");
+                    }
+                    if (b.mod_mask & MOD_ALT) != 0 {
+                        canon.push_str("alt+");
+                    }
+                    if (b.mod_mask & MOD_SHIFT) != 0 {
+                        canon.push_str("shift+");
+                    }
+                    if (b.mod_mask & MOD_SUPER) != 0 {
+                        canon.push_str("super+");
+                    }
+                    if b.base == " " {
+                        canon.push_str("space");
+                    } else {
+                        canon.push_str(&b.base);
+                    }
+                    keys_to_index.push(canon);
+                }
+            }
+        }
+
+        self.exact_fast.clear();
+        for key in keys_to_index {
+            if !self.exact_fast.contains_key(&key) {
+                let mask = self.compute_mask_slow(&key);
+                self.exact_fast.insert(key, mask);
+            }
+        }
+    }
+
+    #[inline]
+    pub fn matches(&self, key: &str, action: TuiAction) -> bool {
+        if key.len() == 1 {
+            let b = key.as_bytes()[0];
+            if b < 128 {
+                return (self.ascii_fast[b as usize] & action.bit()) != 0;
+            }
+        }
+        if let Some(&mask) = self.exact_fast.get(key) {
+            return (mask & action.bit()) != 0;
+        }
+        self.matches_slow(key, action)
+    }
+
     pub fn bind(&mut self, action: TuiAction, pattern: impl Into<String>) {
         let p = pattern.into();
         self.compiled
@@ -368,6 +501,7 @@ impl Keybindings {
             .or_default()
             .push(CompiledBinding::from_raw(p.clone()));
         self.bindings.entry(action).or_default().push(p);
+        self.rebuild_fast_cache();
     }
 
     pub fn set_bindings(&mut self, action: TuiAction, patterns: Vec<String>) {
@@ -377,6 +511,7 @@ impl Keybindings {
             .collect();
         self.compiled.insert(action, compiled);
         self.bindings.insert(action, patterns);
+        self.rebuild_fast_cache();
     }
 
     pub fn get_bindings(&self, action: TuiAction) -> Option<&[String]> {
@@ -491,6 +626,52 @@ mod tests {
 
         let ev_plain = KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE);
         assert_eq!(normalize_crossterm_key(ev_plain), Some(" ".to_string()));
+    }
+
+    #[test]
+    fn test_keybindings_fast_cache_matches_slow_across_ascii_aliases_and_mutations() {
+        let mut kb = Keybindings::default_bindings();
+        let assert_parity = |bindings: &Keybindings| {
+            let mut probe_keys: Vec<String> = (0u8..128)
+                .filter_map(|b| std::str::from_utf8(&[b]).ok().map(str::to_string))
+                .collect();
+            for extra in [
+                "enter",
+                "return",
+                "esc",
+                "escape",
+                "space",
+                "tab",
+                "backtab",
+                "shift+tab",
+                "ctrl+c",
+                "shift+ctrl+P",
+                "ctrl++",
+                "ctrl+x",
+                "alt+left",
+                "up",
+                "down",
+                "page_up",
+                "page_down",
+                "é",
+            ] {
+                probe_keys.push(extra.to_string());
+            }
+            for key in &probe_keys {
+                for action in ALL_TUI_ACTIONS {
+                    assert_eq!(
+                        bindings.matches(key, action),
+                        bindings.matches_slow(key, action),
+                        "fast cache diverged for key={key:?} action={action:?}"
+                    );
+                }
+            }
+        };
+
+        assert_parity(&kb);
+        kb.bind(TuiAction::Submit, "ctrl+x");
+        kb.set_bindings(TuiAction::Interrupt, vec!["k".into(), "ctrl+shift+q".into()]);
+        assert_parity(&kb);
     }
 }
 

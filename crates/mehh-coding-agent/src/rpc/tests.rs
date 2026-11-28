@@ -1523,5 +1523,9 @@ fn format_rpc_event_matches_reference_value_for_all_assistant_event_variants() {
             assistant_message_event: ame,
         };
         assert_eq!(format_rpc_event(&ev), reference_strip(&ev));
+        let mut buf = Vec::new();
+        super::protocol::write_rpc_event_json(&mut buf, &ev).unwrap();
+        let expected = serde_json::to_vec(&format_rpc_event(&ev)).unwrap();
+        assert_eq!(buf, expected, "direct writer diverged for {:?}", format_rpc_event(&ev));
     }
 }
